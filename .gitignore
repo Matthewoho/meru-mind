@@ -1,0 +1,30 @@
+# Dependencies & build
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Runtime data & local state (never commit user data)
+.meru-mind/
+.mindrealm/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+blobs/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# OS & editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local private agent tooling
+.agents/
+CLAUDE.md
+AGENTS.md
