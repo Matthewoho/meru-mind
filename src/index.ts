@@ -18,7 +18,14 @@ import { MindError } from "./types.js";
 export * from "./types.js";
 export * from "./policy.js";
 export * from "./ports.js";
-export { SqliteDb, normalizeForFts } from "./adapters/sqlite-db.js";
+export {
+  SqliteDb,
+  normalizeForFts,
+  parseSearchQuery,
+  buildFtsMatchExpression,
+  type SearchConcept,
+  type ParsedSearchQuery,
+} from "./adapters/sqlite-db.js";
 export { LocalBlobStore } from "./adapters/blob-store.js";
 export {
   NoopEmbedder,
@@ -36,7 +43,15 @@ export {
   type LayerFSRuntimeLike,
   type LayerFSWorkspaceHandle,
 } from "./adapters/layerfs-drive.js";
-export { LedgerEngine, computePayloadHash } from "./engine/ledger.js";
+export {
+  LedgerEngine,
+  computePayloadHash,
+} from "./engine/ledger.js";
+export {
+  createVisibilityHelpers,
+  parseDriveSourceRef,
+  type VisibilityHelpers,
+} from "./engine/visibility.js";
 export { SeaEngine } from "./engine/sea.js";
 export {
   SliceExporter,

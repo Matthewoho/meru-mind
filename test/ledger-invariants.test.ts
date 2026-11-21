@@ -189,14 +189,19 @@ describe("Ledger invariants: supersede chains, human-only rules, verdicts & blin
     });
     engines.push(engine);
 
-    const { org, rootRealm } = engine.ledger.createOrg({ name: "Acme" });
+    const { org, rootRealm } = engine.ledger.createOrg({
+      name: "Acme",
+      policy: "tree",
+    });
     const sibA = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "alpha",
       name: "Alpha",
     });
     const sibB = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "beta",

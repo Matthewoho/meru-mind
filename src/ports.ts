@@ -11,9 +11,12 @@ import type {
   Realm,
   RealmMount,
   RecordKind,
+  RedactedBlocklistEntry,
   SchemaMigrationRecord,
   SeabedEntry,
   SeabedKind,
+  Sensitivity,
+  WalCheckpointResult,
 } from "./types.js";
 
 export interface FtsMatch {
@@ -89,6 +92,8 @@ export interface DbPort {
     topicId?: string;
     since?: string;
     until?: string;
+    /** Defaults to ["secret"] so secret entries are excluded from all list/timeline paths */
+    excludeSensitivities?: Sensitivity[];
     limit?: number;
     offset?: number;
   }): { items: SeabedEntry[]; total: number };
@@ -107,10 +112,53 @@ export interface DbPort {
     includeSuperseded?: boolean;
     since?: string;
     until?: string;
+    /** Defaults to ["secret"] so secret entries are excluded from all list/timeline paths */
+    excludeSensitivities?: Sensitivity[];
     limit?: number;
     offset?: number;
   }): { items: LedgerRecord[]; total: number };
+  listPendingHumanQuestions(filter: {
+    realmIds: string[];
+    excludeSensitivities?: Sensitivity[];
+    limit?: number;
+  }): { items: LedgerRecord[]; total: number };
+  countRecordsByKind(filter: {
+    realmIds: string[];
+    includeSuperseded?: boolean;
+    excludeSensitivities?: Sensitivity[];
+  }): Record<string, number>;
   listAllRecords(): LedgerRecord[];
+
+  // Redaction & Blocklist
+  redactRecordRow(params: {
+    id: string;
+    redactedAt: string;
+    redactedBy: string;
+    redactedReason: string | null;
+  }): boolean;
+  redactSeabedRow(params: {
+    id: string;
+    redactedAt: string;
+    redactedBy: string;
+    redactedReason: string | null;
+  }): boolean;
+  findDistillationsBySourceId(sourceId: string): Distillation[];
+  redactDistillationRow(params: {
+    id: string;
+    hardFacts: Record<string, unknown>;
+  }): boolean;
+  countBlobReferences(sha256: string): {
+    seabedCount: number;
+    driveFiles: DriveFileMeta[];
+  };
+  insertRedactedBlocklist(entry: RedactedBlocklistEntry): void;
+  isRedactedBlocked(
+    orgId: string,
+    sourceRef: string,
+    contentSha256: string,
+  ): boolean;
+  listRedactedBlocklist(orgId: string): RedactedBlocklistEntry[];
+  optimizeFtsAndCheckpoint(): WalCheckpointResult;
 
   // Distillations (rebuildable event slices & cognitive cards)
   insertDistillation(distillation: Distillation): void;
@@ -150,8 +198,10 @@ export interface DbPort {
   ): ChangeLogEntry;
   listChangeLog(params?: {
     orgId?: string;
+    realmIds?: string[];
     sinceSeq?: number;
     limit?: number;
+    includeSecret?: boolean;
   }): { generation: number; entries: ChangeLogEntry[] };
   resetChangeLog(): { generation: number; clearedCount: number };
 
@@ -173,6 +223,12 @@ export interface DbPort {
     includeSuperseded: boolean;
     limit: number;
   }): FtsMatch[];
+  countFts(params: {
+    query: string;
+    realmIds: string[];
+    sourceTypes?: Array<"record" | "seabed" | "distillation">;
+    includeSuperseded: boolean;
+  }): number;
   clearFtsIndex(): void;
 
   // Rebuildable sqlite-vec index
@@ -209,6 +265,7 @@ export interface BlobPort {
   get(sha256: string): Buffer | null;
   getText(sha256: string): string | null;
   has(sha256: string): boolean;
+  delete(sha256: string): boolean;
 }
 
 export interface DriveWriteResult {

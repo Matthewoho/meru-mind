@@ -1,8 +1,10 @@
 import {
   MindError,
   type AccessLevel,
+  type AccessScope,
   type Actor,
   type AssetKind,
+  type OrgPolicy,
   type Realm,
   type RealmMount,
   type VisibleScope,
@@ -92,6 +94,7 @@ export function resolveAccess(params: {
   targetRealmId: string;
   assetKind: AssetKind;
   explicitDescendantDive?: boolean;
+  orgPolicy?: OrgPolicy;
 }): AccessLevel {
   const {
     realms,
@@ -101,6 +104,7 @@ export function resolveAccess(params: {
     targetRealmId,
     assetKind,
     explicitDescendantDive = false,
+    orgPolicy = "tree",
   } = params;
 
   const realmsById = new Map(realms.map((r) => [r.id, r]));
@@ -111,9 +115,18 @@ export function resolveAccess(params: {
     return "none";
   }
 
-  // Organization is a hard boundary; realms and agents never cross orgs.
+  // Organization is a hard boundary; realms and agents never cross orgs (in both open and tree modes).
   if (viewer.orgId !== target.orgId) {
     return "none";
+  }
+
+  // In "open" org policy, all realms within the same organization are readable & writable
+  // (rules still strictly require human actors; cross-org remains "none").
+  if (orgPolicy === "open") {
+    if (assetKind === "rule") {
+      return actor.kind === "human" ? "write" : "read";
+    }
+    return "write";
   }
 
   // 1. Self
@@ -247,6 +260,93 @@ export function computeVisibleScope(params: {
   };
 }
 
+/**
+ * Policy-aware access scope resolution:
+ * - "tree": strict V0.1 hard wall from computeVisibleScope()
+ * - "open": all realms within the SAME organization are readable (cross-org stays strictly isolated);
+ *           computeVisibleScope() is preserved as focusRealmIds for open-mode ranking boost.
+ */
+export function resolveAccessScope(params: {
+  realms: Realm[];
+  mounts: RealmMount[];
+  viewerRealmId: string;
+  orgPolicy?: OrgPolicy;
+  includeDescendantSeabed?: boolean;
+}): AccessScope {
+  const policy = params.orgPolicy ?? "tree";
+  const treeScope = computeVisibleScope({
+    realms: params.realms,
+    mounts: params.mounts,
+    viewerRealmId: params.viewerRealmId,
+    includeDescendantSeabed: params.includeDescendantSeabed ?? false,
+  });
+
+  if (policy === "tree") {
+    return {
+      ...treeScope,
+      policy: "tree",
+      focusRealmIds: [...treeScope.readableLedgerIds],
+    };
+  }
+
+  const orgRealmIds = params.realms
+    .filter((r) => r.orgId === treeScope.orgId)
+    .map((r) => r.id);
+
+  return {
+    ...treeScope,
+    policy: "open",
+    readableLedgerIds: orgRealmIds,
+    readableDriveIds: orgRealmIds,
+    readableSeabedIds: orgRealmIds,
+    focusRealmIds: [...treeScope.readableLedgerIds],
+  };
+}
+
+/**
+ * Intersects two AccessScopes so narrowing a viewer (e.g. MCP bound viewer -> child realm)
+ * can NEVER widen readable ledger, drive, or seabed sets (blocking child @mounts and child seabed bypasses).
+ */
+export function intersectAccessScopes(
+  requested: AccessScope,
+  ceiling: AccessScope,
+): AccessScope {
+  if (requested.orgId !== ceiling.orgId) {
+    return {
+      ...requested,
+      ancestorIds: [],
+      descendantIds: [],
+      mountedLedgerIds: [],
+      mountedDriveIds: [],
+      mountedSeabedIds: [],
+      readableLedgerIds: [],
+      readableDriveIds: [],
+      readableSeabedIds: [],
+      focusRealmIds: [],
+    };
+  }
+  const ceilLedger = new Set(ceiling.readableLedgerIds);
+  const ceilDrive = new Set(ceiling.readableDriveIds);
+  const ceilSeabed = new Set(ceiling.readableSeabedIds);
+
+  const filterBy = (ids: string[], allowed: Set<string>) =>
+    ids.filter((id) => allowed.has(id));
+
+  return {
+    ...requested,
+    policy: ceiling.policy,
+    ancestorIds: filterBy(requested.ancestorIds, ceilLedger),
+    descendantIds: filterBy(requested.descendantIds, ceilLedger),
+    mountedLedgerIds: filterBy(requested.mountedLedgerIds, ceilLedger),
+    mountedDriveIds: filterBy(requested.mountedDriveIds, ceilDrive),
+    mountedSeabedIds: filterBy(requested.mountedSeabedIds, ceilSeabed),
+    readableLedgerIds: filterBy(requested.readableLedgerIds, ceilLedger),
+    readableDriveIds: filterBy(requested.readableDriveIds, ceilDrive),
+    readableSeabedIds: filterBy(requested.readableSeabedIds, ceilSeabed),
+    focusRealmIds: filterBy(requested.focusRealmIds, ceilLedger),
+  };
+}
+
 export function assertAccess(params: {
   realms: Realm[];
   mounts: RealmMount[];
@@ -256,6 +356,7 @@ export function assertAccess(params: {
   assetKind: AssetKind;
   required: "read" | "write";
   explicitDescendantDive?: boolean;
+  orgPolicy?: OrgPolicy;
 }): void {
   const actual = resolveAccess(params);
   if (params.required === "write") {

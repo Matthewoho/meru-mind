@@ -86,27 +86,34 @@ describe("MindRealm visibility & MindSea 4-stage hybrid recall", () => {
 
     expect(engine.db.vecEnabled).toBe(true);
 
-    // Build tree: A (root) -> B1 -> C1, A -> B2 -> C2
-    const { org, rootRealm: A } = engine.ledger.createOrg({ name: "Acme" });
+    // Build tree (explicit policy: "tree"): A (root) -> B1 -> C1, A -> B2 -> C2
+    const { org, rootRealm: A } = engine.ledger.createOrg({
+      name: "Acme",
+      policy: "tree",
+    });
     const B1 = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: A.id,
       slug: "finance",
       name: "Finance",
     });
     const C1 = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: B1.id,
       slug: "payroll",
       name: "Payroll",
     });
     const B2 = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: A.id,
       slug: "engineering",
       name: "Engineering",
     });
     const C2 = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: B2.id,
       slug: "backend",

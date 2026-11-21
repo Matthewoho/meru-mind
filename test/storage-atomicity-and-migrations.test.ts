@@ -264,7 +264,7 @@ function createV01FixtureDb(dbPath: string, vectorDim = 4): void {
   }
 }
 
-describe("V0.2a Slice 1a: migrations, org policy, atomic CAS, idempotency, change_log & async embeddings", () => {
+describe("Storage migrations, org policy backfill, atomic CAS, idempotency, change_log & async embeddings", () => {
   it("C1-1 & C2: migrates real V0.1 fixture cleanly with zero data loss, tree backfill, secure_delete=ON, and re-enqueued vec_pending", async () => {
     const homeDir = makeTempDir("meru-mind-v01-mig-");
     const dbPath = path.join(homeDir, "mind.sqlite");
@@ -674,12 +674,14 @@ describe("V0.2a Slice 1a: migrations, org policy, atomic CAS, idempotency, chang
       policy: "tree",
     });
     const sibA = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "sib-a",
       name: "Sib A",
     });
     const sibB = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "sib-b",
@@ -693,6 +695,7 @@ describe("V0.2a Slice 1a: migrations, org policy, atomic CAS, idempotency, chang
       computePayloadHash({ nested: { a: "first", z: "last" }, a: 1, b: 2 }),
     );
 
+    const logCountBeforeRec1 = engine.sea.listChangeLog().entries.length;
     // 1. Same key + same content with DIFFERENT JSON key order returns original record (no duplicate)
     const rec1 = await engine.ledger.appendRecord({
       actor: humanAlice,
@@ -712,7 +715,9 @@ describe("V0.2a Slice 1a: migrations, org policy, atomic CAS, idempotency, chang
     });
     expect(rec1Retry.id).toBe(rec1.id);
     expect(engine.db.listAllRecords()).toHaveLength(1);
-    expect(engine.sea.listChangeLog().entries).toHaveLength(1);
+    expect(engine.sea.listChangeLog().entries).toHaveLength(
+      logCountBeforeRec1 + 1,
+    );
 
     // Retrying a supersede call with same idempotencyKey returns the winner (never spurious CONFLICT)
     const rec2 = await engine.ledger.appendRecord({

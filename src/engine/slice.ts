@@ -1,13 +1,14 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { computeVisibleScope } from "../policy.js";
+import { resolveAccessScope } from "../policy.js";
 import type { DbPort, DrivePort } from "../ports.js";
 import {
   MindError,
   type Actor,
   type BriefBudget,
   type BriefOutput,
+  type Sensitivity,
   type SliceExportResult,
   type SliceVerificationResult,
 } from "../types.js";
@@ -290,18 +291,29 @@ export class SliceExporter {
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
     const realmsById = new Map(realms.map((r) => [r.id, r]));
+    const viewerRealm = realmsById.get(params.viewerRealmId);
+    const orgPolicy = viewerRealm
+      ? (this.db.getOrg(viewerRealm.orgId)?.policy ?? "tree")
+      : "tree";
 
-    const scope = computeVisibleScope({
+    const scope = resolveAccessScope({
       realms,
       mounts,
       viewerRealmId: params.viewerRealmId,
+      orgPolicy,
       includeDescendantSeabed: false,
     });
+
+    const exportExcludedSensitivities: Sensitivity[] = [
+      "secret",
+      "confidential",
+    ];
 
     const brief = this.sea.brief({
       actor: params.actor,
       viewerRealmId: params.viewerRealmId,
       budget: params.budget,
+      excludeSensitivities: exportExcludedSensitivities,
     });
 
     const files: Record<string, string> = {};
@@ -318,26 +330,81 @@ export class SliceExporter {
     put("BRIEF.md", renderBriefMarkdown(brief));
     put("brief.json", JSON.stringify(brief, null, 2));
 
-    // Export self ledger & drive
+    const visibleLedgerSet = new Set(scope.readableLedgerIds);
+    const visibleSeabedSet = new Set(scope.readableSeabedIds);
+    const visibleDriveSet = new Set(scope.readableDriveIds);
+    const isExportableRef = (ref: string): boolean => {
+      if (ref.startsWith("drive://")) {
+        const rest = ref.slice("drive://".length);
+        const slash = rest.indexOf("/");
+        if (slash > 0) {
+          return visibleDriveSet.has(rest.slice(0, slash));
+        }
+      }
+      const r = this.db.getRecord(ref);
+      if (r) {
+        return (
+          visibleLedgerSet.has(r.realmId) &&
+          r.sensitivity !== "secret" &&
+          r.sensitivity !== "confidential"
+        );
+      }
+      const s = this.db.getSeabedEntry(ref);
+      if (s) {
+        return (
+          visibleSeabedSet.has(s.realmId) &&
+          s.sensitivity !== "secret" &&
+          s.sensitivity !== "confidential"
+        );
+      }
+      const d = this.db.getDistillation(ref);
+      if (d) return visibleLedgerSet.has(d.realmId);
+      return true;
+    };
+
+    // Export self ledger & drive (strictly excluding secret & confidential)
     const exportRealmData = async (prefix: string, realmId: string, includeDrive: boolean) => {
-      const rules = this.db.listRecords({
-        realmIds: [realmId],
-        kinds: ["rule"],
-        includeSuperseded: false,
-        limit: 200,
-      }).items;
-      const decisions = this.db.listRecords({
-        realmIds: [realmId],
-        kinds: ["decision"],
-        includeSuperseded: false,
-        limit: 200,
-      }).items;
-      const things = this.db.listRecords({
-        realmIds: [realmId],
-        kinds: ["thing"],
-        includeSuperseded: false,
-        limit: 200,
-      }).items;
+      const sanitizeList = (items: ReturnType<DbPort["listRecords"]>["items"]) =>
+        items.map((r) => ({
+          ...r,
+          refs: r.refs.filter(isExportableRef),
+          supersedesId:
+            r.supersedesId && isExportableRef(r.supersedesId)
+              ? r.supersedesId
+              : null,
+          supersededById:
+            r.supersededById && isExportableRef(r.supersededById)
+              ? r.supersededById
+              : null,
+        }));
+
+      const rules = sanitizeList(
+        this.db.listRecords({
+          realmIds: [realmId],
+          kinds: ["rule"],
+          includeSuperseded: false,
+          excludeSensitivities: exportExcludedSensitivities,
+          limit: 200,
+        }).items,
+      );
+      const decisions = sanitizeList(
+        this.db.listRecords({
+          realmIds: [realmId],
+          kinds: ["decision"],
+          includeSuperseded: false,
+          excludeSensitivities: exportExcludedSensitivities,
+          limit: 200,
+        }).items,
+      );
+      const things = sanitizeList(
+        this.db.listRecords({
+          realmIds: [realmId],
+          kinds: ["thing"],
+          includeSuperseded: false,
+          excludeSensitivities: exportExcludedSensitivities,
+          limit: 200,
+        }).items,
+      );
 
       put(`${prefix}/rules.json`, JSON.stringify(rules, null, 2));
       put(`${prefix}/decisions.json`, JSON.stringify(decisions, null, 2));
@@ -388,6 +455,26 @@ export class SliceExporter {
         `children/${cRealm.slug}_${cRealm.id}/summary.json`,
         JSON.stringify(childSummary, null, 2),
       );
+    }
+
+    // Open policy: also export same-org peer realms (never cross-org, never secret/confidential)
+    if (scope.policy === "open") {
+      const alreadyExported = new Set<string>([
+        params.viewerRealmId,
+        ...scope.ancestorIds,
+        ...scope.descendantIds,
+        ...mountedAll,
+      ]);
+      for (const peerId of scope.readableLedgerIds) {
+        if (alreadyExported.has(peerId)) continue;
+        const pRealm = realmsById.get(peerId);
+        if (!pRealm) continue;
+        await exportRealmData(
+          `org/${pRealm.slug}_${pRealm.id}`,
+          pRealm.id,
+          scope.readableDriveIds.includes(pRealm.id),
+        );
+      }
     }
 
     // Compute manifest (never mentions hidden sibling realm IDs!)

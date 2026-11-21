@@ -74,4 +74,18 @@ export class LocalBlobStore implements BlobPort {
     const target = this.blobPath(sha256);
     return fs.existsSync(target);
   }
+
+  delete(sha256: string): boolean {
+    const target = this.blobPath(sha256);
+    if (!fs.existsSync(target)) {
+      return false;
+    }
+    try {
+      fs.chmodSync(target, 0o644);
+    } catch {
+      // ignore chmod failure
+    }
+    fs.unlinkSync(target);
+    return true;
+  }
 }

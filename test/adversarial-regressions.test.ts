@@ -61,14 +61,19 @@ describe("Adversarial security & invariant regressions", () => {
     });
     engines.push(engine);
 
-    const { org, rootRealm } = engine.ledger.createOrg({ name: "Acme" });
+    const { org, rootRealm } = engine.ledger.createOrg({
+      name: "Acme",
+      policy: "tree",
+    });
     const sibHidden = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "hidden",
       name: "Hidden",
     });
     const sibViewer = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "viewer",
@@ -124,8 +129,12 @@ describe("Adversarial security & invariant regressions", () => {
     });
     engines.push(engine);
 
-    const { org, rootRealm } = engine.ledger.createOrg({ name: "Acme" });
+    const { org, rootRealm } = engine.ledger.createOrg({
+      name: "Acme",
+      policy: "tree",
+    });
     const child = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "child",
@@ -197,14 +206,19 @@ describe("Adversarial security & invariant regressions", () => {
     });
     engines.push(engine);
 
-    const { org, rootRealm } = engine.ledger.createOrg({ name: "Acme" });
+    const { org, rootRealm } = engine.ledger.createOrg({
+      name: "Acme",
+      policy: "tree",
+    });
     const sib1 = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "sib1",
       name: "Sib1",
     });
     const sib2 = engine.ledger.createRealm({
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "sib2",
@@ -332,6 +346,7 @@ describe("Adversarial security & invariant regressions", () => {
     // Unsafe realmId ".." rejected
     expect(() =>
       engine.ledger.createRealm({
+        actor: humanAlice,
         id: "..",
         orgId: org.id,
         parentId: rootRealm.id,

@@ -7,8 +7,10 @@ import {
   type ActorKind,
   type DistillationLayer,
   type MountScope,
+  type OrgPolicy,
   type RecordKind,
   type SeabedKind,
+  type Sensitivity,
 } from "./index.js";
 
 interface ParsedArgs {
@@ -20,7 +22,9 @@ const BOOLEAN_FLAGS = new Set([
   "json",
   "help",
   "personal",
+  "as-human",
   "include-superseded",
+  "include-history",
   "include-descendant-seabed",
   "no-restore-drive",
 ]);
@@ -103,7 +107,28 @@ function flagBool(
 
 function buildActor(flags: Record<string, string | boolean>): Actor {
   const id = flagStr(flags, "actor") ?? "user";
-  const kind = (flagStr(flags, "actor-kind") ?? "human") as ActorKind;
+  const asHuman = flagBool(flags, "as-human");
+  const rawKind = flagStr(flags, "actor-kind");
+  let kind: ActorKind;
+
+  if (asHuman) {
+    if (rawKind && rawKind !== "human") {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Cannot combine --as-human with --actor-kind ${rawKind}`,
+      );
+    }
+    kind = "human";
+  } else {
+    if (rawKind === "human") {
+      throw new MindError(
+        "INVALID_INPUT",
+        "Human-privileged CLI operations require explicit --as-human",
+      );
+    }
+    kind = (rawKind ?? "agent") as ActorKind;
+  }
+
   if (kind !== "human" && kind !== "agent" && kind !== "system") {
     throw new MindError("INVALID_INPUT", `Invalid --actor-kind: ${kind}`);
   }
@@ -118,20 +143,24 @@ Global flags:
   --home <dir>              Data directory (default: MERU_MIND_HOME or ~/.meru-mind)
   --drive <local|layerfs>   Drive adapter (default: local)
   --actor <id>              Actor ID (default: user)
-  --actor-kind <kind>       human | agent | system (default: human)
+  --actor-kind <kind>       agent | system (default: agent; use --as-human for human)
+  --as-human                Explicitly elevate actor kind to human (required for rule/redact/set-policy/tree-ops)
   --family <name>           Model family for agent actors (e.g. claude, gemini, deepseek)
   --json                    Print JSON output
 
 Commands:
-  init [--org <name>] [--personal]
-  org create --name <name> [--personal]
+  init [--org <name>] [--personal] [--policy open|tree]
+  org create --name <name> [--personal] [--policy open|tree]
+  org set-policy --org <orgId> --policy open|tree --as-human
   org list
-  realm create --org <orgId> --parent <realmId> --slug <slug> --name <name>
-  realm list [--org <orgId>]
-  mount --viewer <realmId> --target <realmId> [--scope all|ledger|drive]
-  unmount --viewer <realmId> --target <realmId>
-  capture --realm <realmId> --kind message|artifact|evidence|signal --text <text> [--topic <id>] [--file <path>]
-  record --realm <realmId> --kind thing|claim|proposal|verdict|finding|decision|rule --title <title> [--payload <json>] [--refs <a,b>] [--supersedes <id>] [--thing <id>]
+  realm create --org <orgId> --parent <realmId> --slug <slug> --name <name> [--as-human]
+  realm list --org <orgId> [--viewer <realmId>]
+  mount --viewer <realmId> --target <realmId> [--scope all|ledger|drive] [--as-human]
+  unmount --viewer <realmId> --target <realmId> [--as-human]
+  capture --realm <realmId> --kind message|artifact|evidence|signal --text <text> [--topic <id>] [--file <path>] [--sensitivity <level>] [--occurred-at <iso>] [--idempotency-key <key>]
+  record --realm <realmId> --kind thing|claim|proposal|verdict|finding|decision|rule --title <title> [--payload <json>] [--refs <a,b>] [--supersedes <id>] [--thing <id>] [--sensitivity <level>] [--occurred-at <iso>] [--idempotency-key <key>] [--as-human]
+  redact --id <entryId> [--reason <text>] --as-human
+  sync-embeddings [--batch-size <n>] [--max-items <n>]
   drive write --realm <realmId> --path <relPath> (--content <text> | --file <path>) [--expected-version <n>] [--message <msg>]
   drive read --viewer <realmId> [--target <realmId>] --path <relPath>
   drive list --viewer <realmId> [--target <realmId>]
@@ -171,18 +200,19 @@ async function main(): Promise<void> {
     if (cmd === "init") {
       const existing = engine.ledger.listOrgs();
       if (existing.length > 0) {
-        const realms = engine.ledger.listRealms(existing[0]!.id);
+        const rootRealm = engine.db.getRealmByPath(existing[0]!.id, "/");
         output({
           initialized: false,
           homeDir: engine.homeDir,
           org: existing[0],
-          rootRealm: realms[0] ?? null,
+          rootRealm: rootRealm ?? null,
         });
         return;
       }
       const created = engine.ledger.createOrg({
         name: flagStr(flags, "org") ?? "Personal",
         isPersonalRoot: !flags["personal"] ? true : flagBool(flags, "personal"),
+        policy: flagStr(flags, "policy") as OrgPolicy | undefined,
       });
       output({ initialized: true, homeDir: engine.homeDir, ...created });
       return;
@@ -194,6 +224,17 @@ async function main(): Promise<void> {
           engine.ledger.createOrg({
             name: requireFlag(flags, "name"),
             isPersonalRoot: flagBool(flags, "personal"),
+            policy: flagStr(flags, "policy") as OrgPolicy | undefined,
+          }),
+        );
+        return;
+      }
+      if (sub === "set-policy") {
+        output(
+          engine.ledger.setOrgPolicy({
+            orgId: requireFlag(flags, "org"),
+            policy: requireFlag(flags, "policy") as OrgPolicy,
+            actor,
           }),
         );
         return;
@@ -209,6 +250,7 @@ async function main(): Promise<void> {
       if (sub === "create") {
         output(
           engine.ledger.createRealm({
+            actor,
             orgId: requireFlag(flags, "org"),
             parentId: requireFlag(flags, "parent"),
             slug: requireFlag(flags, "slug"),
@@ -218,7 +260,12 @@ async function main(): Promise<void> {
         return;
       }
       if (sub === "list") {
-        output(engine.ledger.listRealms(flagStr(flags, "org")));
+        output(
+          engine.ledger.listRealms({
+            orgId: requireFlag(flags, "org"),
+            viewerRealmId: flagStr(flags, "viewer"),
+          }),
+        );
         return;
       }
       throw new MindError("INVALID_INPUT", `Unknown realm subcommand: ${sub ?? ""}`);
@@ -238,10 +285,11 @@ async function main(): Promise<void> {
 
     if (cmd === "unmount") {
       output({
-        removed: engine.ledger.unmountRealm(
-          requireFlag(flags, "viewer"),
-          requireFlag(flags, "target"),
-        ),
+        removed: engine.ledger.unmountRealm({
+          actor,
+          viewerRealmId: requireFlag(flags, "viewer"),
+          targetRealmId: requireFlag(flags, "target"),
+        }),
       });
       return;
     }
@@ -258,6 +306,9 @@ async function main(): Promise<void> {
           topicId: flagStr(flags, "topic"),
           blobContent,
           sourceRef: flagStr(flags, "source-ref"),
+          occurredAt: flagStr(flags, "occurred-at"),
+          sensitivity: flagStr(flags, "sensitivity") as Sensitivity | undefined,
+          idempotencyKey: flagStr(flags, "idempotency-key"),
         }),
       );
       return;
@@ -292,11 +343,37 @@ async function main(): Promise<void> {
           actor,
           viewerRealmId: requireFlag(flags, "realm"),
           kind: requireFlag(flags, "kind") as RecordKind,
+          extKind: flagStr(flags, "ext-kind"),
           title: requireFlag(flags, "title"),
           payload,
           refs,
           supersedesId: flagStr(flags, "supersedes"),
           thingId: flagStr(flags, "thing"),
+          occurredAt: flagStr(flags, "occurred-at"),
+          sensitivity: flagStr(flags, "sensitivity") as Sensitivity | undefined,
+          idempotencyKey: flagStr(flags, "idempotency-key"),
+        }),
+      );
+      return;
+    }
+
+    if (cmd === "redact") {
+      output(
+        engine.ledger.redact({
+          actor,
+          entryId: requireFlag(flags, "id"),
+          reason: flagStr(flags, "reason"),
+          viewerRealmId: flagStr(flags, "realm"),
+        }),
+      );
+      return;
+    }
+
+    if (cmd === "sync-embeddings") {
+      output(
+        await engine.sea.syncEmbeddings({
+          batchSize: parseIntFlag(flags, "batch-size", { min: 1 }),
+          maxItems: parseIntFlag(flags, "max-items", { min: 1 }),
         }),
       );
       return;
@@ -376,7 +453,9 @@ async function main(): Promise<void> {
           id: flagStr(flags, "id"),
           thingId: flagStr(flags, "thing"),
           targetRealmId: flagStr(flags, "target"),
-          includeSuperseded: flagBool(flags, "include-superseded"),
+          includeSuperseded:
+            flagBool(flags, "include-superseded") ||
+            flagBool(flags, "include-history"),
           includeDescendantSeabed: flagBool(flags, "include-descendant-seabed"),
           limit,
         }),

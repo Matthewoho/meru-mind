@@ -1,6 +1,11 @@
 import crypto from "node:crypto";
 import { assertSafeIdentifier } from "../adapters/local-drive.js";
-import { assertAccess, resolveAccess } from "../policy.js";
+import {
+  assertAccess,
+  intersectAccessScopes,
+  resolveAccess,
+  resolveAccessScope,
+} from "../policy.js";
 import type {
   BlobPort,
   DbPort,
@@ -9,6 +14,7 @@ import type {
 } from "../ports.js";
 import {
   MindError,
+  type AccessScope,
   type Actor,
   type DriveFileContent,
   type DriveFileMeta,
@@ -19,10 +25,15 @@ import {
   type Realm,
   type RealmMount,
   type RecordKind,
+  type RedactResult,
   type SeabedEntry,
   type SeabedKind,
   type Sensitivity,
 } from "../types.js";
+import {
+  createVisibilityHelpers,
+  parseDriveSourceRef,
+} from "./visibility.js";
 
 const VALID_SEABED_KINDS = new Set<string>([
   "message",
@@ -130,6 +141,23 @@ function normalizeSlug(raw: string): string {
   return slug;
 }
 
+function stripIdFromHardFacts(value: unknown, entryId: string): unknown {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => item !== entryId)
+      .map((item) => stripIdFromHardFacts(item, entryId));
+  }
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v === entryId) continue;
+      out[k] = stripIdFromHardFacts(v, entryId);
+    }
+    return out;
+  }
+  return value;
+}
+
 export interface IndexHooks {
   indexSeabed(entry: SeabedEntry): Promise<void>;
   indexRecord(record: LedgerRecord): Promise<void>;
@@ -142,6 +170,11 @@ export class LedgerEngine {
     private readonly drive: DrivePort,
     _embedder?: EmbedderPort,
   ) {}
+
+  private getOrgPolicy(orgId: string | undefined): OrgPolicy {
+    if (!orgId) return "tree";
+    return this.db.getOrg(orgId)?.policy ?? "tree";
+  }
 
   private upsertFtsSync(params: {
     itemId: string;
@@ -257,7 +290,7 @@ export class LedgerEngine {
       const now = new Date().toISOString();
       this.db.appendChangeLog({
         orgId: existing.id,
-        realmId: rootRealm?.id ?? "",
+        realmId: rootRealm?.id ?? "__org__",
         entityType: "org",
         entityId: existing.id,
         op: "org_policy_change",
@@ -281,58 +314,140 @@ export class LedgerEngine {
     parentId: string;
     slug: string;
     name: string;
+    actor: Actor;
   }): Realm {
+    const actor = validateActor(params.actor);
     const name = params.name.trim();
     if (!name) {
       throw new MindError("INVALID_INPUT", "Realm name cannot be empty");
     }
-    const org = this.db.getOrg(params.orgId);
-    if (!org) {
-      throw new MindError("NOT_FOUND", `Organization not found: ${params.orgId}`);
-    }
-    const parent = this.db.getRealm(params.parentId);
-    if (!parent) {
-      throw new MindError("NOT_FOUND", `Parent realm not found: ${params.parentId}`);
-    }
-    if (parent.orgId !== params.orgId) {
-      throw new MindError(
-        "ACCESS_DENIED",
-        `Parent realm "${params.parentId}" belongs to a different organization`,
-      );
-    }
 
-    const slug = normalizeSlug(params.slug);
-    const realmPath =
-      parent.path === "/" ? `/${slug}` : `${parent.path}/${slug}`;
-    if (this.db.getRealmByPath(params.orgId, realmPath)) {
-      throw new MindError(
-        "CONFLICT",
-        `Realm already exists at path "${realmPath}" in org "${params.orgId}"`,
-      );
-    }
+    return this.db.transaction(() => {
+      const org = this.db.getOrg(params.orgId);
+      if (!org) {
+        throw new MindError(
+          "NOT_FOUND",
+          `Organization not found: ${params.orgId}`,
+        );
+      }
+      if (org.policy === "tree" && actor.kind !== "human") {
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Only human actors can create realms in 'tree' policy organizations (actor "${actor.id}" is "${actor.kind}")`,
+        );
+      }
+      const parent = this.db.getRealm(params.parentId);
+      if (!parent) {
+        throw new MindError(
+          "NOT_FOUND",
+          `Parent realm not found: ${params.parentId}`,
+        );
+      }
+      if (parent.orgId !== params.orgId) {
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Parent realm "${params.parentId}" belongs to a different organization`,
+        );
+      }
 
-    const realmId = params.id?.trim() || makeId("realm");
-    assertSafeIdentifier(realmId, "realmId");
-    const realm: Realm = {
-      id: realmId,
-      orgId: params.orgId,
-      parentId: parent.id,
-      slug,
-      path: realmPath,
-      name,
-      archivedAt: null,
-      createdAt: new Date().toISOString(),
-    };
-    this.db.insertRealm(realm);
-    return realm;
+      const slug = normalizeSlug(params.slug);
+      const realmPath =
+        parent.path === "/" ? `/${slug}` : `${parent.path}/${slug}`;
+      if (this.db.getRealmByPath(params.orgId, realmPath)) {
+        throw new MindError(
+          "CONFLICT",
+          `Realm already exists at path "${realmPath}" in org "${params.orgId}"`,
+        );
+      }
+
+      const realmId = params.id?.trim() || makeId("realm");
+      assertSafeIdentifier(realmId, "realmId");
+      const now = new Date().toISOString();
+      const realm: Realm = {
+        id: realmId,
+        orgId: params.orgId,
+        parentId: parent.id,
+        slug,
+        path: realmPath,
+        name,
+        archivedAt: null,
+        createdAt: now,
+      };
+      this.db.insertRealm(realm);
+      this.db.appendChangeLog({
+        orgId: org.id,
+        realmId: realm.id,
+        entityType: "realm",
+        entityId: realm.id,
+        op: "create_realm",
+        actorId: actor.id,
+        createdAt: now,
+      });
+      return realm;
+    });
   }
 
   getRealm(id: string): Realm | null {
     return this.db.getRealm(id);
   }
 
-  listRealms(orgId?: string): Realm[] {
-    return this.db.listRealms(orgId);
+  listRealms(params: {
+    orgId: string;
+    viewerRealmId?: string;
+    scopeCeiling?: AccessScope;
+  }): Realm[] {
+    const orgId = params?.orgId?.trim();
+    if (!orgId) {
+      throw new MindError("INVALID_INPUT", "orgId is required for listRealms");
+    }
+    const org = this.db.getOrg(orgId);
+    if (!org) {
+      throw new MindError("NOT_FOUND", `Organization not found: ${orgId}`);
+    }
+    if (params.scopeCeiling && params.scopeCeiling.orgId !== org.id) {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Organization "${orgId}" is outside bound scope`,
+      );
+    }
+
+    const orgRealms = this.db.listRealms(org.id);
+    if (org.policy === "tree") {
+      const viewerRealmId = params.viewerRealmId?.trim();
+      if (!viewerRealmId) {
+        throw new MindError(
+          "INVALID_INPUT",
+          `viewerRealmId is required for listRealms in 'tree' policy organization "${org.id}"`,
+        );
+      }
+      const mounts = this.db.listMounts();
+      const baseScope = resolveAccessScope({
+        realms: orgRealms,
+        mounts,
+        viewerRealmId,
+        orgPolicy: "tree",
+        includeDescendantSeabed: false,
+      });
+      const effective = params.scopeCeiling
+        ? intersectAccessScopes(baseScope, params.scopeCeiling)
+        : baseScope;
+      const visibleIds = new Set<string>([
+        ...effective.readableLedgerIds,
+        ...effective.readableDriveIds,
+        ...effective.readableSeabedIds,
+      ]);
+      return orgRealms.filter((r) => visibleIds.has(r.id));
+    }
+
+    if (params.scopeCeiling) {
+      const visibleIds = new Set<string>([
+        ...params.scopeCeiling.readableLedgerIds,
+        ...params.scopeCeiling.readableDriveIds,
+        ...params.scopeCeiling.readableSeabedIds,
+      ]);
+      return orgRealms.filter((r) => visibleIds.has(r.id));
+    }
+    return orgRealms;
   }
 
   mountRealm(params: {
@@ -344,47 +459,123 @@ export class LedgerEngine {
     const actor = validateActor(params.actor);
     const scope = params.scope ?? "all";
     if (!VALID_MOUNT_SCOPES.has(scope)) {
-      throw new MindError("INVALID_INPUT", `Invalid mount scope: "${String(scope)}"`);
-    }
-    if (params.viewerRealmId === params.targetRealmId) {
       throw new MindError(
         "INVALID_INPUT",
-        "Cannot mount a realm onto itself",
+        `Invalid mount scope: "${String(scope)}"`,
       );
     }
-    const viewer = this.db.getRealm(params.viewerRealmId);
-    const target = this.db.getRealm(params.targetRealmId);
-    if (!viewer) {
-      throw new MindError("NOT_FOUND", `Viewer realm not found: ${params.viewerRealmId}`);
-    }
-    if (!target) {
-      throw new MindError("NOT_FOUND", `Target realm not found: ${params.targetRealmId}`);
-    }
-    if (viewer.orgId !== target.orgId) {
-      throw new MindError(
-        "ACCESS_DENIED",
-        "Cross-organization realm mounts are forbidden",
-      );
+    if (params.viewerRealmId === params.targetRealmId) {
+      throw new MindError("INVALID_INPUT", "Cannot mount a realm onto itself");
     }
 
-    const mount: RealmMount = {
-      id: makeId("mnt"),
-      viewerRealmId: viewer.id,
-      targetRealmId: target.id,
-      scope,
-      mountedBy: actor.id,
-      createdAt: new Date().toISOString(),
-    };
-    this.db.insertMount(mount);
-    return mount;
+    return this.db.transaction(() => {
+      const viewer = this.db.getRealm(params.viewerRealmId);
+      const target = this.db.getRealm(params.targetRealmId);
+      if (!viewer) {
+        throw new MindError(
+          "NOT_FOUND",
+          `Viewer realm not found: ${params.viewerRealmId}`,
+        );
+      }
+      if (!target) {
+        throw new MindError(
+          "NOT_FOUND",
+          `Target realm not found: ${params.targetRealmId}`,
+        );
+      }
+      if (viewer.orgId !== target.orgId) {
+        throw new MindError(
+          "ACCESS_DENIED",
+          "Cross-organization realm mounts are forbidden",
+        );
+      }
+
+      const orgPolicy = this.getOrgPolicy(viewer.orgId);
+      if (orgPolicy === "tree" && actor.kind !== "human") {
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Only human actors can mount realms in 'tree' policy organizations (actor "${actor.id}" is "${actor.kind}")`,
+        );
+      }
+
+      const now = new Date().toISOString();
+      const mount: RealmMount = {
+        id: makeId("mnt"),
+        viewerRealmId: viewer.id,
+        targetRealmId: target.id,
+        scope,
+        mountedBy: actor.id,
+        createdAt: now,
+      };
+      this.db.insertMount(mount);
+      this.db.appendChangeLog({
+        orgId: viewer.orgId,
+        realmId: viewer.id,
+        entityType: "mount",
+        entityId: mount.id,
+        op: "mount_realm",
+        actorId: actor.id,
+        createdAt: now,
+      });
+      return mount;
+    });
   }
 
-  unmountRealm(viewerRealmId: string, targetRealmId: string): boolean {
-    return this.db.deleteMount(viewerRealmId, targetRealmId);
+  unmountRealm(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    targetRealmId: string;
+  }): boolean {
+    const actor = validateActor(params.actor);
+    return this.db.transaction(() => {
+      const viewer = this.db.getRealm(params.viewerRealmId);
+      if (!viewer) {
+        throw new MindError(
+          "NOT_FOUND",
+          `Viewer realm not found: ${params.viewerRealmId}`,
+        );
+      }
+      const orgPolicy = this.getOrgPolicy(viewer.orgId);
+      if (orgPolicy === "tree" && actor.kind !== "human") {
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Only human actors can unmount realms in 'tree' policy organizations (actor "${actor.id}" is "${actor.kind}")`,
+        );
+      }
+      const target = this.db.getRealm(params.targetRealmId);
+      if (target && target.orgId !== viewer.orgId) {
+        throw new MindError(
+          "ACCESS_DENIED",
+          "Cross-organization realm unmounts are forbidden",
+        );
+      }
+      const removed = this.db.deleteMount(viewer.id, params.targetRealmId);
+      if (removed) {
+        this.db.appendChangeLog({
+          orgId: viewer.orgId,
+          realmId: viewer.id,
+          entityType: "mount",
+          entityId: `${viewer.id}->${params.targetRealmId}`,
+          op: "unmount_realm",
+          actorId: actor.id,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      return removed;
+    });
   }
 
-  listMounts(viewerRealmId?: string): RealmMount[] {
-    return this.db.listMounts(viewerRealmId);
+  listMounts(params: {
+    orgId: string;
+    viewerRealmId?: string;
+    scopeCeiling?: AccessScope;
+  }): RealmMount[] {
+    const visibleRealms = this.listRealms(params);
+    const visibleIds = new Set(visibleRealms.map((r) => r.id));
+    const allMounts = this.db.listMounts();
+    return allMounts.filter(
+      (m) => visibleIds.has(m.viewerRealmId) && visibleIds.has(m.targetRealmId),
+    );
   }
 
   // ---- Seabed (Truth Source 1) ----
@@ -450,6 +641,7 @@ export class LedgerEngine {
       const realms = this.db.listRealms();
       const mounts = this.db.listMounts();
       const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+      const orgPolicy = this.getOrgPolicy(viewerRealm?.orgId);
 
       // 1. Idempotency check at the very start of BEGIN IMMEDIATE
       if (idempotencyKey && viewerRealm) {
@@ -468,6 +660,7 @@ export class LedgerEngine {
                   targetRealmId: existingKey.realmId,
                   assetKind: "seabed",
                   explicitDescendantDive: false,
+                  orgPolicy,
                 })
               : (() => {
                   const rec = this.db.getRecord(existingKey.targetId);
@@ -478,6 +671,7 @@ export class LedgerEngine {
                     viewerRealmId: params.viewerRealmId,
                     targetRealmId: existingKey.realmId,
                     assetKind: rec?.kind === "rule" ? "rule" : "ledger",
+                    orgPolicy,
                   });
                 })();
 
@@ -515,6 +709,7 @@ export class LedgerEngine {
         targetRealmId,
         assetKind: "seabed",
         required: "write",
+        orgPolicy,
       });
 
       const targetRealm = realms.find((r) => r.id === targetRealmId)!;
@@ -647,6 +842,7 @@ export class LedgerEngine {
       const realms = this.db.listRealms();
       const mounts = this.db.listMounts();
       const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+      const orgPolicy = this.getOrgPolicy(viewerRealm?.orgId);
 
       // 1. Idempotency check at the very start of BEGIN IMMEDIATE
       if (idempotencyKey && viewerRealm) {
@@ -665,6 +861,7 @@ export class LedgerEngine {
                   targetRealmId: existingKey.realmId,
                   assetKind: "seabed",
                   explicitDescendantDive: false,
+                  orgPolicy,
                 })
               : (() => {
                   const rec = this.db.getRecord(existingKey.targetId);
@@ -675,6 +872,7 @@ export class LedgerEngine {
                     viewerRealmId: params.viewerRealmId,
                     targetRealmId: existingKey.realmId,
                     assetKind: rec?.kind === "rule" ? "rule" : "ledger",
+                    orgPolicy,
                   });
                 })();
 
@@ -713,6 +911,7 @@ export class LedgerEngine {
         targetRealmId,
         assetKind: params.kind === "rule" ? "rule" : "ledger",
         required: "write",
+        orgPolicy,
       });
 
       const targetRealm = realms.find((r) => r.id === targetRealmId)!;
@@ -727,6 +926,7 @@ export class LedgerEngine {
           viewerRealmId: params.viewerRealmId,
           targetRealmId: rec.realmId,
           assetKind: rec.kind === "rule" ? "rule" : "ledger",
+          orgPolicy,
         });
         return access === "none" ? null : rec;
       };
@@ -742,6 +942,7 @@ export class LedgerEngine {
           targetRealmId: sea.realmId,
           assetKind: "seabed",
           explicitDescendantDive: true,
+          orgPolicy,
         });
         return access === "none" ? null : sea;
       };
@@ -884,22 +1085,43 @@ export class LedgerEngine {
     actor: Actor;
     viewerRealmId: string;
     recordId: string;
+    scopeCeiling?: AccessScope;
   }): LedgerRecord[] {
     const actor = validateActor(params.actor);
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    const orgPolicy = this.getOrgPolicy(viewerRealm?.orgId);
+    if (!viewerRealm) {
+      throw new MindError(
+        "NOT_FOUND",
+        `Entry not found in visible scope: ${params.recordId}`,
+      );
+    }
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: params.viewerRealmId,
+      orgPolicy,
+      includeDescendantSeabed: false,
+    });
+    const effectiveScope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    const vis = createVisibilityHelpers({
+      db: this.db,
+      realms,
+      mounts,
+      actor,
+      viewerRealmId: params.viewerRealmId,
+      scope: effectiveScope,
+      includeDescendantSeabed: false,
+    });
+
     const start = this.db.getRecord(params.recordId);
-    const access = start
-      ? resolveAccess({
-          realms,
-          mounts,
-          actor,
-          viewerRealmId: params.viewerRealmId,
-          targetRealmId: start.realmId,
-          assetKind: start.kind === "rule" ? "rule" : "ledger",
-        })
-      : "none";
-    if (!start || access === "none") {
+    if (!start || !vis.canSeeRecord(start)) {
       throw new MindError(
         "NOT_FOUND",
         `Entry not found in visible scope: ${params.recordId}`,
@@ -916,16 +1138,199 @@ export class LedgerEngine {
       oldest = prev;
     }
 
-    // Walk forward to newest
-    const chain: LedgerRecord[] = [oldest];
+    // Walk forward to newest, filtering out any node outside visible scope
+    const rawChain: LedgerRecord[] = [oldest];
     let cur = oldest;
     while (cur.supersededById) {
       const next = this.db.getRecord(cur.supersededById);
-      if (!next || chain.some((c) => c.id === next.id)) break;
-      chain.push(next);
+      if (!next || rawChain.some((c) => c.id === next.id)) break;
+      rawChain.push(next);
       cur = next;
     }
-    return chain;
+
+    return rawChain
+      .filter(
+        (node) =>
+          vis.canSeeRecord(node) &&
+          (node.sensitivity !== "secret" || node.id === start.id),
+      )
+      .map((node) => vis.sanitizeRecord(node));
+  }
+
+  // ---- Full-Chain Redact (Human-Only Withdrawal + Blob Refcount + FTS Optimize + WAL Checkpoint) ----
+
+  redact(params: {
+    actor: Actor;
+    entryId: string;
+    reason?: string;
+    viewerRealmId?: string;
+  }): RedactResult {
+    const actor = validateActor(params.actor);
+    if (actor.kind !== "human") {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Only human actors can redact entries (actor "${actor.id}" is "${actor.kind}")`,
+      );
+    }
+    const entryId = params.entryId?.trim();
+    if (!entryId) {
+      throw new MindError("INVALID_INPUT", "entryId is required for redact");
+    }
+    const reason = params.reason?.trim() || null;
+
+    const txResult = this.db.transaction(() => {
+      const rec = this.db.getRecord(entryId);
+      const sea = rec ? null : this.db.getSeabedEntry(entryId);
+      if (!rec && !sea) {
+        throw new MindError("NOT_FOUND", `Entry not found: ${entryId}`);
+      }
+
+      const entityType: "record" | "seabed" = rec ? "record" : "seabed";
+      const realmId = rec ? rec.realmId : sea!.realmId;
+      const realm = this.db.getRealm(realmId);
+      const orgId = (rec ? rec.orgId : sea!.orgId) || realm?.orgId || "";
+
+      if (params.viewerRealmId) {
+        const viewerRealm = this.db.getRealm(params.viewerRealmId);
+        if (!viewerRealm || viewerRealm.orgId !== orgId) {
+          throw new MindError("NOT_FOUND", `Entry not found: ${entryId}`);
+        }
+      }
+
+      const now = new Date().toISOString();
+      const residualLocations: string[] = [];
+      let blobToDelete: string | null = null;
+
+      // Compute blocklist key (org_id, source_ref, content_sha256) before wiping content
+      let sourceRef: string;
+      let contentSha256: string;
+      let blobSha256: string | null = null;
+
+      if (rec) {
+        sourceRef =
+          typeof rec.payload.sourceRef === "string" &&
+          rec.payload.sourceRef.trim()
+            ? rec.payload.sourceRef.trim()
+            : `record://${rec.id}`;
+        contentSha256 = sha256Buffer(
+          `${rec.title}\n${JSON.stringify(canonicalizeJson(rec.payload))}`,
+        );
+        this.db.redactRecordRow({
+          id: rec.id,
+          redactedAt: now,
+          redactedBy: actor.id,
+          redactedReason: reason,
+        });
+      } else {
+        const s = sea!;
+        blobSha256 = s.blobSha256;
+        sourceRef = s.sourceRef?.trim() || `seabed://${s.id}`;
+        contentSha256 = s.blobSha256 ?? sha256Buffer(s.text);
+        this.db.redactSeabedRow({
+          id: s.id,
+          redactedAt: now,
+          redactedBy: actor.id,
+          redactedReason: reason,
+        });
+      }
+
+      // Remove target from FTS5, sqlite-vec, and vec_pending
+      this.db.deleteFtsItem(entryId);
+      this.db.deleteVectorItem(entryId);
+
+      // Cascade retraction to every distillation citing this entryId in source_ids
+      const affectedDists = this.db.findDistillationsBySourceId(entryId);
+      const retractedDistillationIds: string[] = [];
+      for (const dist of affectedDists) {
+        const cleanedHardFacts = stripIdFromHardFacts(
+          dist.hardFacts,
+          entryId,
+        ) as Record<string, unknown>;
+        this.db.redactDistillationRow({
+          id: dist.id,
+          hardFacts: cleanedHardFacts,
+        });
+        this.db.deleteFtsItem(dist.id);
+        this.db.deleteVectorItem(dist.id);
+        retractedDistillationIds.push(dist.id);
+      }
+
+      // Blob reference count check across seabed_entries and drive_files
+      // (actual disk deletion happens AFTER transaction COMMIT so a rollback never orphans DB refs)
+      const residualSet = new Set<string>();
+      if (blobSha256) {
+        const refs = this.db.countBlobReferences(blobSha256);
+        for (const df of refs.driveFiles) {
+          residualSet.add(`drive://${df.realmId}/${df.relPath}@v${df.version}`);
+        }
+        if (refs.seabedCount === 0 && refs.driveFiles.length === 0) {
+          blobToDelete = blobSha256;
+        }
+      }
+
+      // Also inspect sourceRef if it points to a live drive file
+      const parsedDriveRef = parseDriveSourceRef(sourceRef);
+      if (parsedDriveRef) {
+        const df = this.db.getDriveFileMeta(
+          parsedDriveRef.realmId,
+          parsedDriveRef.relPath,
+        );
+        if (df) {
+          residualSet.add(`drive://${df.realmId}/${df.relPath}@v${df.version}`);
+        }
+      }
+      residualLocations.push(...Array.from(residualSet).sort());
+
+      // Record exact (org_id, source_ref, content_sha256) in redacted_blocklist
+      this.db.insertRedactedBlocklist({
+        orgId,
+        sourceRef,
+        contentSha256,
+        reason,
+        redactedAt: now,
+      });
+
+      // Record redact op in change_log
+      this.db.appendChangeLog({
+        orgId,
+        realmId,
+        entityType,
+        entityId: entryId,
+        op: "redact",
+        actorId: actor.id,
+        createdAt: now,
+      });
+
+      return {
+        entryId,
+        entityType,
+        orgId,
+        realmId,
+        redactedAt: now,
+        redactedBy: actor.id,
+        reason,
+        retractedDistillationIds,
+        blobToDelete,
+        blocklistRecorded: true,
+        residualLocations,
+      };
+    });
+
+    // Post-commit: unlink unreferenced blob from disk only after SQLite COMMIT succeeded
+    let deletedBlobSha256: string | null = null;
+    if (txResult.blobToDelete && this.blobs.delete(txResult.blobToDelete)) {
+      deletedBlobSha256 = txResult.blobToDelete;
+    }
+
+    // Post-commit: optimize FTS5 b-trees and truncate WAL
+    const walCheckpoint = this.db.optimizeFtsAndCheckpoint();
+
+    const { blobToDelete: _ignored, ...publicResult } = txResult;
+    return {
+      ...publicResult,
+      deletedBlobSha256,
+      walCheckpoint,
+    };
   }
 
   // ---- MindRealm Shared Drive (LayerFS / Local + Immutable Blob Mirror) ----
@@ -942,6 +1347,8 @@ export class LedgerEngine {
     const targetRealmId = params.targetRealmId ?? params.viewerRealmId;
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    const orgPolicy = this.getOrgPolicy(viewerRealm?.orgId);
 
     assertAccess({
       realms,
@@ -951,6 +1358,7 @@ export class LedgerEngine {
       targetRealmId,
       assetKind: "drive",
       required: "write",
+      orgPolicy,
     });
 
     // Write via DrivePort (LayerFS or LocalFs) with optimistic conflict detection
@@ -996,10 +1404,13 @@ export class LedgerEngine {
     viewerRealmId: string;
     targetRealmId?: string;
     relPath: string;
+    scopeCeiling?: AccessScope;
   }): Promise<DriveFileContent | null> {
     const targetRealmId = params.targetRealmId ?? params.viewerRealmId;
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    const orgPolicy = this.getOrgPolicy(viewerRealm?.orgId);
 
     assertAccess({
       realms,
@@ -1009,7 +1420,18 @@ export class LedgerEngine {
       targetRealmId,
       assetKind: "drive",
       required: "read",
+      orgPolicy,
     });
+
+    if (
+      params.scopeCeiling &&
+      !params.scopeCeiling.readableDriveIds.includes(targetRealmId)
+    ) {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Read access denied for drive in realm "${targetRealmId}" outside bound scope.`,
+      );
+    }
 
     return this.drive.readFile(targetRealmId, params.relPath);
   }
@@ -1018,10 +1440,13 @@ export class LedgerEngine {
     actor: Actor;
     viewerRealmId: string;
     targetRealmId?: string;
+    scopeCeiling?: AccessScope;
   }): Promise<DriveFileMeta[]> {
     const targetRealmId = params.targetRealmId ?? params.viewerRealmId;
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    const orgPolicy = this.getOrgPolicy(viewerRealm?.orgId);
 
     assertAccess({
       realms,
@@ -1031,7 +1456,18 @@ export class LedgerEngine {
       targetRealmId,
       assetKind: "drive",
       required: "read",
+      orgPolicy,
     });
+
+    if (
+      params.scopeCeiling &&
+      !params.scopeCeiling.readableDriveIds.includes(targetRealmId)
+    ) {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Read access denied for drive in realm "${targetRealmId}" outside bound scope.`,
+      );
+    }
 
     return this.drive.listFiles(targetRealmId);
   }

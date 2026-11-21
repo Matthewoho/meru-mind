@@ -89,6 +89,12 @@ export interface VisibleScope {
   readableSeabedIds: string[];
 }
 
+export interface AccessScope extends VisibleScope {
+  policy: OrgPolicy;
+  /** Tree-scoped focus realms (viewer + ancestors + descendants + mounts) used for open-mode focus boost */
+  focusRealmIds: string[];
+}
+
 export type SeabedKind = "message" | "artifact" | "evidence" | "signal";
 
 export interface SeabedEntry {
@@ -164,7 +170,7 @@ export interface Distillation {
   realmId: string;
   layer: DistillationLayer;
   periodKey: string;
-  status: "active" | "superseded";
+  status: "active" | "superseded" | "retracted";
   /** Deterministic facts computed exclusively by system code */
   hardFacts: Record<string, unknown>;
   /** Narrative markdown with cited [id] references */
@@ -254,8 +260,12 @@ export interface RecallQuery {
   since?: string;
   until?: string;
   includeSuperseded?: boolean;
+  /** Alias for includeSuperseded */
+  includeHistory?: boolean;
   /** Parent diving explicitly into descendant raw seabed */
   includeDescendantSeabed?: boolean;
+  /** Optional process-level ceiling scope (e.g. MCP bound viewer intersection) */
+  scopeCeiling?: AccessScope;
   /** Stage 3 & 4: Keyword (FTS5) + Semantic (sqlite-vec) query */
   query?: string;
   limit?: number;
@@ -274,9 +284,12 @@ export interface RecallItem {
   snippet: string;
   authorId: string;
   createdAt: string;
+  occurredAt?: string;
   sourceRefs: string[];
   supersedesId?: string | null;
   supersededById?: string | null;
+  /** When item is superseded, 1-hop pointer to the visible active chain head (null if retracted or invisible) */
+  currentHeadId?: string | null;
   matchedBy: Array<"id" | "filter" | "fts" | "vector">;
   score: number;
 }
@@ -350,4 +363,33 @@ export interface SyncEmbeddingsResult {
   skipped: number;
   failed: number;
   remaining: number;
+}
+
+export interface WalCheckpointResult {
+  busy: number;
+  log: number;
+  checkpointed: number;
+}
+
+export interface RedactedBlocklistEntry {
+  orgId: string;
+  sourceRef: string;
+  contentSha256: string;
+  reason: string | null;
+  redactedAt: string;
+}
+
+export interface RedactResult {
+  entryId: string;
+  entityType: "record" | "seabed";
+  orgId: string;
+  realmId: string;
+  redactedAt: string;
+  redactedBy: string;
+  reason: string | null;
+  retractedDistillationIds: string[];
+  deletedBlobSha256: string | null;
+  blocklistRecorded: boolean;
+  walCheckpoint: WalCheckpointResult;
+  residualLocations: string[];
 }
