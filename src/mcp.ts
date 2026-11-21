@@ -385,7 +385,7 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
 
   server.tool(
     "mind_capture_seabed",
-    "Append an immutable seabed entry (message, artifact, evidence, or signal) within bound write scope.",
+    "[DEPRECATED: alias for mind_write_raw; scheduled for removal in v0.3.0] Append an immutable raw entry (message, artifact, evidence, or signal) within bound write scope.",
     {
       viewerRealmId: z.string().optional(),
       targetRealmId: z.string().optional(),
@@ -393,6 +393,8 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
       text: z.string(),
       topicId: z.string().optional(),
       sourceRef: z.string().optional(),
+      objectIds: z.array(z.string()).optional(),
+      resourceTags: z.array(z.string()).optional(),
       occurredAt: z.string().optional(),
       sensitivity: z
         .enum(["public", "internal", "confidential", "secret"])
@@ -413,6 +415,53 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
             text: args.text,
             topicId: args.topicId,
             sourceRef: args.sourceRef,
+            objectIds: args.objectIds,
+            resourceTags: args.resourceTags,
+            occurredAt: args.occurredAt,
+            sensitivity: args.sensitivity,
+            idempotencyKey: args.idempotencyKey,
+          }),
+        );
+      } catch (err) {
+        return errResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "mind_write_raw",
+    "Append an immutable [raw] entry (message, artifact, evidence, or signal) within bound write scope.",
+    {
+      viewerRealmId: z.string().optional(),
+      targetRealmId: z.string().optional(),
+      kind: z.enum(["message", "artifact", "evidence", "signal"]),
+      text: z.string(),
+      topicId: z.string().optional(),
+      sourceRef: z.string().optional(),
+      objectIds: z.array(z.string()).optional(),
+      resourceTags: z.array(z.string()).optional(),
+      occurredAt: z.string().optional(),
+      sensitivity: z
+        .enum(["public", "internal", "confidential", "secret"])
+        .optional(),
+      idempotencyKey: z.string().optional(),
+    },
+    async (args) => {
+      try {
+        const ctx = resolveCallContext(args.viewerRealmId, false);
+        const targetRealmId = args.targetRealmId?.trim() || ctx.effectiveViewerId;
+        assertMcpWrite(ctx, targetRealmId, "seabed");
+        return okResult(
+          await engine.ledger.captureSeabed({
+            actor: boundActor,
+            viewerRealmId: boundViewerRealmId,
+            targetRealmId,
+            kind: args.kind,
+            text: args.text,
+            topicId: args.topicId,
+            sourceRef: args.sourceRef,
+            objectIds: args.objectIds,
+            resourceTags: args.resourceTags,
             occurredAt: args.occurredAt,
             sensitivity: args.sensitivity,
             idempotencyKey: args.idempotencyKey,
@@ -426,7 +475,7 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
 
   server.tool(
     "mind_append_record",
-    "Append a non-rule ledger record (thing, claim, proposal, verdict, finding, decision) within bound write scope.",
+    "[DEPRECATED: alias for mind_write_conclusion; scheduled for removal in v0.3.0] Append a non-rule [conclusion] ledger record within bound write scope.",
     {
       viewerRealmId: z.string().optional(),
       targetRealmId: z.string().optional(),
@@ -442,6 +491,10 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
       title: z.string(),
       payload: z.record(z.unknown()).optional(),
       refs: z.array(z.string()).optional(),
+      externalRef: z.string().optional(),
+      sourceRef: z.string().optional(),
+      objectIds: z.array(z.string()).optional(),
+      resourceTags: z.array(z.string()).optional(),
       supersedesId: z.string().optional(),
       thingId: z.string().optional(),
       occurredAt: z.string().optional(),
@@ -465,6 +518,72 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
             title: args.title,
             payload: args.payload,
             refs: args.refs,
+            externalRef: args.externalRef,
+            sourceRef: args.sourceRef,
+            objectIds: args.objectIds,
+            resourceTags: args.resourceTags,
+            supersedesId: args.supersedesId,
+            thingId: args.thingId,
+            occurredAt: args.occurredAt,
+            sensitivity: args.sensitivity,
+            idempotencyKey: args.idempotencyKey,
+          }),
+        );
+      } catch (err) {
+        return errResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "mind_write_conclusion",
+    "Append a non-rule [conclusion] record (thing, claim, proposal, verdict, finding, decision) within bound write scope.",
+    {
+      viewerRealmId: z.string().optional(),
+      targetRealmId: z.string().optional(),
+      kind: z.enum([
+        "thing",
+        "claim",
+        "proposal",
+        "verdict",
+        "finding",
+        "decision",
+      ]),
+      extKind: z.string().optional(),
+      title: z.string(),
+      payload: z.record(z.unknown()).optional(),
+      refs: z.array(z.string()).optional(),
+      externalRef: z.string().optional(),
+      sourceRef: z.string().optional(),
+      objectIds: z.array(z.string()).optional(),
+      resourceTags: z.array(z.string()).optional(),
+      supersedesId: z.string().optional(),
+      thingId: z.string().optional(),
+      occurredAt: z.string().optional(),
+      sensitivity: z
+        .enum(["public", "internal", "confidential", "secret"])
+        .optional(),
+      idempotencyKey: z.string().optional(),
+    },
+    async (args) => {
+      try {
+        const ctx = resolveCallContext(args.viewerRealmId, false);
+        const targetRealmId = args.targetRealmId?.trim() || ctx.effectiveViewerId;
+        assertMcpWrite(ctx, targetRealmId, "ledger");
+        return okResult(
+          await engine.ledger.appendRecord({
+            actor: boundActor,
+            viewerRealmId: boundViewerRealmId,
+            targetRealmId,
+            kind: args.kind,
+            extKind: args.extKind,
+            title: args.title,
+            payload: args.payload,
+            refs: args.refs,
+            externalRef: args.externalRef,
+            sourceRef: args.sourceRef,
+            objectIds: args.objectIds,
+            resourceTags: args.resourceTags,
             supersedesId: args.supersedesId,
             thingId: args.thingId,
             occurredAt: args.occurredAt,
@@ -617,6 +736,247 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
             actor: boundActor,
             viewerRealmId: ctx.effectiveViewerId,
             recordId: args.recordId,
+            scopeCeiling: ctx.effectiveScope,
+          }),
+        );
+      } catch (err) {
+        return errResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "mind_tree",
+    "List visible MindRealms and Objects as hierarchical trees within process-bound scope intersection.",
+    {
+      viewerRealmId: z.string().optional(),
+    },
+    async (args) => {
+      try {
+        const ctx = resolveCallContext(args.viewerRealmId, false);
+        return okResult(
+          engine.sea.tree({
+            actor: boundActor,
+            viewerRealmId: ctx.effectiveViewerId,
+            scopeCeiling: ctx.effectiveScope,
+          }),
+        );
+      } catch (err) {
+        return errResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "mind_ls",
+    "List visible non-secret entries by realm path/ID, object ID, thing ID/externalRef, or resource tag within bound scope.",
+    {
+      viewerRealmId: z.string().optional(),
+      target: z.string().optional(),
+      targetType: z.enum(["realm", "object", "thing", "resource"]).optional(),
+      includeSuperseded: z.boolean().optional(),
+      includeDescendantSeabed: z.boolean().optional(),
+      limit: z.number().int().positive().max(200).optional(),
+      offset: z.number().int().nonnegative().optional(),
+    },
+    async (args) => {
+      try {
+        const ctx = resolveCallContext(
+          args.viewerRealmId,
+          Boolean(args.includeDescendantSeabed),
+        );
+        return okResult(
+          await engine.sea.ls({
+            actor: boundActor,
+            viewerRealmId: ctx.effectiveViewerId,
+            target: args.target,
+            targetType: args.targetType,
+            includeSuperseded: args.includeSuperseded,
+            includeDescendantSeabed: args.includeDescendantSeabed,
+            limit: args.limit,
+            offset: args.offset,
+            scopeCeiling: ctx.effectiveScope,
+          }),
+        );
+      } catch (err) {
+        return errResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "mind_cat",
+    "Read a single visible entry (record, raw entry, distillation) or drive file within bound scope.",
+    {
+      viewerRealmId: z.string().optional(),
+      target: z.string(),
+      targetRealmRef: z.string().optional(),
+      includeDescendantSeabed: z.boolean().optional(),
+    },
+    async (args) => {
+      try {
+        const ctx = resolveCallContext(
+          args.viewerRealmId,
+          Boolean(args.includeDescendantSeabed),
+        );
+        return okResult(
+          await engine.sea.cat({
+            actor: boundActor,
+            viewerRealmId: ctx.effectiveViewerId,
+            target: args.target,
+            targetRealmRef: args.targetRealmRef,
+            includeDescendantSeabed: args.includeDescendantSeabed,
+            scopeCeiling: ctx.effectiveScope,
+          }),
+        );
+      } catch (err) {
+        return errResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "mind_replay",
+    "Replay surrounding occurred_at context entries and supersede chain for a visible entry within bound scope.",
+    {
+      viewerRealmId: z.string().optional(),
+      entryId: z.string(),
+      window: z.number().int().positive().max(100).optional(),
+      includeDescendantSeabed: z.boolean().optional(),
+    },
+    async (args) => {
+      try {
+        const ctx = resolveCallContext(
+          args.viewerRealmId,
+          Boolean(args.includeDescendantSeabed),
+        );
+        return okResult(
+          engine.sea.replay({
+            actor: boundActor,
+            viewerRealmId: ctx.effectiveViewerId,
+            entryId: args.entryId,
+            window: args.window,
+            includeDescendantSeabed: args.includeDescendantSeabed,
+            scopeCeiling: ctx.effectiveScope,
+          }),
+        );
+      } catch (err) {
+        return errResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "mind_changes",
+    "Read operational change_log entries since a sequence number, filtered to visible non-secret scope.",
+    {
+      viewerRealmId: z.string().optional(),
+      sinceSeq: z.number().int().nonnegative().optional(),
+      limit: z.number().int().positive().max(500).optional(),
+      includeDescendantSeabed: z.boolean().optional(),
+    },
+    async (args) => {
+      try {
+        const ctx = resolveCallContext(
+          args.viewerRealmId,
+          Boolean(args.includeDescendantSeabed),
+        );
+        return okResult(
+          engine.sea.changes({
+            actor: boundActor,
+            viewerRealmId: ctx.effectiveViewerId,
+            sinceSeq: args.sinceSeq,
+            limit: args.limit,
+            includeDescendantSeabed: args.includeDescendantSeabed,
+            scopeCeiling: ctx.effectiveScope,
+          }),
+        );
+      } catch (err) {
+        return errResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "mind_list_objects",
+    "List visible single-parent object nodes within bound scope.",
+    {
+      viewerRealmId: z.string().optional(),
+      realmRef: z.string().optional(),
+      parentObjectId: z.string().optional(),
+      kind: z.string().optional(),
+    },
+    async (args) => {
+      try {
+        const ctx = resolveCallContext(args.viewerRealmId, false);
+        return okResult(
+          engine.objects.listObjects({
+            viewerRealmId: ctx.effectiveViewerId,
+            realmRef: args.realmRef,
+            parentObjectId: args.parentObjectId,
+            kind: args.kind,
+            scopeCeiling: ctx.effectiveScope,
+          }),
+        );
+      } catch (err) {
+        return errResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "mind_list_tags",
+    "List visible <type>:<name> resource tags (excluding secret/redacted entries) within bound scope.",
+    {
+      viewerRealmId: z.string().optional(),
+      realmRef: z.string().optional(),
+      prefix: z.string().optional(),
+      includeDescendantSeabed: z.boolean().optional(),
+    },
+    async (args) => {
+      try {
+        const ctx = resolveCallContext(
+          args.viewerRealmId,
+          Boolean(args.includeDescendantSeabed),
+        );
+        return okResult(
+          engine.objects.listResourceTags({
+            viewerRealmId: ctx.effectiveViewerId,
+            realmRef: args.realmRef,
+            prefix: args.prefix,
+            includeDescendantSeabed: args.includeDescendantSeabed,
+            scopeCeiling: ctx.effectiveScope,
+          }),
+        );
+      } catch (err) {
+        return errResult(err);
+      }
+    },
+  );
+
+  server.tool(
+    "mind_list_things",
+    "List visible thing identity anchors (records.kind='thing') optionally filtered by externalRef.",
+    {
+      viewerRealmId: z.string().optional(),
+      targetRealmRef: z.string().optional(),
+      externalRef: z.string().optional(),
+      includeSuperseded: z.boolean().optional(),
+      limit: z.number().int().positive().max(200).optional(),
+      offset: z.number().int().nonnegative().optional(),
+    },
+    async (args) => {
+      try {
+        const ctx = resolveCallContext(args.viewerRealmId, false);
+        return okResult(
+          engine.ledger.listThings({
+            actor: boundActor,
+            viewerRealmId: ctx.effectiveViewerId,
+            targetRealmRef: args.targetRealmRef,
+            externalRef: args.externalRef,
+            includeSuperseded: args.includeSuperseded,
+            limit: args.limit,
+            offset: args.offset,
             scopeCeiling: ctx.effectiveScope,
           }),
         );

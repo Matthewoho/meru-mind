@@ -25,6 +25,11 @@ Define mixed CJK/English FTS5 search with exact JS identifier boundary verificat
 - **WHEN** two sibling realms in an `open` organization contain equivalent matching records
 - **THEN** querying from realm A ranks realm A's record strictly above realm B's by at least `0.35`, and querying from realm B flips the order
 
+#### Scenario: Multi-valued realm derivation grants focus boost in open mode only
+- **WHEN** a record physically stored in realm A is linked via `entry_objects` to an object in realm B inside an `open` organization
+- **THEN** querying from viewer realm B grants the record the `open`-mode focus boost (`+0.35` focus + `+0.05` self)
+- **AND** in a `tree` organization, `entry_objects` never widens visibility or focus beyond physical `realm_id`
+
 #### Scenario: Redacted chain head clears currentHeadId
 - **WHEN** the active head `v3` of a supersede chain `v1 -> v2 -> v3` is redacted
 - **THEN** direct ID lookup of `v1` returns `currentHeadId: null`
@@ -38,12 +43,17 @@ Define mixed CJK/English FTS5 search with exact JS identifier boundary verificat
 
 ### Requirement: Full-Chain Human-Only Redaction and Byte-Level Purge
 `LedgerEngine.redact()` SHALL require `actor.kind === 'human'` and perform the following inside a single transaction:
-- Wipe target `records` (`status = 'retracted'`, `title = '[REDACTED]'`, `payload_json = '{}'`, `redacted_at/by/reason`) or `seabed_entries` (`text = '[REDACTED]'`, `metadata_json = '{}'`, `blob_sha256 = NULL`, `redacted_at/by/reason`).
-- Delete target rows from `fts_index`, `vec_items`, and `vec_pending`.
+- Wipe target `records` (`status = 'retracted'`, `title = '[REDACTED]'`, `payload_json = '{}'`, `external_ref = NULL`, `source_ref = NULL`, `redacted_at/by/reason`) or `seabed_entries` (`text = '[REDACTED]'`, `metadata_json = '{}'`, `blob_sha256 = NULL`, `redacted_at/by/reason`).
+- Delete target rows from `fts_index`, `vec_items`, `vec_pending`, `entry_objects`, and `resource_tags`, and sanitize associated `change_log` `entity_id` suffixes for the entry inside the same transaction.
 - Retract every `distillations` row citing the entry ID in `source_ids_json` (`status = 'retracted'`, `narrative_md = '[REDACTED]'`, prune the ID from `hard_facts_json`, and delete its `fts_index`, `vec_items`, and `vec_pending` rows).
-- Compute blob reference counts across `seabed_entries` and `drive_files`, collect live `drive://` paths in `residualLocations`, record `(org_id, source_ref, content_sha256)` in `redacted_blocklist`, and append `op = 'redact'` to `change_log`.
+- Compute blob reference counts across `seabed_entries` and `drive_files`, collect live `drive://` paths in `residualLocations`, record `(org_id, source_ref, content_sha256)` in `redacted_blocklist` (preferring `records.source_ref` and `payload.contentSha256` when present), and append `op = 'redact'` to `change_log`.
 
 After transaction commit, `redact()` SHALL unlink unreferenced blob files from disk, execute FTS5 `'optimize'` and `PRAGMA wal_checkpoint(TRUNCATE)`, and return `walCheckpoint: { busy, log, checkpointed }` and `residualLocations`.
+
+#### Scenario: Redacting an entry deletes its resource tags and object links with zero plaintext residue
+- **WHEN** a human redacts a record or seabed entry that has `entry_objects` links and `resource_tags` rows
+- **THEN** all `entry_objects` and `resource_tags` rows for that entry are deleted inside the redaction transaction and no longer appear in `listResourceTags` or `ls`
+- **AND** `change_log` never stores plaintext resource tag values, so `changes()` and raw byte-level sweeps across `.sqlite`, `-wal`, `-shm`, and `blobs/` find zero occurrences of the redacted tag text
 
 #### Scenario: Byte-level sweep finds zero residual plaintext after closing connections
 - **WHEN** a human redacts a record, a blob-backed seabed entry, and their citing distillation (containing single-token secrets) and closes all database handles

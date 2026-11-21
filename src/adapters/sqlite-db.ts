@@ -14,14 +14,18 @@ import {
   type Distillation,
   type DistillationLayer,
   type DriveFileMeta,
+  type EntryObjectLink,
   type IdempotencyRecord,
   type LedgerRecord,
+  type MindObject,
   type Organization,
   type OrgPolicy,
   type Realm,
   type RealmMount,
   type RecordKind,
   type RedactedBlocklistEntry,
+  type ResourceTag,
+  type ResourceTagSummary,
   type SchemaMigrationRecord,
   type SeabedEntry,
   type SeabedKind,
@@ -766,6 +770,137 @@ export class SqliteDb implements DbPort {
           .run(now);
       }
 
+      // Migration v3: V0.2a Slice 2a (objects single-parent tree, entry_objects, resource_tags,
+      // records.external_ref for reusing kind='thing', records.source_ref for fast chain-head lookup)
+      if (!applied.has(3)) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS objects (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES orgs(id),
+            parent_object_id TEXT REFERENCES objects(id),
+            realm_id TEXT NOT NULL REFERENCES realms(id),
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_objects_org_realm ON objects(org_id, realm_id);
+          CREATE INDEX IF NOT EXISTS idx_objects_org_parent ON objects(org_id, parent_object_id);
+
+          CREATE TABLE IF NOT EXISTS entry_objects (
+            entry_id TEXT NOT NULL,
+            org_id TEXT NOT NULL REFERENCES orgs(id),
+            object_id TEXT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+            PRIMARY KEY (entry_id, object_id)
+          );
+          CREATE INDEX IF NOT EXISTS idx_entry_objects_org_object ON entry_objects(org_id, object_id);
+
+          CREATE TABLE IF NOT EXISTS resource_tags (
+            entry_id TEXT NOT NULL,
+            org_id TEXT NOT NULL REFERENCES orgs(id),
+            tag TEXT NOT NULL,
+            PRIMARY KEY (entry_id, tag)
+          );
+          CREATE INDEX IF NOT EXISTS idx_resource_tags_org_tag ON resource_tags(org_id, tag);
+        `);
+
+        this.ensureColumn("records", "external_ref", "TEXT");
+        this.ensureColumn("records", "source_ref", "TEXT");
+
+        const hasSourceRefsJson = this.hasColumn("records", "source_refs_json");
+        const backfillRows = this.db
+          .prepare(
+            hasSourceRefsJson
+              ? `SELECT id, payload_json, source_refs_json FROM records WHERE source_ref IS NULL OR external_ref IS NULL`
+              : `SELECT id, payload_json FROM records WHERE source_ref IS NULL OR external_ref IS NULL`,
+          )
+          .all() as Array<{
+          id: string;
+          payload_json: string;
+          source_refs_json?: string | null;
+        }>;
+
+        const updateBackfill = this.db.prepare(
+          `UPDATE records
+           SET source_ref = COALESCE(source_ref, ?),
+               external_ref = COALESCE(external_ref, ?)
+           WHERE id = ?`,
+        );
+
+        for (const row of backfillRows) {
+          let sourceRef: string | null = null;
+          let externalRef: string | null = null;
+
+          if (hasSourceRefsJson && row.source_refs_json) {
+            try {
+              const arr = JSON.parse(String(row.source_refs_json)) as unknown;
+              if (
+                Array.isArray(arr) &&
+                typeof arr[0] === "string" &&
+                arr[0].trim()
+              ) {
+                sourceRef = arr[0].trim();
+              }
+            } catch {
+              // ignore malformed json
+            }
+          }
+
+          try {
+            const payload = JSON.parse(String(row.payload_json)) as Record<
+              string,
+              unknown
+            >;
+            if (!sourceRef) {
+              if (
+                typeof payload.sourceRef === "string" &&
+                payload.sourceRef.trim()
+              ) {
+                sourceRef = payload.sourceRef.trim();
+              } else if (
+                typeof payload.source_ref === "string" &&
+                payload.source_ref.trim()
+              ) {
+                sourceRef = payload.source_ref.trim();
+              } else if (
+                Array.isArray(payload.sourceRefs) &&
+                typeof payload.sourceRefs[0] === "string" &&
+                payload.sourceRefs[0].trim()
+              ) {
+                sourceRef = payload.sourceRefs[0].trim();
+              }
+            }
+            if (
+              typeof payload.externalRef === "string" &&
+              payload.externalRef.trim()
+            ) {
+              externalRef = payload.externalRef.trim();
+            } else if (
+              typeof payload.external_ref === "string" &&
+              payload.external_ref.trim()
+            ) {
+              externalRef = payload.external_ref.trim();
+            }
+          } catch {
+            // ignore malformed payload_json
+          }
+
+          if (sourceRef !== null || externalRef !== null) {
+            updateBackfill.run(sourceRef, externalRef, row.id);
+          }
+        }
+
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_records_org_external_ref ON records(org_id, external_ref);
+          CREATE INDEX IF NOT EXISTS idx_records_org_source_ref_status ON records(org_id, source_ref, status);
+        `);
+
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (3, 'v0.2a_slice2a', ?)`,
+          )
+          .run(now);
+      }
+
       if (this.vecEnabled && !this.tableExists("vec_items")) {
         this.createVecItemsTable();
       }
@@ -1135,8 +1270,8 @@ export class SqliteDb implements DbPort {
     this.db
       .prepare(
         `INSERT INTO records
-         (id, org_id, realm_id, thing_id, kind, ext_kind, status, supersedes_id, superseded_by_id, author_id, author_kind, author_family, confirmed_by_human, title, payload_json, refs_json, occurred_at, origin_session_id, sensitivity, redacted_at, redacted_by, redacted_reason, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, org_id, realm_id, thing_id, kind, ext_kind, status, supersedes_id, superseded_by_id, author_id, author_kind, author_family, confirmed_by_human, title, payload_json, refs_json, external_ref, source_ref, occurred_at, origin_session_id, sensitivity, redacted_at, redacted_by, redacted_reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -1155,6 +1290,8 @@ export class SqliteDb implements DbPort {
         record.title,
         JSON.stringify(record.payload),
         JSON.stringify(record.refs),
+        record.externalRef,
+        record.sourceRef,
         record.occurredAt,
         record.originSessionId,
         record.sensitivity,
@@ -1165,14 +1302,22 @@ export class SqliteDb implements DbPort {
       );
   }
 
-  markRecordSuperseded(oldId: string, newId: string): boolean {
-    const res = this.db
-      .prepare(
-        `UPDATE records
-         SET superseded_by_id = ?, status = 'superseded'
-         WHERE id = ? AND status = 'active' AND superseded_by_id IS NULL`,
-      )
-      .run(newId, oldId);
+  markRecordSuperseded(oldId: string, newId: string, orgId?: string): boolean {
+    const res = orgId
+      ? this.db
+          .prepare(
+            `UPDATE records
+             SET superseded_by_id = ?, status = 'superseded'
+             WHERE id = ? AND org_id = ? AND status = 'active' AND superseded_by_id IS NULL`,
+          )
+          .run(newId, oldId, orgId)
+      : this.db
+          .prepare(
+            `UPDATE records
+             SET superseded_by_id = ?, status = 'superseded'
+             WHERE id = ? AND status = 'active' AND superseded_by_id IS NULL`,
+          )
+          .run(newId, oldId);
     return Number(res.changes) === 1;
   }
 
@@ -1183,11 +1328,67 @@ export class SqliteDb implements DbPort {
     return row ? this.mapRecord(row) : null;
   }
 
+  findActiveRecordBySourceRef(
+    orgId: string,
+    sourceRef: string,
+    realmId?: string,
+  ): LedgerRecord | null {
+    const row = realmId
+      ? (this.db
+          .prepare(
+            `SELECT * FROM records
+             WHERE org_id = ? AND source_ref = ? AND status = 'active' AND realm_id = ? AND redacted_at IS NULL
+             ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+          )
+          .get(orgId, sourceRef, realmId) as Record<string, unknown> | undefined)
+      : (this.db
+          .prepare(
+            `SELECT * FROM records
+             WHERE org_id = ? AND source_ref = ? AND status = 'active' AND redacted_at IS NULL
+             ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+          )
+          .get(orgId, sourceRef) as Record<string, unknown> | undefined);
+    return row ? this.mapRecord(row) : null;
+  }
+
+  findRecordsByExternalRef(
+    orgId: string,
+    externalRef: string,
+    realmIds?: string[],
+    excludeSensitivities: Sensitivity[] = ["secret"],
+  ): LedgerRecord[] {
+    if (realmIds && realmIds.length === 0) return [];
+    const where: string[] = [
+      `org_id = ?`,
+      `external_ref = ?`,
+      `status = 'active'`,
+      `redacted_at IS NULL`,
+    ];
+    const params: SQLInputValue[] = [orgId, externalRef];
+    if (realmIds && realmIds.length > 0) {
+      where.push(`realm_id IN (${placeholders(realmIds.length)})`);
+      params.push(...realmIds);
+    }
+    if (excludeSensitivities.length > 0) {
+      where.push(
+        `sensitivity NOT IN (${placeholders(excludeSensitivities.length)})`,
+      );
+      params.push(...excludeSensitivities);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM records WHERE ${where.join(" AND ")} ORDER BY created_at DESC, rowid DESC`,
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapRecord(r));
+  }
+
   listRecords(filter: {
     realmIds: string[];
     thingId?: string;
     kinds?: RecordKind[];
     authorId?: string;
+    externalRef?: string;
     includeSuperseded?: boolean;
     since?: string;
     until?: string;
@@ -1224,6 +1425,10 @@ export class SqliteDb implements DbPort {
       where.push(`author_id = ?`);
       params.push(filter.authorId);
     }
+    if (filter.externalRef) {
+      where.push(`external_ref = ?`);
+      params.push(filter.externalRef);
+    }
     if (filter.since) {
       where.push(`created_at >= ?`);
       params.push(filter.since);
@@ -1250,6 +1455,111 @@ export class SqliteDb implements DbPort {
       items: rows.map((r) => this.mapRecord(r)),
       total: Number(totalRow.c),
     };
+  }
+
+  listRecordsWindow(params: {
+    realmIds: string[];
+    anchorOccurredAt: string;
+    anchorId: string;
+    direction: "before" | "after";
+    limit: number;
+    excludeSensitivities?: Sensitivity[];
+  }): LedgerRecord[] {
+    if (params.realmIds.length === 0 || params.limit <= 0) return [];
+    const excludeSens = params.excludeSensitivities ?? ["secret"];
+    const where: string[] = [
+      `realm_id IN (${placeholders(params.realmIds.length)})`,
+      `redacted_at IS NULL`,
+      `status != 'retracted'`,
+      `id != ?`,
+    ];
+    const sqlParams: SQLInputValue[] = [...params.realmIds, params.anchorId];
+    if (excludeSens.length > 0) {
+      where.push(`sensitivity NOT IN (${placeholders(excludeSens.length)})`);
+      sqlParams.push(...excludeSens);
+    }
+    if (params.direction === "before") {
+      where.push(
+        `(occurred_at < ? OR (occurred_at = ? AND id < ?))`,
+      );
+      sqlParams.push(
+        params.anchorOccurredAt,
+        params.anchorOccurredAt,
+        params.anchorId,
+      );
+    } else {
+      where.push(
+        `(occurred_at > ? OR (occurred_at = ? AND id > ?))`,
+      );
+      sqlParams.push(
+        params.anchorOccurredAt,
+        params.anchorOccurredAt,
+        params.anchorId,
+      );
+    }
+    const order =
+      params.direction === "before"
+        ? `ORDER BY occurred_at DESC, id DESC`
+        : `ORDER BY occurred_at ASC, id ASC`;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM records WHERE ${where.join(" AND ")} ${order} LIMIT ?`,
+      )
+      .all(...sqlParams, params.limit) as Array<Record<string, unknown>>;
+    const mapped = rows.map((r) => this.mapRecord(r));
+    return params.direction === "before" ? mapped.reverse() : mapped;
+  }
+
+  listSeabedWindow(params: {
+    realmIds: string[];
+    anchorOccurredAt: string;
+    anchorId: string;
+    direction: "before" | "after";
+    limit: number;
+    excludeSensitivities?: Sensitivity[];
+  }): SeabedEntry[] {
+    if (params.realmIds.length === 0 || params.limit <= 0) return [];
+    const excludeSens = params.excludeSensitivities ?? ["secret"];
+    const where: string[] = [
+      `realm_id IN (${placeholders(params.realmIds.length)})`,
+      `redacted_at IS NULL`,
+      `id != ?`,
+    ];
+    const sqlParams: SQLInputValue[] = [...params.realmIds, params.anchorId];
+    if (excludeSens.length > 0) {
+      where.push(`sensitivity NOT IN (${placeholders(excludeSens.length)})`);
+      sqlParams.push(...excludeSens);
+    }
+    if (params.direction === "before") {
+      where.push(
+        `(occurred_at < ? OR (occurred_at = ? AND id < ?))`,
+      );
+      sqlParams.push(
+        params.anchorOccurredAt,
+        params.anchorOccurredAt,
+        params.anchorId,
+      );
+    } else {
+      where.push(
+        `(occurred_at > ? OR (occurred_at = ? AND id > ?))`,
+      );
+      sqlParams.push(
+        params.anchorOccurredAt,
+        params.anchorOccurredAt,
+        params.anchorId,
+      );
+    }
+    const order =
+      params.direction === "before"
+        ? `ORDER BY occurred_at DESC, id DESC`
+        : `ORDER BY occurred_at ASC, id ASC`;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM seabed_entries WHERE ${where.join(" AND ")} ${order} LIMIT ?`,
+      )
+      .all(...sqlParams, params.limit) as Array<Record<string, unknown>>;
+    const mapped = rows.map((r) => this.mapSeabed(r));
+    return params.direction === "before" ? mapped.reverse() : mapped;
   }
 
   listAllRecords(): LedgerRecord[] {
@@ -1351,6 +1661,8 @@ export class SqliteDb implements DbPort {
          SET status = 'retracted',
              title = '[REDACTED]',
              payload_json = '{}',
+             external_ref = NULL,
+             source_ref = NULL,
              redacted_at = ?,
              redacted_by = ?,
              redacted_reason = ?
@@ -1389,6 +1701,17 @@ export class SqliteDb implements DbPort {
         params.id,
       );
     return Number(res.changes) > 0;
+  }
+
+  redactChangeLogForEntry(entryId: string): number {
+    const res = this.db
+      .prepare(
+        `UPDATE change_log
+         SET entity_id = ?
+         WHERE entity_id LIKE ? AND op != 'redact'`,
+      )
+      .run(entryId, `${entryId}:%`);
+    return Number(res.changes);
   }
 
   findDistillationsBySourceId(sourceId: string): Distillation[] {
@@ -1525,6 +1848,8 @@ export class SqliteDb implements DbPort {
       title: String(row.title),
       payload: JSON.parse(String(row.payload_json)) as Record<string, unknown>,
       refs: JSON.parse(String(row.refs_json)) as string[],
+      externalRef: row.external_ref ? String(row.external_ref) : null,
+      sourceRef: row.source_ref ? String(row.source_ref) : null,
       occurredAt: String(row.occurred_at ?? row.created_at),
       originSessionId: row.origin_session_id
         ? String(row.origin_session_id)
@@ -1537,6 +1862,292 @@ export class SqliteDb implements DbPort {
       redactedReason: row.redacted_reason ? String(row.redacted_reason) : null,
       createdAt: String(row.created_at),
     };
+  }
+
+  // ---- Objects, Entry-Object Links & Resource Tags (Migration v3) ----
+
+  insertObject(obj: MindObject): void {
+    this.db
+      .prepare(
+        `INSERT INTO objects (id, org_id, parent_object_id, realm_id, kind, name, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        obj.id,
+        obj.orgId,
+        obj.parentObjectId,
+        obj.realmId,
+        obj.kind,
+        obj.name,
+        obj.createdAt,
+      );
+  }
+
+  getObject(id: string): MindObject | null {
+    const row = this.db
+      .prepare(`SELECT * FROM objects WHERE id = ?`)
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapObject(row) : null;
+  }
+
+  listObjects(filter: {
+    orgId: string;
+    realmIds?: string[];
+    parentObjectId?: string | null;
+    kind?: string;
+  }): MindObject[] {
+    if (filter.realmIds && filter.realmIds.length === 0) return [];
+    const where: string[] = [`org_id = ?`];
+    const params: SQLInputValue[] = [filter.orgId];
+
+    if (filter.realmIds && filter.realmIds.length > 0) {
+      where.push(`realm_id IN (${placeholders(filter.realmIds.length)})`);
+      params.push(...filter.realmIds);
+    }
+    if (filter.parentObjectId !== undefined) {
+      if (filter.parentObjectId === null) {
+        where.push(`parent_object_id IS NULL`);
+      } else {
+        where.push(`parent_object_id = ?`);
+        params.push(filter.parentObjectId);
+      }
+    }
+    if (filter.kind) {
+      where.push(`kind = ?`);
+      params.push(filter.kind);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM objects WHERE ${where.join(" AND ")} ORDER BY created_at ASC, id ASC`,
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapObject(r));
+  }
+
+  updateObjectParent(id: string, parentObjectId: string | null): boolean {
+    const res = this.db
+      .prepare(`UPDATE objects SET parent_object_id = ? WHERE id = ?`)
+      .run(parentObjectId, id);
+    return Number(res.changes) > 0;
+  }
+
+  countChildObjects(parentObjectId: string): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS c FROM objects WHERE parent_object_id = ?`)
+      .get(parentObjectId) as { c: number };
+    return Number(row.c);
+  }
+
+  deleteObject(id: string): boolean {
+    const res = this.db.prepare(`DELETE FROM objects WHERE id = ?`).run(id);
+    return Number(res.changes) > 0;
+  }
+
+  private mapObject(row: Record<string, unknown>): MindObject {
+    return {
+      id: String(row.id),
+      orgId: String(row.org_id),
+      parentObjectId: row.parent_object_id
+        ? String(row.parent_object_id)
+        : null,
+      realmId: String(row.realm_id),
+      kind: String(row.kind),
+      name: String(row.name),
+      createdAt: String(row.created_at),
+    };
+  }
+
+  insertEntryObject(link: EntryObjectLink): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO entry_objects (entry_id, org_id, object_id)
+         VALUES (?, ?, ?)`,
+      )
+      .run(link.entryId, link.orgId, link.objectId);
+  }
+
+  deleteEntryObject(entryId: string, objectId: string): boolean {
+    const res = this.db
+      .prepare(
+        `DELETE FROM entry_objects WHERE entry_id = ? AND object_id = ?`,
+      )
+      .run(entryId, objectId);
+    return Number(res.changes) > 0;
+  }
+
+  deleteEntryObjectsByEntry(entryId: string): number {
+    const res = this.db
+      .prepare(`DELETE FROM entry_objects WHERE entry_id = ?`)
+      .run(entryId);
+    return Number(res.changes);
+  }
+
+  listObjectIdsForEntry(entryId: string, orgId?: string): string[] {
+    const rows = orgId
+      ? (this.db
+          .prepare(
+            `SELECT object_id FROM entry_objects WHERE entry_id = ? AND org_id = ? ORDER BY object_id ASC`,
+          )
+          .all(entryId, orgId) as Array<{ object_id: string }>)
+      : (this.db
+          .prepare(
+            `SELECT object_id FROM entry_objects WHERE entry_id = ? ORDER BY object_id ASC`,
+          )
+          .all(entryId) as Array<{ object_id: string }>);
+    return rows.map((r) => String(r.object_id));
+  }
+
+  listObjectRealmIdsForEntry(entryId: string, orgId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT o.realm_id
+         FROM entry_objects eo
+         JOIN objects o ON o.id = eo.object_id
+         WHERE eo.entry_id = ? AND eo.org_id = ? AND o.org_id = ?`,
+      )
+      .all(entryId, orgId, orgId) as Array<{ realm_id: string }>;
+    return rows.map((r) => String(r.realm_id));
+  }
+
+  listEntryIdsForObjects(orgId: string, objectIds: string[]): string[] {
+    if (objectIds.length === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT entry_id
+         FROM entry_objects
+         WHERE org_id = ? AND object_id IN (${placeholders(objectIds.length)})`,
+      )
+      .all(orgId, ...objectIds) as Array<{ entry_id: string }>;
+    return rows.map((r) => String(r.entry_id));
+  }
+
+  listEntryIdsByObjectRealm(orgId: string, realmId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT eo.entry_id
+         FROM entry_objects eo
+         JOIN objects o ON o.id = eo.object_id
+         WHERE eo.org_id = ? AND o.org_id = ? AND o.realm_id = ?`,
+      )
+      .all(orgId, orgId, realmId) as Array<{ entry_id: string }>;
+    return rows.map((r) => String(r.entry_id));
+  }
+
+  insertResourceTag(tag: ResourceTag): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO resource_tags (entry_id, org_id, tag)
+         VALUES (?, ?, ?)`,
+      )
+      .run(tag.entryId, tag.orgId, tag.tag);
+  }
+
+  deleteResourceTag(entryId: string, tag: string): boolean {
+    const res = this.db
+      .prepare(`DELETE FROM resource_tags WHERE entry_id = ? AND tag = ?`)
+      .run(entryId, tag);
+    return Number(res.changes) > 0;
+  }
+
+  deleteResourceTagsByEntry(entryId: string): number {
+    const res = this.db
+      .prepare(`DELETE FROM resource_tags WHERE entry_id = ?`)
+      .run(entryId);
+    return Number(res.changes);
+  }
+
+  listResourceTagsForEntry(entryId: string, orgId?: string): string[] {
+    const rows = orgId
+      ? (this.db
+          .prepare(
+            `SELECT tag FROM resource_tags WHERE entry_id = ? AND org_id = ? ORDER BY tag ASC`,
+          )
+          .all(entryId, orgId) as Array<{ tag: string }>)
+      : (this.db
+          .prepare(
+            `SELECT tag FROM resource_tags WHERE entry_id = ? ORDER BY tag ASC`,
+          )
+          .all(entryId) as Array<{ tag: string }>);
+    return rows.map((r) => String(r.tag));
+  }
+
+  listEntryIdsByResourceTag(orgId: string, tag: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT entry_id FROM resource_tags WHERE org_id = ? AND tag = ?`,
+      )
+      .all(orgId, tag) as Array<{ entry_id: string }>;
+    return rows.map((r) => String(r.entry_id));
+  }
+
+  listVisibleResourceTags(params: {
+    orgId: string;
+    ledgerRealmIds: string[];
+    seabedRealmIds: string[];
+    prefix?: string;
+  }): ResourceTagSummary[] {
+    if (
+      params.ledgerRealmIds.length === 0 &&
+      params.seabedRealmIds.length === 0
+    ) {
+      return [];
+    }
+
+    const visibilityClauses: string[] = [];
+    const sqlParams: SQLInputValue[] = [params.orgId];
+
+    if (params.ledgerRealmIds.length > 0) {
+      visibilityClauses.push(
+        `EXISTS (
+          SELECT 1 FROM records r
+          WHERE r.id = rt.entry_id
+            AND r.org_id = rt.org_id
+            AND r.realm_id IN (${placeholders(params.ledgerRealmIds.length)})
+            AND r.sensitivity != 'secret'
+            AND r.redacted_at IS NULL
+            AND r.status != 'retracted'
+        )`,
+      );
+      sqlParams.push(...params.ledgerRealmIds);
+    }
+
+    if (params.seabedRealmIds.length > 0) {
+      visibilityClauses.push(
+        `EXISTS (
+          SELECT 1 FROM seabed_entries s
+          WHERE s.id = rt.entry_id
+            AND s.org_id = rt.org_id
+            AND s.realm_id IN (${placeholders(params.seabedRealmIds.length)})
+            AND s.sensitivity != 'secret'
+            AND s.redacted_at IS NULL
+        )`,
+      );
+      sqlParams.push(...params.seabedRealmIds);
+    }
+
+    const where: string[] = [
+      `rt.org_id = ?`,
+      `(${visibilityClauses.join(" OR ")})`,
+    ];
+    if (params.prefix && params.prefix.trim()) {
+      where.push(`rt.tag LIKE ?`);
+      sqlParams.push(`${params.prefix.trim()}%`);
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT rt.tag AS tag, COUNT(DISTINCT rt.entry_id) AS c
+         FROM resource_tags rt
+         WHERE ${where.join(" AND ")}
+         GROUP BY rt.tag
+         ORDER BY c DESC, rt.tag ASC`,
+      )
+      .all(...sqlParams) as Array<{ tag: string; c: number }>;
+
+    return rows.map((r) => ({
+      tag: String(r.tag),
+      count: Number(r.c),
+    }));
   }
 
   // ---- Distillations ----
@@ -1771,6 +2382,70 @@ export class SqliteDb implements DbPort {
     const raw = this.getMeta("change_log_generation");
     const parsed = raw ? Number.parseInt(raw, 10) : 1;
     return Number.isInteger(parsed) && parsed >= 1 ? parsed : 1;
+  }
+
+  getLatestChangeLogSeq(orgId?: string): number {
+    const row = orgId
+      ? (this.db
+          .prepare(`SELECT COALESCE(MAX(seq), 0) AS s FROM change_log WHERE org_id = ?`)
+          .get(orgId) as { s: number })
+      : (this.db
+          .prepare(`SELECT COALESCE(MAX(seq), 0) AS s FROM change_log`)
+          .get() as { s: number });
+    return Number(row.s ?? 0);
+  }
+
+  getChangeLogSeqForEntity(entityType: string, entityId: string): number | null {
+    const row = this.db
+      .prepare(
+        `SELECT seq FROM change_log
+         WHERE entity_type = ? AND entity_id = ?
+         ORDER BY seq DESC LIMIT 1`,
+      )
+      .get(entityType, entityId) as { seq: number } | undefined;
+    return row ? Number(row.seq) : null;
+  }
+
+  countChangeLogSince(params: {
+    orgId: string;
+    realmIds: string[];
+    sinceSeq: number;
+    generation: number;
+    includeSecret?: boolean;
+  }): number {
+    if (params.realmIds.length === 0) return 0;
+    const where: string[] = [
+      `cl.org_id = ?`,
+      `cl.generation = ?`,
+      `cl.seq > ?`,
+      `cl.realm_id IN (${placeholders(params.realmIds.length)})`,
+    ];
+    const sqlParams: SQLInputValue[] = [
+      params.orgId,
+      params.generation,
+      params.sinceSeq,
+      ...params.realmIds,
+    ];
+    if (!params.includeSecret) {
+      where.push(`NOT (
+        cl.entity_type = 'record'
+        AND EXISTS (
+          SELECT 1 FROM records r
+          WHERE r.id = cl.entity_id AND r.sensitivity = 'secret'
+        )
+      )`);
+      where.push(`NOT (
+        cl.entity_type = 'seabed'
+        AND EXISTS (
+          SELECT 1 FROM seabed_entries s
+          WHERE s.id = cl.entity_id AND s.sensitivity = 'secret'
+        )
+      )`);
+    }
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS c FROM change_log cl WHERE ${where.join(" AND ")}`)
+      .get(...sqlParams) as { c: number };
+    return Number(row.c ?? 0);
   }
 
   appendChangeLog(

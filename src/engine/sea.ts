@@ -16,26 +16,46 @@ import {
   MindError,
   type AccessScope,
   type Actor,
+  type BehaviorClass,
   type BriefBudget,
   type BriefOutput,
+  type CatResult,
   type ChangeLogEntry,
+  type ChangesResult,
   type ChildRealmSummary,
   type Distillation,
   type DistillationLayer,
   type LedgerRecord,
+  type LsEntry,
+  type LsResult,
+  type LsTargetType,
+  type MindObject,
+  type ObjectTreeNode,
   type OrgPolicy,
   type Realm,
   type RealmMount,
+  type RealmTreeNode,
   type RecallItem,
   type RecallQuery,
   type RecallResult,
   type RebuildResult,
+  type ReplayResult,
   type SeabedEntry,
   type Sensitivity,
   type SyncEmbeddingsResult,
+  type TreeResult,
 } from "../types.js";
 import {
+  getDescendantObjectIds,
+  normalizeResourceTag,
+  OPAQUE_ENTRY_NOT_FOUND,
+  OPAQUE_OBJECT_NOT_FOUND,
+  OPAQUE_REALM_NOT_FOUND,
+  resolveVisibleRealm,
+} from "./objects.js";
+import {
   createVisibilityHelpers,
+  parseDriveSourceRef,
   type VisibilityHelpers,
 } from "./visibility.js";
 
@@ -299,9 +319,50 @@ export class SeaEngine {
 
     const childSlice = allChildSummaries.slice(0, maxChildSummaries);
 
+    // Exact 3-bucket counts (rules / conclusions / raw) excluding secret entries
+    const countsByKind = canSeeSelfLedger
+      ? this.db.countRecordsByKind({
+          realmIds: [realm.id],
+          includeSuperseded: false,
+          excludeSensitivities,
+        })
+      : {};
+    let conclusionsCount = 0;
+    for (const [k, c] of Object.entries(countsByKind)) {
+      if (k !== "rule") conclusionsCount += c;
+    }
+    const rawTotal = canSeeSelfSeabed
+      ? this.db.listSeabedEntries({
+          realmIds: [realm.id],
+          excludeSensitivities,
+          limit: 1,
+        }).total
+      : 0;
+
+    const generation = this.db.getChangeLogGeneration();
+    const currentSeq = this.db.getLatestChangeLogSeq(realm.orgId);
+    const cardSeq = realmCard
+      ? this.db.getChangeLogSeqForEntity("distillation", realmCard.id)
+      : null;
+    const changesSinceCard =
+      cardSeq !== null
+        ? this.db.countChangeLogSince({
+            orgId: realm.orgId,
+            realmIds: [realm.id],
+            sinceSeq: cardSeq,
+            generation,
+            includeSecret: false,
+          })
+        : 0;
+
     return {
       realm,
       generatedAt: new Date().toISOString(),
+      buckets: {
+        rules: rulesRes.total,
+        conclusions: conclusionsCount,
+        raw: rawTotal,
+      },
       surface: {
         recentMessages: {
           items: msgRes.items.map(vis.sanitizeSeabed),
@@ -334,6 +395,12 @@ export class SeaEngine {
       },
       middleMind: {
         realmCard,
+        realmCardMeta: {
+          cardSeq,
+          changesSinceCard,
+          currentSeq,
+          generation,
+        },
         rules: {
           items: ruleSummaries,
           totalCount: rulesRes.total,
@@ -350,7 +417,7 @@ export class SeaEngine {
         },
       },
       drilldownHint:
-        "Use recall(id=...) for exact record/chain inspection, recall(query=...) for FTS5+vector search, or recall(targetRealmId=..., includeDescendantSeabed=true) to read child seabed.",
+        "Use recall(id=...) / cat for exact inspection, ls/tree for browsing, replay(id) for occurred_at context, or recall(query=...) for FTS5+vector search.",
     };
   }
 
@@ -416,6 +483,7 @@ export class SeaEngine {
         rec.status === "superseded" ? vis.resolveCurrentHeadId(rec) : undefined;
       return {
         id: clean.id,
+        behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
         sourceType: "record",
         kind: clean.kind,
         realmId: clean.realmId,
@@ -444,6 +512,7 @@ export class SeaEngine {
       const clean = vis.sanitizeSeabed(sea);
       return {
         id: clean.id,
+        behaviorClass: "raw",
         sourceType: "seabed",
         kind: clean.kind,
         realmId: clean.realmId,
@@ -467,6 +536,7 @@ export class SeaEngine {
       const clean = vis.sanitizeDistillation(dist);
       return {
         id: clean.id,
+        behaviorClass: "conclusion",
         sourceType: "distillation",
         kind: clean.layer,
         realmId: clean.realmId,
@@ -722,6 +792,8 @@ export class SeaEngine {
     let vectorOnlyHydratedCount = 0;
 
     const computeRankedScore = (params: {
+      entryId?: string;
+      orgId?: string;
       titleText: string;
       bodyText: string;
       sourceType: "record" | "seabed" | "distillation";
@@ -778,12 +850,25 @@ export class SeaEngine {
         statusWeight = 1.35;
       }
 
-      // Normalize rank-1 RRF to 1.0 so statusWeight & open-mode focus boost (+0.35) combine cleanly
+      // Normalize rank-1 RRF to 1.0 so statusWeight & open-mode focus boost (+0.35) combine cleanly.
+      // In open mode, an entry linked to objects in multiple realms inherits focus boost from any linked object's realm.
       const normRrf = params.rrf * (RRF_K + 1);
-      const isOpenFocus =
-        scope.policy === "open" && focusRealmSet.has(params.realmId);
-      const isOpenSelf =
-        scope.policy === "open" && params.realmId === query.viewerRealmId;
+      let isOpenFocus = false;
+      let isOpenSelf = false;
+      if (scope.policy === "open") {
+        const derivedRealms =
+          params.entryId && params.orgId
+            ? [
+                params.realmId,
+                ...this.db.listObjectRealmIdsForEntry(
+                  params.entryId,
+                  params.orgId,
+                ),
+              ]
+            : [params.realmId];
+        isOpenFocus = derivedRealms.some((rid) => focusRealmSet.has(rid));
+        isOpenSelf = derivedRealms.includes(query.viewerRealmId);
+      }
       const focusBonus = (isOpenFocus ? 0.35 : 0) + (isOpenSelf ? 0.05 : 0);
 
       return tier * 10 + normRrf * statusWeight + focusBonus;
@@ -813,6 +898,8 @@ export class SeaEngine {
           )
           .join("\n");
         const finalScore = computeRankedScore({
+          entryId: rec.id,
+          orgId: rec.orgId,
           titleText: rec.title,
           bodyText,
           sourceType: "record",
@@ -839,6 +926,8 @@ export class SeaEngine {
 
         const titleText = `${sea.kind}:${sea.topicId ?? sea.realmId}`;
         const finalScore = computeRankedScore({
+          entryId: sea.id,
+          orgId: sea.orgId,
           titleText,
           bodyText: sea.text,
           sourceType: "seabed",
@@ -912,6 +1001,914 @@ export class SeaEngine {
         page.length > 0
           ? `Found ${totalMatched} matching item(s)${vectorUsed ? " (FTS5 + vector hybrid)" : " (FTS5)"}.`
           : "No matching entries found within your visible realm scope.",
+    };
+  }
+
+  // ---- Scoped Read Views (tree, ls, cat, replay, changes) — All Reusing visibility.ts ----
+
+  private buildObjectForest(objects: MindObject[]): ObjectTreeNode[] {
+    const visibleIds = new Set(objects.map((o) => o.id));
+    const nodeMap = new Map<string, ObjectTreeNode>();
+    for (const obj of objects) {
+      nodeMap.set(obj.id, { object: obj, children: [] });
+    }
+    const roots: ObjectTreeNode[] = [];
+    for (const obj of objects) {
+      const node = nodeMap.get(obj.id)!;
+      if (obj.parentObjectId && visibleIds.has(obj.parentObjectId)) {
+        nodeMap.get(obj.parentObjectId)!.children.push(node);
+      } else {
+        roots.push(node);
+      }
+    }
+    return roots;
+  }
+
+  private buildRealmForest(
+    realms: Realm[],
+    objects: MindObject[],
+  ): RealmTreeNode[] {
+    const visibleIds = new Set(realms.map((r) => r.id));
+    const objsByRealm = new Map<string, MindObject[]>();
+    for (const obj of objects) {
+      const arr = objsByRealm.get(obj.realmId) ?? [];
+      arr.push(obj);
+      objsByRealm.set(obj.realmId, arr);
+    }
+    const nodeMap = new Map<string, RealmTreeNode>();
+    for (const realm of realms) {
+      nodeMap.set(realm.id, {
+        realm,
+        objects: this.buildObjectForest(objsByRealm.get(realm.id) ?? []),
+        children: [],
+      });
+    }
+    const roots: RealmTreeNode[] = [];
+    for (const realm of realms) {
+      const node = nodeMap.get(realm.id)!;
+      if (realm.parentId && visibleIds.has(realm.parentId)) {
+        nodeMap.get(realm.parentId)!.children.push(node);
+      } else {
+        roots.push(node);
+      }
+    }
+    return roots;
+  }
+
+  private visibleObjectIdsForEntry(
+    entryId: string,
+    orgId: string,
+    readableLedgerSet: Set<string>,
+  ): string[] {
+    const ids = this.db.listObjectIdsForEntry(entryId, orgId);
+    if (ids.length === 0) return [];
+    const out: string[] = [];
+    for (const id of ids) {
+      const obj = this.db.getObject(id);
+      if (obj && obj.orgId === orgId && readableLedgerSet.has(obj.realmId)) {
+        out.push(id);
+      }
+    }
+    return out;
+  }
+
+  private toLsEntryFromRecord(
+    rec: LedgerRecord,
+    vis: VisibilityHelpers,
+    realmsById: Map<string, Realm>,
+    readableLedgerSet: Set<string>,
+  ): LsEntry {
+    const clean = vis.sanitizeRecord(rec);
+    const bodySnippet =
+      typeof clean.payload.summary === "string" && clean.payload.summary.trim()
+        ? clean.payload.summary
+        : typeof clean.payload.body === "string" && clean.payload.body.trim()
+          ? clean.payload.body
+          : Object.keys(clean.payload).length > 0
+            ? JSON.stringify(clean.payload)
+            : "";
+    return {
+      id: clean.id,
+      behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
+      sourceType: "record",
+      kind: clean.kind,
+      extKind: clean.extKind,
+      realmId: clean.realmId,
+      realmPath: realmsById.get(clean.realmId)?.path ?? "/",
+      status: clean.status,
+      title: clean.title,
+      snippet: snippet(bodySnippet ? `${clean.title} — ${bodySnippet}` : clean.title),
+      authorId: clean.authorId,
+      confirmedByHuman: clean.confirmedByHuman,
+      occurredAt: clean.occurredAt,
+      createdAt: clean.createdAt,
+      externalRef: clean.externalRef,
+      sourceRef: clean.sourceRef,
+      refs: clean.refs,
+      supersedesId: clean.supersedesId,
+      supersededById: clean.supersededById,
+      objectIds: this.visibleObjectIdsForEntry(
+        clean.id,
+        clean.orgId,
+        readableLedgerSet,
+      ),
+      resourceTags: this.db.listResourceTagsForEntry(clean.id, clean.orgId),
+    };
+  }
+
+  private toLsEntryFromSeabed(
+    sea: SeabedEntry,
+    vis: VisibilityHelpers,
+    realmsById: Map<string, Realm>,
+    readableLedgerSet: Set<string>,
+  ): LsEntry {
+    const clean = vis.sanitizeSeabed(sea);
+    return {
+      id: clean.id,
+      behaviorClass: "raw",
+      sourceType: "seabed",
+      kind: clean.kind,
+      extKind: null,
+      realmId: clean.realmId,
+      realmPath: realmsById.get(clean.realmId)?.path ?? "/",
+      status: clean.redactedAt ? "retracted" : "evidence",
+      title: `${clean.kind}${clean.topicId ? ` (${clean.topicId})` : ""}`,
+      snippet: snippet(clean.text),
+      authorId: clean.authorId,
+      confirmedByHuman: clean.authorKind === "human",
+      occurredAt: clean.occurredAt,
+      createdAt: clean.createdAt,
+      externalRef: null,
+      sourceRef: clean.sourceRef,
+      refs: clean.sourceRef ? [clean.sourceRef] : [],
+      supersedesId: null,
+      supersededById: null,
+      objectIds: this.visibleObjectIdsForEntry(
+        clean.id,
+        clean.orgId,
+        readableLedgerSet,
+      ),
+      resourceTags: this.db.listResourceTagsForEntry(clean.id, clean.orgId),
+    };
+  }
+
+  tree(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    scopeCeiling?: AccessScope;
+  }): TreeResult {
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const org = this.db.getOrg(viewerRealm.orgId);
+    if (!org) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy: org.policy,
+      includeDescendantSeabed: false,
+    });
+    const scope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    const visibleRealmSet = new Set<string>([
+      ...scope.readableLedgerIds,
+      ...scope.readableDriveIds,
+      ...scope.readableSeabedIds,
+    ]);
+    const visibleRealms = realms.filter(
+      (r) => r.orgId === org.id && visibleRealmSet.has(r.id),
+    );
+    const visibleObjects = this.db.listObjects({
+      orgId: org.id,
+      realmIds: scope.readableLedgerIds,
+    });
+
+    return {
+      org,
+      viewerRealmId: viewerRealm.id,
+      realms: visibleRealms,
+      objects: visibleObjects,
+      realmTree: this.buildRealmForest(visibleRealms, visibleObjects),
+      objectTree: this.buildObjectForest(visibleObjects),
+    };
+  }
+
+  async ls(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    target?: string;
+    targetType?: LsTargetType;
+    includeSuperseded?: boolean;
+    includeDescendantSeabed?: boolean;
+    limit?: number;
+    offset?: number;
+    scopeCeiling?: AccessScope;
+  }): Promise<LsResult> {
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const realmsById = new Map(realms.map((r) => [r.id, r]));
+    const viewerRealm = realmsById.get(params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+    const includeSuperseded = Boolean(params.includeSuperseded);
+    const includeDescendantSeabed = Boolean(params.includeDescendantSeabed);
+    const limit = Math.max(1, Math.min(params.limit ?? 50, 200));
+    const offset = Math.max(0, params.offset ?? 0);
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy,
+      includeDescendantSeabed,
+    });
+    const scope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    const readableLedgerSet = new Set(scope.readableLedgerIds);
+    const readableSeabedSet = new Set(scope.readableSeabedIds);
+
+    const vis = this.buildVisibilityHelpers({
+      realms,
+      mounts,
+      actor: params.actor,
+      viewerRealmId: viewerRealm.id,
+      scope,
+      ledgerRealmIds: scope.readableLedgerIds,
+      seabedRealmIds: scope.readableSeabedIds,
+      includeDescendantSeabed,
+    });
+
+    const rawTarget = params.target?.trim() || viewerRealm.id;
+    let targetType: LsTargetType;
+    if (params.targetType) {
+      targetType = params.targetType;
+    } else if (rawTarget.startsWith("/") || rawTarget.startsWith("realm_")) {
+      targetType = "realm";
+    } else if (
+      rawTarget.startsWith("obj_") ||
+      Boolean(this.db.getObject(rawTarget))
+    ) {
+      targetType = "object";
+    } else if (rawTarget.startsWith("thing:")) {
+      targetType = "thing";
+    } else if (this.db.getRecord(rawTarget)?.kind === "thing") {
+      targetType = "thing";
+    } else if (rawTarget.includes(":")) {
+      targetType = "resource";
+    } else {
+      targetType = "realm";
+    }
+
+    const entriesMap = new Map<string, LsEntry>();
+    let resolvedId = rawTarget;
+    let driveFiles: LsResult["driveFiles"] | undefined;
+
+    const addRecord = (rec: LedgerRecord | null) => {
+      if (!rec) return;
+      if (rec.orgId !== viewerRealm.orgId) return;
+      if (rec.sensitivity === "secret" || rec.redactedAt !== null) return;
+      if (rec.status === "retracted") return;
+      if (!includeSuperseded && rec.status !== "active") return;
+      if (!vis.canSeeRecord(rec)) return;
+      if (!entriesMap.has(rec.id)) {
+        entriesMap.set(
+          rec.id,
+          this.toLsEntryFromRecord(rec, vis, realmsById, readableLedgerSet),
+        );
+      }
+    };
+
+    const addSeabed = (sea: SeabedEntry | null) => {
+      if (!sea) return;
+      if (sea.orgId !== viewerRealm.orgId) return;
+      if (sea.sensitivity === "secret" || sea.redactedAt !== null) return;
+      if (!vis.canSeeSeabed(sea)) return;
+      if (!entriesMap.has(sea.id)) {
+        entriesMap.set(
+          sea.id,
+          this.toLsEntryFromSeabed(sea, vis, realmsById, readableLedgerSet),
+        );
+      }
+    };
+
+    if (targetType === "realm") {
+      const targetRealm = resolveVisibleRealm({
+        realms,
+        orgId: viewerRealm.orgId,
+        ref: rawTarget,
+        scope,
+      });
+      resolvedId = targetRealm.id;
+
+      if (readableLedgerSet.has(targetRealm.id)) {
+        const recs = this.db.listRecords({
+          realmIds: [targetRealm.id],
+          includeSuperseded,
+          excludeSensitivities: ["secret"],
+          limit: 10_000,
+          offset: 0,
+        });
+        for (const r of recs.items) addRecord(r);
+      }
+      if (readableSeabedSet.has(targetRealm.id)) {
+        const seas = this.db.listSeabedEntries({
+          realmIds: [targetRealm.id],
+          excludeSensitivities: ["secret"],
+          limit: 10_000,
+          offset: 0,
+        });
+        for (const s of seas.items) addSeabed(s);
+      }
+
+      // In open mode, also aggregate entries linked via objects belonging to targetRealm
+      // (tree mode NEVER amplifies beyond physical realm_id)
+      if (scope.policy === "open") {
+        const linkedIds = this.db.listEntryIdsByObjectRealm(
+          viewerRealm.orgId,
+          targetRealm.id,
+        );
+        for (const eid of linkedIds) {
+          const rec = this.db.getRecord(eid);
+          if (rec) {
+            addRecord(rec);
+            continue;
+          }
+          addSeabed(this.db.getSeabedEntry(eid));
+        }
+      }
+
+      if (vis.canSeeDriveRealm(targetRealm.id)) {
+        driveFiles = await this.drive.listFiles(targetRealm.id);
+      }
+    } else if (targetType === "object") {
+      const obj = this.db.getObject(rawTarget);
+      if (
+        !obj ||
+        obj.orgId !== viewerRealm.orgId ||
+        !readableLedgerSet.has(obj.realmId)
+      ) {
+        throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
+      }
+      resolvedId = obj.id;
+      const visibleObjects = this.db.listObjects({
+        orgId: viewerRealm.orgId,
+        realmIds: scope.readableLedgerIds,
+      });
+      const objectIds = [
+        obj.id,
+        ...getDescendantObjectIds(visibleObjects, obj.id),
+      ];
+      const linkedIds = this.db.listEntryIdsForObjects(
+        viewerRealm.orgId,
+        objectIds,
+      );
+      for (const eid of linkedIds) {
+        const rec = this.db.getRecord(eid);
+        if (rec) {
+          addRecord(rec);
+          continue;
+        }
+        addSeabed(this.db.getSeabedEntry(eid));
+      }
+    } else if (targetType === "thing") {
+      const ref = rawTarget.startsWith("thing:")
+        ? rawTarget.slice("thing:".length).trim()
+        : rawTarget;
+      let thingRec = this.db.getRecord(ref);
+      if (!thingRec || thingRec.kind !== "thing") {
+        const byExt = this.db.findRecordsByExternalRef(
+          viewerRealm.orgId,
+          ref,
+          scope.readableLedgerIds,
+          ["secret"],
+        );
+        thingRec = byExt.find((r) => r.kind === "thing") ?? null;
+      }
+      if (
+        !thingRec ||
+        thingRec.orgId !== viewerRealm.orgId ||
+        thingRec.sensitivity === "secret" ||
+        !vis.canSeeRecord(thingRec)
+      ) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      resolvedId = thingRec.thingId ?? thingRec.id;
+      const recs = this.db.listRecords({
+        realmIds: scope.readableLedgerIds,
+        thingId: resolvedId,
+        includeSuperseded,
+        excludeSensitivities: ["secret"],
+        limit: 10_000,
+        offset: 0,
+      });
+      for (const r of recs.items) addRecord(r);
+      addRecord(thingRec);
+    } else {
+      const tag = normalizeResourceTag(rawTarget);
+      resolvedId = tag;
+      const taggedIds = this.db.listEntryIdsByResourceTag(
+        viewerRealm.orgId,
+        tag,
+      );
+      for (const eid of taggedIds) {
+        const rec = this.db.getRecord(eid);
+        if (rec) {
+          addRecord(rec);
+          continue;
+        }
+        addSeabed(this.db.getSeabedEntry(eid));
+      }
+    }
+
+    const allItems = Array.from(entriesMap.values()).sort((a, b) => {
+      if (b.occurredAt !== a.occurredAt) {
+        return b.occurredAt.localeCompare(a.occurredAt);
+      }
+      if (b.createdAt !== a.createdAt) {
+        return b.createdAt.localeCompare(a.createdAt);
+      }
+      return a.id.localeCompare(b.id);
+    });
+    const totalMatched = allItems.length;
+    const page = allItems.slice(offset, offset + limit);
+
+    return {
+      targetType,
+      target: rawTarget,
+      resolvedId,
+      viewerRealmId: viewerRealm.id,
+      items: page,
+      totalMatched,
+      omittedCount: Math.max(0, totalMatched - offset - page.length),
+      ...(driveFiles !== undefined ? { driveFiles } : {}),
+    };
+  }
+
+  async cat(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    target: string;
+    targetRealmRef?: string;
+    includeDescendantSeabed?: boolean;
+    scopeCeiling?: AccessScope;
+  }): Promise<CatResult> {
+    const target = params.target.trim();
+    if (!target) {
+      throw new MindError("INVALID_INPUT", "cat target cannot be empty");
+    }
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const realmsById = new Map(realms.map((r) => [r.id, r]));
+    const viewerRealm = realmsById.get(params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy,
+      includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
+    });
+    const scope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    const readableLedgerSet = new Set(scope.readableLedgerIds);
+    const vis = this.buildVisibilityHelpers({
+      realms,
+      mounts,
+      actor: params.actor,
+      viewerRealmId: viewerRealm.id,
+      scope,
+      ledgerRealmIds: scope.readableLedgerIds,
+      seabedRealmIds: scope.readableSeabedIds,
+      includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
+    });
+
+    // 1. drive://<realmId>/<relPath> URI
+    const parsedDrive = parseDriveSourceRef(target);
+    if (parsedDrive) {
+      if (!vis.canSeeDriveRealm(parsedDrive.realmId)) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      const file = await this.drive.readFile(
+        parsedDrive.realmId,
+        parsedDrive.relPath,
+      );
+      if (!file) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      return {
+        kind: "drive",
+        behaviorClass: "raw",
+        file,
+        realmPath: realmsById.get(parsedDrive.realmId)?.path ?? "/",
+      };
+    }
+
+    // 2. Exact entry lookup (records / seabed / distillations)
+    const rec = this.db.getRecord(target);
+    if (rec) {
+      if (rec.orgId !== viewerRealm.orgId || !vis.canSeeRecord(rec)) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      const clean = vis.sanitizeRecord(rec);
+      return {
+        kind: "record",
+        behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
+        record: clean,
+        realmPath: realmsById.get(clean.realmId)?.path ?? "/",
+        objectIds: this.visibleObjectIdsForEntry(
+          clean.id,
+          clean.orgId,
+          readableLedgerSet,
+        ),
+        resourceTags: this.db.listResourceTagsForEntry(clean.id, clean.orgId),
+        currentHeadId: vis.resolveCurrentHeadId(rec),
+      };
+    }
+
+    const sea = this.db.getSeabedEntry(target);
+    if (sea) {
+      if (sea.orgId !== viewerRealm.orgId || !vis.canSeeSeabed(sea)) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      const clean = vis.sanitizeSeabed(sea);
+      return {
+        kind: "seabed",
+        behaviorClass: "raw",
+        seabed: clean,
+        realmPath: realmsById.get(clean.realmId)?.path ?? "/",
+        objectIds: this.visibleObjectIdsForEntry(
+          clean.id,
+          clean.orgId,
+          readableLedgerSet,
+        ),
+        resourceTags: this.db.listResourceTagsForEntry(clean.id, clean.orgId),
+      };
+    }
+
+    const dist = this.db.getDistillation(target);
+    if (dist) {
+      const distRealm = realmsById.get(dist.realmId);
+      if (
+        !distRealm ||
+        distRealm.orgId !== viewerRealm.orgId ||
+        !vis.canSeeDistillation(dist)
+      ) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      const clean = vis.sanitizeDistillation(dist);
+      return {
+        kind: "distillation",
+        behaviorClass: "conclusion",
+        distillation: clean,
+        realmPath: distRealm.path,
+      };
+    }
+
+    // 3. Drive relative path (with optional targetRealmRef or "<realmPath>:<relPath>")
+    let driveRealm = viewerRealm;
+    let relPath = target;
+    if (params.targetRealmRef) {
+      driveRealm = resolveVisibleRealm({
+        realms,
+        orgId: viewerRealm.orgId,
+        ref: params.targetRealmRef,
+        scope,
+      });
+    } else if (target.startsWith("/") && target.includes(":")) {
+      const colonIdx = target.indexOf(":");
+      const realmPart = target.slice(0, colonIdx);
+      const pathPart = target.slice(colonIdx + 1);
+      driveRealm = resolveVisibleRealm({
+        realms,
+        orgId: viewerRealm.orgId,
+        ref: realmPart,
+        scope,
+      });
+      relPath = pathPart;
+    }
+
+    if (!vis.canSeeDriveRealm(driveRealm.id)) {
+      throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+    }
+    const file = await this.drive.readFile(driveRealm.id, relPath);
+    if (!file) {
+      throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+    }
+    return {
+      kind: "drive",
+      behaviorClass: "raw",
+      file,
+      realmPath: driveRealm.path,
+    };
+  }
+
+  replay(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    entryId: string;
+    window?: number;
+    includeDescendantSeabed?: boolean;
+    scopeCeiling?: AccessScope;
+  }): ReplayResult {
+    const entryId = params.entryId.trim();
+    if (!entryId) {
+      throw new MindError("INVALID_INPUT", "entryId is required for replay");
+    }
+    const windowSize = Math.max(1, Math.min(params.window ?? 10, 100));
+
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const realmsById = new Map(realms.map((r) => [r.id, r]));
+    const viewerRealm = realmsById.get(params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy,
+      includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
+    });
+    const scope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    const readableLedgerSet = new Set(scope.readableLedgerIds);
+    const readableSeabedSet = new Set(scope.readableSeabedIds);
+
+    const vis = this.buildVisibilityHelpers({
+      realms,
+      mounts,
+      actor: params.actor,
+      viewerRealmId: viewerRealm.id,
+      scope,
+      ledgerRealmIds: scope.readableLedgerIds,
+      seabedRealmIds: scope.readableSeabedIds,
+      includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
+    });
+
+    const anchorRec = this.db.getRecord(entryId);
+    const anchorSea = anchorRec ? null : this.db.getSeabedEntry(entryId);
+    if (!anchorRec && !anchorSea) {
+      throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+    }
+
+    let anchorRealmId: string;
+    let anchorOccurredAt: string;
+    let anchorBehaviorClass: BehaviorClass;
+    let anchorEntry: LsEntry;
+    let supersedeChain: LedgerRecord[] = [];
+
+    if (anchorRec) {
+      if (
+        anchorRec.orgId !== viewerRealm.orgId ||
+        !vis.canSeeRecord(anchorRec)
+      ) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      anchorRealmId = anchorRec.realmId;
+      anchorOccurredAt = anchorRec.occurredAt;
+      anchorBehaviorClass = anchorRec.kind === "rule" ? "rule" : "conclusion";
+      anchorEntry = this.toLsEntryFromRecord(
+        anchorRec,
+        vis,
+        realmsById,
+        readableLedgerSet,
+      );
+
+      // Walk full supersede chain and filter/sanitize via visibility.ts
+      let oldest = anchorRec;
+      const seen = new Set<string>([oldest.id]);
+      while (oldest.supersedesId && !seen.has(oldest.supersedesId)) {
+        const prev = this.db.getRecord(oldest.supersedesId);
+        if (!prev) break;
+        seen.add(prev.id);
+        oldest = prev;
+      }
+      const rawChain: LedgerRecord[] = [oldest];
+      let cur = oldest;
+      while (cur.supersededById) {
+        const next = this.db.getRecord(cur.supersededById);
+        if (!next || rawChain.some((c) => c.id === next.id)) break;
+        rawChain.push(next);
+        cur = next;
+      }
+      supersedeChain = rawChain
+        .filter(
+          (node) =>
+            vis.canSeeRecord(node) &&
+            (node.sensitivity !== "secret" || node.id === anchorRec.id),
+        )
+        .map((node) => vis.sanitizeRecord(node));
+    } else {
+      const s = anchorSea!;
+      if (s.orgId !== viewerRealm.orgId || !vis.canSeeSeabed(s)) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      anchorRealmId = s.realmId;
+      anchorOccurredAt = s.occurredAt;
+      anchorBehaviorClass = "raw";
+      anchorEntry = this.toLsEntryFromSeabed(
+        s,
+        vis,
+        realmsById,
+        readableLedgerSet,
+      );
+    }
+
+    const windowLedgerRealmIds = readableLedgerSet.has(anchorRealmId)
+      ? [anchorRealmId]
+      : [];
+    const windowSeabedRealmIds = readableSeabedSet.has(anchorRealmId)
+      ? [anchorRealmId]
+      : [];
+
+    const collectWindow = (direction: "before" | "after"): LsEntry[] => {
+      const recs =
+        windowLedgerRealmIds.length > 0
+          ? this.db
+              .listRecordsWindow({
+                realmIds: windowLedgerRealmIds,
+                anchorOccurredAt,
+                anchorId: entryId,
+                direction,
+                limit: windowSize,
+                excludeSensitivities: ["secret"],
+              })
+              .filter((r) => r.sensitivity !== "secret" && vis.canSeeRecord(r))
+              .map((r) =>
+                this.toLsEntryFromRecord(r, vis, realmsById, readableLedgerSet),
+              )
+          : [];
+      const seas =
+        windowSeabedRealmIds.length > 0
+          ? this.db
+              .listSeabedWindow({
+                realmIds: windowSeabedRealmIds,
+                anchorOccurredAt,
+                anchorId: entryId,
+                direction,
+                limit: windowSize,
+                excludeSensitivities: ["secret"],
+              })
+              .filter((s) => s.sensitivity !== "secret" && vis.canSeeSeabed(s))
+              .map((s) =>
+                this.toLsEntryFromSeabed(s, vis, realmsById, readableLedgerSet),
+              )
+          : [];
+
+      const merged = [...recs, ...seas].sort((a, b) => {
+        if (a.occurredAt !== b.occurredAt) {
+          return a.occurredAt.localeCompare(b.occurredAt);
+        }
+        return a.id.localeCompare(b.id);
+      });
+      return direction === "before"
+        ? merged.slice(-windowSize)
+        : merged.slice(0, windowSize);
+    };
+
+    return {
+      anchorId: entryId,
+      anchorBehaviorClass,
+      anchorRealmId,
+      anchorOccurredAt,
+      window: windowSize,
+      supersedeChain,
+      before: collectWindow("before"),
+      anchor: anchorEntry,
+      after: collectWindow("after"),
+    };
+  }
+
+  changes(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    sinceSeq?: number;
+    limit?: number;
+    includeDescendantSeabed?: boolean;
+    scopeCeiling?: AccessScope;
+  }): ChangesResult {
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy,
+      includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
+    });
+    const scope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    const ledgerSet = new Set(scope.readableLedgerIds);
+    const seabedSet = new Set(scope.readableSeabedIds);
+    const candidateRealms = Array.from(
+      new Set([...scope.readableLedgerIds, ...scope.readableSeabedIds, "__org__"]),
+    );
+
+    const sinceSeq = Math.max(0, params.sinceSeq ?? 0);
+    const limit = Math.max(1, Math.min(params.limit ?? 100, 500));
+
+    const vis = this.buildVisibilityHelpers({
+      realms,
+      mounts,
+      actor: params.actor,
+      viewerRealmId: viewerRealm.id,
+      scope,
+      ledgerRealmIds: scope.readableLedgerIds,
+      seabedRealmIds: scope.readableSeabedIds,
+      includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
+    });
+
+    const raw = this.db.listChangeLog({
+      orgId: viewerRealm.orgId,
+      realmIds: candidateRealms,
+      sinceSeq,
+      limit: limit * 2,
+      includeSecret: false,
+    });
+
+    const filtered: ChangeLogEntry[] = [];
+    let scannedSeq = sinceSeq;
+    for (const entry of raw.entries) {
+      scannedSeq = entry.seq;
+      if (entry.entityType === "seabed") {
+        if (!seabedSet.has(entry.realmId)) continue;
+        const sea = this.db.getSeabedEntry(entry.entityId);
+        if (sea && (sea.sensitivity === "secret" || !vis.canSeeSeabed(sea))) {
+          continue;
+        }
+      } else if (entry.entityType === "record") {
+        if (!ledgerSet.has(entry.realmId)) continue;
+        const rec = this.db.getRecord(entry.entityId);
+        if (rec && (rec.sensitivity === "secret" || !vis.canSeeRecord(rec))) {
+          continue;
+        }
+      } else if (
+        entry.entityType === "entry_object" ||
+        entry.entityType === "resource_tag"
+      ) {
+        if (!ledgerSet.has(entry.realmId) && !seabedSet.has(entry.realmId)) {
+          continue;
+        }
+        const entryId = entry.entityId.split(":")[0] ?? "";
+        const rec = this.db.getRecord(entryId);
+        if (rec && (rec.sensitivity === "secret" || !vis.canSeeRecord(rec))) {
+          continue;
+        }
+        const sea = rec ? null : this.db.getSeabedEntry(entryId);
+        if (sea && (sea.sensitivity === "secret" || !vis.canSeeSeabed(sea))) {
+          continue;
+        }
+      } else if (entry.realmId !== "__org__" && !ledgerSet.has(entry.realmId)) {
+        continue;
+      }
+
+      filtered.push(entry);
+      if (filtered.length >= limit) break;
+    }
+
+    // Cursor semantics:
+    // - When raw batch had rows, advance strictly to the last scanned row in this batch
+    //   (never jumping to org-wide maxSeq, which would skip subsequent visible changes or leak hidden activity).
+    // - When raw batch was empty, keep sinceSeq unchanged.
+    const latestSeq = raw.entries.length > 0 ? scannedSeq : sinceSeq;
+
+    return {
+      generation: raw.generation,
+      sinceSeq,
+      latestSeq,
+      entries: filtered,
     };
   }
 

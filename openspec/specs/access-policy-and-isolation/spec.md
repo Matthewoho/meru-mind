@@ -32,7 +32,11 @@ In `tree` mode, `createRealm()`, `mountRealm()`, and `unmountRealm()` SHALL requ
 
 #### Scenario: Narrowing MCP viewer to a child realm cannot escalate via child mounts or seabed
 - **WHEN** an MCP server is bound to parent realm `B2` in a `tree` organization and child realm `C2` mounts sibling `C1` (`scope: 'all'`) and has its own seabed entries
-- **THEN** calling `mind_recall`, `mind_brief`, `mind_drive_read`, `mind_get_supersede_chain`, or `mind_list_realms` with `viewerRealmId = C2` returns `C2`'s ledger items while strictly blocking `C1`'s mounted items and blocking `C2`'s seabed unless `includeDescendantSeabed = true`
+- **THEN** calling `mind_recall`, `mind_brief`, `mind_tree`, `mind_ls`, `mind_cat`, `mind_replay`, `mind_changes`, `mind_list_objects`, `mind_list_tags`, `mind_list_things`, `mind_drive_read`, `mind_get_supersede_chain`, or `mind_list_realms` with `viewerRealmId = C2` stays strictly within `scope(C2) ∩ scope(B2)`, blocking `C1`'s mounted items and blocking `C2`'s seabed unless `includeDescendantSeabed = true`
+
+#### Scenario: MCP write tools always bind engine writes to boundViewerRealmId
+- **WHEN** an MCP server bound to parent realm `B2` in a `tree` organization receives a write call (`mind_append_record`, `mind_write_conclusion`, `mind_capture_seabed`, `mind_write_raw`, `mind_drive_write`, or `mind_settle`) with narrowed `viewerRealmId = C2` and `targetRealmId = B2`
+- **THEN** the MCP server passes `boundViewerRealmId` (`B2`) to the underlying engine so valid writes to `B2` succeed while references to `C2`'s private mounts (such as `C1`) are rejected with `NOT_FOUND`
 
 ### Requirement: Default-Safe CLI Privilege Model
 `meru-mind` CLI SHALL default `--actor-kind` to `'agent'` and reject `--actor-kind human` unless `--as-human` is explicitly passed. Human-only operations (`rule` records, `redact`, `org set-policy`, and `tree`-mode realm mutations) SHALL require `--as-human`.
@@ -55,7 +59,7 @@ In `tree` mode, `createRealm()`, `mountRealm()`, and `unmountRealm()` SHALL requ
 - **THEN** no file in the exported slice directory contains any `confidential` content or ID
 
 ### Requirement: Unified Field-Level Reference Sanitization
-`LedgerEngine.getSupersedeChain()`, `SeaEngine.brief()`, and `SeaEngine.recall()` SHALL share a single visibility sanitizer (`createVisibilityHelpers`) that strips any invisible or `secret` reference from `record.refs`, `RecallItem.sourceRefs`, `record.supersedesId`, `record.supersededById`, `distillation.sourceIds`, and `seabed.sourceRef` (including `drive://<realmId>/...`).
+`LedgerEngine.getSupersedeChain()`, `LedgerEngine.listThings()`, `LedgerEngine.findThingByExternalRef()`, and `SeaEngine` (`brief()`, `recall()`, `ls()`, `cat()`, `replay()`, `changes()`) SHALL share a single visibility sanitizer (`createVisibilityHelpers`) that strips any invisible or `secret` reference from `record.refs`, `RecallItem.sourceRefs`, `record.supersedesId`, `record.supersededById`, `distillation.sourceIds`, and `seabed.sourceRef` (including `drive://<realmId>/...`).
 
 #### Scenario: Ledger-mounted viewer traverses a supersede chain referencing hidden descendant seabed
 - **WHEN** realm `B` has a record citing descendant `C`'s seabed, and realm `X` mounts only `B`'s `ledger`

@@ -4,14 +4,18 @@ import type {
   DistillationLayer,
   DriveFileContent,
   DriveFileMeta,
+  EntryObjectLink,
   IdempotencyRecord,
   LedgerRecord,
+  MindObject,
   Organization,
   OrgPolicy,
   Realm,
   RealmMount,
   RecordKind,
   RedactedBlocklistEntry,
+  ResourceTag,
+  ResourceTagSummary,
   SchemaMigrationRecord,
   SeabedEntry,
   SeabedKind,
@@ -102,13 +106,25 @@ export interface DbPort {
   // Records (truth source 2: append-only ledger with supersede chains)
   insertRecord(record: LedgerRecord): void;
   /** Atomic CAS supersede: returns true iff the target row was active and unsuperseded (changes === 1). */
-  markRecordSuperseded(oldId: string, newId: string): boolean;
+  markRecordSuperseded(oldId: string, newId: string, orgId?: string): boolean;
   getRecord(id: string): LedgerRecord | null;
+  findActiveRecordBySourceRef(
+    orgId: string,
+    sourceRef: string,
+    realmId?: string,
+  ): LedgerRecord | null;
+  findRecordsByExternalRef(
+    orgId: string,
+    externalRef: string,
+    realmIds?: string[],
+    excludeSensitivities?: Sensitivity[],
+  ): LedgerRecord[];
   listRecords(filter: {
     realmIds: string[];
     thingId?: string;
     kinds?: RecordKind[];
     authorId?: string;
+    externalRef?: string;
     includeSuperseded?: boolean;
     since?: string;
     until?: string;
@@ -117,6 +133,22 @@ export interface DbPort {
     limit?: number;
     offset?: number;
   }): { items: LedgerRecord[]; total: number };
+  listRecordsWindow(params: {
+    realmIds: string[];
+    anchorOccurredAt: string;
+    anchorId: string;
+    direction: "before" | "after";
+    limit: number;
+    excludeSensitivities?: Sensitivity[];
+  }): LedgerRecord[];
+  listSeabedWindow(params: {
+    realmIds: string[];
+    anchorOccurredAt: string;
+    anchorId: string;
+    direction: "before" | "after";
+    limit: number;
+    excludeSensitivities?: Sensitivity[];
+  }): SeabedEntry[];
   listPendingHumanQuestions(filter: {
     realmIds: string[];
     excludeSensitivities?: Sensitivity[];
@@ -128,6 +160,39 @@ export interface DbPort {
     excludeSensitivities?: Sensitivity[];
   }): Record<string, number>;
   listAllRecords(): LedgerRecord[];
+
+  // Objects, Entry-Object Links & Resource Tags (Migration v3)
+  insertObject(obj: MindObject): void;
+  getObject(id: string): MindObject | null;
+  listObjects(filter: {
+    orgId: string;
+    realmIds?: string[];
+    parentObjectId?: string | null;
+    kind?: string;
+  }): MindObject[];
+  updateObjectParent(id: string, parentObjectId: string | null): boolean;
+  countChildObjects(parentObjectId: string): number;
+  deleteObject(id: string): boolean;
+
+  insertEntryObject(link: EntryObjectLink): void;
+  deleteEntryObject(entryId: string, objectId: string): boolean;
+  deleteEntryObjectsByEntry(entryId: string): number;
+  listObjectIdsForEntry(entryId: string, orgId?: string): string[];
+  listObjectRealmIdsForEntry(entryId: string, orgId: string): string[];
+  listEntryIdsForObjects(orgId: string, objectIds: string[]): string[];
+  listEntryIdsByObjectRealm(orgId: string, realmId: string): string[];
+
+  insertResourceTag(tag: ResourceTag): void;
+  deleteResourceTag(entryId: string, tag: string): boolean;
+  deleteResourceTagsByEntry(entryId: string): number;
+  listResourceTagsForEntry(entryId: string, orgId?: string): string[];
+  listEntryIdsByResourceTag(orgId: string, tag: string): string[];
+  listVisibleResourceTags(params: {
+    orgId: string;
+    ledgerRealmIds: string[];
+    seabedRealmIds: string[];
+    prefix?: string;
+  }): ResourceTagSummary[];
 
   // Redaction & Blocklist
   redactRecordRow(params: {
@@ -142,6 +207,7 @@ export interface DbPort {
     redactedBy: string;
     redactedReason: string | null;
   }): boolean;
+  redactChangeLogForEntry(entryId: string): number;
   findDistillationsBySourceId(sourceId: string): Distillation[];
   redactDistillationRow(params: {
     id: string;
@@ -193,6 +259,15 @@ export interface DbPort {
 
   // Change log (append-only operational event log; never cleared by rebuild())
   getChangeLogGeneration(): number;
+  getLatestChangeLogSeq(orgId?: string): number;
+  getChangeLogSeqForEntity(entityType: string, entityId: string): number | null;
+  countChangeLogSince(params: {
+    orgId: string;
+    realmIds: string[];
+    sinceSeq: number;
+    generation: number;
+    includeSecret?: boolean;
+  }): number;
   appendChangeLog(
     entry: Omit<ChangeLogEntry, "seq" | "generation">,
   ): ChangeLogEntry;

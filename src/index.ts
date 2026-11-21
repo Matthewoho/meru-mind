@@ -10,6 +10,8 @@ import {
 import { LocalFsDriveAdapter } from "./adapters/local-drive.js";
 import { SqliteDb } from "./adapters/sqlite-db.js";
 import { LedgerEngine } from "./engine/ledger.js";
+import { ImporterEngine } from "./engine/importer.js";
+import { ObjectEngine } from "./engine/objects.js";
 import { SeaEngine } from "./engine/sea.js";
 import { SliceExporter } from "./engine/slice.js";
 import type { BlobPort, DbPort, DrivePort, EmbedderPort } from "./ports.js";
@@ -48,6 +50,23 @@ export {
   computePayloadHash,
 } from "./engine/ledger.js";
 export {
+  ObjectEngine,
+  normalizeResourceTag,
+  normalizeRealmPath,
+  resolveRealmByPath,
+  resolveVisibleRealm,
+  assertNoObjectCycle,
+  getDescendantObjectIds,
+  OPAQUE_REALM_NOT_FOUND,
+  OPAQUE_OBJECT_NOT_FOUND,
+  OPAQUE_ENTRY_NOT_FOUND,
+} from "./engine/objects.js";
+export {
+  ImporterEngine,
+  parseMarkdownDocument,
+  type ParsedMarkdownDoc,
+} from "./engine/importer.js";
+export {
   createVisibilityHelpers,
   parseDriveSourceRef,
   type VisibilityHelpers,
@@ -57,6 +76,22 @@ export {
   SliceExporter,
   restoreWritablePermissions,
 } from "./engine/slice.js";
+export {
+  formatBehaviorBadge,
+  formatBriefMarkdown,
+  formatCatMarkdown,
+  formatChangesMarkdown,
+  formatGenericMarkdown,
+  formatImportJsonlMarkdown,
+  formatImportMdMarkdown,
+  formatLsMarkdown,
+  formatObjectsMarkdown,
+  formatRecallMarkdown,
+  formatReplayMarkdown,
+  formatTagsMarkdown,
+  formatThingsMarkdown,
+  formatTreeMarkdown,
+} from "./format/markdown.js";
 
 export interface MindEngineOptions {
   /** Runtime data home directory. Defaults to MERU_MIND_HOME or ~/.meru-mind */
@@ -86,7 +121,9 @@ export interface MindEngine {
   readonly drive: DrivePort;
   readonly embedder: EmbedderPort;
   readonly ledger: LedgerEngine;
+  readonly objects: ObjectEngine;
   readonly sea: SeaEngine;
+  readonly importer: ImporterEngine;
   readonly slice: SliceExporter;
   close(): Promise<void>;
 }
@@ -188,7 +225,9 @@ export async function createMindEngine(
   await drive.init();
 
   const ledger = new LedgerEngine(db, blobs, drive, embedder);
+  const objects = new ObjectEngine(db);
   const sea = new SeaEngine(db, blobs, drive, embedder);
+  const importer = new ImporterEngine(db, ledger, sea);
   const slice = new SliceExporter(db, drive, ledger, sea, homeDir);
 
   return {
@@ -198,7 +237,9 @@ export async function createMindEngine(
     drive,
     embedder,
     ledger,
+    objects,
     sea,
+    importer,
     slice,
     async close() {
       await drive.close();

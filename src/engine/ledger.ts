@@ -34,6 +34,11 @@ import {
   createVisibilityHelpers,
   parseDriveSourceRef,
 } from "./visibility.js";
+import {
+  normalizeResourceTag,
+  OPAQUE_OBJECT_NOT_FOUND,
+  resolveVisibleRealm,
+} from "./objects.js";
 
 const VALID_SEABED_KINDS = new Set<string>([
   "message",
@@ -590,6 +595,8 @@ export class LedgerEngine {
     blobContent?: Buffer | string;
     sourceRef?: string | null;
     metadata?: Record<string, unknown>;
+    objectIds?: string[];
+    resourceTags?: string[];
     occurredAt?: string;
     originSessionId?: string | null;
     sensitivity?: Sensitivity;
@@ -615,6 +622,12 @@ export class LedgerEngine {
     }
 
     const metadata = params.metadata ?? {};
+    const objectIds = Array.from(
+      new Set((params.objectIds ?? []).map((s) => s.trim()).filter(Boolean)),
+    ).sort();
+    const resourceTags = Array.from(
+      new Set((params.resourceTags ?? []).map((t) => normalizeResourceTag(t))),
+    ).sort();
     const pendingBlobSha256 =
       params.blobContent !== undefined
         ? sha256Buffer(params.blobContent)
@@ -631,6 +644,8 @@ export class LedgerEngine {
           blobSha256: pendingBlobSha256,
           sourceRef: params.sourceRef ?? null,
           metadata,
+          ...(objectIds.length > 0 ? { objectIds } : {}),
+          ...(resourceTags.length > 0 ? { resourceTags } : {}),
           occurredAt: explicitOccurredAt,
           originSessionId: params.originSessionId ?? null,
           sensitivity,
@@ -714,6 +729,27 @@ export class LedgerEngine {
 
       const targetRealm = realms.find((r) => r.id === targetRealmId)!;
 
+      if (objectIds.length > 0) {
+        const callerScope = resolveAccessScope({
+          realms,
+          mounts,
+          viewerRealmId: params.viewerRealmId,
+          orgPolicy,
+          includeDescendantSeabed: false,
+        });
+        const readableSet = new Set(callerScope.readableLedgerIds);
+        for (const objId of objectIds) {
+          const obj = this.db.getObject(objId);
+          if (
+            !obj ||
+            obj.orgId !== targetRealm.orgId ||
+            !readableSet.has(obj.realmId)
+          ) {
+            throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
+          }
+        }
+      }
+
       let blobSha256: string | null = null;
       if (params.blobContent !== undefined) {
         blobSha256 = this.blobs.put(params.blobContent).sha256;
@@ -743,6 +779,21 @@ export class LedgerEngine {
       };
 
       this.db.insertSeabedEntry(entry);
+
+      for (const objId of objectIds) {
+        this.db.insertEntryObject({
+          entryId: entry.id,
+          orgId: entry.orgId,
+          objectId: objId,
+        });
+      }
+      for (const tag of resourceTags) {
+        this.db.insertResourceTag({
+          entryId: entry.id,
+          orgId: entry.orgId,
+          tag,
+        });
+      }
 
       if (idempotencyKey) {
         this.db.insertIdempotencyKey({
@@ -794,6 +845,10 @@ export class LedgerEngine {
     title: string;
     payload?: Record<string, unknown>;
     refs?: string[];
+    externalRef?: string | null;
+    sourceRef?: string | null;
+    objectIds?: string[];
+    resourceTags?: string[];
     supersedesId?: string | null;
     occurredAt?: string;
     originSessionId?: string | null;
@@ -819,6 +874,22 @@ export class LedgerEngine {
     const extKind = params.extKind?.trim() || null;
     const payload = params.payload ?? {};
     const refs = Array.from(new Set(params.refs ?? []));
+    const objectIds = Array.from(
+      new Set((params.objectIds ?? []).map((s) => s.trim()).filter(Boolean)),
+    ).sort();
+    const resourceTags = Array.from(
+      new Set((params.resourceTags ?? []).map((t) => normalizeResourceTag(t))),
+    ).sort();
+    const externalRef =
+      params.externalRef?.trim() ||
+      (typeof payload.externalRef === "string" && payload.externalRef.trim()
+        ? payload.externalRef.trim()
+        : null);
+    const sourceRef =
+      params.sourceRef?.trim() ||
+      (typeof payload.sourceRef === "string" && payload.sourceRef.trim()
+        ? payload.sourceRef.trim()
+        : null);
     const explicitOccurredAt = params.occurredAt?.trim() || null;
 
     const payloadHash = idempotencyKey
@@ -831,6 +902,10 @@ export class LedgerEngine {
           title,
           payload,
           refs,
+          ...(externalRef ? { externalRef } : {}),
+          ...(sourceRef ? { sourceRef } : {}),
+          ...(objectIds.length > 0 ? { objectIds } : {}),
+          ...(resourceTags.length > 0 ? { resourceTags } : {}),
           supersedesId: params.supersedesId ?? null,
           occurredAt: explicitOccurredAt,
           originSessionId: params.originSessionId ?? null,
@@ -916,6 +991,27 @@ export class LedgerEngine {
 
       const targetRealm = realms.find((r) => r.id === targetRealmId)!;
 
+      if (objectIds.length > 0) {
+        const callerScope = resolveAccessScope({
+          realms,
+          mounts,
+          viewerRealmId: params.viewerRealmId,
+          orgPolicy,
+          includeDescendantSeabed: false,
+        });
+        const readableSet = new Set(callerScope.readableLedgerIds);
+        for (const objId of objectIds) {
+          const obj = this.db.getObject(objId);
+          if (
+            !obj ||
+            obj.orgId !== targetRealm.orgId ||
+            !readableSet.has(obj.realmId)
+          ) {
+            throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
+          }
+        }
+      }
+
       const resolveVisibleRecord = (id: string): LedgerRecord | null => {
         const rec = this.db.getRecord(id);
         if (!rec) return null;
@@ -965,10 +1061,17 @@ export class LedgerEngine {
       }
 
       // 3. Validate supersede chain inside BEGIN IMMEDIATE
+      // - open mode: allows same-org cross-realm supersedes (prevents dual-active heads across realms)
+      // - tree mode: enforces strict same-realm supersedes
       let oldRecord: LedgerRecord | null = null;
       if (params.supersedesId) {
         oldRecord = this.db.getRecord(params.supersedesId);
-        if (!oldRecord || oldRecord.realmId !== targetRealmId) {
+        const allowedSupersedeTarget =
+          oldRecord &&
+          (orgPolicy === "open"
+            ? oldRecord.orgId === targetRealm.orgId
+            : oldRecord.realmId === targetRealmId);
+        if (!oldRecord || !allowedSupersedeTarget) {
           throw new MindError(
             "NOT_FOUND",
             `Entry not found in visible scope: ${params.supersedesId}`,
@@ -1012,6 +1115,8 @@ export class LedgerEngine {
         title,
         payload,
         refs,
+        externalRef,
+        sourceRef,
         occurredAt: explicitOccurredAt ?? now,
         originSessionId: params.originSessionId ?? null,
         sensitivity,
@@ -1023,9 +1128,28 @@ export class LedgerEngine {
 
       this.db.insertRecord(record);
 
-      // 4. Atomic CAS on superseded chain head (assert changes === 1, else rollback)
+      for (const objId of objectIds) {
+        this.db.insertEntryObject({
+          entryId: record.id,
+          orgId: record.orgId,
+          objectId: objId,
+        });
+      }
+      for (const tag of resourceTags) {
+        this.db.insertResourceTag({
+          entryId: record.id,
+          orgId: record.orgId,
+          tag,
+        });
+      }
+
+      // 4. Atomic CAS on superseded chain head (assert changes === 1 with org_id guard, else rollback)
       if (oldRecord) {
-        const casOk = this.db.markRecordSuperseded(oldRecord.id, record.id);
+        const casOk = this.db.markRecordSuperseded(
+          oldRecord.id,
+          record.id,
+          targetRealm.orgId,
+        );
         if (!casOk) {
           throw new MindError(
             "CONFLICT",
@@ -1079,6 +1203,179 @@ export class LedgerEngine {
 
       return record;
     });
+  }
+
+  // ---- Identity Anchors (Reusing records.kind = 'thing' + external_ref, no separate things table) ----
+
+  async createThing(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    targetRealmId?: string;
+    title: string;
+    externalRef?: string | null;
+    payload?: Record<string, unknown>;
+    refs?: string[];
+    objectIds?: string[];
+    resourceTags?: string[];
+    occurredAt?: string;
+    originSessionId?: string | null;
+    sensitivity?: Sensitivity;
+    idempotencyKey?: string;
+    dedupeByExternalRef?: boolean;
+  }): Promise<LedgerRecord> {
+    const extRef = params.externalRef?.trim() || null;
+    if (params.dedupeByExternalRef && extRef) {
+      const existing = this.findThingByExternalRef({
+        actor: params.actor,
+        viewerRealmId: params.viewerRealmId,
+        externalRef: extRef,
+      });
+      if (existing) {
+        return existing;
+      }
+    }
+    return this.appendRecord({
+      actor: params.actor,
+      viewerRealmId: params.viewerRealmId,
+      targetRealmId: params.targetRealmId,
+      kind: "thing",
+      title: params.title,
+      externalRef: extRef,
+      payload: params.payload,
+      refs: params.refs,
+      objectIds: params.objectIds,
+      resourceTags: params.resourceTags,
+      occurredAt: params.occurredAt,
+      originSessionId: params.originSessionId,
+      sensitivity: params.sensitivity,
+      idempotencyKey: params.idempotencyKey,
+    });
+  }
+
+  findThingByExternalRef(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    externalRef: string;
+    scopeCeiling?: AccessScope;
+  }): LedgerRecord | null {
+    const actor = validateActor(params.actor);
+    const extRef = params.externalRef.trim();
+    if (!extRef) return null;
+
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    if (!viewerRealm) return null;
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy,
+      includeDescendantSeabed: false,
+    });
+    const scope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    const vis = createVisibilityHelpers({
+      db: this.db,
+      realms,
+      mounts,
+      actor,
+      viewerRealmId: viewerRealm.id,
+      scope,
+      includeDescendantSeabed: false,
+    });
+
+    const matches = this.db.findRecordsByExternalRef(
+      viewerRealm.orgId,
+      extRef,
+      scope.readableLedgerIds,
+      ["secret"],
+    );
+    const found = matches.find(
+      (r) =>
+        r.kind === "thing" &&
+        r.sensitivity !== "secret" &&
+        r.redactedAt === null &&
+        vis.canSeeRecord(r),
+    );
+    return found ? vis.sanitizeRecord(found) : null;
+  }
+
+  listThings(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    targetRealmRef?: string;
+    externalRef?: string;
+    includeSuperseded?: boolean;
+    limit?: number;
+    offset?: number;
+    scopeCeiling?: AccessScope;
+  }): { items: LedgerRecord[]; total: number } {
+    const actor = validateActor(params.actor);
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError(
+        "NOT_FOUND",
+        `Realm not found: ${params.viewerRealmId}`,
+      );
+    }
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy,
+      includeDescendantSeabed: false,
+    });
+    const scope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    let realmIds = scope.readableLedgerIds;
+    if (params.targetRealmRef) {
+      const target = resolveVisibleRealm({
+        realms,
+        orgId: viewerRealm.orgId,
+        ref: params.targetRealmRef,
+        scope,
+      });
+      realmIds = scope.readableLedgerIds.includes(target.id) ? [target.id] : [];
+    }
+
+    const vis = createVisibilityHelpers({
+      db: this.db,
+      realms,
+      mounts,
+      actor,
+      viewerRealmId: viewerRealm.id,
+      scope,
+      ledgerRealmIds: realmIds,
+      includeDescendantSeabed: false,
+    });
+
+    const res = this.db.listRecords({
+      realmIds,
+      kinds: ["thing"],
+      externalRef: params.externalRef?.trim() || undefined,
+      includeSuperseded: Boolean(params.includeSuperseded),
+      excludeSensitivities: ["secret"],
+      limit: params.limit ?? 50,
+      offset: params.offset ?? 0,
+    });
+
+    return {
+      items: res.items
+        .filter((r) => r.sensitivity !== "secret" && vis.canSeeRecord(r))
+        .map((r) => vis.sanitizeRecord(r)),
+      total: res.total,
+    };
   }
 
   getSupersedeChain(params: {
@@ -1208,13 +1505,18 @@ export class LedgerEngine {
 
       if (rec) {
         sourceRef =
-          typeof rec.payload.sourceRef === "string" &&
+          rec.sourceRef?.trim() ||
+          (typeof rec.payload.sourceRef === "string" &&
           rec.payload.sourceRef.trim()
             ? rec.payload.sourceRef.trim()
-            : `record://${rec.id}`;
-        contentSha256 = sha256Buffer(
-          `${rec.title}\n${JSON.stringify(canonicalizeJson(rec.payload))}`,
-        );
+            : `record://${rec.id}`);
+        contentSha256 =
+          typeof rec.payload.contentSha256 === "string" &&
+          rec.payload.contentSha256.trim()
+            ? rec.payload.contentSha256.trim()
+            : sha256Buffer(
+                `${rec.title}\n${JSON.stringify(canonicalizeJson(rec.payload))}`,
+              );
         this.db.redactRecordRow({
           id: rec.id,
           redactedAt: now,
@@ -1225,7 +1527,12 @@ export class LedgerEngine {
         const s = sea!;
         blobSha256 = s.blobSha256;
         sourceRef = s.sourceRef?.trim() || `seabed://${s.id}`;
-        contentSha256 = s.blobSha256 ?? sha256Buffer(s.text);
+        contentSha256 =
+          s.blobSha256 ??
+          (typeof s.metadata.contentSha256 === "string" &&
+          s.metadata.contentSha256.trim()
+            ? s.metadata.contentSha256.trim()
+            : sha256Buffer(s.text));
         this.db.redactSeabedRow({
           id: s.id,
           redactedAt: now,
@@ -1234,9 +1541,12 @@ export class LedgerEngine {
         });
       }
 
-      // Remove target from FTS5, sqlite-vec, and vec_pending
+      // Remove target from FTS5, sqlite-vec, vec_pending, entry_objects, resource_tags, and sanitize change_log suffixes
       this.db.deleteFtsItem(entryId);
       this.db.deleteVectorItem(entryId);
+      this.db.deleteEntryObjectsByEntry(entryId);
+      this.db.deleteResourceTagsByEntry(entryId);
+      this.db.redactChangeLogForEntry(entryId);
 
       // Cascade retraction to every distillation citing this entryId in source_ids
       const affectedDists = this.db.findDistillationsBySourceId(entryId);

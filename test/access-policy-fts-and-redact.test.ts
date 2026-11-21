@@ -1696,6 +1696,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
     const secretSeaCanary = "zqxjkvbsecretkeysea1122334455";
     const secretBlobCanary = "zqxjkvbsecretblob6677889900";
     const secretDistCanary = "zqxjkvbsecretcard5544332211";
+    const secretTagCanary = "zqxjtagsecret778899";
 
     const targetRec = await engine.ledger.appendRecord({
       actor: humanAlice,
@@ -1703,6 +1704,14 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       kind: "decision",
       title: `Leaked decision ${secretRecCanary}`,
       payload: { secret: secretRecCanary, sourceRef: "doc://leak/rec.md" },
+    });
+
+    // Attach a sensitive resource tag via tagEntryResource (writes change_log too — kills B1)
+    engine.objects.tagEntryResource({
+      actor: humanAlice,
+      viewerRealmId: rootRealm.id,
+      entryId: targetRec.id,
+      tag: `secret:${secretTagCanary}`,
     });
 
     const targetSea = await engine.ledger.captureSeabed({
@@ -1808,13 +1817,20 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       ),
     ).toBe(true);
 
-    // Verify change_log logged both redact ops
+    // Verify change_log logged both redact ops and NEVER exposes redacted tag plaintext
     const redactLogs = engine.sea
       .listChangeLog({ orgId: org.id })
       .entries.filter((e) => e.op === "redact");
     expect(redactLogs.map((e) => e.entityId).sort()).toEqual(
       [targetRec.id, targetSea.id].sort(),
     );
+    const changesAfterRedact = engine.sea.changes({
+      actor: humanAlice,
+      viewerRealmId: rootRealm.id,
+      sinceSeq: 0,
+      limit: 500,
+    });
+    expect(JSON.stringify(changesAfterRedact)).not.toContain(secretTagCanary);
 
     // 3. Close ALL connections and perform raw BYTE-LEVEL grep over .sqlite, -wal, -shm, and blobs/
     await engine.close();
@@ -1833,6 +1849,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       secretSeaCanary,
       secretBlobCanary,
       secretDistCanary,
+      secretTagCanary,
     ];
     for (const filePath of filesToSweep) {
       const rawBuf = fs.readFileSync(filePath);

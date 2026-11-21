@@ -130,6 +130,35 @@ export type RecordKind =
 
 export type RecordStatus = "active" | "superseded" | "retracted";
 
+export type BehaviorClass = "rule" | "conclusion" | "raw";
+
+export interface MindObject {
+  id: string;
+  orgId: string;
+  parentObjectId: string | null;
+  realmId: string;
+  kind: string;
+  name: string;
+  createdAt: string;
+}
+
+export interface EntryObjectLink {
+  entryId: string;
+  orgId: string;
+  objectId: string;
+}
+
+export interface ResourceTag {
+  entryId: string;
+  orgId: string;
+  tag: string;
+}
+
+export interface ResourceTagSummary {
+  tag: string;
+  count: number;
+}
+
 export interface LedgerRecord {
   id: string;
   orgId: string;
@@ -147,6 +176,8 @@ export interface LedgerRecord {
   title: string;
   payload: Record<string, unknown>;
   refs: string[];
+  externalRef: string | null;
+  sourceRef: string | null;
   occurredAt: string;
   originSessionId: string | null;
   sensitivity: Sensitivity;
@@ -220,6 +251,11 @@ export interface ChildRealmSummary {
 export interface BriefOutput {
   realm: Realm;
   generatedAt: string;
+  buckets?: {
+    rules: number;
+    conclusions: number;
+    raw: number;
+  };
   surface: {
     recentMessages: BriefSection<SeabedEntry>;
   };
@@ -230,6 +266,12 @@ export interface BriefOutput {
   };
   middleMind: {
     realmCard: Distillation | null;
+    realmCardMeta?: {
+      cardSeq: number | null;
+      changesSinceCard: number;
+      currentSeq: number;
+      generation: number;
+    };
     rules: BriefSection<{
       id: string;
       realmId: string;
@@ -276,6 +318,8 @@ export type RecallItemStatus = "active" | "superseded" | "retracted" | "evidence
 
 export interface RecallItem {
   id: string;
+  behaviorClass?: BehaviorClass;
+  /** @deprecated Will be removed in v0.3.0; prefer behaviorClass */
   sourceType: "record" | "seabed" | "distillation";
   kind: string;
   realmId: string;
@@ -392,4 +436,198 @@ export interface RedactResult {
   blocklistRecorded: boolean;
   walCheckpoint: WalCheckpointResult;
   residualLocations: string[];
+}
+
+export interface ObjectTreeNode {
+  object: MindObject;
+  children: ObjectTreeNode[];
+}
+
+export interface RealmTreeNode {
+  realm: Realm;
+  objects: ObjectTreeNode[];
+  children: RealmTreeNode[];
+}
+
+export interface TreeResult {
+  org: Organization;
+  viewerRealmId: string;
+  realms: Realm[];
+  objects: MindObject[];
+  realmTree: RealmTreeNode[];
+  objectTree: ObjectTreeNode[];
+}
+
+export type LsTargetType = "realm" | "object" | "thing" | "resource";
+
+export interface LsEntry {
+  id: string;
+  behaviorClass: BehaviorClass;
+  /** @deprecated Will be removed in v0.3.0; prefer behaviorClass */
+  sourceType: "record" | "seabed";
+  kind: string;
+  extKind: string | null;
+  realmId: string;
+  realmPath: string;
+  status: string;
+  title: string;
+  snippet: string;
+  authorId: string;
+  confirmedByHuman: boolean;
+  occurredAt: string;
+  createdAt: string;
+  externalRef: string | null;
+  sourceRef: string | null;
+  refs: string[];
+  supersedesId: string | null;
+  supersededById: string | null;
+  objectIds: string[];
+  resourceTags: string[];
+}
+
+export interface LsResult {
+  targetType: LsTargetType;
+  target: string;
+  resolvedId: string;
+  viewerRealmId: string;
+  items: LsEntry[];
+  totalMatched: number;
+  omittedCount: number;
+  driveFiles?: DriveFileMeta[];
+}
+
+export type CatResult =
+  | {
+      kind: "record";
+      behaviorClass: "rule" | "conclusion";
+      record: LedgerRecord;
+      realmPath: string;
+      objectIds: string[];
+      resourceTags: string[];
+      currentHeadId: string | null;
+    }
+  | {
+      kind: "seabed";
+      behaviorClass: "raw";
+      seabed: SeabedEntry;
+      realmPath: string;
+      objectIds: string[];
+      resourceTags: string[];
+    }
+  | {
+      kind: "distillation";
+      behaviorClass: "conclusion";
+      distillation: Distillation;
+      realmPath: string;
+    }
+  | {
+      kind: "drive";
+      behaviorClass: "raw";
+      file: DriveFileContent;
+      realmPath: string;
+    };
+
+export interface ReplayResult {
+  anchorId: string;
+  anchorBehaviorClass: BehaviorClass;
+  anchorRealmId: string;
+  anchorOccurredAt: string;
+  window: number;
+  supersedeChain: LedgerRecord[];
+  before: LsEntry[];
+  anchor: LsEntry;
+  after: LsEntry[];
+}
+
+export interface ChangesResult {
+  generation: number;
+  sinceSeq: number;
+  latestSeq: number;
+  entries: ChangeLogEntry[];
+}
+
+export interface ImportMdItemResult {
+  filePath: string;
+  sourceRef: string;
+  contentSha256: string;
+  action:
+    | "created"
+    | "superseded"
+    | "skipped_unchanged"
+    | "skipped_redacted"
+    | "skipped_secret";
+  recordId: string | null;
+  supersedesId: string | null;
+  realmId: string;
+  occurredAt: string | null;
+}
+
+export interface ImportMdResult {
+  totalFiles: number;
+  created: number;
+  superseded: number;
+  skippedUnchanged: number;
+  skippedRedacted: number;
+  skippedSecret: number;
+  items: ImportMdItemResult[];
+  embeddingsSynced?: SyncEmbeddingsResult;
+}
+
+export interface JsonlMappingConfig {
+  /** Destination table: "record" (default) or "seabed" */
+  target?: "record" | "seabed";
+  /** Dot-path for source item ID */
+  id?: string;
+  /** Dot-path for kind + optional lookup map + default */
+  kind?: string;
+  kindMap?: Record<string, string>;
+  defaultKind?: string;
+  /** Dot-path for extKind */
+  extKind?: string;
+  /** Dot-path(s) for title */
+  title?: string | string[];
+  /** Dot-path(s) for body/text */
+  body?: string | string[];
+  /** Dot-path(s) for occurredAt timestamp */
+  occurredAt?: string | string[];
+  /** Dot-path for realm path or key + optional lookup map + default */
+  realmPath?: string;
+  realmMap?: Record<string, string>;
+  defaultRealm?: string;
+  /** Dot-path for object references + optional lookup map */
+  objectRefs?: string;
+  objectMap?: Record<string, string>;
+  /** Dot-path for resource tags + optional default tag type prefix */
+  resourceTags?: string;
+  defaultTagType?: string;
+  /** Dot-path for thing reference (source ID, record ID, or external_ref) */
+  thingRef?: string;
+  /** Dot-path for external_ref on thing records */
+  externalRef?: string;
+  /** Dot-path for supersedes reference */
+  supersedes?: string;
+  /** Dot-path for refs array */
+  refs?: string;
+  /** Dot-path for sensitivity + default + skipSecret (default: true) */
+  sensitivity?: string;
+  defaultSensitivity?: Sensitivity;
+  skipSecret?: boolean;
+  /** Dot-path for sourceRef */
+  sourceRef?: string;
+  /** Optional allowlist of dot-paths to extract into payload */
+  extractFields?: string[];
+  /** Optional idempotency key prefix (default: "import-jsonl") */
+  idempotencyPrefix?: string;
+}
+
+export interface ImportJsonlResult {
+  totalRows: number;
+  imported: number;
+  superseded: number;
+  skippedSecret: number;
+  skippedRedacted: number;
+  treeDegradedCrossRealmSupersedes: number;
+  idMap: Record<string, string>;
+  entryIds: string[];
+  embeddingsSynced?: SyncEmbeddingsResult;
 }

@@ -17,7 +17,13 @@ Define durable SQLite schema migration, atomic write-path invariants, organizati
 
 #### Scenario: Multiple OS processes open an unmigrated database simultaneously
 - **WHEN** multiple processes invoke `new SqliteDb(...)` against the same V0.1 file concurrently
-- **THEN** all processes complete initialization cleanly with zero `duplicate column` or lock-race failures and record migrations `[1, 2]`
+- **THEN** all processes complete initialization cleanly with zero `duplicate column` or lock-race failures and record migrations `[1, 2, 3]`
+
+#### Scenario: Migration v3 creates object/tag tables and record reference columns without a separate things table
+- **WHEN** `SqliteDb` runs migration v3 inside `BEGIN IMMEDIATE`
+- **THEN** it creates `objects`, `entry_objects`, and `resource_tags` with their organization-scoped indexes
+- **AND** adds `external_ref` (indexed by `(org_id, external_ref)`) and `source_ref` (indexed by `(org_id, source_ref, status)`) to `records` without creating a separate `things` table
+- **AND** safely backfills `source_ref` and `external_ref` on pre-existing rows from `payload_json` (or `source_refs_json[0]` when present)
 
 ### Requirement: Newly Created Organizations Default to Open Policy
 `LedgerEngine.createOrg()` SHALL default `policy` to `'open'` for newly created organizations while accepting explicit `policy: 'tree'`. Changing an existing organization's policy via `setOrgPolicy()` SHALL require `actor.kind === 'human'` and append an `org_policy_change` entry to `change_log` (using `'__org__'` if no root realm exists).
@@ -31,8 +37,13 @@ Define durable SQLite schema migration, atomic write-path invariants, organizati
 
 #### Scenario: Concurrent processes supersede the same active chain head
 - **WHEN** multiple OS processes concurrently call `appendRecord()` with `supersedesId` pointing to the same active record
-- **THEN** `markRecordSuperseded()` enforces `WHERE id = ? AND status = 'active' AND superseded_by_id IS NULL` with `changes === 1`
+- **THEN** `markRecordSuperseded()` enforces `WHERE id = ? AND org_id = ? AND status = 'active' AND superseded_by_id IS NULL` with `changes === 1`
 - **AND** strictly one writer succeeds while all contenders roll back with `CONFLICT` and leave zero forked or dirty rows
+
+#### Scenario: Policy-scoped cross-realm supersede
+- **WHEN** a writer in an `open` organization appends a record superseding an active same-kind record in another realm of the same organization
+- **THEN** `appendRecord()` atomically supersedes the old record via CAS so only the new record remains `'active'`
+- **AND** when an organization uses `policy = 'tree'`, cross-realm `supersedesId` is rejected with opaque `NOT_FOUND` (and cross-organization `supersedesId` is always rejected in both modes)
 
 #### Scenario: Superseding a retracted record is rejected
 - **WHEN** an actor attempts to supersede a record whose status is `'retracted'`
