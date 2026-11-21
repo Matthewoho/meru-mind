@@ -18,6 +18,7 @@ import {
   type ResourceTag,
   type ResourceTagSummary,
 } from "../types.js";
+import { createVisibilityHelpers, sanitizeRealmsForScope } from "./visibility.js";
 
 export const OPAQUE_REALM_NOT_FOUND = "Realm not found in visible scope";
 export const OPAQUE_OBJECT_NOT_FOUND = "Object not found in visible scope";
@@ -85,9 +86,10 @@ export function resolveRealmByPath(
 }
 
 /**
- * Resolves a realm reference (either stable realm ID or slash path like `/ops/cicd`)
- * within `scope`. In `tree` mode, hidden realms and nonexistent realms throw the
- * EXACT same opaque `NOT_FOUND` error with zero existence disclosure.
+ * Resolves a realm reference (stable realm ID, slash path like `/ops/cicd`, or `@mounted/<alias>`)
+ * within `scope`. In `tree` mode, hidden realms, hidden-ancestor paths, and nonexistent realms
+ * throw the EXACT same opaque `NOT_FOUND` error with zero existence disclosure.
+ * Always returns the P0-1 sanitized Realm.
  */
 export function resolveVisibleRealm(params: {
   realms: Realm[];
@@ -100,23 +102,37 @@ export function resolveVisibleRealm(params: {
     throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
   }
   const orgRealms = params.realms.filter((r) => r.orgId === params.orgId);
-  const candidate = ref.startsWith("/")
-    ? resolveRealmByPath(orgRealms, ref)
-    : (orgRealms.find((r) => r.id === ref) ?? null);
+  const sanitizedMap = sanitizeRealmsForScope(orgRealms, params.scope);
 
-  if (!candidate) {
+  if (ref.toLowerCase().startsWith("@mounted/")) {
+    const targetLower = ref.toLowerCase();
+    for (const clean of sanitizedMap.values()) {
+      if (clean.path.toLowerCase() === targetLower) {
+        return { ...clean };
+      }
+    }
     throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
   }
 
-  const visibleSet = new Set<string>([
-    ...params.scope.readableLedgerIds,
-    ...params.scope.readableDriveIds,
-    ...params.scope.readableSeabedIds,
-  ]);
-  if (!visibleSet.has(candidate.id)) {
+  if (ref.startsWith("/")) {
+    const normalized = normalizeRealmPath(ref);
+    const candidate = resolveRealmByPath(orgRealms, normalized);
+    if (!candidate) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const clean = sanitizedMap.get(candidate.id);
+    // Reject real path when ANY ancestor is hidden (clean.path was rewritten to @mounted/<alias>)
+    if (!clean || clean.path.toLowerCase() !== normalized.toLowerCase()) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    return { ...clean };
+  }
+
+  const clean = sanitizedMap.get(ref);
+  if (!clean) {
     throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
   }
-  return candidate;
+  return { ...clean };
 }
 
 export function assertNoObjectCycle(
@@ -390,7 +406,7 @@ export class ObjectEngine {
     objectId: string;
     scopeCeiling?: AccessScope;
   }): MindObject {
-    const { viewerRealm, scope } = this.resolveScope({
+    const { viewerRealm, realms, scope } = this.resolveScope({
       viewerRealmId: params.viewerRealmId,
       scopeCeiling: params.scopeCeiling,
     });
@@ -402,7 +418,15 @@ export class ObjectEngine {
     ) {
       throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
     }
-    return obj;
+    const vis = createVisibilityHelpers({
+      db: this.db,
+      realms,
+      mounts: this.db.listMounts(),
+      actor: { id: "reader", kind: "agent" },
+      viewerRealmId: viewerRealm.id,
+      scope,
+    });
+    return vis.sanitizeObject(obj);
   }
 
   listObjects(params: {
@@ -439,12 +463,21 @@ export class ObjectEngine {
       }
     }
 
-    return this.db.listObjects({
+    const rawObjects = this.db.listObjects({
       orgId: viewerRealm.orgId,
       realmIds,
       parentObjectId: params.parentObjectId,
       kind: params.kind?.trim() || undefined,
     });
+    const vis = createVisibilityHelpers({
+      db: this.db,
+      realms,
+      mounts: [],
+      actor: { id: "reader", kind: "agent" },
+      viewerRealmId: viewerRealm.id,
+      scope,
+    });
+    return vis.sanitizeObjects(rawObjects);
   }
 
   deleteObject(params: {
@@ -645,16 +678,12 @@ export class ObjectEngine {
         tag: normalizedTag,
       };
       this.db.insertResourceTag(resTag);
-      const tagHash = crypto
-        .createHash("sha256")
-        .update(normalizedTag, "utf8")
-        .digest("hex")
-        .slice(0, 16);
+      // Store ONLY entryId in change_log.entity_id (zero tag text or unkeyed hash leakage)
       this.db.appendChangeLog({
         orgId: viewerRealm.orgId,
         realmId: entryRealmId,
         entityType: "resource_tag",
-        entityId: `${params.entryId}:${tagHash}`,
+        entityId: params.entryId,
         op: "tag",
         actorId: params.actor.id,
         createdAt: new Date().toISOString(),

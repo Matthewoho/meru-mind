@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
-import { parseSearchQuery } from "../adapters/sqlite-db.js";
+import { parseSearchQuery, type SearchConcept } from "../adapters/sqlite-db.js";
+import { buildSnippet, extractReadableText } from "../format/snippet.js";
 import {
   assertAccess,
   intersectAccessScopes,
@@ -11,6 +12,7 @@ import type {
   DbPort,
   DrivePort,
   EmbedderPort,
+  UnifiedEntryRef,
 } from "../ports.js";
 import {
   MindError,
@@ -34,11 +36,13 @@ import {
   type OrgPolicy,
   type Realm,
   type RealmMount,
+  type RealmTreeCounts,
   type RealmTreeNode,
   type RecallItem,
   type RecallQuery,
   type RecallResult,
   type RebuildResult,
+  type RecordKind,
   type ReplayResult,
   type SeabedEntry,
   type Sensitivity,
@@ -73,6 +77,15 @@ const VALID_DISTILLATION_LAYERS = new Set<string>([
   "card_progress",
 ]);
 
+const NON_RULE_RECORD_KINDS: RecordKind[] = [
+  "thing",
+  "claim",
+  "proposal",
+  "verdict",
+  "finding",
+  "decision",
+];
+
 function clampBudget(value: number | undefined, fallback: number): number {
   if (value === undefined) return fallback;
   if (!Number.isInteger(value) || value < 1) {
@@ -82,11 +95,6 @@ function clampBudget(value: number | undefined, fallback: number): number {
     );
   }
   return Math.min(value, 200);
-}
-
-function snippet(text: string, max = 240): string {
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}…`;
 }
 
 export class SeaEngine {
@@ -118,26 +126,48 @@ export class SeaEngine {
     });
   }
 
-  private distillationHasExcludedSensitivity(
-    dist: Distillation | null,
+  private filterDistillationsBySensitivity(
+    dists: Distillation[],
     excludeSensitivities: Sensitivity[],
-  ): boolean {
-    if (!dist || excludeSensitivities.length === 0) return false;
+  ): Set<string> {
+    const blocked = new Set<string>();
+    if (dists.length === 0 || excludeSensitivities.length === 0) return blocked;
     const excluded = new Set(excludeSensitivities);
-    for (const sid of dist.sourceIds) {
-      const rec = this.db.getRecord(sid);
-      if (rec && excluded.has(rec.sensitivity)) return true;
-      const sea = rec ? null : this.db.getSeabedEntry(sid);
-      if (sea && excluded.has(sea.sensitivity)) return true;
+    const allSourceIds: string[] = [];
+    for (const d of dists) {
+      allSourceIds.push(...d.sourceIds);
     }
-    return false;
+    const uniqueIds = Array.from(new Set(allSourceIds));
+    if (uniqueIds.length === 0) return blocked;
+
+    const secretIds = new Set<string>();
+    const recs = this.db.getRecordsByIds(uniqueIds);
+    const foundRecIds = new Set<string>();
+    for (const r of recs) {
+      foundRecIds.add(r.id);
+      if (excluded.has(r.sensitivity)) secretIds.add(r.id);
+    }
+    const remaining = uniqueIds.filter((id) => !foundRecIds.has(id));
+    if (remaining.length > 0) {
+      const seas = this.db.getSeabedEntriesByIds(remaining);
+      for (const s of seas) {
+        if (excluded.has(s.sensitivity)) secretIds.add(s.id);
+      }
+    }
+    for (const d of dists) {
+      if (d.sourceIds.some((sid) => secretIds.has(sid))) {
+        blocked.add(d.id);
+      }
+    }
+    return blocked;
   }
 
-  // ---- Brief (Boot Surface with Strict Item Budgets & Mandatory Omitted Counts) ----
+  // ---- Brief (Kind Histogram, occurred_at Recency, Batch GROUP BY SQL, Bounded Child Summaries) ----
 
   brief(params: {
     actor: Actor;
     viewerRealmId: string;
+    target?: string;
     budget?: BriefBudget;
     scopeCeiling?: AccessScope;
     excludeSensitivities?: Sensitivity[];
@@ -145,19 +175,19 @@ export class SeaEngine {
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
     const realmsById = new Map(realms.map((r) => [r.id, r]));
-    const realm = realmsById.get(params.viewerRealmId);
-    if (!realm) {
+    const viewerRealm = realmsById.get(params.viewerRealmId);
+    if (!viewerRealm) {
       throw new MindError(
         "NOT_FOUND",
         `Realm not found: ${params.viewerRealmId}`,
       );
     }
 
-    const orgPolicy = this.getOrgPolicy(realm.orgId);
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
     const baseScope = resolveAccessScope({
       realms,
       mounts,
-      viewerRealmId: realm.id,
+      viewerRealmId: viewerRealm.id,
       orgPolicy,
       includeDescendantSeabed: false,
     });
@@ -165,45 +195,75 @@ export class SeaEngine {
       ? intersectAccessScopes(baseScope, params.scopeCeiling)
       : baseScope;
 
+    const targetRealm = params.target
+      ? resolveVisibleRealm({
+          realms,
+          orgId: viewerRealm.orgId,
+          ref: params.target,
+          scope,
+        })
+      : viewerRealm;
+
+    // For brief center on targetRealm, compute ancestor/descendant view bounded by effective scope
+    const centerScope =
+      targetRealm.id === viewerRealm.id
+        ? scope
+        : intersectAccessScopes(
+            resolveAccessScope({
+              realms,
+              mounts,
+              viewerRealmId: targetRealm.id,
+              orgPolicy,
+              includeDescendantSeabed: false,
+            }),
+            scope,
+          );
+
     const excludeSensitivities = params.excludeSensitivities ?? ["secret"];
     const vis = this.buildVisibilityHelpers({
       realms,
       mounts,
       actor: params.actor,
-      viewerRealmId: realm.id,
+      viewerRealmId: viewerRealm.id,
       scope,
       ledgerRealmIds: scope.readableLedgerIds,
       seabedRealmIds: scope.readableSeabedIds,
       includeDescendantSeabed: false,
     });
 
+    const sanitizedCenterRealm = vis.sanitizeRealm(targetRealm);
+
     const recentMessagesLimit = clampBudget(params.budget?.recentMessages, 10);
     const maxQuestions = clampBudget(params.budget?.maxQuestions, 5);
     const maxActiveThings = clampBudget(params.budget?.maxActiveThings, 5);
     const maxDecisions = clampBudget(params.budget?.maxDecisions, 5);
+    const maxRecentConclusions = clampBudget(
+      params.budget?.maxRecentConclusions,
+      10,
+    );
     const maxRules = clampBudget(params.budget?.maxRules, 20);
-    const maxChildSummaries = clampBudget(params.budget?.maxChildSummaries, 10);
+    const maxChildSummaries = clampBudget(params.budget?.maxChildSummaries, 20);
 
-    const canSeeSelfLedger = scope.readableLedgerIds.includes(realm.id);
-    const canSeeSelfSeabed = scope.readableSeabedIds.includes(realm.id);
+    const canSeeSelfLedger = scope.readableLedgerIds.includes(targetRealm.id);
+    const canSeeSelfSeabed = scope.readableSeabedIds.includes(targetRealm.id);
 
-    // 1. Surface: recent messages in self realm (blocked if bound ceiling excludes self seabed)
+    // 1. Surface: recent messages in target realm
     const msgRes = canSeeSelfSeabed
       ? this.db.listSeabedEntries({
-          realmIds: [realm.id],
+          realmIds: [targetRealm.id],
           kinds: ["message"],
           excludeSensitivities,
           limit: recentMessagesLimit,
         })
       : { items: [], total: 0 };
 
-    // 2. Upper Ledger: pending human questions (exact SQL COUNT(*)), active things, active decisions
-    const selfAndAncestors = [realm.id, ...scope.ancestorIds].filter((id) =>
-      scope.readableLedgerIds.includes(id),
+    // 2. Upper Ledger: pending questions, active things, active decisions, recent conclusions (occurred_at DESC)
+    const selfAndAncestors = [targetRealm.id, ...centerScope.ancestorIds].filter(
+      (id) => scope.readableLedgerIds.includes(id),
     );
     const pendingQuestionsRes = canSeeSelfLedger
       ? this.db.listPendingHumanQuestions({
-          realmIds: [realm.id],
+          realmIds: [targetRealm.id],
           excludeSensitivities,
           limit: maxQuestions,
         })
@@ -211,7 +271,7 @@ export class SeaEngine {
 
     const thingsRes = canSeeSelfLedger
       ? this.db.listRecords({
-          realmIds: [realm.id],
+          realmIds: [targetRealm.id],
           kinds: ["thing"],
           includeSuperseded: false,
           excludeSensitivities,
@@ -227,18 +287,15 @@ export class SeaEngine {
       limit: maxDecisions,
     });
 
-    // 3. Middle Mind: realm cognitive card, active rules (titles only), ancestor 1-liners, child summaries
-    const rawRealmCard = canSeeSelfLedger
-      ? this.db.getLatestDistillation(realm.id, "card_realm")
-      : null;
-    const realmCard =
-      rawRealmCard &&
-      !this.distillationHasExcludedSensitivity(
-        rawRealmCard,
-        excludeSensitivities,
-      )
-        ? vis.sanitizeDistillation(rawRealmCard)
-        : null;
+    const recentConclusionsRes = canSeeSelfLedger
+      ? this.db.listRecords({
+          realmIds: [targetRealm.id],
+          kinds: NON_RULE_RECORD_KINDS,
+          includeSuperseded: false,
+          excludeSensitivities,
+          limit: maxRecentConclusions,
+        })
+      : { items: [], total: 0 };
 
     const rulesRes = this.db.listRecords({
       realmIds: selfAndAncestors,
@@ -250,105 +307,151 @@ export class SeaEngine {
     const ruleSummaries = rulesRes.items.map((r) => ({
       id: r.id,
       realmId: r.realmId,
-      inherited: r.realmId !== realm.id,
+      inherited: r.realmId !== targetRealm.id,
       title: r.title,
     }));
 
-    const ancestorSummaries = scope.ancestorIds.map((aid) => {
-      const aRealm = realmsById.get(aid)!;
-      const rawCard = this.db.getLatestDistillation(aid, "card_realm");
-      const card =
-        rawCard &&
-        !this.distillationHasExcludedSensitivity(rawCard, excludeSensitivities)
-          ? rawCard
-          : null;
-      const summary = card
-        ? snippet(card.narrativeMd || JSON.stringify(card.hardFacts), 140)
-        : `Ancestor realm "${aRealm.name}" (${aRealm.path})`;
+    // 3. Batch fetch cognitive cards for self + ancestors + capped visible descendants (1 query!)
+    const visibleDescendants = centerScope.descendantIds.filter((id) =>
+      scope.readableLedgerIds.includes(id),
+    );
+    const totalChildRealmsCount = visibleDescendants.length;
+    const cappedDescendantIds = visibleDescendants.slice(0, maxChildSummaries);
+    const omittedChildRealmsCount = Math.max(
+      0,
+      totalChildRealmsCount - cappedDescendantIds.length,
+    );
+
+    const cardRealmIds = Array.from(
+      new Set([
+        ...(canSeeSelfLedger ? [targetRealm.id] : []),
+        ...centerScope.ancestorIds.filter((id) =>
+          scope.readableLedgerIds.includes(id),
+        ),
+        ...cappedDescendantIds,
+      ]),
+    );
+    const latestCardsMap = this.db.getLatestDistillationsByRealms(
+      cardRealmIds,
+      "card_realm",
+    );
+    const blockedDistIds = this.filterDistillationsBySensitivity(
+      Array.from(latestCardsMap.values()),
+      excludeSensitivities,
+    );
+    const getSafeCard = (rid: string): Distillation | null => {
+      const card = latestCardsMap.get(rid) ?? null;
+      if (!card || blockedDistIds.has(card.id)) return null;
+      return card;
+    };
+
+    const rawRealmCard = canSeeSelfLedger ? getSafeCard(targetRealm.id) : null;
+
+    // Preload all refs across brief items in 1 batched pass (O(1) queries)
+    const refsToPreload: string[] = [];
+    for (const r of [
+      ...pendingQuestionsRes.items,
+      ...thingsRes.items,
+      ...decisionsRes.items,
+      ...recentConclusionsRes.items,
+    ]) {
+      refsToPreload.push(...r.refs);
+      if (r.supersedesId) refsToPreload.push(r.supersedesId);
+      if (r.supersedesIds) refsToPreload.push(...r.supersedesIds);
+      if (r.supersededById) refsToPreload.push(r.supersededById);
+    }
+    for (const m of msgRes.items) {
+      if (m.sourceRef) refsToPreload.push(m.sourceRef);
+    }
+    if (rawRealmCard) {
+      refsToPreload.push(...rawRealmCard.sourceIds);
+    }
+    vis.preloadRefs(refsToPreload);
+
+    const realmCard = rawRealmCard ? vis.sanitizeDistillation(rawRealmCard) : null;
+
+    const ancestorSummaries = centerScope.ancestorIds
+      .filter((aid) => scope.readableLedgerIds.includes(aid))
+      .map((aid) => {
+        const aRealm = vis.sanitizeRealm(realmsById.get(aid)!);
+        const card = getSafeCard(aid);
+        const summary = card
+          ? buildSnippet({
+              text: card.narrativeMd || JSON.stringify(card.hardFacts),
+              maxLen: 140,
+            })
+          : `Ancestor realm "${aRealm.name}" (${aRealm.path})`;
+        return {
+          realmId: aid,
+          realmPath: aRealm.path,
+          summary,
+        };
+      });
+
+    // Batch GROUP BY counts for capped child summaries (ZERO per-child N+1 loops!)
+    const childRecordCounts =
+      cappedDescendantIds.length > 0
+        ? this.db.countActiveRecordsByRealm({
+            realmIds: cappedDescendantIds,
+            excludeSensitivities,
+          })
+        : new Map();
+    const childPendingCounts =
+      cappedDescendantIds.length > 0
+        ? this.db.countPendingQuestionsByRealm({
+            realmIds: cappedDescendantIds,
+            excludeSensitivities,
+          })
+        : new Map();
+
+    const childSlice: ChildRealmSummary[] = cappedDescendantIds.map((cid) => {
+      const cRealm = vis.sanitizeRealm(realmsById.get(cid)!);
+      const counts = childRecordCounts.get(cid);
+      const cCard = getSafeCard(cid);
       return {
-        realmId: aid,
-        realmPath: aRealm.path,
-        summary,
+        realmId: cid,
+        realmPath: cRealm.path,
+        realmName: cRealm.name,
+        activeThings: counts?.things ?? 0,
+        pendingQuestions: childPendingCounts.get(cid) ?? 0,
+        activeDecisions: counts?.decisions ?? 0,
+        latestCardSummary: cCard
+          ? buildSnippet({ text: cCard.narrativeMd, maxLen: 120 })
+          : null,
       };
     });
 
-    // Parent automatically sees child ledger summaries (without descendant raw chat flood)
-    const allChildSummaries: ChildRealmSummary[] = scope.descendantIds.map(
-      (cid) => {
-        const cRealm = realmsById.get(cid)!;
-        const cThings = this.db.listRecords({
-          realmIds: [cid],
-          kinds: ["thing"],
-          includeSuperseded: false,
-          excludeSensitivities,
-          limit: 1,
-        });
-        const cDecisions = this.db.listRecords({
-          realmIds: [cid],
-          kinds: ["decision"],
-          includeSuperseded: false,
-          excludeSensitivities,
-          limit: 1,
-        });
-        const cPendingQ = this.db.listPendingHumanQuestions({
-          realmIds: [cid],
-          excludeSensitivities,
-          limit: 1,
-        }).total;
-        const rawCCard = this.db.getLatestDistillation(cid, "card_realm");
-        const cCard =
-          rawCCard &&
-          !this.distillationHasExcludedSensitivity(
-            rawCCard,
-            excludeSensitivities,
-          )
-            ? rawCCard
-            : null;
-
-        return {
-          realmId: cid,
-          realmPath: cRealm.path,
-          realmName: cRealm.name,
-          activeThings: cThings.total,
-          pendingQuestions: cPendingQ,
-          activeDecisions: cDecisions.total,
-          latestCardSummary: cCard ? snippet(cCard.narrativeMd, 120) : null,
-        };
-      },
-    );
-
-    const childSlice = allChildSummaries.slice(0, maxChildSummaries);
-
-    // Exact 3-bucket counts (rules / conclusions / raw) excluding secret entries
-    const countsByKind = canSeeSelfLedger
+    // Exact kind histogram & 3-bucket counts (rules / conclusions / raw) excluding secret entries
+    const kindHistogram = canSeeSelfLedger
       ? this.db.countRecordsByKind({
-          realmIds: [realm.id],
+          realmIds: [targetRealm.id],
           includeSuperseded: false,
           excludeSensitivities,
         })
       : {};
     let conclusionsCount = 0;
-    for (const [k, c] of Object.entries(countsByKind)) {
+    for (const [k, c] of Object.entries(kindHistogram)) {
       if (k !== "rule") conclusionsCount += c;
     }
     const rawTotal = canSeeSelfSeabed
-      ? this.db.listSeabedEntries({
-          realmIds: [realm.id],
-          excludeSensitivities,
-          limit: 1,
-        }).total
+      ? (this.db
+          .countSeabedByRealm({
+            realmIds: [targetRealm.id],
+            excludeSensitivities,
+          })
+          .get(targetRealm.id) ?? 0)
       : 0;
 
     const generation = this.db.getChangeLogGeneration();
-    const currentSeq = this.db.getLatestChangeLogSeq(realm.orgId);
+    const currentSeq = this.db.getLatestChangeLogSeq(targetRealm.orgId);
     const cardSeq = realmCard
       ? this.db.getChangeLogSeqForEntity("distillation", realmCard.id)
       : null;
     const changesSinceCard =
       cardSeq !== null
         ? this.db.countChangeLogSince({
-            orgId: realm.orgId,
-            realmIds: [realm.id],
+            orgId: targetRealm.orgId,
+            realmIds: [targetRealm.id],
             sinceSeq: cardSeq,
             generation,
             includeSecret: false,
@@ -356,13 +459,23 @@ export class SeaEngine {
         : 0;
 
     return {
-      realm,
+      realm: sanitizedCenterRealm,
       generatedAt: new Date().toISOString(),
+      kindHistogram,
       buckets: {
         rules: rulesRes.total,
         conclusions: conclusionsCount,
         raw: rawTotal,
       },
+      recentConclusions: {
+        items: recentConclusionsRes.items.map(vis.sanitizeRecord),
+        totalCount: recentConclusionsRes.total,
+        omittedCount: Math.max(
+          0,
+          recentConclusionsRes.total - recentConclusionsRes.items.length,
+        ),
+      },
+      omittedChildRealmsCount,
       surface: {
         recentMessages: {
           items: msgRes.items.map(vis.sanitizeSeabed),
@@ -409,19 +522,16 @@ export class SeaEngine {
         ancestorSummaries,
         childSummaries: {
           items: childSlice,
-          totalCount: allChildSummaries.length,
-          omittedCount: Math.max(
-            0,
-            allChildSummaries.length - childSlice.length,
-          ),
+          totalCount: totalChildRealmsCount,
+          omittedCount: omittedChildRealmsCount,
         },
       },
       drilldownHint:
-        "Use recall(id=...) / cat for exact inspection, ls/tree for browsing, replay(id) for occurred_at context, or recall(query=...) for FTS5+vector search.",
+        "Use recall / cat for exact inspection, ls/tree for browsing, replay <id> for timeline context, or recall <query> for FTS5+vector search.",
     };
   }
 
-  // ---- Recall (4-Stage Pipeline: ID -> Filter -> FTS5 -> sqlite-vec RRF, Strictly Scoped) ----
+  // ---- Recall (4-Stage Pipeline: ID -> Filter -> Staged FTS5 + Vector -> Strict Lexicographic Rank) ----
 
   async recall(query: RecallQuery): Promise<RecallResult> {
     const realms = this.db.listRealms();
@@ -477,10 +587,16 @@ export class SeaEngine {
       rec: LedgerRecord,
       matchedBy: RecallItem["matchedBy"],
       score: number,
+      concepts?: SearchConcept[],
     ): RecallItem => {
       const clean = vis.sanitizeRecord(rec);
-      const currentHeadId =
-        rec.status === "superseded" ? vis.resolveCurrentHeadId(rec) : undefined;
+      const isSuperseded = rec.status === "superseded";
+      const currentHeadId = isSuperseded
+        ? vis.resolveCurrentHeadId(rec)
+        : undefined;
+      const orphanSuperseded = isSuperseded
+        ? vis.isOrphanSuperseded(rec)
+        : undefined;
       return {
         id: clean.id,
         behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
@@ -489,16 +605,19 @@ export class SeaEngine {
         realmId: clean.realmId,
         status: clean.status,
         title: clean.title,
-        snippet: snippet(
-          `${clean.title}${Object.keys(clean.payload).length > 0 ? " — " + JSON.stringify(clean.payload) : ""}`,
-        ),
+        snippet: buildSnippet({
+          title: clean.title,
+          payload: clean.payload,
+          concepts,
+        }),
         authorId: clean.authorId,
         createdAt: clean.createdAt,
         occurredAt: clean.occurredAt,
         sourceRefs: clean.refs,
         supersedesId: clean.supersedesId,
+        supersedesIds: clean.supersedesIds,
         supersededById: clean.supersededById,
-        ...(rec.status === "superseded" ? { currentHeadId } : {}),
+        ...(isSuperseded ? { currentHeadId, orphanSuperseded } : {}),
         matchedBy,
         score,
       };
@@ -508,6 +627,7 @@ export class SeaEngine {
       sea: SeabedEntry,
       matchedBy: RecallItem["matchedBy"],
       score: number,
+      concepts?: SearchConcept[],
     ): RecallItem => {
       const clean = vis.sanitizeSeabed(sea);
       return {
@@ -518,7 +638,7 @@ export class SeaEngine {
         realmId: clean.realmId,
         status: clean.redactedAt ? "retracted" : "evidence",
         title: `${clean.kind}${clean.topicId ? ` (${clean.topicId})` : ""}`,
-        snippet: snippet(clean.text),
+        snippet: buildSnippet({ text: clean.text, concepts }),
         authorId: clean.authorId,
         createdAt: clean.createdAt,
         occurredAt: clean.occurredAt,
@@ -532,6 +652,7 @@ export class SeaEngine {
       dist: Distillation,
       matchedBy: RecallItem["matchedBy"],
       score: number,
+      concepts?: SearchConcept[],
     ): RecallItem => {
       const clean = vis.sanitizeDistillation(dist);
       return {
@@ -542,7 +663,10 @@ export class SeaEngine {
         realmId: clean.realmId,
         status: clean.status,
         title: `${clean.layer} (${clean.periodKey})`,
-        snippet: snippet(clean.narrativeMd || JSON.stringify(clean.hardFacts)),
+        snippet: buildSnippet({
+          text: clean.narrativeMd || JSON.stringify(clean.hardFacts),
+          concepts,
+        }),
         authorId: "system",
         createdAt: clean.createdAt,
         occurredAt: clean.createdAt,
@@ -552,19 +676,43 @@ export class SeaEngine {
       };
     };
 
+    const compareRecencyDesc = (
+      a: { occurredAt: string | null; createdAt: string; id: string },
+      b: { occurredAt: string | null; createdAt: string; id: string },
+    ): number => {
+      const hasA = a.occurredAt !== null ? 1 : 0;
+      const hasB = b.occurredAt !== null ? 1 : 0;
+      if (hasB !== hasA) return hasB - hasA;
+      if (a.occurredAt !== null && b.occurredAt !== null && b.occurredAt !== a.occurredAt) {
+        return b.occurredAt.localeCompare(a.occurredAt);
+      }
+      if (b.createdAt !== a.createdAt) {
+        return b.createdAt.localeCompare(a.createdAt);
+      }
+      return b.id.localeCompare(a.id);
+    };
+
     // Stage 1: Direct ID lookup (explicitly allows secret entries if visible in scope)
     if (query.id) {
       const items: RecallItem[] = [];
       const rec = this.db.getRecord(query.id);
       if (rec && vis.canSeeRecord(rec)) {
+        vis.preloadRefs([
+          ...rec.refs,
+          ...(rec.supersedesId ? [rec.supersedesId] : []),
+          ...(rec.supersedesIds ?? []),
+          ...(rec.supersededById ? [rec.supersededById] : []),
+        ]);
         items.push(toRecordItem(rec, ["id"], 1));
       }
       const sea = this.db.getSeabedEntry(query.id);
       if (sea && vis.canSeeSeabed(sea)) {
+        if (sea.sourceRef) vis.preloadRefs([sea.sourceRef]);
         items.push(toSeabedItem(sea, ["id"], 1));
       }
       const dist = this.db.getDistillation(query.id);
       if (dist && vis.canSeeDistillation(dist)) {
+        vis.preloadRefs(dist.sourceIds);
         items.push(toDistillationItem(dist, ["id"], 1));
       }
       return {
@@ -594,9 +742,18 @@ export class SeaEngine {
         limit,
         offset,
       });
-      const items = res.items
-        .filter((r) => r.sensitivity !== "secret" && vis.canSeeRecord(r))
-        .map((r) => toRecordItem(r, ["id", "filter"], 1));
+      const visible = res.items.filter(
+        (r) => r.sensitivity !== "secret" && vis.canSeeRecord(r),
+      );
+      const refsToPreload: string[] = [];
+      for (const r of visible) {
+        refsToPreload.push(...r.refs);
+        if (r.supersedesId) refsToPreload.push(r.supersedesId);
+        if (r.supersedesIds) refsToPreload.push(...r.supersedesIds);
+        if (r.supersededById) refsToPreload.push(r.supersededById);
+      }
+      vis.preloadRefs(refsToPreload);
+      const items = visible.map((r) => toRecordItem(r, ["id", "filter"], 1));
       return {
         viewerRealmId: query.viewerRealmId,
         items,
@@ -610,7 +767,7 @@ export class SeaEngine {
       };
     }
 
-    // Stage 2: Pure structured filter with exact SQL COUNT(*) (zero 500 truncation, excludes secret)
+    // Stage 2: Pure structured filter with exact SQL COUNT(*) (excludes secret, filters occurred_at)
     if (!query.query || !query.query.trim()) {
       const wantRecords =
         !query.seabedKinds || (query.recordKinds && query.recordKinds.length > 0);
@@ -619,7 +776,8 @@ export class SeaEngine {
 
       const fetchWindow = offset + limit;
       let totalMatched = 0;
-      const combined: RecallItem[] = [];
+      const rawRecs: LedgerRecord[] = [];
+      const rawSeas: SeabedEntry[] = [];
 
       if (wantRecords && ledgerRealmIds.length > 0) {
         const recRes = this.db.listRecords({
@@ -636,7 +794,7 @@ export class SeaEngine {
         totalMatched += recRes.total;
         for (const r of recRes.items) {
           if (r.sensitivity !== "secret" && vis.canSeeRecord(r)) {
-            combined.push(toRecordItem(r, ["filter"], 1));
+            rawRecs.push(r);
           }
         }
       }
@@ -655,12 +813,28 @@ export class SeaEngine {
         totalMatched += seaRes.total;
         for (const s of seaRes.items) {
           if (s.sensitivity !== "secret" && vis.canSeeSeabed(s)) {
-            combined.push(toSeabedItem(s, ["filter"], 0.9));
+            rawSeas.push(s);
           }
         }
       }
 
-      combined.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      const refsToPreload: string[] = [];
+      for (const r of rawRecs) {
+        refsToPreload.push(...r.refs);
+        if (r.supersedesId) refsToPreload.push(r.supersedesId);
+        if (r.supersedesIds) refsToPreload.push(...r.supersedesIds);
+        if (r.supersededById) refsToPreload.push(r.supersededById);
+      }
+      for (const s of rawSeas) {
+        if (s.sourceRef) refsToPreload.push(s.sourceRef);
+      }
+      vis.preloadRefs(refsToPreload);
+
+      const combined: RecallItem[] = [
+        ...rawRecs.map((r) => toRecordItem(r, ["filter"], 1)),
+        ...rawSeas.map((s) => toSeabedItem(s, ["filter"], 0.9)),
+      ];
+      combined.sort(compareRecencyDesc);
       const page = combined.slice(offset, offset + limit);
       return {
         viewerRealmId: query.viewerRealmId,
@@ -675,54 +849,90 @@ export class SeaEngine {
       };
     }
 
-    // Stages 3 & 4: Mixed CJK/English FTS5 + JS Identifier Boundary + Concept Tiers + RRF + Active-First + Open Focus Boost
+    // Stages 3 & 4: Comparable Staged FTS5 (Pass 1 AND + Pass 2 OR) + Vector + Strict Total-Order Lexicographic Rank
     const parsedQuery = parseSearchQuery(query.query);
     const candidateLimit = Math.max((offset + limit) * 5, 100);
 
-    const ledgerFts =
-      ledgerRealmIds.length > 0
-        ? this.db.searchFts({
-            query: query.query,
-            realmIds: ledgerRealmIds,
-            sourceTypes: ["record", "distillation"],
-            includeSuperseded,
-            limit: candidateLimit,
-          })
-        : [];
-    const seabedFts =
-      seabedRealmIds.length > 0
-        ? this.db.searchFts({
-            query: query.query,
-            realmIds: seabedRealmIds,
-            sourceTypes: ["seabed"],
-            includeSuperseded,
-            limit: candidateLimit,
-          })
-        : [];
-    const ftsMatches = [...ledgerFts, ...seabedFts].sort(
-      (a, b) => a.rank - b.rank,
-    );
+    const pass1Map = new Map<
+      string,
+      { sourceType: "record" | "seabed" | "distillation"; rank: number }
+    >();
+    const pass2Map = new Map<
+      string,
+      { sourceType: "record" | "seabed" | "distillation"; rank: number }
+    >();
 
-    const exactFtsTotal =
-      (ledgerRealmIds.length > 0
-        ? this.db.countFts({
-            query: query.query,
-            realmIds: ledgerRealmIds,
-            sourceTypes: ["record", "distillation"],
-            includeSuperseded,
-          })
-        : 0) +
-      (seabedRealmIds.length > 0
-        ? this.db.countFts({
-            query: query.query,
-            realmIds: seabedRealmIds,
-            sourceTypes: ["seabed"],
-            includeSuperseded,
-          })
-        : 0);
+    const runFtsPass = (
+      ftsExpr: string | null,
+      targetMap: Map<
+        string,
+        { sourceType: "record" | "seabed" | "distillation"; rank: number }
+      >,
+    ) => {
+      if (!ftsExpr) return;
+      if (ledgerRealmIds.length > 0) {
+        const ledgerHits = this.db.searchFts({
+          ftsExpression: ftsExpr,
+          realmIds: ledgerRealmIds,
+          sourceTypes: ["record", "distillation"],
+          includeSuperseded,
+          limit: candidateLimit,
+        });
+        for (const m of ledgerHits) {
+          targetMap.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
+        }
+      }
+      if (seabedRealmIds.length > 0) {
+        const seabedHits = this.db.searchFts({
+          ftsExpression: ftsExpr,
+          realmIds: seabedRealmIds,
+          sourceTypes: ["seabed"],
+          includeSuperseded,
+          limit: candidateLimit,
+        });
+        for (const m of seabedHits) {
+          targetMap.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
+        }
+      }
+    };
+
+    // Pass 1: All-concept AND (multi-bigram CJK segments use OR inside parenthesized group)
+    runFtsPass(parsedQuery.ftsAndExpression, pass1Map);
+
+    // Pass 2: Broad partial OR (only run separately when distinct from Pass 1)
+    const hasDistinctPass2 =
+      parsedQuery.ftsOrExpression !== null &&
+      parsedQuery.ftsOrExpression !== parsedQuery.ftsAndExpression;
+    if (hasDistinctPass2) {
+      runFtsPass(parsedQuery.ftsOrExpression, pass2Map);
+    }
+
+    // Exact SQL COUNT(*) of the broad recall union (Pass 2 OR)
+    const broadFtsExpr = parsedQuery.ftsOrExpression ?? parsedQuery.ftsAndExpression;
+    const exactFtsTotal = broadFtsExpr
+      ? (ledgerRealmIds.length > 0
+          ? this.db.countFts({
+              ftsExpression: broadFtsExpr,
+              realmIds: ledgerRealmIds,
+              sourceTypes: ["record", "distillation"],
+              includeSuperseded,
+            })
+          : 0) +
+        (seabedRealmIds.length > 0
+          ? this.db.countFts({
+              ftsExpression: broadFtsExpr,
+              realmIds: seabedRealmIds,
+              sourceTypes: ["seabed"],
+              includeSuperseded,
+            })
+          : 0)
+      : 0;
 
     let vectorUsed = false;
-    let vecMatches: ReturnType<DbPort["searchVectors"]> = [];
+    const vecMap = new Map<
+      string,
+      { sourceType: "record" | "seabed" | "distillation"; cosine: number }
+    >();
     if (this.db.vecEnabled && this.embedder.configured) {
       const qVec = await this.embedder.embed(query.query);
       if (qVec) {
@@ -747,139 +957,247 @@ export class SeaEngine {
                 limit: candidateLimit,
               })
             : [];
-        // Filter out orthogonal/unrelated vectors (unit L2 distance >= 1.25 => cosine <= ~0.22)
-        vecMatches = [...ledgerVec, ...seabedVec]
-          .filter((m) => m.distance <= 1.25)
-          .sort((a, b) => a.distance - b.distance);
+        for (const m of [...ledgerVec, ...seabedVec]) {
+          // Filter out orthogonal/unrelated vectors (unit L2 distance >= 1.25 => cosine <= ~0.22)
+          if (m.distance > 1.25) continue;
+          const cosine = Math.max(-1, Math.min(1, 1 - (m.distance * m.distance) / 2));
+          const prev = vecMap.get(m.itemId);
+          if (!prev || cosine > prev.cosine) {
+            vecMap.set(m.itemId, { sourceType: m.sourceType, cosine });
+          }
+        }
       }
     }
 
-    // RRF fusion (k = 60)
-    const RRF_K = 60;
-    const scoreMap = new Map<
+    // Collect unique candidate IDs by sourceType for O(1) batched hydration
+    const recordCandIds: string[] = [];
+    const seabedCandIds: string[] = [];
+    const distCandIds: string[] = [];
+    const candidateSourceMap = new Map<
       string,
-      {
-        sourceType: "record" | "seabed" | "distillation";
-        rrf: number;
-        matchedBy: Set<"fts" | "vector">;
-      }
+      "record" | "seabed" | "distillation"
     >();
 
-    ftsMatches.forEach((m, idx) => {
-      const entry = scoreMap.get(m.itemId) ?? {
-        sourceType: m.sourceType,
-        rrf: 0,
-        matchedBy: new Set<"fts" | "vector">(),
-      };
-      entry.rrf += 1 / (RRF_K + idx + 1);
-      entry.matchedBy.add("fts");
-      scoreMap.set(m.itemId, entry);
-    });
+    for (const [id, info] of pass1Map.entries()) {
+      candidateSourceMap.set(id, info.sourceType);
+    }
+    for (const [id, info] of pass2Map.entries()) {
+      if (!candidateSourceMap.has(id)) {
+        candidateSourceMap.set(id, info.sourceType);
+      }
+    }
+    for (const [id, info] of vecMap.entries()) {
+      if (!candidateSourceMap.has(id)) {
+        candidateSourceMap.set(id, info.sourceType);
+      }
+    }
 
-    vecMatches.forEach((m, idx) => {
-      const entry = scoreMap.get(m.itemId) ?? {
-        sourceType: m.sourceType,
-        rrf: 0,
-        matchedBy: new Set<"fts" | "vector">(),
-      };
-      entry.rrf += 1 / (RRF_K + idx + 1);
-      entry.matchedBy.add("vector");
-      scoreMap.set(m.itemId, entry);
-    });
+    for (const [id, sourceType] of candidateSourceMap.entries()) {
+      if (sourceType === "record") recordCandIds.push(id);
+      else if (sourceType === "seabed") seabedCandIds.push(id);
+      else distCandIds.push(id);
+    }
 
-    const focusRealmSet = new Set(scope.focusRealmIds);
+    const hydratedRecords = new Map(
+      this.db.getRecordsByIds(recordCandIds).map((r) => [r.id, r]),
+    );
+    const hydratedSeabed = new Map(
+      this.db.getSeabedEntriesByIds(seabedCandIds).map((s) => [s.id, s]),
+    );
+    const hydratedDists = new Map(
+      this.db.getDistillationsByIds(distCandIds).map((d) => [d.id, d]),
+    );
+
+    type MatchSource = "pass1" | "pass2" | "vector";
+    interface RankedCandidate {
+      id: string;
+      sourceType: "record" | "seabed" | "distillation";
+      record?: LedgerRecord;
+      seabed?: SeabedEntry;
+      distillation?: Distillation;
+      realmId: string;
+      occurredAt: string | null;
+      createdAt: string;
+      matchedBy: Array<"fts" | "vector">;
+      coverageTier: number;
+      coverageRatioBand: number;
+      lexicalMatchFlag: number;
+      statusPriority: number;
+      matchSource: MatchSource;
+      rawRelevance: number;
+      relevanceBand: number;
+      isOlderSameObjectSibling: number;
+      focusFlag: number;
+      objectIds: string[];
+    }
+
+    const concepts = parsedQuery.concepts;
     let droppedByIdentifierBoundary = false;
     let vectorOnlyHydratedCount = 0;
 
-    const computeRankedScore = (params: {
-      entryId?: string;
-      orgId?: string;
+    const evaluateCandidate = (params: {
+      id: string;
+      sourceType: "record" | "seabed" | "distillation";
+      record?: LedgerRecord;
+      seabed?: SeabedEntry;
+      distillation?: Distillation;
+      realmId: string;
+      status: string;
+      occurredAt: string | null;
+      createdAt: string;
       titleText: string;
       bodyText: string;
-      sourceType: "record" | "seabed" | "distillation";
-      status: string;
-      realmId: string;
-      rrf: number;
-      matchedBy: Array<"fts" | "vector">;
-    }): number | null => {
-      const concepts = parsedQuery.concepts;
-      const fullText = `${params.titleText}\n${params.bodyText}`;
-      let titleHits = 0;
-      let fullHits = 0;
-      for (const c of concepts) {
-        if (c.matchText(params.titleText)) {
-          titleHits += 1;
-          fullHits += 1;
-        } else if (c.matchText(fullText)) {
-          fullHits += 1;
-        }
-      }
+    }): RankedCandidate | null => {
+      const p1 = pass1Map.get(params.id);
+      const p2 = pass2Map.get(params.id);
+      const vec = vecMap.get(params.id);
+      const hasFts = Boolean(p1 || p2);
+      const hasVector = Boolean(vec);
+      const matchedBy: Array<"fts" | "vector"> = [];
+      if (hasFts) matchedBy.push("fts");
+      if (hasVector) matchedBy.push("vector");
 
-      // JS exact identifier boundary verification:
-      // Reject FTS-only false positives where an identifier like "agent-worker"
-      // only matched inside a longer token like "agent-worker-bridge".
-      const isFtsOnly =
-        params.matchedBy.includes("fts") && !params.matchedBy.includes("vector");
-      if (parsedQuery.hasIdentifiers && isFtsOnly && fullHits === 0) {
-        droppedByIdentifierBoundary = true;
+      const fullText = `${params.titleText}\n${params.bodyText}`;
+
+      // Explicitly compute JS title vs title+body coverage (never rely solely on Pass 1 membership)
+      let titleAllCovered = concepts.length > 0;
+      let fullAllCovered = concepts.length > 0;
+      let scoreSum = 0;
+      for (const c of concepts) {
+        if (!c.matchText(params.titleText)) {
+          titleAllCovered = false;
+        }
+        if (!c.matchText(fullText)) {
+          fullAllCovered = false;
+        }
+        scoreSum += c.scoreText(fullText);
+      }
+      const coverageRatio =
+        concepts.length > 0 ? scoreSum / concepts.length : 0;
+
+      // Reject FTS-only false positives where identifier or lexical terms scored 0 in JS
+      if (hasFts && !hasVector && concepts.length > 0 && coverageRatio === 0) {
+        if (parsedQuery.hasIdentifiers) {
+          droppedByIdentifierBoundary = true;
+        }
         return null;
       }
 
-      let tier = 0;
-      if (concepts.length > 0) {
-        if (titleHits === concepts.length) {
-          tier = 3;
-        } else if (fullHits === concepts.length) {
-          tier = 2;
-        } else if (fullHits > 0) {
-          tier = 1;
+      // Compute coverageTier, coverageRatioBand, lexicalMatchFlag, and comparable matchSource/rawRelevance.
+      // SQLite bm25() returns NEGATIVE numbers (more negative = more relevant), so positive magnitude = -rank.
+      let coverageTier = 0;
+      let coverageRatioBand = 0;
+      let lexicalMatchFlag = 0;
+      let matchSource: MatchSource = "vector";
+      let rawRelevance = vec ? vec.cosine : 0;
+
+      const p1Magnitude = p1 ? Math.max(0, -p1.rank) : null;
+      const p2Magnitude = p2 ? Math.max(0, -p2.rank) : null;
+
+      if (hasFts && titleAllCovered) {
+        coverageTier = 4;
+        coverageRatioBand = 10;
+        lexicalMatchFlag = 1;
+        if (p1Magnitude !== null) {
+          matchSource = "pass1";
+          rawRelevance = p1Magnitude;
         } else {
-          tier = 0;
+          matchSource = "pass2";
+          rawRelevance = p2Magnitude ?? 0;
         }
-      }
-
-      // Active-first weighting: active conclusion (1.35) > raw seabed (1.0) > superseded (0.55)
-      let statusWeight = 1.0;
-      if (params.status === "superseded") {
-        statusWeight = 0.55;
-      } else if (params.status === "retracted") {
-        statusWeight = 0.1;
-      } else if (params.sourceType === "seabed") {
-        statusWeight = 1.0;
+      } else if (hasFts && fullAllCovered) {
+        coverageTier = 3;
+        coverageRatioBand = 10;
+        lexicalMatchFlag = 1;
+        if (p1Magnitude !== null) {
+          matchSource = "pass1";
+          rawRelevance = p1Magnitude;
+        } else {
+          matchSource = "pass2";
+          rawRelevance = p2Magnitude ?? 0;
+        }
+      } else if (hasFts && coverageRatio >= 0.5) {
+        coverageTier = 2;
+        coverageRatioBand = Math.round(coverageRatio * 10);
+        lexicalMatchFlag = 1;
+        if (p2Magnitude !== null) {
+          matchSource = "pass2";
+          rawRelevance = p2Magnitude;
+        } else {
+          matchSource = "pass1";
+          rawRelevance = p1Magnitude ?? 0;
+        }
+      } else if (hasVector && vec!.cosine >= 0.75) {
+        // High-confidence semantic hit (pure vector-only or weak-lexical hybrid) placed in Tier 2
+        coverageTier = 2;
+        coverageRatioBand = vec!.cosine >= 0.85 ? 10 : 8;
+        lexicalMatchFlag = hasFts && coverageRatio > 0 ? 1 : 0;
+        matchSource = "vector";
+        rawRelevance = vec!.cosine;
+      } else if (hasFts && coverageRatio > 0) {
+        coverageTier = 1;
+        coverageRatioBand = Math.round(coverageRatio * 10);
+        lexicalMatchFlag = 1;
+        if (p2Magnitude !== null) {
+          matchSource = "pass2";
+          rawRelevance = p2Magnitude;
+        } else {
+          matchSource = "pass1";
+          rawRelevance = p1Magnitude ?? 0;
+        }
+      } else if (hasVector) {
+        coverageTier = 0;
+        coverageRatioBand = 0;
+        lexicalMatchFlag = 0;
+        matchSource = "vector";
+        rawRelevance = vec!.cosine;
       } else {
-        statusWeight = 1.35;
+        return null;
       }
 
-      // Normalize rank-1 RRF to 1.0 so statusWeight & open-mode focus boost (+0.35) combine cleanly.
-      // In open mode, an entry linked to objects in multiple realms inherits focus boost from any linked object's realm.
-      const normRrf = params.rrf * (RRF_K + 1);
-      let isOpenFocus = false;
-      let isOpenSelf = false;
-      if (scope.policy === "open") {
-        const derivedRealms =
-          params.entryId && params.orgId
-            ? [
-                params.realmId,
-                ...this.db.listObjectRealmIdsForEntry(
-                  params.entryId,
-                  params.orgId,
-                ),
-              ]
-            : [params.realmId];
-        isOpenFocus = derivedRealms.some((rid) => focusRealmSet.has(rid));
-        isOpenSelf = derivedRealms.includes(query.viewerRealmId);
+      let statusPriority = 2;
+      if (params.status === "superseded") {
+        statusPriority = 1;
+      } else if (params.status === "retracted") {
+        statusPriority = 0;
+      } else if (params.sourceType === "seabed") {
+        statusPriority = 2;
+      } else {
+        statusPriority = 3;
       }
-      const focusBonus = (isOpenFocus ? 0.35 : 0) + (isOpenSelf ? 0.05 : 0);
 
-      return tier * 10 + normRrf * statusWeight + focusBonus;
+      if (!hasFts && hasVector) {
+        vectorOnlyHydratedCount += 1;
+      }
+
+      return {
+        id: params.id,
+        sourceType: params.sourceType,
+        record: params.record,
+        seabed: params.seabed,
+        distillation: params.distillation,
+        realmId: params.realmId,
+        occurredAt: params.occurredAt,
+        createdAt: params.createdAt,
+        matchedBy,
+        coverageTier,
+        coverageRatioBand,
+        lexicalMatchFlag,
+        statusPriority,
+        matchSource,
+        rawRelevance,
+        relevanceBand: 1,
+        isOlderSameObjectSibling: 0,
+        focusFlag: 0,
+        objectIds: [],
+      };
     };
 
-    // Hydrate and enforce exact per-asset visibility + sensitivity + structured filters + JS scoring
-    const hydrated: RecallItem[] = [];
-    for (const [itemId, info] of scoreMap.entries()) {
-      const matched = Array.from(info.matchedBy);
-      if (info.sourceType === "record") {
-        const rec = this.db.getRecord(itemId);
+    const candidates: RankedCandidate[] = [];
+
+    for (const [itemId, sourceType] of candidateSourceMap.entries()) {
+      if (sourceType === "record") {
+        const rec = hydratedRecords.get(itemId);
         if (!rec || rec.sensitivity === "secret" || !vis.canSeeRecord(rec)) {
           continue;
         }
@@ -888,8 +1206,12 @@ export class SeaEngine {
         if (query.thingId && rec.thingId !== query.thingId) continue;
         if (query.recordKinds && !query.recordKinds.includes(rec.kind)) continue;
         if (query.authorId && rec.authorId !== query.authorId) continue;
-        if (query.since && rec.createdAt < query.since) continue;
-        if (query.until && rec.createdAt > query.until) continue;
+        if (query.since && (rec.occurredAt === null || rec.occurredAt < query.since)) {
+          continue;
+        }
+        if (query.until && (rec.occurredAt === null || rec.occurredAt > query.until)) {
+          continue;
+        }
 
         const bodyText = Object.entries(rec.payload)
           .map(
@@ -897,23 +1219,21 @@ export class SeaEngine {
               `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
           )
           .join("\n");
-        const finalScore = computeRankedScore({
-          entryId: rec.id,
-          orgId: rec.orgId,
+        const cand = evaluateCandidate({
+          id: rec.id,
+          sourceType: "record",
+          record: rec,
+          realmId: rec.realmId,
+          status: rec.status,
+          occurredAt: rec.occurredAt,
+          createdAt: rec.createdAt,
           titleText: rec.title,
           bodyText,
-          sourceType: "record",
-          status: rec.status,
-          realmId: rec.realmId,
-          rrf: info.rrf,
-          matchedBy: matched,
         });
-        if (finalScore === null) continue;
-        if (!info.matchedBy.has("fts")) vectorOnlyHydratedCount += 1;
-        hydrated.push(toRecordItem(rec, matched, finalScore));
-      } else if (info.sourceType === "seabed") {
+        if (cand) candidates.push(cand);
+      } else if (sourceType === "seabed") {
         if (query.thingId) continue;
-        const sea = this.db.getSeabedEntry(itemId);
+        const sea = hydratedSeabed.get(itemId);
         if (!sea || sea.sensitivity === "secret" || !vis.canSeeSeabed(sea)) {
           continue;
         }
@@ -921,28 +1241,30 @@ export class SeaEngine {
         if (query.recordKinds && !query.seabedKinds) continue;
         if (query.seabedKinds && !query.seabedKinds.includes(sea.kind)) continue;
         if (query.authorId && sea.authorId !== query.authorId) continue;
-        if (query.since && sea.createdAt < query.since) continue;
-        if (query.until && sea.createdAt > query.until) continue;
+        if (query.since && (sea.occurredAt === null || sea.occurredAt < query.since)) {
+          continue;
+        }
+        if (query.until && (sea.occurredAt === null || sea.occurredAt > query.until)) {
+          continue;
+        }
 
         const titleText = `${sea.kind}:${sea.topicId ?? sea.realmId}`;
-        const finalScore = computeRankedScore({
-          entryId: sea.id,
-          orgId: sea.orgId,
+        const cand = evaluateCandidate({
+          id: sea.id,
+          sourceType: "seabed",
+          seabed: sea,
+          realmId: sea.realmId,
+          status: "evidence",
+          occurredAt: sea.occurredAt,
+          createdAt: sea.createdAt,
           titleText,
           bodyText: sea.text,
-          sourceType: "seabed",
-          status: "evidence",
-          realmId: sea.realmId,
-          rrf: info.rrf,
-          matchedBy: matched,
         });
-        if (finalScore === null) continue;
-        if (!info.matchedBy.has("fts")) vectorOnlyHydratedCount += 1;
-        hydrated.push(toSeabedItem(sea, matched, finalScore));
-      } else if (info.sourceType === "distillation") {
+        if (cand) candidates.push(cand);
+      } else {
         if (query.thingId) continue;
         if (query.authorId && query.authorId !== "system") continue;
-        const dist = this.db.getDistillation(itemId);
+        const dist = hydratedDists.get(itemId);
         if (!dist || !vis.canSeeDistillation(dist)) continue;
         if (dist.status === "retracted") continue;
         if (!includeSuperseded && dist.status !== "active") continue;
@@ -951,30 +1273,177 @@ export class SeaEngine {
         if (query.until && dist.createdAt > query.until) continue;
 
         const titleText = `${dist.layer}:${dist.periodKey}`;
-        const finalScore = computeRankedScore({
+        const cand = evaluateCandidate({
+          id: dist.id,
+          sourceType: "distillation",
+          distillation: dist,
+          realmId: dist.realmId,
+          status: dist.status,
+          occurredAt: dist.createdAt,
+          createdAt: dist.createdAt,
           titleText,
           bodyText: dist.narrativeMd,
-          sourceType: "distillation",
-          status: dist.status,
-          realmId: dist.realmId,
-          rrf: info.rrf,
-          matchedBy: matched,
         });
-        if (finalScore === null) continue;
-        if (!info.matchedBy.has("fts")) vectorOnlyHydratedCount += 1;
-        hydrated.push(toDistillationItem(dist, matched, finalScore));
+        if (cand) candidates.push(cand);
       }
     }
 
-    hydrated.sort((a, b) => {
-      if (Math.abs(b.score - a.score) > 1e-9) return b.score - a.score;
-      const occA = a.occurredAt ?? a.createdAt;
-      const occB = b.occurredAt ?? b.createdAt;
-      if (occB !== occA) return occB.localeCompare(occA);
-      if (b.createdAt !== a.createdAt) {
-        return b.createdAt.localeCompare(a.createdAt);
+    // Step A: Compute comparable relevanceBand strictly within each (coverageTier, matchSource) group
+    const groupBest = new Map<string, number>();
+    for (const c of candidates) {
+      const key = `${c.coverageTier}:${c.matchSource}`;
+      const prev = groupBest.get(key);
+      if (prev === undefined || c.rawRelevance > prev) {
+        groupBest.set(key, c.rawRelevance);
       }
-      return a.id.localeCompare(b.id);
+    }
+    for (const c of candidates) {
+      const best = groupBest.get(`${c.coverageTier}:${c.matchSource}`) ?? 0;
+      if (c.matchSource === "vector") {
+        const gap = best - c.rawRelevance;
+        c.relevanceBand = gap <= 0.05 ? 3 : gap <= 0.12 ? 2 : 1;
+      } else {
+        if (best <= 0) {
+          c.relevanceBand = 3;
+        } else if (c.rawRelevance >= best * 0.85) {
+          c.relevanceBand = 3;
+        } else if (c.rawRelevance >= best * 0.6) {
+          c.relevanceBand = 2;
+        } else {
+          c.relevanceBand = 1;
+        }
+      }
+    }
+
+    // Step B: Batch fetch objectIds for pre-computed unary isOlderSameObjectSibling (1-2 SQL queries)
+    const entryCandidateIds = candidates
+      .filter((c) => c.sourceType !== "distillation")
+      .map((c) => c.id);
+    if (entryCandidateIds.length > 0 && viewerRealm) {
+      const objMap = this.db.listObjectIdsByEntryIds(
+        viewerRealm.orgId,
+        entryCandidateIds,
+      );
+      const allObjIds = Array.from(
+        new Set(Array.from(objMap.values()).flat()),
+      );
+      const visibleObjSet = new Set(
+        this.db
+          .getObjectsByIds(allObjIds)
+          .filter(
+            (o) =>
+              o.orgId === viewerRealm.orgId &&
+              allowedLedgerSet.has(o.realmId),
+          )
+          .map((o) => o.id),
+      );
+      for (const c of candidates) {
+        const rawObjs = objMap.get(c.id) ?? [];
+        c.objectIds = rawObjs.filter((oid) => visibleObjSet.has(oid));
+      }
+    }
+
+    // Pre-compute unary isOlderSameObjectSibling within each exact
+    // (coverageTier, coverageRatioBand, lexicalMatchFlag, statusPriority, relevanceBand) bucket
+    const buckets = new Map<string, RankedCandidate[]>();
+    for (const c of candidates) {
+      const bKey = `${c.coverageTier}:${c.coverageRatioBand}:${c.lexicalMatchFlag}:${c.statusPriority}:${c.relevanceBand}`;
+      const list = buckets.get(bKey) ?? [];
+      list.push(c);
+      buckets.set(bKey, list);
+    }
+
+    for (const bucket of buckets.values()) {
+      const newestByObj = new Map<
+        string,
+        { occurredAt: string; createdAt: string; id: string }
+      >();
+      for (const c of bucket) {
+        if (c.occurredAt === null || c.objectIds.length === 0) continue;
+        for (const oid of c.objectIds) {
+          const cur = newestByObj.get(oid);
+          if (
+            !cur ||
+            compareRecencyDesc(
+              { occurredAt: c.occurredAt, createdAt: c.createdAt, id: c.id },
+              cur,
+            ) < 0
+          ) {
+            newestByObj.set(oid, {
+              occurredAt: c.occurredAt,
+              createdAt: c.createdAt,
+              id: c.id,
+            });
+          }
+        }
+      }
+      for (const c of bucket) {
+        if (c.objectIds.length === 0) {
+          c.isOlderSameObjectSibling = 0;
+          continue;
+        }
+        let hasStrictlyNewerSibling = false;
+        for (const oid of c.objectIds) {
+          const newest = newestByObj.get(oid);
+          if (!newest) continue;
+          if (
+            c.occurredAt === null ||
+            compareRecencyDesc(newest, {
+              occurredAt: c.occurredAt,
+              createdAt: c.createdAt,
+              id: c.id,
+            }) < 0
+          ) {
+            hasStrictlyNewerSibling = true;
+            break;
+          }
+        }
+        c.isOlderSameObjectSibling = hasStrictlyNewerSibling ? 1 : 0;
+      }
+    }
+
+    // Step C: Optional opt-in intra-band focus tie-breaker (DEFAULT OFF)
+    const focusBoostEnabled = query.focusBoost === true;
+    if (focusBoostEnabled && viewerRealm) {
+      const focusRealmSet = new Set(scope.focusRealmIds);
+      const objRealmMap =
+        scope.policy === "open" && entryCandidateIds.length > 0
+          ? this.db.listObjectRealmIdsByEntryIds(
+              viewerRealm.orgId,
+              entryCandidateIds,
+            )
+          : new Map<string, string[]>();
+      for (const c of candidates) {
+        const derivedRealms =
+          scope.policy === "open"
+            ? [c.realmId, ...(objRealmMap.get(c.id) ?? [])]
+            : [c.realmId];
+        c.focusFlag = derivedRealms.some((rid) => focusRealmSet.has(rid))
+          ? 1
+          : 0;
+      }
+    }
+
+    // Step D: Strict total-order lexicographic sort (every key is unary; id breaks final ties)
+    candidates.sort((a, b) => {
+      if (b.coverageTier !== a.coverageTier) return b.coverageTier - a.coverageTier;
+      if (b.coverageRatioBand !== a.coverageRatioBand) {
+        return b.coverageRatioBand - a.coverageRatioBand;
+      }
+      if (b.lexicalMatchFlag !== a.lexicalMatchFlag) {
+        return b.lexicalMatchFlag - a.lexicalMatchFlag;
+      }
+      if (b.statusPriority !== a.statusPriority) {
+        return b.statusPriority - a.statusPriority;
+      }
+      if (b.relevanceBand !== a.relevanceBand) {
+        return b.relevanceBand - a.relevanceBand;
+      }
+      if (a.isOlderSameObjectSibling !== b.isOlderSameObjectSibling) {
+        return a.isOlderSameObjectSibling - b.isOlderSameObjectSibling;
+      }
+      if (b.focusFlag !== a.focusFlag) return b.focusFlag - a.focusFlag;
+      return compareRecencyDesc(a, b);
     });
 
     const hasPostFilter = Boolean(
@@ -987,10 +1456,52 @@ export class SeaEngine {
         droppedByIdentifierBoundary,
     );
     const totalMatched = hasPostFilter
-      ? hydrated.length
-      : Math.max(hydrated.length, exactFtsTotal + vectorOnlyHydratedCount);
+      ? candidates.length
+      : Math.max(candidates.length, exactFtsTotal + vectorOnlyHydratedCount);
 
-    const page = hydrated.slice(offset, offset + limit);
+    const pageCandidates = candidates.slice(offset, offset + limit);
+
+    // Preload refs ONLY for the returned page (O(1) SQL queries)
+    const pageRefs: string[] = [];
+    for (const c of pageCandidates) {
+      if (c.record) {
+        pageRefs.push(...c.record.refs);
+        if (c.record.supersedesId) pageRefs.push(c.record.supersedesId);
+        if (c.record.supersedesIds) pageRefs.push(...c.record.supersedesIds);
+        if (c.record.supersededById) pageRefs.push(c.record.supersededById);
+      } else if (c.seabed) {
+        if (c.seabed.sourceRef) pageRefs.push(c.seabed.sourceRef);
+      } else if (c.distillation) {
+        pageRefs.push(...c.distillation.sourceIds);
+      }
+    }
+    vis.preloadRefs(pageRefs);
+
+    const computeDisplayScore = (c: RankedCandidate): number =>
+      c.coverageTier * 1000 +
+      c.coverageRatioBand * 20 +
+      c.lexicalMatchFlag * 10 +
+      c.statusPriority * 4 +
+      c.relevanceBand -
+      c.isOlderSameObjectSibling * 0.5 +
+      c.focusFlag * 0.1;
+
+    const page: RecallItem[] = pageCandidates.map((c) => {
+      const displayScore = computeDisplayScore(c);
+      if (c.record) {
+        return toRecordItem(c.record, c.matchedBy, displayScore, concepts);
+      }
+      if (c.seabed) {
+        return toSeabedItem(c.seabed, c.matchedBy, displayScore, concepts);
+      }
+      return toDistillationItem(
+        c.distillation!,
+        c.matchedBy,
+        displayScore,
+        concepts,
+      );
+    });
+
     return {
       viewerRealmId: query.viewerRealmId,
       items: page,
@@ -1004,7 +1515,7 @@ export class SeaEngine {
     };
   }
 
-  // ---- Scoped Read Views (tree, ls, cat, replay, changes) — All Reusing visibility.ts ----
+  // ---- Scoped Read Views (tree, ls, cat, replay, changes) — All Reusing visibility.ts & Batch SQL ----
 
   private buildObjectForest(objects: MindObject[]): ObjectTreeNode[] {
     const visibleIds = new Set(objects.map((o) => o.id));
@@ -1024,137 +1535,146 @@ export class SeaEngine {
     return roots;
   }
 
-  private buildRealmForest(
-    realms: Realm[],
-    objects: MindObject[],
-  ): RealmTreeNode[] {
-    const visibleIds = new Set(realms.map((r) => r.id));
-    const objsByRealm = new Map<string, MindObject[]>();
-    for (const obj of objects) {
-      const arr = objsByRealm.get(obj.realmId) ?? [];
-      arr.push(obj);
-      objsByRealm.set(obj.realmId, arr);
-    }
-    const nodeMap = new Map<string, RealmTreeNode>();
-    for (const realm of realms) {
-      nodeMap.set(realm.id, {
-        realm,
-        objects: this.buildObjectForest(objsByRealm.get(realm.id) ?? []),
-        children: [],
-      });
-    }
-    const roots: RealmTreeNode[] = [];
-    for (const realm of realms) {
-      const node = nodeMap.get(realm.id)!;
-      if (realm.parentId && visibleIds.has(realm.parentId)) {
-        nodeMap.get(realm.parentId)!.children.push(node);
-      } else {
-        roots.push(node);
-      }
-    }
-    return roots;
-  }
+  private hydrateLsPage(params: {
+    orgId: string;
+    refs: UnifiedEntryRef[];
+    vis: VisibilityHelpers;
+    readableLedgerSet: Set<string>;
+  }): LsEntry[] {
+    if (params.refs.length === 0) return [];
+    const recIds = params.refs
+      .filter((r) => r.sourceType === "record")
+      .map((r) => r.id);
+    const seaIds = params.refs
+      .filter((r) => r.sourceType === "seabed")
+      .map((r) => r.id);
 
-  private visibleObjectIdsForEntry(
-    entryId: string,
-    orgId: string,
-    readableLedgerSet: Set<string>,
-  ): string[] {
-    const ids = this.db.listObjectIdsForEntry(entryId, orgId);
-    if (ids.length === 0) return [];
-    const out: string[] = [];
-    for (const id of ids) {
-      const obj = this.db.getObject(id);
-      if (obj && obj.orgId === orgId && readableLedgerSet.has(obj.realmId)) {
-        out.push(id);
+    const recsMap = new Map(
+      this.db.getRecordsByIds(recIds).map((r) => [r.id, r]),
+    );
+    const seasMap = new Map(
+      this.db.getSeabedEntriesByIds(seaIds).map((s) => [s.id, s]),
+    );
+
+    const allEntryIds = params.refs.map((r) => r.id);
+    const objIdsByEntry = this.db.listObjectIdsByEntryIds(
+      params.orgId,
+      allEntryIds,
+    );
+    const tagsByEntry = this.db.listResourceTagsByEntryIds(
+      params.orgId,
+      allEntryIds,
+    );
+
+    const allLinkedObjIds = Array.from(
+      new Set(Array.from(objIdsByEntry.values()).flat()),
+    );
+    const visibleObjSet = new Set(
+      this.db
+        .getObjectsByIds(allLinkedObjIds)
+        .filter(
+          (o) =>
+            o.orgId === params.orgId &&
+            params.readableLedgerSet.has(o.realmId),
+        )
+        .map((o) => o.id),
+    );
+
+    const refsToPreload: string[] = [];
+    for (const r of recsMap.values()) {
+      refsToPreload.push(...r.refs);
+      if (r.supersedesId) refsToPreload.push(r.supersedesId);
+      if (r.supersedesIds) refsToPreload.push(...r.supersedesIds);
+      if (r.supersededById) refsToPreload.push(r.supersededById);
+    }
+    for (const s of seasMap.values()) {
+      if (s.sourceRef) refsToPreload.push(s.sourceRef);
+    }
+    params.vis.preloadRefs(refsToPreload);
+
+    const out: LsEntry[] = [];
+    for (const ref of params.refs) {
+      const objectIds = (objIdsByEntry.get(ref.id) ?? []).filter((oid) =>
+        visibleObjSet.has(oid),
+      );
+      const resourceTags = tagsByEntry.get(ref.id) ?? [];
+
+      if (ref.sourceType === "record") {
+        const rec = recsMap.get(ref.id);
+        if (!rec || rec.sensitivity === "secret" || !params.vis.canSeeRecord(rec)) {
+          continue;
+        }
+        const clean = params.vis.sanitizeRecord(rec);
+        const bodyText = extractReadableText(clean.payload);
+        out.push({
+          id: clean.id,
+          behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
+          sourceType: "record",
+          kind: clean.kind,
+          extKind: clean.extKind,
+          realmId: clean.realmId,
+          realmPath: params.vis.getSanitizedRealmPath(clean.realmId),
+          status: clean.status,
+          title: clean.title,
+          snippet: buildSnippet({
+            title: clean.title,
+            text: bodyText ? `${clean.title} — ${bodyText}` : clean.title,
+          }),
+          authorId: clean.authorId,
+          confirmedByHuman: clean.confirmedByHuman,
+          occurredAt: clean.occurredAt,
+          createdAt: clean.createdAt,
+          externalRef: clean.externalRef,
+          sourceRef: clean.sourceRef,
+          refs: clean.refs,
+          supersedesId: clean.supersedesId,
+          supersedesIds: clean.supersedesIds,
+          supersededById: clean.supersededById,
+          objectIds,
+          resourceTags,
+        });
+      } else {
+        const sea = seasMap.get(ref.id);
+        if (!sea || sea.sensitivity === "secret" || !params.vis.canSeeSeabed(sea)) {
+          continue;
+        }
+        const clean = params.vis.sanitizeSeabed(sea);
+        out.push({
+          id: clean.id,
+          behaviorClass: "raw",
+          sourceType: "seabed",
+          kind: clean.kind,
+          extKind: null,
+          realmId: clean.realmId,
+          realmPath: params.vis.getSanitizedRealmPath(clean.realmId),
+          status: clean.redactedAt ? "retracted" : "evidence",
+          title: `${clean.kind}${clean.topicId ? ` (${clean.topicId})` : ""}`,
+          snippet: buildSnippet({ text: clean.text }),
+          authorId: clean.authorId,
+          confirmedByHuman: clean.authorKind === "human",
+          occurredAt: clean.occurredAt,
+          createdAt: clean.createdAt,
+          externalRef: null,
+          sourceRef: clean.sourceRef,
+          refs: clean.sourceRef ? [clean.sourceRef] : [],
+          supersedesId: null,
+          supersedesIds: [],
+          supersededById: null,
+          objectIds,
+          resourceTags,
+        });
       }
     }
     return out;
   }
 
-  private toLsEntryFromRecord(
-    rec: LedgerRecord,
-    vis: VisibilityHelpers,
-    realmsById: Map<string, Realm>,
-    readableLedgerSet: Set<string>,
-  ): LsEntry {
-    const clean = vis.sanitizeRecord(rec);
-    const bodySnippet =
-      typeof clean.payload.summary === "string" && clean.payload.summary.trim()
-        ? clean.payload.summary
-        : typeof clean.payload.body === "string" && clean.payload.body.trim()
-          ? clean.payload.body
-          : Object.keys(clean.payload).length > 0
-            ? JSON.stringify(clean.payload)
-            : "";
-    return {
-      id: clean.id,
-      behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
-      sourceType: "record",
-      kind: clean.kind,
-      extKind: clean.extKind,
-      realmId: clean.realmId,
-      realmPath: realmsById.get(clean.realmId)?.path ?? "/",
-      status: clean.status,
-      title: clean.title,
-      snippet: snippet(bodySnippet ? `${clean.title} — ${bodySnippet}` : clean.title),
-      authorId: clean.authorId,
-      confirmedByHuman: clean.confirmedByHuman,
-      occurredAt: clean.occurredAt,
-      createdAt: clean.createdAt,
-      externalRef: clean.externalRef,
-      sourceRef: clean.sourceRef,
-      refs: clean.refs,
-      supersedesId: clean.supersedesId,
-      supersededById: clean.supersededById,
-      objectIds: this.visibleObjectIdsForEntry(
-        clean.id,
-        clean.orgId,
-        readableLedgerSet,
-      ),
-      resourceTags: this.db.listResourceTagsForEntry(clean.id, clean.orgId),
-    };
-  }
-
-  private toLsEntryFromSeabed(
-    sea: SeabedEntry,
-    vis: VisibilityHelpers,
-    realmsById: Map<string, Realm>,
-    readableLedgerSet: Set<string>,
-  ): LsEntry {
-    const clean = vis.sanitizeSeabed(sea);
-    return {
-      id: clean.id,
-      behaviorClass: "raw",
-      sourceType: "seabed",
-      kind: clean.kind,
-      extKind: null,
-      realmId: clean.realmId,
-      realmPath: realmsById.get(clean.realmId)?.path ?? "/",
-      status: clean.redactedAt ? "retracted" : "evidence",
-      title: `${clean.kind}${clean.topicId ? ` (${clean.topicId})` : ""}`,
-      snippet: snippet(clean.text),
-      authorId: clean.authorId,
-      confirmedByHuman: clean.authorKind === "human",
-      occurredAt: clean.occurredAt,
-      createdAt: clean.createdAt,
-      externalRef: null,
-      sourceRef: clean.sourceRef,
-      refs: clean.sourceRef ? [clean.sourceRef] : [],
-      supersedesId: null,
-      supersededById: null,
-      objectIds: this.visibleObjectIdsForEntry(
-        clean.id,
-        clean.orgId,
-        readableLedgerSet,
-      ),
-      resourceTags: this.db.listResourceTagsForEntry(clean.id, clean.orgId),
-    };
-  }
-
   tree(params: {
     actor: Actor;
     viewerRealmId: string;
+    target?: string;
+    depth?: number | "all";
+    includeObjects?: boolean;
+    limit?: number;
     scopeCeiling?: AccessScope;
   }): TreeResult {
     const realms = this.db.listRealms();
@@ -1179,26 +1699,211 @@ export class SeaEngine {
       ? intersectAccessScopes(baseScope, params.scopeCeiling)
       : baseScope;
 
-    const visibleRealmSet = new Set<string>([
-      ...scope.readableLedgerIds,
-      ...scope.readableDriveIds,
-      ...scope.readableSeabedIds,
-    ]);
-    const visibleRealms = realms.filter(
-      (r) => r.orgId === org.id && visibleRealmSet.has(r.id),
-    );
-    const visibleObjects = this.db.listObjects({
+    const vis = this.buildVisibilityHelpers({
+      realms,
+      mounts,
+      actor: params.actor,
+      viewerRealmId: viewerRealm.id,
+      scope,
+      ledgerRealmIds: scope.readableLedgerIds,
+      seabedRealmIds: scope.readableSeabedIds,
+      includeDescendantSeabed: false,
+    });
+
+    const targetRealm = params.target
+      ? resolveVisibleRealm({
+          realms,
+          orgId: org.id,
+          ref: params.target,
+          scope,
+        })
+      : vis.sanitizeRealm(viewerRealm);
+
+    const depth = params.depth ?? 1;
+    const includeObjects = params.includeObjects ?? true;
+    const lineLimit = Math.max(1, Math.min(params.limit ?? 60, 500));
+
+    const orgRealms = realms.filter((r) => r.orgId === org.id);
+    const visibleRealms = vis.sanitizeRealms(orgRealms);
+    const visibleRealmIds = new Set(visibleRealms.map((r) => r.id));
+
+    const rawObjects = this.db.listObjects({
       orgId: org.id,
       realmIds: scope.readableLedgerIds,
     });
+    const visibleObjects = vis.sanitizeObjects(rawObjects);
+
+    // Batch GROUP BY aggregate queries (3-4 SQL queries TOTAL regardless of DB size!)
+    const readableLedgerSet = new Set(scope.readableLedgerIds);
+    const readableSeabedSet = new Set(scope.readableSeabedIds);
+
+    const recCounts = this.db.countActiveRecordsByRealm({
+      realmIds: scope.readableLedgerIds,
+      excludeSensitivities: ["secret"],
+    });
+    const seaCounts = this.db.countSeabedByRealm({
+      realmIds: scope.readableSeabedIds,
+      excludeSensitivities: ["secret"],
+    });
+    const objCounts = this.db.countObjectsByRealm({
+      orgId: org.id,
+      realmIds: scope.readableLedgerIds,
+    });
+    const linkedCounts =
+      scope.policy === "open"
+        ? this.db.countLinkedEntriesByObjectRealm({
+            orgId: org.id,
+            realmIds: scope.readableLedgerIds,
+            excludeSensitivities: ["secret"],
+          })
+        : new Map<string, number>();
+
+    // Build visible parent -> visible children adjacency using SANITIZED parentId
+    const childrenByParent = new Map<string, Realm[]>();
+    for (const r of visibleRealms) {
+      if (r.parentId && visibleRealmIds.has(r.parentId)) {
+        const list = childrenByParent.get(r.parentId) ?? [];
+        list.push(r);
+        childrenByParent.set(r.parentId, list);
+      }
+    }
+
+    // Subtree rollups allowed ONLY on self + visible descendants in tree mode (and all realms in open mode).
+    // Ancestors & @mounted realms expose direct-only counts (subtree* = null).
+    const rollupEligibleSet =
+      scope.policy === "open"
+        ? visibleRealmIds
+        : new Set<string>([viewerRealm.id, ...scope.descendantIds]);
+
+    const subtreeMemo = new Map<
+      string,
+      {
+        rules: number;
+        conclusions: number;
+        raw: number | null;
+        objects: number;
+      }
+    >();
+
+    const computeSubtree = (
+      realmId: string,
+      visited = new Set<string>(),
+    ): {
+      rules: number;
+      conclusions: number;
+      raw: number | null;
+      objects: number;
+    } => {
+      if (subtreeMemo.has(realmId)) return subtreeMemo.get(realmId)!;
+      if (visited.has(realmId)) {
+        return { rules: 0, conclusions: 0, raw: null, objects: 0 };
+      }
+      visited.add(realmId);
+      const rc = recCounts.get(realmId);
+      let rules = readableLedgerSet.has(realmId) ? (rc?.rules ?? 0) : 0;
+      let conclusions = readableLedgerSet.has(realmId)
+        ? (rc?.conclusions ?? 0)
+        : 0;
+      let raw: number | null = readableSeabedSet.has(realmId)
+        ? (seaCounts.get(realmId) ?? 0)
+        : null;
+      let objects = readableLedgerSet.has(realmId)
+        ? (objCounts.get(realmId) ?? 0)
+        : 0;
+
+      for (const child of childrenByParent.get(realmId) ?? []) {
+        const sub = computeSubtree(child.id, visited);
+        rules += sub.rules;
+        conclusions += sub.conclusions;
+        objects += sub.objects;
+        if (raw === null || sub.raw === null) {
+          raw = null;
+        } else {
+          raw += sub.raw;
+        }
+      }
+      const res = { rules, conclusions, raw, objects };
+      subtreeMemo.set(realmId, res);
+      return res;
+    };
+
+    const countsByRealm = new Map<string, RealmTreeCounts>();
+    for (const r of visibleRealms) {
+      const rc = recCounts.get(r.id);
+      const directRules = readableLedgerSet.has(r.id) ? (rc?.rules ?? 0) : 0;
+      const directConclusions = readableLedgerSet.has(r.id)
+        ? (rc?.conclusions ?? 0)
+        : 0;
+      const directRaw = readableSeabedSet.has(r.id)
+        ? (seaCounts.get(r.id) ?? 0)
+        : null;
+      const directObjects = readableLedgerSet.has(r.id)
+        ? (objCounts.get(r.id) ?? 0)
+        : 0;
+      const childRealmsCount = (childrenByParent.get(r.id) ?? []).length;
+
+      const allowRollup = rollupEligibleSet.has(r.id);
+      const sub = allowRollup ? computeSubtree(r.id) : null;
+
+      countsByRealm.set(r.id, {
+        directRules,
+        directConclusions,
+        directRaw,
+        directObjects,
+        subtreeRules: sub ? sub.rules : null,
+        subtreeConclusions: sub ? sub.conclusions : null,
+        subtreeRaw: sub ? sub.raw : null,
+        subtreeObjects: sub ? sub.objects : null,
+        linkedViaObjects:
+          scope.policy === "open" ? (linkedCounts.get(r.id) ?? 0) : null,
+        childRealmsCount,
+      });
+    }
+
+    const objsByRealm = new Map<string, MindObject[]>();
+    if (includeObjects) {
+      for (const obj of visibleObjects) {
+        const arr = objsByRealm.get(obj.realmId) ?? [];
+        arr.push(obj);
+        objsByRealm.set(obj.realmId, arr);
+      }
+    }
+
+    const buildNode = (realm: Realm, currentDepth: number): RealmTreeNode => {
+      const canExpand = depth === "all" || currentDepth < depth;
+      const childRealms = canExpand ? (childrenByParent.get(realm.id) ?? []) : [];
+      return {
+        realm,
+        counts: countsByRealm.get(realm.id)!,
+        objects: includeObjects
+          ? this.buildObjectForest(objsByRealm.get(realm.id) ?? [])
+          : [],
+        children: childRealms.map((c) => buildNode(c, currentDepth + 1)),
+      };
+    };
+
+    let realmTree: RealmTreeNode[];
+    if (params.target) {
+      const rootNode = visibleRealms.find((r) => r.id === targetRealm.id);
+      realmTree = rootNode ? [buildNode(rootNode, 0)] : [];
+    } else {
+      const rootRealms = visibleRealms.filter(
+        (r) => !r.parentId || !visibleRealmIds.has(r.parentId),
+      );
+      realmTree = rootRealms.map((r) => buildNode(r, 0));
+    }
 
     return {
       org,
       viewerRealmId: viewerRealm.id,
+      targetRealmId: targetRealm.id,
+      depth,
+      includeObjects,
+      lineLimit,
       realms: visibleRealms,
-      objects: visibleObjects,
-      realmTree: this.buildRealmForest(visibleRealms, visibleObjects),
-      objectTree: this.buildObjectForest(visibleObjects),
+      objects: includeObjects ? visibleObjects : [],
+      realmTree,
+      objectTree: includeObjects ? this.buildObjectForest(visibleObjects) : [],
     };
   }
 
@@ -1207,6 +1912,8 @@ export class SeaEngine {
     viewerRealmId: string;
     target?: string;
     targetType?: LsTargetType;
+    kind?: string;
+    tag?: string;
     includeSuperseded?: boolean;
     includeDescendantSeabed?: boolean;
     limit?: number;
@@ -1223,8 +1930,12 @@ export class SeaEngine {
     const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
     const includeSuperseded = Boolean(params.includeSuperseded);
     const includeDescendantSeabed = Boolean(params.includeDescendantSeabed);
-    const limit = Math.max(1, Math.min(params.limit ?? 50, 200));
+    const limit = Math.max(1, Math.min(params.limit ?? 20, 200));
     const offset = Math.max(0, params.offset ?? 0);
+    const kindFilter = params.kind?.trim() || undefined;
+    const tagFilter = params.tag?.trim()
+      ? normalizeResourceTag(params.tag.trim())
+      : undefined;
 
     const baseScope = resolveAccessScope({
       realms,
@@ -1252,121 +1963,113 @@ export class SeaEngine {
     });
 
     const rawTarget = params.target?.trim() || viewerRealm.id;
+
+    // Explicit target prefixes ONLY (no DB existence-probe guessing)
     let targetType: LsTargetType;
+    let normalizedRef = rawTarget;
     if (params.targetType) {
       targetType = params.targetType;
-    } else if (rawTarget.startsWith("/") || rawTarget.startsWith("realm_")) {
-      targetType = "realm";
+      if (targetType === "realm" && normalizedRef.startsWith("realm:")) {
+        normalizedRef = normalizedRef.slice("realm:".length).trim();
+      } else if (targetType === "object" && normalizedRef.startsWith("obj:")) {
+        normalizedRef = normalizedRef.slice("obj:".length).trim();
+      } else if (targetType === "thing" && normalizedRef.startsWith("thing:")) {
+        normalizedRef = normalizedRef.slice("thing:".length).trim();
+      } else if (targetType === "resource" && normalizedRef.startsWith("tag:")) {
+        normalizedRef = normalizedRef.slice("tag:".length).trim();
+      }
     } else if (
-      rawTarget.startsWith("obj_") ||
-      Boolean(this.db.getObject(rawTarget))
+      rawTarget.startsWith("/") ||
+      rawTarget.toLowerCase().startsWith("@mounted/") ||
+      rawTarget.startsWith("realm_")
     ) {
+      targetType = "realm";
+    } else if (rawTarget.startsWith("realm:")) {
+      targetType = "realm";
+      normalizedRef = rawTarget.slice("realm:".length).trim();
+    } else if (rawTarget.startsWith("obj:")) {
+      targetType = "object";
+      normalizedRef = rawTarget.slice("obj:".length).trim();
+    } else if (rawTarget.startsWith("obj_")) {
       targetType = "object";
     } else if (rawTarget.startsWith("thing:")) {
       targetType = "thing";
-    } else if (this.db.getRecord(rawTarget)?.kind === "thing") {
-      targetType = "thing";
-    } else if (rawTarget.includes(":")) {
+      normalizedRef = rawTarget.slice("thing:".length).trim();
+    } else if (rawTarget.startsWith("tag:")) {
       targetType = "resource";
+      normalizedRef = rawTarget.slice("tag:".length).trim();
     } else {
-      targetType = "realm";
+      throw new MindError(
+        "INVALID_INPUT",
+        `Ambiguous ls target "${rawTarget}". Use an explicit prefix: /path, @mounted/<alias>, realm:<id>, obj:<id|name>, thing:<ref>, or tag:<type:name>.`,
+      );
     }
 
-    const entriesMap = new Map<string, LsEntry>();
-    let resolvedId = rawTarget;
+    let resolvedId = normalizedRef;
     let driveFiles: LsResult["driveFiles"] | undefined;
-
-    const addRecord = (rec: LedgerRecord | null) => {
-      if (!rec) return;
-      if (rec.orgId !== viewerRealm.orgId) return;
-      if (rec.sensitivity === "secret" || rec.redactedAt !== null) return;
-      if (rec.status === "retracted") return;
-      if (!includeSuperseded && rec.status !== "active") return;
-      if (!vis.canSeeRecord(rec)) return;
-      if (!entriesMap.has(rec.id)) {
-        entriesMap.set(
-          rec.id,
-          this.toLsEntryFromRecord(rec, vis, realmsById, readableLedgerSet),
-        );
-      }
-    };
-
-    const addSeabed = (sea: SeabedEntry | null) => {
-      if (!sea) return;
-      if (sea.orgId !== viewerRealm.orgId) return;
-      if (sea.sensitivity === "secret" || sea.redactedAt !== null) return;
-      if (!vis.canSeeSeabed(sea)) return;
-      if (!entriesMap.has(sea.id)) {
-        entriesMap.set(
-          sea.id,
-          this.toLsEntryFromSeabed(sea, vis, realmsById, readableLedgerSet),
-        );
-      }
+    let subRealms: LsResult["subRealms"] | undefined;
+    let unifiedRes: { rows: UnifiedEntryRef[]; total: number } = {
+      rows: [],
+      total: 0,
     };
 
     if (targetType === "realm") {
       const targetRealm = resolveVisibleRealm({
         realms,
         orgId: viewerRealm.orgId,
-        ref: rawTarget,
+        ref: normalizedRef,
         scope,
       });
       resolvedId = targetRealm.id;
 
-      if (readableLedgerSet.has(targetRealm.id)) {
-        const recs = this.db.listRecords({
-          realmIds: [targetRealm.id],
-          includeSuperseded,
-          excludeSensitivities: ["secret"],
-          limit: 10_000,
-          offset: 0,
-        });
-        for (const r of recs.items) addRecord(r);
-      }
-      if (readableSeabedSet.has(targetRealm.id)) {
-        const seas = this.db.listSeabedEntries({
-          realmIds: [targetRealm.id],
-          excludeSensitivities: ["secret"],
-          limit: 10_000,
-          offset: 0,
-        });
-        for (const s of seas.items) addSeabed(s);
-      }
+      // Single-query SQL UNION + exact COUNT(*) (no limit: 10_000, no N+1)
+      unifiedRes = this.db.lsRealmEntriesUnified({
+        orgId: viewerRealm.orgId,
+        targetRealmId: targetRealm.id,
+        includePhysicalLedger: readableLedgerSet.has(targetRealm.id),
+        includePhysicalSeabed: readableSeabedSet.has(targetRealm.id),
+        includeObjectLinkedOpenMode: scope.policy === "open",
+        includeSuperseded,
+        kind: kindFilter,
+        tag: tagFilter,
+        excludeSensitivities: ["secret"],
+        limit,
+        offset,
+      });
 
-      // In open mode, also aggregate entries linked via objects belonging to targetRealm
-      // (tree mode NEVER amplifies beyond physical realm_id)
-      if (scope.policy === "open") {
-        const linkedIds = this.db.listEntryIdsByObjectRealm(
-          viewerRealm.orgId,
-          targetRealm.id,
-        );
-        for (const eid of linkedIds) {
-          const rec = this.db.getRecord(eid);
-          if (rec) {
-            addRecord(rec);
-            continue;
-          }
-          addSeabed(this.db.getSeabedEntry(eid));
-        }
-      }
+      const orgRealms = realms.filter((r) => r.orgId === viewerRealm.orgId);
+      const visibleSanitizedRealms = vis.sanitizeRealms(orgRealms);
+      subRealms = visibleSanitizedRealms
+        .filter((r) => r.parentId === targetRealm.id)
+        .map((r) => ({
+          id: r.id,
+          path: r.path,
+          name: r.name,
+          slug: r.slug,
+        }));
 
       if (vis.canSeeDriveRealm(targetRealm.id)) {
         driveFiles = await this.drive.listFiles(targetRealm.id);
       }
     } else if (targetType === "object") {
-      const obj = this.db.getObject(rawTarget);
-      if (
-        !obj ||
-        obj.orgId !== viewerRealm.orgId ||
-        !readableLedgerSet.has(obj.realmId)
-      ) {
+      const visibleObjects = vis.sanitizeObjects(
+        this.db.listObjects({
+          orgId: viewerRealm.orgId,
+          realmIds: scope.readableLedgerIds,
+        }),
+      );
+      let obj =
+        visibleObjects.find((o) => o.id === normalizedRef) ??
+        visibleObjects.find(
+          (o) =>
+            o.name.toLowerCase() === normalizedRef.toLowerCase() ||
+            `${o.kind}:${o.name}`.toLowerCase() === normalizedRef.toLowerCase(),
+        ) ??
+        null;
+      if (!obj) {
         throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
       }
       resolvedId = obj.id;
-      const visibleObjects = this.db.listObjects({
-        orgId: viewerRealm.orgId,
-        realmIds: scope.readableLedgerIds,
-      });
       const objectIds = [
         obj.id,
         ...getDescendantObjectIds(visibleObjects, obj.id),
@@ -1375,23 +2078,24 @@ export class SeaEngine {
         viewerRealm.orgId,
         objectIds,
       );
-      for (const eid of linkedIds) {
-        const rec = this.db.getRecord(eid);
-        if (rec) {
-          addRecord(rec);
-          continue;
-        }
-        addSeabed(this.db.getSeabedEntry(eid));
-      }
+      unifiedRes = this.db.lsEntriesByIdsUnified({
+        orgId: viewerRealm.orgId,
+        entryIds: linkedIds,
+        ledgerRealmIds: scope.readableLedgerIds,
+        seabedRealmIds: scope.readableSeabedIds,
+        includeSuperseded,
+        kind: kindFilter,
+        tag: tagFilter,
+        excludeSensitivities: ["secret"],
+        limit,
+        offset,
+      });
     } else if (targetType === "thing") {
-      const ref = rawTarget.startsWith("thing:")
-        ? rawTarget.slice("thing:".length).trim()
-        : rawTarget;
-      let thingRec = this.db.getRecord(ref);
+      let thingRec = this.db.getRecord(normalizedRef);
       if (!thingRec || thingRec.kind !== "thing") {
         const byExt = this.db.findRecordsByExternalRef(
           viewerRealm.orgId,
-          ref,
+          normalizedRef,
           scope.readableLedgerIds,
           ["secret"],
         );
@@ -1411,39 +2115,51 @@ export class SeaEngine {
         thingId: resolvedId,
         includeSuperseded,
         excludeSensitivities: ["secret"],
-        limit: 10_000,
+        limit: 500,
         offset: 0,
       });
-      for (const r of recs.items) addRecord(r);
-      addRecord(thingRec);
+      const candidateIds = Array.from(
+        new Set([thingRec.id, ...recs.items.map((r) => r.id)]),
+      );
+      unifiedRes = this.db.lsEntriesByIdsUnified({
+        orgId: viewerRealm.orgId,
+        entryIds: candidateIds,
+        ledgerRealmIds: scope.readableLedgerIds,
+        seabedRealmIds: [],
+        includeSuperseded,
+        kind: kindFilter,
+        tag: tagFilter,
+        excludeSensitivities: ["secret"],
+        limit,
+        offset,
+      });
     } else {
-      const tag = normalizeResourceTag(rawTarget);
+      const tag = normalizeResourceTag(normalizedRef);
       resolvedId = tag;
       const taggedIds = this.db.listEntryIdsByResourceTag(
         viewerRealm.orgId,
         tag,
       );
-      for (const eid of taggedIds) {
-        const rec = this.db.getRecord(eid);
-        if (rec) {
-          addRecord(rec);
-          continue;
-        }
-        addSeabed(this.db.getSeabedEntry(eid));
-      }
+      unifiedRes = this.db.lsEntriesByIdsUnified({
+        orgId: viewerRealm.orgId,
+        entryIds: taggedIds,
+        ledgerRealmIds: scope.readableLedgerIds,
+        seabedRealmIds: scope.readableSeabedIds,
+        includeSuperseded,
+        kind: kindFilter,
+        tag: tagFilter,
+        excludeSensitivities: ["secret"],
+        limit,
+        offset,
+      });
     }
 
-    const allItems = Array.from(entriesMap.values()).sort((a, b) => {
-      if (b.occurredAt !== a.occurredAt) {
-        return b.occurredAt.localeCompare(a.occurredAt);
-      }
-      if (b.createdAt !== a.createdAt) {
-        return b.createdAt.localeCompare(a.createdAt);
-      }
-      return a.id.localeCompare(b.id);
+    const page = this.hydrateLsPage({
+      orgId: viewerRealm.orgId,
+      refs: unifiedRes.rows,
+      vis,
+      readableLedgerSet,
     });
-    const totalMatched = allItems.length;
-    const page = allItems.slice(offset, offset + limit);
 
     return {
       targetType,
@@ -1451,8 +2167,9 @@ export class SeaEngine {
       resolvedId,
       viewerRealmId: viewerRealm.id,
       items: page,
-      totalMatched,
-      omittedCount: Math.max(0, totalMatched - offset - page.length),
+      totalMatched: unifiedRes.total,
+      omittedCount: Math.max(0, unifiedRes.total - offset - page.length),
+      ...(subRealms !== undefined ? { subRealms } : {}),
       ...(driveFiles !== undefined ? { driveFiles } : {}),
     };
   }
@@ -1468,6 +2185,12 @@ export class SeaEngine {
     const target = params.target.trim();
     if (!target) {
       throw new MindError("INVALID_INPUT", "cat target cannot be empty");
+    }
+    if (target.startsWith("obj:")) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Objects cannot be viewed with "cat"; run "meru-mind ls ${target}" instead.`,
+      );
     }
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
@@ -1501,6 +2224,15 @@ export class SeaEngine {
       includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
     });
 
+    const visibleObjectIds = (entryId: string, orgId: string): string[] => {
+      const ids = this.db.listObjectIdsForEntry(entryId, orgId);
+      if (ids.length === 0) return [];
+      return this.db
+        .getObjectsByIds(ids)
+        .filter((o) => o.orgId === orgId && readableLedgerSet.has(o.realmId))
+        .map((o) => o.id);
+    };
+
     // 1. drive://<realmId>/<relPath> URI
     const parsedDrive = parseDriveSourceRef(target);
     if (parsedDrive) {
@@ -1518,7 +2250,7 @@ export class SeaEngine {
         kind: "drive",
         behaviorClass: "raw",
         file,
-        realmPath: realmsById.get(parsedDrive.realmId)?.path ?? "/",
+        realmPath: vis.getSanitizedRealmPath(parsedDrive.realmId),
       };
     }
 
@@ -1528,19 +2260,22 @@ export class SeaEngine {
       if (rec.orgId !== viewerRealm.orgId || !vis.canSeeRecord(rec)) {
         throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
       }
+      vis.preloadRefs([
+        ...rec.refs,
+        ...(rec.supersedesId ? [rec.supersedesId] : []),
+        ...(rec.supersedesIds ?? []),
+        ...(rec.supersededById ? [rec.supersededById] : []),
+      ]);
       const clean = vis.sanitizeRecord(rec);
       return {
         kind: "record",
         behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
         record: clean,
-        realmPath: realmsById.get(clean.realmId)?.path ?? "/",
-        objectIds: this.visibleObjectIdsForEntry(
-          clean.id,
-          clean.orgId,
-          readableLedgerSet,
-        ),
+        realmPath: vis.getSanitizedRealmPath(clean.realmId),
+        objectIds: visibleObjectIds(clean.id, clean.orgId),
         resourceTags: this.db.listResourceTagsForEntry(clean.id, clean.orgId),
         currentHeadId: vis.resolveCurrentHeadId(rec),
+        orphanSuperseded: vis.isOrphanSuperseded(rec),
       };
     }
 
@@ -1549,17 +2284,14 @@ export class SeaEngine {
       if (sea.orgId !== viewerRealm.orgId || !vis.canSeeSeabed(sea)) {
         throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
       }
+      if (sea.sourceRef) vis.preloadRefs([sea.sourceRef]);
       const clean = vis.sanitizeSeabed(sea);
       return {
         kind: "seabed",
         behaviorClass: "raw",
         seabed: clean,
-        realmPath: realmsById.get(clean.realmId)?.path ?? "/",
-        objectIds: this.visibleObjectIdsForEntry(
-          clean.id,
-          clean.orgId,
-          readableLedgerSet,
-        ),
+        realmPath: vis.getSanitizedRealmPath(clean.realmId),
+        objectIds: visibleObjectIds(clean.id, clean.orgId),
         resourceTags: this.db.listResourceTagsForEntry(clean.id, clean.orgId),
       };
     }
@@ -1574,17 +2306,18 @@ export class SeaEngine {
       ) {
         throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
       }
+      vis.preloadRefs(dist.sourceIds);
       const clean = vis.sanitizeDistillation(dist);
       return {
         kind: "distillation",
         behaviorClass: "conclusion",
         distillation: clean,
-        realmPath: distRealm.path,
+        realmPath: vis.getSanitizedRealmPath(distRealm.id),
       };
     }
 
     // 3. Drive relative path (with optional targetRealmRef or "<realmPath>:<relPath>")
-    let driveRealm = viewerRealm;
+    let driveRealm = vis.sanitizeRealm(viewerRealm);
     let relPath = target;
     if (params.targetRealmRef) {
       driveRealm = resolveVisibleRealm({
@@ -1593,7 +2326,10 @@ export class SeaEngine {
         ref: params.targetRealmRef,
         scope,
       });
-    } else if (target.startsWith("/") && target.includes(":")) {
+    } else if (
+      (target.startsWith("/") || target.toLowerCase().startsWith("@mounted/")) &&
+      target.includes(":")
+    ) {
       const colonIdx = target.indexOf(":");
       const realmPart = target.slice(0, colonIdx);
       const pathPart = target.slice(colonIdx + 1);
@@ -1617,7 +2353,7 @@ export class SeaEngine {
       kind: "drive",
       behaviorClass: "raw",
       file,
-      realmPath: driveRealm.path,
+      realmPath: vis.getSanitizedRealmPath(driveRealm.id),
     };
   }
 
@@ -1676,9 +2412,10 @@ export class SeaEngine {
     }
 
     let anchorRealmId: string;
-    let anchorOccurredAt: string;
+    let anchorOccurredAt: string | null;
+    let anchorCreatedAt: string;
     let anchorBehaviorClass: BehaviorClass;
-    let anchorEntry: LsEntry;
+    let anchorRef: UnifiedEntryRef;
     let supersedeChain: LedgerRecord[] = [];
 
     if (anchorRec) {
@@ -1690,38 +2427,15 @@ export class SeaEngine {
       }
       anchorRealmId = anchorRec.realmId;
       anchorOccurredAt = anchorRec.occurredAt;
+      anchorCreatedAt = anchorRec.createdAt;
       anchorBehaviorClass = anchorRec.kind === "rule" ? "rule" : "conclusion";
-      anchorEntry = this.toLsEntryFromRecord(
-        anchorRec,
-        vis,
-        realmsById,
-        readableLedgerSet,
-      );
-
-      // Walk full supersede chain and filter/sanitize via visibility.ts
-      let oldest = anchorRec;
-      const seen = new Set<string>([oldest.id]);
-      while (oldest.supersedesId && !seen.has(oldest.supersedesId)) {
-        const prev = this.db.getRecord(oldest.supersedesId);
-        if (!prev) break;
-        seen.add(prev.id);
-        oldest = prev;
-      }
-      const rawChain: LedgerRecord[] = [oldest];
-      let cur = oldest;
-      while (cur.supersededById) {
-        const next = this.db.getRecord(cur.supersededById);
-        if (!next || rawChain.some((c) => c.id === next.id)) break;
-        rawChain.push(next);
-        cur = next;
-      }
-      supersedeChain = rawChain
-        .filter(
-          (node) =>
-            vis.canSeeRecord(node) &&
-            (node.sensitivity !== "secret" || node.id === anchorRec.id),
-        )
-        .map((node) => vis.sanitizeRecord(node));
+      anchorRef = {
+        id: anchorRec.id,
+        sourceType: "record",
+        occurredAt: anchorRec.occurredAt,
+        createdAt: anchorRec.createdAt,
+      };
+      supersedeChain = vis.traverseSupersedeDag(anchorRec).nodes;
     } else {
       const s = anchorSea!;
       if (s.orgId !== viewerRealm.orgId || !vis.canSeeSeabed(s)) {
@@ -1729,14 +2443,19 @@ export class SeaEngine {
       }
       anchorRealmId = s.realmId;
       anchorOccurredAt = s.occurredAt;
+      anchorCreatedAt = s.createdAt;
       anchorBehaviorClass = "raw";
-      anchorEntry = this.toLsEntryFromSeabed(
-        s,
-        vis,
-        realmsById,
-        readableLedgerSet,
-      );
+      anchorRef = {
+        id: s.id,
+        sourceType: "seabed",
+        occurredAt: s.occurredAt,
+        createdAt: s.createdAt,
+      };
     }
+
+    const timeBasis: "occurred_at" | "created_at" =
+      anchorOccurredAt !== null ? "occurred_at" : "created_at";
+    const anchorTime = anchorOccurredAt ?? anchorCreatedAt;
 
     const windowLedgerRealmIds = readableLedgerSet.has(anchorRealmId)
       ? [anchorRealmId]
@@ -1745,44 +2464,52 @@ export class SeaEngine {
       ? [anchorRealmId]
       : [];
 
-    const collectWindow = (direction: "before" | "after"): LsEntry[] => {
+    const collectWindowRefs = (direction: "before" | "after"): UnifiedEntryRef[] => {
       const recs =
         windowLedgerRealmIds.length > 0
           ? this.db
               .listRecordsWindow({
                 realmIds: windowLedgerRealmIds,
-                anchorOccurredAt,
+                anchorTime,
                 anchorId: entryId,
                 direction,
+                timeBasis,
                 limit: windowSize,
                 excludeSensitivities: ["secret"],
               })
               .filter((r) => r.sensitivity !== "secret" && vis.canSeeRecord(r))
-              .map((r) =>
-                this.toLsEntryFromRecord(r, vis, realmsById, readableLedgerSet),
-              )
+              .map<UnifiedEntryRef>((r) => ({
+                id: r.id,
+                sourceType: "record",
+                occurredAt: r.occurredAt,
+                createdAt: r.createdAt,
+              }))
           : [];
       const seas =
         windowSeabedRealmIds.length > 0
           ? this.db
               .listSeabedWindow({
                 realmIds: windowSeabedRealmIds,
-                anchorOccurredAt,
+                anchorTime,
                 anchorId: entryId,
                 direction,
+                timeBasis,
                 limit: windowSize,
                 excludeSensitivities: ["secret"],
               })
               .filter((s) => s.sensitivity !== "secret" && vis.canSeeSeabed(s))
-              .map((s) =>
-                this.toLsEntryFromSeabed(s, vis, realmsById, readableLedgerSet),
-              )
+              .map<UnifiedEntryRef>((s) => ({
+                id: s.id,
+                sourceType: "seabed",
+                occurredAt: s.occurredAt,
+                createdAt: s.createdAt,
+              }))
           : [];
 
       const merged = [...recs, ...seas].sort((a, b) => {
-        if (a.occurredAt !== b.occurredAt) {
-          return a.occurredAt.localeCompare(b.occurredAt);
-        }
+        const tA = timeBasis === "occurred_at" ? (a.occurredAt ?? a.createdAt) : a.createdAt;
+        const tB = timeBasis === "occurred_at" ? (b.occurredAt ?? b.createdAt) : b.createdAt;
+        if (tA !== tB) return tA.localeCompare(tB);
         return a.id.localeCompare(b.id);
       });
       return direction === "before"
@@ -1790,22 +2517,42 @@ export class SeaEngine {
         : merged.slice(0, windowSize);
     };
 
+    const beforeRefs = collectWindowRefs("before");
+    const afterRefs = collectWindowRefs("after");
+    const hydratedAll = this.hydrateLsPage({
+      orgId: viewerRealm.orgId,
+      refs: [...beforeRefs, anchorRef, ...afterRefs],
+      vis,
+      readableLedgerSet,
+    });
+    const hydratedById = new Map(hydratedAll.map((e) => [e.id, e]));
+
+    const anchorEntry = hydratedById.get(entryId)!;
+    const before = beforeRefs
+      .map((r) => hydratedById.get(r.id))
+      .filter((e): e is LsEntry => Boolean(e));
+    const after = afterRefs
+      .map((r) => hydratedById.get(r.id))
+      .filter((e): e is LsEntry => Boolean(e));
+
     return {
       anchorId: entryId,
       anchorBehaviorClass,
       anchorRealmId,
       anchorOccurredAt,
+      timeBasis,
       window: windowSize,
       supersedeChain,
-      before: collectWindow("before"),
+      before,
       anchor: anchorEntry,
-      after: collectWindow("after"),
+      after,
     };
   }
 
   changes(params: {
     actor: Actor;
     viewerRealmId: string;
+    target?: string;
     sinceSeq?: number;
     limit?: number;
     includeDescendantSeabed?: boolean;
@@ -1830,14 +2577,37 @@ export class SeaEngine {
       ? intersectAccessScopes(baseScope, params.scopeCeiling)
       : baseScope;
 
-    const ledgerSet = new Set(scope.readableLedgerIds);
-    const seabedSet = new Set(scope.readableSeabedIds);
+    let ledgerRealmIds = scope.readableLedgerIds;
+    let seabedRealmIds = scope.readableSeabedIds;
+    let includeOrgLevel = true;
+    if (params.target) {
+      const targetRealm = resolveVisibleRealm({
+        realms,
+        orgId: viewerRealm.orgId,
+        ref: params.target,
+        scope,
+      });
+      ledgerRealmIds = scope.readableLedgerIds.includes(targetRealm.id)
+        ? [targetRealm.id]
+        : [];
+      seabedRealmIds = scope.readableSeabedIds.includes(targetRealm.id)
+        ? [targetRealm.id]
+        : [];
+      includeOrgLevel = false;
+    }
+
+    const ledgerSet = new Set(ledgerRealmIds);
+    const seabedSet = new Set(seabedRealmIds);
     const candidateRealms = Array.from(
-      new Set([...scope.readableLedgerIds, ...scope.readableSeabedIds, "__org__"]),
+      new Set([
+        ...ledgerRealmIds,
+        ...seabedRealmIds,
+        ...(includeOrgLevel ? ["__org__"] : []),
+      ]),
     );
 
     const sinceSeq = Math.max(0, params.sinceSeq ?? 0);
-    const limit = Math.max(1, Math.min(params.limit ?? 100, 500));
+    const limit = Math.max(1, Math.min(params.limit ?? 50, 500));
 
     const vis = this.buildVisibilityHelpers({
       realms,
@@ -1845,8 +2615,8 @@ export class SeaEngine {
       actor: params.actor,
       viewerRealmId: viewerRealm.id,
       scope,
-      ledgerRealmIds: scope.readableLedgerIds,
-      seabedRealmIds: scope.readableSeabedIds,
+      ledgerRealmIds,
+      seabedRealmIds,
       includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
     });
 
@@ -1858,19 +2628,43 @@ export class SeaEngine {
       includeSecret: false,
     });
 
+    // Batch preload records, seabed, and objects referenced in raw change_log entries
+    const checkEntryIds: string[] = [];
+    const checkObjectIds: string[] = [];
+    for (const entry of raw.entries) {
+      if (entry.entityType === "record" || entry.entityType === "seabed") {
+        checkEntryIds.push(entry.entityId);
+      } else if (entry.entityType === "resource_tag") {
+        checkEntryIds.push(entry.entityId.split(":")[0] ?? entry.entityId);
+      } else if (entry.entityType === "entry_object") {
+        const [eid, oid] = entry.entityId.split(":");
+        if (eid) checkEntryIds.push(eid);
+        if (oid) checkObjectIds.push(oid);
+      }
+    }
+    const recsMap = new Map(
+      this.db.getRecordsByIds(checkEntryIds).map((r) => [r.id, r]),
+    );
+    const seasMap = new Map(
+      this.db.getSeabedEntriesByIds(checkEntryIds).map((s) => [s.id, s]),
+    );
+    const objsMap = new Map(
+      this.db.getObjectsByIds(checkObjectIds).map((o) => [o.id, o]),
+    );
+
     const filtered: ChangeLogEntry[] = [];
     let scannedSeq = sinceSeq;
     for (const entry of raw.entries) {
       scannedSeq = entry.seq;
       if (entry.entityType === "seabed") {
         if (!seabedSet.has(entry.realmId)) continue;
-        const sea = this.db.getSeabedEntry(entry.entityId);
+        const sea = seasMap.get(entry.entityId);
         if (sea && (sea.sensitivity === "secret" || !vis.canSeeSeabed(sea))) {
           continue;
         }
       } else if (entry.entityType === "record") {
         if (!ledgerSet.has(entry.realmId)) continue;
-        const rec = this.db.getRecord(entry.entityId);
+        const rec = recsMap.get(entry.entityId);
         if (rec && (rec.sensitivity === "secret" || !vis.canSeeRecord(rec))) {
           continue;
         }
@@ -1881,14 +2675,20 @@ export class SeaEngine {
         if (!ledgerSet.has(entry.realmId) && !seabedSet.has(entry.realmId)) {
           continue;
         }
-        const entryId = entry.entityId.split(":")[0] ?? "";
-        const rec = this.db.getRecord(entryId);
+        const [entryId = "", objId] = entry.entityId.split(":");
+        const rec = recsMap.get(entryId);
         if (rec && (rec.sensitivity === "secret" || !vis.canSeeRecord(rec))) {
           continue;
         }
-        const sea = rec ? null : this.db.getSeabedEntry(entryId);
+        const sea = rec ? undefined : seasMap.get(entryId);
         if (sea && (sea.sensitivity === "secret" || !vis.canSeeSeabed(sea))) {
           continue;
+        }
+        if (entry.entityType === "entry_object" && objId) {
+          const obj = objsMap.get(objId);
+          if (obj && !scope.readableLedgerIds.includes(obj.realmId)) {
+            continue;
+          }
         }
       } else if (entry.realmId !== "__org__" && !ledgerSet.has(entry.realmId)) {
         continue;

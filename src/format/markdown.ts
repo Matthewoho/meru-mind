@@ -3,6 +3,7 @@ import type {
   BriefOutput,
   CatResult,
   ChangesResult,
+  ImportConsistencyResult,
   ImportJsonlResult,
   ImportMdResult,
   LedgerRecord,
@@ -10,6 +11,7 @@ import type {
   LsResult,
   MindObject,
   ObjectTreeNode,
+  RealmTreeCounts,
   RealmTreeNode,
   RecallResult,
   ReplayResult,
@@ -25,6 +27,33 @@ export function formatBehaviorBadge(
   if (behaviorClass === "rule") return "[rule]";
   const detail = extKind || kind;
   return detail ? `[${behaviorClass}/${detail}]` : `[${behaviorClass}]`;
+}
+
+function formatDateLabel(occurredAt: string | null): string {
+  return occurredAt ?? "undated";
+}
+
+function formatCountsTag(counts: RealmTreeCounts, collapsedChildren: number): string {
+  const rawStr = counts.directRaw === null ? "—" : String(counts.directRaw);
+  const parts: string[] = [
+    `rules=${counts.directRules}`,
+    `conclusions=${counts.directConclusions}`,
+    `raw=${rawStr}`,
+    `objects=${counts.directObjects}`,
+  ];
+  if (counts.subtreeConclusions !== null) {
+    const subRaw = counts.subtreeRaw === null ? "—" : String(counts.subtreeRaw);
+    parts.push(
+      `subtree(conclusions=${counts.subtreeConclusions}, raw=${subRaw})`,
+    );
+  }
+  if (counts.linkedViaObjects !== null && counts.linkedViaObjects > 0) {
+    parts.push(`linked=${counts.linkedViaObjects}`);
+  }
+  if (collapsedChildren > 0) {
+    parts.push(`+${collapsedChildren} child realm(s)`);
+  }
+  return `[${parts.join(", ")}]`;
 }
 
 function renderObjectTreeLines(
@@ -46,7 +75,14 @@ function renderRealmTreeLines(nodes: RealmTreeNode[], indent = ""): string[] {
   const lines: string[] = [];
   for (const node of nodes) {
     const r = node.realm;
-    lines.push(`${indent}- **${r.path}** — ${r.name} (\`${r.id}\`)`);
+    const collapsed = Math.max(
+      0,
+      node.counts.childRealmsCount - node.children.length,
+    );
+    const countsStr = formatCountsTag(node.counts, collapsed);
+    lines.push(
+      `${indent}- **${r.path}** — ${r.name} (\`${r.id}\`) ${countsStr}`,
+    );
     if (node.objects.length > 0) {
       lines.push(...renderObjectTreeLines(node.objects, `${indent}  `));
     }
@@ -59,7 +95,7 @@ function renderRealmTreeLines(nodes: RealmTreeNode[], indent = ""): string[] {
 
 export function formatTreeMarkdown(res: TreeResult): string {
   const lines: string[] = [
-    `# Tree: ${res.org.name} (\`${res.org.id}\`, policy: \`${res.org.policy}\`)`,
+    `# Tree: ${res.org.name} (\`${res.org.id}\`, policy: \`${res.org.policy}\`, depth: \`${String(res.depth)}\`)`,
     "",
     `## Realms (${res.realms.length})`,
   ];
@@ -68,11 +104,22 @@ export function formatTreeMarkdown(res: TreeResult): string {
   } else {
     lines.push(...renderRealmTreeLines(res.realmTree));
   }
-  lines.push("", `## Objects (${res.objects.length})`);
-  if (res.objectTree.length === 0) {
-    lines.push("- _(none)_");
-  } else {
-    lines.push(...renderObjectTreeLines(res.objectTree));
+  if (res.includeObjects) {
+    lines.push("", `## Objects (${res.objects.length})`);
+    if (res.objectTree.length === 0) {
+      lines.push("- _(none)_");
+    } else {
+      lines.push(...renderObjectTreeLines(res.objectTree));
+    }
+  }
+
+  const cap = Math.max(1, res.lineLimit || 60);
+  if (lines.length > cap) {
+    const omitted = lines.length - cap;
+    return [
+      ...lines.slice(0, cap),
+      `... and ${omitted} more (drill down: meru-mind tree <path> -L 2, or increase --limit ${cap + 60})`,
+    ].join("\n");
   }
   return lines.join("\n");
 }
@@ -82,21 +129,35 @@ function formatLsEntryLine(item: LsEntry): string {
   const tags =
     item.resourceTags.length > 0 ? ` {${item.resourceTags.join(", ")}}` : "";
   const ext = item.externalRef ? ` <${item.externalRef}>` : "";
-  const statusTag = item.status !== "active" && item.status !== "evidence" ? ` (${item.status})` : "";
-  return `- ${badge} \`${item.id}\` ${item.title}${ext}${statusTag} — ${item.realmPath} @ ${item.occurredAt}${tags}`;
+  const statusTag =
+    item.status !== "active" && item.status !== "evidence"
+      ? ` (${item.status})`
+      : "";
+  return `- ${badge} \`${item.id}\` ${item.title}${ext}${statusTag} — ${item.realmPath} @ ${formatDateLabel(item.occurredAt)}${tags}`;
 }
 
 export function formatLsMarkdown(res: LsResult): string {
   const lines: string[] = [
     `# ls ${res.targetType}: \`${res.target}\` (resolved: \`${res.resolvedId}\`)`,
     `Showing ${res.items.length} of ${res.totalMatched} (omitted: ${res.omittedCount})`,
-    "",
   ];
+  if (res.subRealms && res.subRealms.length > 0) {
+    lines.push(
+      `Sub-realms (${res.subRealms.length}): ${res.subRealms.map((s) => `\`${s.path}\``).join(", ")}`,
+    );
+  }
+  lines.push("");
   if (res.items.length === 0) {
     lines.push("_(empty)_");
   } else {
     for (const item of res.items) {
       lines.push(formatLsEntryLine(item));
+    }
+    if (res.omittedCount > 0) {
+      const pageSize = Math.max(1, res.items.length);
+      lines.push(
+        `... and ${res.omittedCount} more (next page: meru-mind ls ${res.target} --offset ${res.items.length} --limit ${pageSize}; inspect: meru-mind cat <id>)`,
+      );
     }
   }
   if (res.driveFiles && res.driveFiles.length > 0) {
@@ -117,22 +178,32 @@ export function formatCatMarkdown(res: CatResult): string {
       "",
       `- **ID**: \`${r.id}\``,
       `- **Realm**: \`${res.realmPath}\` (\`${r.realmId}\`)`,
-      `- **Status**: \`${r.status}\``,
+      `- **Status**: \`${r.status}\`${res.orphanSuperseded ? " _(orphan superseded)_" : ""}`,
       `- **Author**: \`${r.authorId}\` (${r.authorKind}, confirmedByHuman: ${r.confirmedByHuman})`,
-      `- **Occurred**: ${r.occurredAt}`,
+      `- **Occurred**: ${formatDateLabel(r.occurredAt)}`,
       `- **Sensitivity**: \`${r.sensitivity}\``,
     ];
     if (r.externalRef) lines.push(`- **External Ref**: \`${r.externalRef}\``);
     if (r.sourceRef) lines.push(`- **Source Ref**: \`${r.sourceRef}\``);
-    if (r.supersedesId) lines.push(`- **Supersedes**: \`${r.supersedesId}\``);
+    if (r.supersedesIds && r.supersedesIds.length > 1) {
+      lines.push(
+        `- **Supersedes**: ${r.supersedesIds.map((id) => `\`${id}\``).join(", ")}`,
+      );
+    } else if (r.supersedesId) {
+      lines.push(`- **Supersedes**: \`${r.supersedesId}\``);
+    }
     if (r.supersededById)
       lines.push(`- **Superseded By**: \`${r.supersededById}\``);
     if (res.currentHeadId)
       lines.push(`- **Current Head**: \`${res.currentHeadId}\``);
     if (res.objectIds.length > 0)
-      lines.push(`- **Objects**: ${res.objectIds.map((o) => `\`${o}\``).join(", ")}`);
+      lines.push(
+        `- **Objects**: ${res.objectIds.map((o) => `\`${o}\``).join(", ")}`,
+      );
     if (res.resourceTags.length > 0)
-      lines.push(`- **Tags**: ${res.resourceTags.map((t) => `\`${t}\``).join(", ")}`);
+      lines.push(
+        `- **Tags**: ${res.resourceTags.map((t) => `\`${t}\``).join(", ")}`,
+      );
     if (r.refs.length > 0)
       lines.push(`- **Refs**: ${r.refs.map((ref) => `\`${ref}\``).join(", ")}`);
 
@@ -167,14 +238,18 @@ export function formatCatMarkdown(res: CatResult): string {
       `- **ID**: \`${s.id}\``,
       `- **Realm**: \`${res.realmPath}\` (\`${s.realmId}\`)`,
       `- **Author**: \`${s.authorId}\` (${s.authorKind})`,
-      `- **Occurred**: ${s.occurredAt}`,
+      `- **Occurred**: ${formatDateLabel(s.occurredAt)}`,
       `- **Sensitivity**: \`${s.sensitivity}\``,
     ];
     if (s.sourceRef) lines.push(`- **Source Ref**: \`${s.sourceRef}\``);
     if (res.objectIds.length > 0)
-      lines.push(`- **Objects**: ${res.objectIds.map((o) => `\`${o}\``).join(", ")}`);
+      lines.push(
+        `- **Objects**: ${res.objectIds.map((o) => `\`${o}\``).join(", ")}`,
+      );
     if (res.resourceTags.length > 0)
-      lines.push(`- **Tags**: ${res.resourceTags.map((t) => `\`${t}\``).join(", ")}`);
+      lines.push(
+        `- **Tags**: ${res.resourceTags.map((t) => `\`${t}\``).join(", ")}`,
+      );
     lines.push("", "## Content", "", s.text);
     return lines.join("\n");
   }
@@ -216,6 +291,14 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
       `Buckets: **rules**=${brief.buckets.rules}, **conclusions**=${brief.buckets.conclusions}, **raw**=${brief.buckets.raw}`,
     );
   }
+  const histEntries = Object.entries(brief.kindHistogram ?? {}).sort(([a], [b]) =>
+    a.localeCompare(b),
+  );
+  if (histEntries.length > 0) {
+    lines.push(
+      `Kinds: ${histEntries.map(([k, c]) => `${k}=${c}`).join(", ")}`,
+    );
+  }
 
   // Bucket 1: Rules
   lines.push(
@@ -232,10 +315,23 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
     }
   }
 
-  // Bucket 2: Conclusions (Pending Questions, Things, Decisions, Realm Card)
+  // Bucket 2: Conclusions
   lines.push(
     "",
     `## Conclusions`,
+    `### Recent Conclusions (${brief.recentConclusions.items.length}/${brief.recentConclusions.totalCount}, omitted: ${brief.recentConclusions.omittedCount})`,
+  );
+  if (brief.recentConclusions.items.length === 0) {
+    lines.push("- _(none)_");
+  } else {
+    for (const c of brief.recentConclusions.items) {
+      lines.push(
+        `- [conclusion/${c.kind}] \`${c.id}\` ${c.title} @ ${formatDateLabel(c.occurredAt)}`,
+      );
+    }
+  }
+
+  lines.push(
     `### Pending Human Questions (${brief.upperLedger.pendingQuestions.items.length}/${brief.upperLedger.pendingQuestions.totalCount}, omitted: ${brief.upperLedger.pendingQuestions.omittedCount})`,
   );
   if (brief.upperLedger.pendingQuestions.items.length === 0) {
@@ -291,7 +387,7 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
   } else {
     for (const m of brief.surface.recentMessages.items) {
       lines.push(
-        `- [raw/${m.kind}] \`${m.id}\` (${m.authorId} @ ${m.occurredAt}): ${m.text}`,
+        `- [raw/${m.kind}] \`${m.id}\` (${m.authorId} @ ${formatDateLabel(m.occurredAt)}): ${m.text}`,
       );
     }
   }
@@ -299,11 +395,16 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
   if (brief.middleMind.childSummaries.totalCount > 0) {
     lines.push(
       "",
-      `## Child Realms (${brief.middleMind.childSummaries.items.length}/${brief.middleMind.childSummaries.totalCount}, omitted: ${brief.middleMind.childSummaries.omittedCount})`,
+      `## Child Realms (${brief.middleMind.childSummaries.items.length}/${brief.middleMind.childSummaries.totalCount}, omitted: ${brief.omittedChildRealmsCount})`,
     );
     for (const c of brief.middleMind.childSummaries.items) {
       lines.push(
         `- **${c.realmPath}** (${c.realmName}): things=${c.activeThings}, decisions=${c.activeDecisions}, pendingQ=${c.pendingQuestions}`,
+      );
+    }
+    if (brief.omittedChildRealmsCount > 0) {
+      lines.push(
+        `... and ${brief.omittedChildRealmsCount} more (explore: meru-mind tree ${brief.realm.path} -L 1, or meru-mind brief ${brief.realm.path} --max-children ${brief.middleMind.childSummaries.totalCount})`,
       );
     }
   }
@@ -313,7 +414,7 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
 
 export function formatReplayMarkdown(res: ReplayResult): string {
   const lines: string[] = [
-    `# Replay: \`${res.anchorId}\` (${res.anchorOccurredAt}, window: ±${res.window})`,
+    `# Replay: \`${res.anchorId}\` (${formatDateLabel(res.anchorOccurredAt)}, basis: \`${res.timeBasis}\`, window: ±${res.window})`,
     "",
     `## Before (${res.before.length})`,
   ];
@@ -340,7 +441,7 @@ export function formatReplayMarkdown(res: ReplayResult): string {
     lines.push("", `## Supersede Chain (${res.supersedeChain.length})`);
     for (const node of res.supersedeChain) {
       lines.push(
-        `- \`${node.id}\` (${node.status}) ${node.title} @ ${node.occurredAt}`,
+        `- \`${node.id}\` (${node.status}) ${node.title} @ ${formatDateLabel(node.occurredAt)}`,
       );
     }
   }
@@ -383,12 +484,18 @@ export function formatRecallMarkdown(res: RecallResult): string {
             ? "rule"
             : "conclusion");
       const badge = formatBehaviorBadge(cls, item.kind);
-      const headHint =
-        item.currentHeadId !== undefined
+      const headHint = item.orphanSuperseded
+        ? " (orphan superseded)"
+        : item.currentHeadId !== undefined
           ? ` -> head:\`${item.currentHeadId ?? "none"}\``
           : "";
       lines.push(
-        `- ${badge} \`${item.id}\` **${item.title}** (${item.status}${headHint}) — ${item.snippet}`,
+        `- ${badge} \`${item.id}\` **${item.title}** (${item.status}${headHint}, @ ${formatDateLabel(item.occurredAt)}) — ${item.snippet}`,
+      );
+    }
+    if (res.omittedCount > 0) {
+      lines.push(
+        `... and ${res.omittedCount} more (next page: --offset ${res.items.length}; inspect: meru-mind cat <id>)`,
       );
     }
   }
@@ -399,8 +506,9 @@ export function formatThingsMarkdown(
   items: LedgerRecord[],
   total: number,
 ): string {
+  const omitted = Math.max(0, total - items.length);
   const lines: string[] = [
-    `# Things (${items.length}/${total})`,
+    `# Things (${items.length}/${total}, omitted: ${omitted})`,
     "",
   ];
   if (items.length === 0) {
@@ -412,12 +520,24 @@ export function formatThingsMarkdown(
         `- [conclusion/thing] \`${t.id}\` **${t.title}**${ext} (realm \`${t.realmId}\`, ${t.status})`,
       );
     }
+    if (omitted > 0) {
+      lines.push(
+        `... and ${omitted} more (next page: meru-mind thing list --offset ${items.length})`,
+      );
+    }
   }
   return lines.join("\n");
 }
 
-export function formatObjectsMarkdown(objects: MindObject[]): string {
-  const lines: string[] = [`# Objects (${objects.length})`, ""];
+export function formatObjectsMarkdown(
+  objects: MindObject[],
+  total = objects.length,
+): string {
+  const omitted = Math.max(0, total - objects.length);
+  const lines: string[] = [
+    `# Objects (${objects.length}/${total}${omitted > 0 ? `, omitted: ${omitted}` : ""})`,
+    "",
+  ];
   if (objects.length === 0) {
     lines.push("_(none)_");
   } else {
@@ -427,17 +547,34 @@ export function formatObjectsMarkdown(objects: MindObject[]): string {
         `- \`${o.kind}\` **${o.name}** (\`${o.id}\`, realm \`${o.realmId}\`${parent})`,
       );
     }
+    if (omitted > 0) {
+      lines.push(
+        `... and ${omitted} more (list more: meru-mind object list --limit ${objects.length + 50}; inspect: meru-mind ls obj:<id>)`,
+      );
+    }
   }
   return lines.join("\n");
 }
 
-export function formatTagsMarkdown(tags: ResourceTagSummary[]): string {
-  const lines: string[] = [`# Resource Tags (${tags.length})`, ""];
+export function formatTagsMarkdown(
+  tags: ResourceTagSummary[],
+  total = tags.length,
+): string {
+  const omitted = Math.max(0, total - tags.length);
+  const lines: string[] = [
+    `# Resource Tags (${tags.length}/${total}${omitted > 0 ? `, omitted: ${omitted}` : ""})`,
+    "",
+  ];
   if (tags.length === 0) {
     lines.push("_(none)_");
   } else {
     for (const t of tags) {
       lines.push(`- \`${t.tag}\` (${t.count})`);
+    }
+    if (omitted > 0) {
+      lines.push(
+        `... and ${omitted} more (list more: meru-mind tag list --limit ${tags.length + 50}; inspect: meru-mind ls tag:<type:name>)`,
+      );
     }
   }
   return lines.join("\n");
@@ -452,13 +589,18 @@ export function formatImportMdMarkdown(res: ImportMdResult): string {
     `- Skipped (unchanged): ${res.skippedUnchanged}`,
     `- Skipped (redacted): ${res.skippedRedacted}`,
     `- Skipped (secret): ${res.skippedSecret}`,
+    `- Undated: ${res.undatedCount}`,
+    `- Default realm fallback: ${res.defaultRealmCount}`,
   ];
   if (res.items.length > 0) {
     lines.push("");
-    for (const it of res.items) {
+    for (const it of res.items.slice(0, 50)) {
       lines.push(
         `- \`${it.action}\` \`${it.sourceRef}\`${it.recordId ? ` -> \`${it.recordId}\`` : ""}${it.supersedesId ? ` (supersedes \`${it.supersedesId}\`)` : ""}`,
       );
+    }
+    if (res.items.length > 50) {
+      lines.push(`... and ${res.items.length - 50} more`);
     }
   }
   return lines.join("\n");
@@ -473,7 +615,40 @@ export function formatImportJsonlMarkdown(res: ImportJsonlResult): string {
     `- Skipped (secret): ${res.skippedSecret}`,
     `- Skipped (redacted): ${res.skippedRedacted}`,
     `- Tree-degraded cross-realm supersedes: ${res.treeDegradedCrossRealmSupersedes}`,
+    `- Undated: ${res.undatedCount}`,
+    `- Default realm fallback: ${res.defaultRealmCount}`,
   ].join("\n");
+}
+
+export function formatImportVerifyMarkdown(
+  res: ImportConsistencyResult,
+): string {
+  const lines: string[] = [
+    `# import-verify: ${res.passed ? "PASSED" : "FAILED"}`,
+    `- Checked: ${res.totalChecked}`,
+    `- Missing: ${res.missingCount}`,
+    `- Active/Superseded mismatches: ${res.activeSupersededMismatches.length}`,
+    `- Timestamp mismatches: ${res.timestampMismatches.length}`,
+    `- Undated: ${res.undatedCount}`,
+    `- Default realm fallback: ${res.defaultRealmFallbackCount}`,
+  ];
+  if (res.activeSupersededMismatches.length > 0) {
+    lines.push("", "## Active/Superseded Mismatches");
+    for (const m of res.activeSupersededMismatches.slice(0, 20)) {
+      lines.push(
+        `- \`${m.sourceRef}\` (\`${m.recordId ?? "missing"}\`): expected \`${m.expected}\`, got \`${m.actual}\``,
+      );
+    }
+  }
+  if (res.timestampMismatches.length > 0) {
+    lines.push("", "## Timestamp Mismatches");
+    for (const m of res.timestampMismatches.slice(0, 20)) {
+      lines.push(
+        `- \`${m.sourceRef}\` (\`${m.recordId ?? "missing"}\`): expected \`${m.expected ?? "null"}\`, got \`${m.actual ?? "null"}\``,
+      );
+    }
+  }
+  return lines.join("\n");
 }
 
 export function formatGenericMarkdown(title: string, data: unknown): string {

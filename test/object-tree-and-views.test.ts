@@ -273,7 +273,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
           const rec = db.getRecord("rec_v2_legacy");
           const bySource = db.findActiveRecordBySourceRef("org_v2", "docs/legacy-note.md");
           const byExt = db.findRecordsByExternalRef("org_v2", "tracker:LEG-99");
-          if (migrations.join(",") !== "1,2,3") {
+          if (migrations.join(",") !== "1,2,3,4") {
             throw new Error("unexpected migrations: " + migrations.join(","));
           }
           if (!rec || rec.sourceRef !== "docs/legacy-note.md" || rec.externalRef !== "tracker:LEG-99") {
@@ -609,7 +609,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
     const treeLsTag = await engine.sea.ls({
       actor: agentBot,
       viewerRealmId: beta.id,
-      target: "svc:beta-shared",
+      target: "tag:svc:beta-shared",
     });
     expect(treeLsTag.items).toHaveLength(0);
     expect(
@@ -675,17 +675,19 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       payload: { detail: "Configure gateway timeout budget cleanly" },
     });
 
-    // Query from beta: multiRec gets focus+self boost via objBeta and outranks controlGamma by >= 0.35
+    // Query from beta with explicit opt-in focusBoost=true: multiRec gets intra-band focus tie-breaker via objBeta
     const recallFromBeta = await engine.sea.recall({
       actor: agentBot,
       viewerRealmId: beta.id,
       query: "Gateway timeout budget",
+      focusBoost: true,
     });
     const multiHit = recallFromBeta.items.find((i) => i.id === multiRec.id);
     const gammaHit = recallFromBeta.items.find((i) => i.id === controlGamma.id);
     expect(multiHit).toBeDefined();
     expect(gammaHit).toBeDefined();
-    expect(multiHit!.score - gammaHit!.score).toBeGreaterThanOrEqual(0.35);
+    expect(recallFromBeta.items[0]!.id).toBe(multiRec.id);
+    expect(multiHit!.score).toBeGreaterThan(gammaHit!.score);
 
     // Open-mode cross-realm supersede: v2 in beta supersedes v1 in alpha atomically (zero dual-active)
     const v2InBeta = await engine.ledger.appendRecord({
@@ -943,11 +945,11 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
         expect(props).not.toHaveProperty("actorKind");
       }
 
-      // Narrowing to child C2 MUST NOT expose C1's mounted items, C2's seabed (without flag), or secretB2
+      // Narrowing focus to child C2 MUST NOT expose C1's mounted items, C2's seabed (without flag), or secretB2
       const lsC2 = parseText(
         await client.callTool({
           name: "mind_ls",
-          arguments: { viewerRealmId: c2.id, target: c2.id },
+          arguments: { focus: c2.id, target: c2.id },
         }),
       ) as { items: Array<{ id: string; refs: string[] }> };
       const c2Item = lsC2.items.find((i) => i.id === recC2.id);
@@ -957,19 +959,19 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       // C2 seabed is blocked by bound B2 ceiling without includeDescendantSeabed
       expect(lsC2.items.some((i) => i.id === seaC2.id)).toBe(false);
 
-      // mind_cat on C1's record via narrowed C2 MUST fail with NOT_FOUND
+      // mind_cat on C1's record via narrowed focus C2 MUST fail with NOT_FOUND
       const catC1 = await client.callTool({
         name: "mind_cat",
-        arguments: { viewerRealmId: c2.id, target: recC1.id },
+        arguments: { focus: c2.id, target: recC1.id },
       });
       expect(catC1.isError).toBe(true);
       expect(parseText(catC1).error).toBe("NOT_FOUND");
 
-      // mind_list_objects & mind_list_tags via narrowed C2 MUST exclude C1 and secretB2
+      // mind_list_objects & mind_list_tags via narrowed focus C2 MUST exclude C1 and secretB2
       const objsC2 = parseText(
         await client.callTool({
           name: "mind_list_objects",
-          arguments: { viewerRealmId: c2.id },
+          arguments: { focus: c2.id },
         }),
       ) as unknown as Array<{ id: string }>;
       expect(objsC2.some((o) => o.id === objC1.id)).toBe(false);
@@ -977,7 +979,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       const tagsB2 = parseText(
         await client.callTool({
           name: "mind_list_tags",
-          arguments: { viewerRealmId: c2.id },
+          arguments: { focus: c2.id },
         }),
       ) as unknown as Array<{ tag: string }>;
       expect(tagsB2.some((t) => t.tag === "svc:hidden-c1")).toBe(false);
@@ -1000,7 +1002,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       const changesB2 = parseText(
         await client.callTool({
           name: "mind_changes",
-          arguments: { viewerRealmId: c2.id, sinceSeq: 0 },
+          arguments: { focus: c2.id, sinceSeq: 0 },
         }),
       ) as { entries: Array<{ entityId: string }> };
       const changeIds = changesB2.entries.map((e) => e.entityId);
@@ -1009,14 +1011,12 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       expect(changeIds).not.toContain(secretB2.id);
 
       // ---- K14 REGRESSION KILLER ----
-      // Bound viewer is B2. Passing narrowed viewerRealmId = C2 while writing to targetRealmId = B2
-      // MUST pass boundViewerRealmId (B2) into the engine (so self-write to B2 succeeds across all write tools;
-      // a K14 mutant passing C2 would fail ACCESS_DENIED because C2 cannot write to ancestor B2!).
+      // Bound viewer is B2. Write tools NEVER accept focus/viewer overrides and always bind writes
+      // to boundViewerRealmId (B2), accepting target as path OR ID!
       const k14Append = await client.callTool({
         name: "mind_append_record",
         arguments: {
-          viewerRealmId: c2.id,
-          targetRealmId: b2.id,
+          target: b2.id,
           kind: "decision",
           title: "K14 guard append_record",
         },
@@ -1027,8 +1027,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       const k14WriteConc = await client.callTool({
         name: "mind_write_conclusion",
         arguments: {
-          viewerRealmId: c2.id,
-          targetRealmId: b2.id,
+          target: "/b2",
           kind: "claim",
           title: "K14 guard write_conclusion",
         },
@@ -1038,8 +1037,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       const k14Capture = await client.callTool({
         name: "mind_capture_seabed",
         arguments: {
-          viewerRealmId: c2.id,
-          targetRealmId: b2.id,
+          target: b2.id,
           kind: "message",
           text: "K14 guard capture_seabed",
         },
@@ -1049,8 +1047,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       const k14WriteRaw = await client.callTool({
         name: "mind_write_raw",
         arguments: {
-          viewerRealmId: c2.id,
-          targetRealmId: b2.id,
+          target: "/b2",
           kind: "signal",
           text: "K14 guard write_raw",
         },
@@ -1060,8 +1057,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       const k14Drive = await client.callTool({
         name: "mind_drive_write",
         arguments: {
-          viewerRealmId: c2.id,
-          targetRealmId: b2.id,
+          target: b2.id,
           relPath: "k14.md",
           content: "ok",
         },
@@ -1071,8 +1067,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       const k14Settle = await client.callTool({
         name: "mind_settle",
         arguments: {
-          viewerRealmId: c2.id,
-          targetRealmId: b2.id,
+          target: "/b2",
           layer: "card_realm",
           periodKey: "2026-11-21",
         },
@@ -1083,8 +1078,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       const smuggleRef = await client.callTool({
         name: "mind_append_record",
         arguments: {
-          viewerRealmId: c2.id,
-          targetRealmId: b2.id,
+          target: b2.id,
           kind: "decision",
           title: "Attempt to smuggle C1 ref into B2",
           refs: [recC1.id],
@@ -1117,11 +1111,10 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       "Operations",
     ]) as { id: string; path: string };
 
-    // Create object, thing, rule, conclusion, raw, and settle card via CLI
+    // Create object, thing, rule, conclusion, raw, and settle card via CLI (positional <targetRealm>, zero --realm)
     const obj = runCliJson(homeDir, [
       "object",
       "create",
-      "--realm",
       "/ops",
       "--kind",
       "service",
@@ -1132,10 +1125,9 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
     runCliJson(homeDir, [
       "--as-human",
       "write",
+      "/ops",
       "--class",
       "rule",
-      "--realm",
-      "/ops",
       "--title",
       "Never skip healthchecks",
     ]);
@@ -1143,7 +1135,6 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
     const thing = runCliJson(homeDir, [
       "thing",
       "create",
-      "--realm",
       "/ops",
       "--title",
       "Gateway Rollout",
@@ -1157,12 +1148,11 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
 
     const dec1 = runCliJson(homeDir, [
       "write",
+      "/ops",
       "--class",
       "conclusion",
       "--kind",
       "decision",
-      "--realm",
-      "/ops",
       "--title",
       "Enable canary rollout",
       "--occurred-at",
@@ -1175,12 +1165,11 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
 
     runCliJson(homeDir, [
       "write",
+      "/ops",
       "--class",
       "raw",
       "--kind",
       "message",
-      "--realm",
-      "/ops",
       "--text",
       "Canary traffic at 10 percent",
       "--occurred-at",
@@ -1190,7 +1179,6 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
     // Settle a narrative card, then write 1 more entry so changesSinceCard >= 1
     runCliJson(homeDir, [
       "settle",
-      "--realm",
       "/ops",
       "--layer",
       "card_realm",
@@ -1202,12 +1190,11 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
 
     const dec2 = runCliJson(homeDir, [
       "write",
+      "/ops",
       "--class",
       "conclusion",
       "--kind",
       "decision",
-      "--realm",
-      "/ops",
       "--title",
       "Promote canary to 100 percent",
       "--supersedes",
@@ -1217,28 +1204,28 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
     ]) as { id: string };
 
     // Default CLI output (NO --json) is compact Markdown
-    const treeMd = runCliRaw(homeDir, ["tree", "--realm", "/ops"]);
+    const treeMd = runCliRaw(homeDir, ["tree"]);
     expect(treeMd).toContain("# Tree: DemoOrg");
     expect(treeMd).toContain("/ops");
     expect(treeMd).toContain("Gateway");
 
-    const lsMd = runCliRaw(homeDir, ["ls", "/ops", "--realm", "/ops"]);
+    const lsMd = runCliRaw(homeDir, ["ls", "/ops"]);
     expect(lsMd).toContain("# ls realm:");
     expect(lsMd).toContain("[rule]");
     expect(lsMd).toContain("[conclusion/decision]");
     expect(lsMd).toContain("[raw/message]");
 
-    const catMd = runCliRaw(homeDir, ["cat", dec2.id, "--realm", "/ops"]);
+    const catMd = runCliRaw(homeDir, ["cat", dec2.id]);
     expect(catMd).toContain("# [conclusion/decision] Promote canary to 100 percent");
     expect(catMd).toContain(dec1.id);
 
-    const briefMd = runCliRaw(homeDir, ["brief", "--realm", "/ops"]);
+    const briefMd = runCliRaw(homeDir, ["brief", "/ops"]);
     expect(briefMd).toContain("# Brief: Operations");
     expect(briefMd).toContain("Buckets:");
     expect(briefMd).toContain("## Narrative Card (seq:");
     expect(briefMd).toContain("changes since card:");
 
-    const briefJson = runCliJson(homeDir, ["brief", "--realm", "/ops"]) as {
+    const briefJson = runCliJson(homeDir, ["brief", "/ops"]) as {
       buckets: { rules: number; conclusions: number; raw: number };
       middleMind: {
         realmCardMeta: { cardSeq: number; changesSinceCard: number };
@@ -1255,8 +1242,6 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
     const replayMd = runCliRaw(homeDir, [
       "replay",
       dec2.id,
-      "--realm",
-      "/ops",
       "--window",
       "5",
     ]);
@@ -1265,17 +1250,16 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
 
     const changesMd = runCliRaw(homeDir, [
       "changes",
-      "--realm",
       "/ops",
       "--since",
       "0",
     ]);
     expect(changesMd).toContain("# Changes (generation: 1");
 
-    const tagsMd = runCliRaw(homeDir, ["tag", "list", "--realm", "/ops"]);
+    const tagsMd = runCliRaw(homeDir, ["tag", "list", "/ops"]);
     expect(tagsMd).toContain("svc:gateway");
 
-    const thingsMd = runCliRaw(homeDir, ["thing", "list", "--realm", "/ops"]);
+    const thingsMd = runCliRaw(homeDir, ["thing", "list", "/ops"]);
     expect(thingsMd).toContain(thing.id);
     expect(thingsMd).toContain("tracker:OPS-7");
   });
@@ -1404,15 +1388,15 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       actor: agentBot,
       viewerRealmId: realmB.id,
       query: "Quartz telemetry sampling",
+      focusBoost: true,
     });
     const unlinkedHit = treeRecall.items.find((i) => i.id === childUnlinked.id);
     const linkedHit = treeRecall.items.find((i) => i.id === childLinkedToB.id);
     expect(unlinkedHit).toBeDefined();
     expect(linkedHit).toBeDefined();
-    // Max Tier 3 active record score with zero focusBonus is 30 + 1.0 * 1.35 = 31.35.
-    // If tree mode erroneously applied focusBonus (+0.35 or +0.05 via objInB), linkedHit.score would exceed 31.36!
-    expect(linkedHit!.score).toBeLessThanOrEqual(31.36);
-    expect(unlinkedHit!.score).toBeLessThanOrEqual(31.36);
-    expect(Math.abs(linkedHit!.score - unlinkedHit!.score)).toBeLessThan(0.03);
+    // Both records are in realmC (same tier, status, relevance band); tree mode MUST NOT amplify
+    // via entry_objects into realmB, so newer childUnlinked ranks strictly before older childLinkedToB.
+    expect(treeRecall.items[0]!.id).toBe(childUnlinked.id);
+    expect(linkedHit!.score).toBe(unlinkedHit!.score);
   });
 });

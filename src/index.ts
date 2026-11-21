@@ -25,6 +25,7 @@ export {
   normalizeForFts,
   parseSearchQuery,
   buildFtsMatchExpression,
+  CJK_COVERAGE_THRESHOLD,
   type SearchConcept,
   type ParsedSearchQuery,
 } from "./adapters/sqlite-db.js";
@@ -69,8 +70,14 @@ export {
 export {
   createVisibilityHelpers,
   parseDriveSourceRef,
+  sanitizeRealmsForScope,
   type VisibilityHelpers,
 } from "./engine/visibility.js";
+export {
+  buildSnippet,
+  extractReadableText,
+  type SnippetConceptLike,
+} from "./format/snippet.js";
 export { SeaEngine } from "./engine/sea.js";
 export {
   SliceExporter,
@@ -84,6 +91,7 @@ export {
   formatGenericMarkdown,
   formatImportJsonlMarkdown,
   formatImportMdMarkdown,
+  formatImportVerifyMarkdown,
   formatLsMarkdown,
   formatObjectsMarkdown,
   formatRecallMarkdown,

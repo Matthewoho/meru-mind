@@ -83,7 +83,9 @@ describe("Ledger invariants: supersede chains, human-only rules, verdicts & blin
       viewerRealmId: rootRealm.id,
       recordId: v2.id,
     });
-    expect(chain.map((r) => r.id)).toEqual([v1.id, v2.id]);
+    expect(chain.nodes.map((r) => r.id)).toEqual([v1.id, v2.id]);
+    expect(chain.currentHeadId).toBe(v2.id);
+    expect(chain.orphanSuperseded).toBe(false);
 
     // Double-superseding v1 is rejected with CONFLICT
     await expect(

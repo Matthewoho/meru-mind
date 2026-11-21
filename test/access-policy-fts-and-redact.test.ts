@@ -46,11 +46,15 @@ afterEach(async () => {
 const humanAlice: Actor = { id: "alice", kind: "human" };
 const agentWorker: Actor = { id: "worker-1", kind: "agent", family: "gemini" };
 
-function runCli(homeDir: string, args: string[]): unknown {
+function runCli(
+  homeDir: string,
+  args: string[],
+  extraEnv?: Record<string, string>,
+): unknown {
   const out = execFileSync(
     process.execPath,
     [cliBin, "--home", homeDir, "--json", ...args],
-    { encoding: "utf8" },
+    { encoding: "utf8", env: extraEnv ? { ...process.env, ...extraEnv } : process.env },
   );
   return JSON.parse(out.trim()) as unknown;
 }
@@ -58,12 +62,17 @@ function runCli(homeDir: string, args: string[]): unknown {
 function runCliFail(
   homeDir: string,
   args: string[],
+  extraEnv?: Record<string, string>,
 ): { status: number; stderr: string } {
   try {
     execFileSync(
       process.execPath,
       [cliBin, "--home", homeDir, "--json", ...args],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+      },
     );
     throw new Error("Expected CLI command to fail");
   } catch (err: unknown) {
@@ -297,12 +306,12 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       expect(forgedDecision.confirmedByHuman).toBe(false);
       expect(forgedDecision.authorId).toBe("b2-agent");
 
-      // Narrowing viewerRealmId to child C2 MUST intersect scope(C2) ∩ scope(B2):
+      // Narrowing focus to child C2 MUST intersect scope(C2) ∩ scope(B2):
       // 1) C2's ledger IS visible
       const c2LedgerHit = parseText(
         await treeClient.callTool({
           name: "mind_recall",
-          arguments: { viewerRealmId: C2.id, query: "MCP_C2_LEDGER_101" },
+          arguments: { focus: C2.id, query: "MCP_C2_LEDGER_101" },
         }),
       ) as { items: Array<{ id: string }> };
       expect(c2LedgerHit.items.some((i) => i.id === c2Rec.id)).toBe(true);
@@ -311,7 +320,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       const mountQueryLeak = parseText(
         await treeClient.callTool({
           name: "mind_recall",
-          arguments: { viewerRealmId: C2.id, query: "MCP_MOUNT_ESCALATION_991" },
+          arguments: { focus: C2.id, query: "MCP_MOUNT_ESCALATION_991" },
         }),
       ) as { items: unknown[] };
       expect(mountQueryLeak.items).toHaveLength(0);
@@ -319,7 +328,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       const mountIdLeak = parseText(
         await treeClient.callTool({
           name: "mind_recall",
-          arguments: { viewerRealmId: C2.id, id: c1Rec.id },
+          arguments: { focus: C2.id, id: c1Rec.id },
         }),
       ) as { items: unknown[] };
       expect(mountIdLeak.items).toHaveLength(0);
@@ -328,7 +337,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
         await treeClient.callTool({
           name: "mind_recall",
           arguments: {
-            viewerRealmId: C2.id,
+            focus: C2.id,
             id: c1Sea.id,
             includeDescendantSeabed: true,
           },
@@ -339,8 +348,8 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       const mountDriveRead = await treeClient.callTool({
         name: "mind_drive_read",
         arguments: {
-          viewerRealmId: C2.id,
-          targetRealmId: C1.id,
+          focus: C2.id,
+          target: C1.id,
           relPath: "c1-secret.md",
         },
       });
@@ -349,7 +358,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
 
       const mountChainRead = await treeClient.callTool({
         name: "mind_get_supersede_chain",
-        arguments: { viewerRealmId: C2.id, recordId: c1Rec.id },
+        arguments: { focus: C2.id, recordId: c1Rec.id },
       });
       expect(mountChainRead.isError).toBe(true);
       expect(parseText(mountChainRead).error).toBe("NOT_FOUND");
@@ -357,7 +366,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       const listFromC2 = parseText(
         await treeClient.callTool({
           name: "mind_list_realms",
-          arguments: { viewerRealmId: C2.id },
+          arguments: { focus: C2.id },
         }),
       ) as { realms: Array<{ id: string }>; mounts: Array<{ targetRealmId: string }> };
       expect(listFromC2.realms.some((r) => r.id === C1.id)).toBe(false);
@@ -368,7 +377,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
         await treeClient.callTool({
           name: "mind_recall",
           arguments: {
-            viewerRealmId: C2.id,
+            focus: C2.id,
             query: "MCP_C2_SEABED_102",
             includeDescendantSeabed: false,
           },
@@ -379,7 +388,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       const c2BriefNoDive = parseText(
         await treeClient.callTool({
           name: "mind_brief",
-          arguments: { viewerRealmId: C2.id },
+          arguments: { focus: C2.id },
         }),
       ) as { surface: { recentMessages: { items: unknown[] } } };
       expect(c2BriefNoDive.surface.recentMessages.items).toHaveLength(0);
@@ -389,7 +398,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
         await treeClient.callTool({
           name: "mind_recall",
           arguments: {
-            viewerRealmId: C2.id,
+            focus: C2.id,
             query: "MCP_C2_SEABED_102",
             includeDescendantSeabed: true,
           },
@@ -401,7 +410,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       const childWrite = await treeClient.callTool({
         name: "mind_append_record",
         arguments: {
-          viewerRealmId: C2.id,
+          target: C2.id,
           kind: "decision",
           title: "Unauthorized write into child realm",
         },
@@ -443,7 +452,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       ) as { items: Array<{ id: string }> };
       expect(ownOrgRecall.items.some((i) => i.id === o1Rec.id)).toBe(true);
 
-      // Cannot read OpenTwo via query, ID, viewerRealmId switch, or drive read
+      // Cannot read OpenTwo via query, ID, focus switch, or drive read
       const crossQuery = parseText(
         await openClient.callTool({
           name: "mind_recall",
@@ -462,14 +471,14 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
 
       const crossViewer = await openClient.callTool({
         name: "mind_recall",
-        arguments: { viewerRealmId: o2Root.id, query: "OPEN_ORG2_CANARY" },
+        arguments: { focus: o2Root.id, query: "OPEN_ORG2_CANARY" },
       });
       expect(crossViewer.isError).toBe(true);
       expect(parseText(crossViewer).error).toBe("ACCESS_DENIED");
 
       const crossDrive = await openClient.callTool({
         name: "mind_drive_read",
-        arguments: { targetRealmId: o2Root.id, relPath: "org2.md" },
+        arguments: { target: o2Root.id, relPath: "org2.md" },
       });
       expect(crossDrive.isError).toBe(true);
       expect(parseText(crossDrive).error).toBe("ACCESS_DENIED");
@@ -477,7 +486,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       const crossWrite = await openClient.callTool({
         name: "mind_append_record",
         arguments: {
-          targetRealmId: o2Root.id,
+          target: o2Root.id,
           kind: "decision",
           title: "Cross-org write attempt",
         },
@@ -499,75 +508,94 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       "tree",
     ]) as { org: { id: string }; rootRealm: { id: string } };
 
+    const rootEnv = { MERU_MIND_VIEWER_REALM_ID: init.rootRealm.id };
+
     // --actor-kind human without --as-human is rejected
-    const spoofHuman = runCliFail(homeDir, [
-      "--actor-kind",
-      "human",
-      "record",
-      "--realm",
-      init.rootRealm.id,
-      "--kind",
-      "rule",
-      "--title",
-      "Spoofed human",
-    ]);
-    expect(spoofHuman.stderr).toContain("--as-human");
-
-    // Default agent rejected on tree createRealm, rule, set-policy, redact
-    expect(
-      runCliFail(homeDir, [
-        "realm",
-        "create",
-        "--org",
-        init.org.id,
-        "--parent",
-        init.rootRealm.id,
-        "--slug",
-        "sub",
-        "--name",
-        "Sub",
-      ]).stderr,
-    ).toContain("ACCESS_DENIED");
-
-    expect(
-      runCliFail(homeDir, [
+    const spoofHuman = runCliFail(
+      homeDir,
+      [
+        "--actor-kind",
+        "human",
         "record",
-        "--realm",
         init.rootRealm.id,
         "--kind",
         "rule",
         "--title",
-        "No human flag",
-      ]).stderr,
+        "Spoofed human",
+      ],
+      rootEnv,
+    );
+    expect(spoofHuman.stderr).toContain("--as-human");
+
+    // Default agent rejected on tree createRealm, rule, set-policy, redact
+    expect(
+      runCliFail(
+        homeDir,
+        [
+          "realm",
+          "create",
+          "--org",
+          init.org.id,
+          "--parent",
+          init.rootRealm.id,
+          "--slug",
+          "sub",
+          "--name",
+          "Sub",
+        ],
+        rootEnv,
+      ).stderr,
+    ).toContain("ACCESS_DENIED");
+
+    expect(
+      runCliFail(
+        homeDir,
+        [
+          "record",
+          init.rootRealm.id,
+          "--kind",
+          "rule",
+          "--title",
+          "No human flag",
+        ],
+        rootEnv,
+      ).stderr,
     ).toContain("RULE_REQUIRES_HUMAN");
 
     expect(
-      runCliFail(homeDir, [
-        "org",
-        "set-policy",
-        "--org",
-        init.org.id,
-        "--policy",
-        "open",
-      ]).stderr,
+      runCliFail(
+        homeDir,
+        [
+          "org",
+          "set-policy",
+          "--org",
+          init.org.id,
+          "--policy",
+          "open",
+        ],
+        rootEnv,
+      ).stderr,
     ).toContain("ACCESS_DENIED");
 
-    const dec = runCli(homeDir, [
-      "record",
-      "--realm",
-      init.rootRealm.id,
-      "--kind",
-      "decision",
-      "--title",
-      "Agent decision",
-    ]) as { id: string; authorKind: string };
+    const dec = runCli(
+      homeDir,
+      [
+        "record",
+        init.rootRealm.id,
+        "--kind",
+        "decision",
+        "--title",
+        "Agent decision",
+      ],
+      rootEnv,
+    ) as { id: string; authorKind: string };
     expect(dec.authorKind).toBe("agent");
 
-    expect(runCliFail(homeDir, ["redact", "--id", dec.id]).stderr).toContain(
-      "ACCESS_DENIED",
-    );
+    expect(
+      runCliFail(homeDir, ["redact", "--id", dec.id], rootEnv).stderr,
+    ).toContain("ACCESS_DENIED");
 
-    // Explicit --as-human succeeds for all of them
+    // Explicit --as-human succeeds for all of them (admin whitelist even without MERU_MIND_VIEWER_REALM_ID)
     const sub = runCli(homeDir, [
       "--as-human",
       "realm",
@@ -583,16 +611,19 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
     ]) as { id: string };
     expect(sub.id).toMatch(/^realm_/);
 
-    const rule = runCli(homeDir, [
-      "--as-human",
-      "record",
-      "--realm",
-      init.rootRealm.id,
-      "--kind",
-      "rule",
-      "--title",
-      "Human rule",
-    ]) as { id: string; confirmedByHuman: boolean };
+    const rule = runCli(
+      homeDir,
+      [
+        "--as-human",
+        "record",
+        init.rootRealm.id,
+        "--kind",
+        "rule",
+        "--title",
+        "Human rule",
+      ],
+      rootEnv,
+    ) as { id: string; confirmedByHuman: boolean };
     expect(rule.confirmedByHuman).toBe(true);
 
     const redactRes = runCli(homeDir, [
@@ -736,7 +767,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       viewerRealmId: oB.id,
       recordId: oARec2.id,
     });
-    expect(chainFromB.map((r) => r.id)).toEqual([oARec1.id, oARec2.id]);
+    expect(chainFromB.nodes.map((r) => r.id)).toEqual([oARec1.id, oARec2.id]);
 
     const driveFromB = await engine.ledger.readDriveFile({
       actor: agentWorker,
@@ -1115,8 +1146,8 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       viewerRealmId: realmX.id,
       recordId: bCitingC.id,
     });
-    expect(chainFromX.map((r) => r.id)).toEqual([bVisibleDec.id, bCitingC.id]);
-    const sanitizedBInChain = chainFromX.find((r) => r.id === bCitingC.id)!;
+    expect(chainFromX.nodes.map((r) => r.id)).toEqual([bVisibleDec.id, bCitingC.id]);
+    const sanitizedBInChain = chainFromX.nodes.find((r) => r.id === bCitingC.id)!;
     expect(sanitizedBInChain.refs).toEqual([bVisibleDec.id]);
     expect(sanitizedBInChain.refs).not.toContain(cSeabed.id);
 
@@ -1423,10 +1454,15 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       name: "Beta",
     });
 
-    // A) 2-char Chinese word phrase matching + stopword stripping + all-stopword protection
+    // A) Intact CJK overlapping bigrams + filler bigram filtering + all-filler protection
     const parsedStop = parseSearchQuery("查找一下关于支付网关的相关");
-    expect(parsedStop.concepts.map((c) => c.raw)).toEqual(["支付网关"]);
-    expect(parsedStop.ftsExpression).toBe('"支 付 网 关"');
+    expect(parsedStop.concepts.length).toBe(1);
+    expect(parsedStop.concepts[0]!.terms).toContain("支付");
+    expect(parsedStop.concepts[0]!.terms).toContain("网关");
+    expect(parsedStop.concepts[0]!.terms).not.toContain("查找");
+    expect(parsedStop.concepts[0]!.terms).not.toContain("相关");
+    expect(parsedStop.ftsExpression).toContain('"支 付"');
+    expect(parsedStop.ftsExpression).toContain('"网 关"');
 
     const parsedAllStop = parseSearchQuery("查找一下相关");
     expect(parsedAllStop.concepts.length).toBeGreaterThan(0);
@@ -1567,7 +1603,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       tieOlderOccurred.id,
     ]);
 
-    // C) Open-mode focus boost: identical-quality docs in Alpha vs Beta flip rank based on viewerRealmId
+    // C) Open-mode focus boost: default OFF (pure relevance/time tie-break), opt-in focusBoost: true flips identical-quality docs in Alpha vs Beta
     const alphaDoc = await engine.ledger.appendRecord({
       actor: humanAlice,
       viewerRealmId: realmAlpha.id,
@@ -1583,27 +1619,37 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       occurredAt: "2026-11-20T10:00:00.000Z",
     });
 
-    const fromAlpha = await engine.sea.recall({
+    const fromAlphaDefault = await engine.sea.recall({
       actor: agentWorker,
       viewerRealmId: realmAlpha.id,
       query: "FOCUS_BOOST_CANARY",
     });
+    const fromBetaDefault = await engine.sea.recall({
+      actor: agentWorker,
+      viewerRealmId: realmBeta.id,
+      query: "FOCUS_BOOST_CANARY",
+    });
+    expect(fromAlphaDefault.items.map((i) => i.id)).toEqual(
+      fromBetaDefault.items.map((i) => i.id),
+    );
+
+    const fromAlpha = await engine.sea.recall({
+      actor: agentWorker,
+      viewerRealmId: realmAlpha.id,
+      query: "FOCUS_BOOST_CANARY",
+      focusBoost: true,
+    });
     expect(fromAlpha.items[0]!.id).toBe(alphaDoc.id);
     expect(fromAlpha.items[1]!.id).toBe(betaDoc.id);
-    expect(fromAlpha.items[0]!.score - fromAlpha.items[1]!.score).toBeGreaterThanOrEqual(
-      0.35,
-    );
 
     const fromBeta = await engine.sea.recall({
       actor: agentWorker,
       viewerRealmId: realmBeta.id,
       query: "FOCUS_BOOST_CANARY",
+      focusBoost: true,
     });
     expect(fromBeta.items[0]!.id).toBe(betaDoc.id);
     expect(fromBeta.items[1]!.id).toBe(alphaDoc.id);
-    expect(fromBeta.items[0]!.score - fromBeta.items[1]!.score).toBeGreaterThanOrEqual(
-      0.35,
-    );
 
     // D) Active conclusion > raw seabed > superseded, plus 1-hop currentHeadId & occurredAt tie-break
     const chainV1 = await engine.ledger.appendRecord({

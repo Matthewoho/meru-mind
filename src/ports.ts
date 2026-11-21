@@ -59,12 +59,28 @@ export interface PendingVectorItem {
  * `sqlite_sequence`). Multi-writer cloud backends swapping in Postgres/D1 must either
  * serialize `change_log` appends or explicitly tolerate sequence gaps when polling cursors.
  */
+export interface RealmRecordCountRow {
+  rules: number;
+  conclusions: number;
+  things: number;
+  decisions: number;
+}
+
+export interface UnifiedEntryRef {
+  id: string;
+  sourceType: "record" | "seabed";
+  occurredAt: string | null;
+  createdAt: string;
+}
+
 export interface DbPort {
   readonly vecEnabled: boolean;
   readonly vectorDimensions: number;
 
   close(): void;
   transaction<T>(fn: () => T): T;
+  getQueryCount(): number;
+  resetQueryCount(): void;
 
   // Schema & Meta
   listSchemaMigrations(): SchemaMigrationRecord[];
@@ -89,6 +105,7 @@ export interface DbPort {
   // Seabed (truth source 1: append-only raw messages, artifacts, evidence, signals)
   insertSeabedEntry(entry: SeabedEntry): void;
   getSeabedEntry(id: string): SeabedEntry | null;
+  getSeabedEntriesByIds(ids: string[]): SeabedEntry[];
   listSeabedEntries(filter: {
     realmIds: string[];
     kinds?: SeabedKind[];
@@ -108,7 +125,13 @@ export interface DbPort {
   /** Atomic CAS supersede: returns true iff the target row was active and unsuperseded (changes === 1). */
   markRecordSuperseded(oldId: string, newId: string, orgId?: string): boolean;
   getRecord(id: string): LedgerRecord | null;
+  getRecordsByIds(ids: string[]): LedgerRecord[];
   findActiveRecordBySourceRef(
+    orgId: string,
+    sourceRef: string,
+    realmId?: string,
+  ): LedgerRecord | null;
+  findLatestRecordBySourceRef(
     orgId: string,
     sourceRef: string,
     realmId?: string,
@@ -135,17 +158,19 @@ export interface DbPort {
   }): { items: LedgerRecord[]; total: number };
   listRecordsWindow(params: {
     realmIds: string[];
-    anchorOccurredAt: string;
+    anchorTime: string;
     anchorId: string;
     direction: "before" | "after";
+    timeBasis?: "occurred_at" | "created_at";
     limit: number;
     excludeSensitivities?: Sensitivity[];
   }): LedgerRecord[];
   listSeabedWindow(params: {
     realmIds: string[];
-    anchorOccurredAt: string;
+    anchorTime: string;
     anchorId: string;
     direction: "before" | "after";
+    timeBasis?: "occurred_at" | "created_at";
     limit: number;
     excludeSensitivities?: Sensitivity[];
   }): SeabedEntry[];
@@ -159,11 +184,58 @@ export interface DbPort {
     includeSuperseded?: boolean;
     excludeSensitivities?: Sensitivity[];
   }): Record<string, number>;
+  countActiveRecordsByRealm(filter: {
+    realmIds: string[];
+    excludeSensitivities?: Sensitivity[];
+  }): Map<string, RealmRecordCountRow>;
+  countSeabedByRealm(filter: {
+    realmIds: string[];
+    excludeSensitivities?: Sensitivity[];
+  }): Map<string, number>;
+  countPendingQuestionsByRealm(filter: {
+    realmIds: string[];
+    excludeSensitivities?: Sensitivity[];
+  }): Map<string, number>;
+  countObjectsByRealm(filter: {
+    orgId: string;
+    realmIds: string[];
+  }): Map<string, number>;
+  countLinkedEntriesByObjectRealm(filter: {
+    orgId: string;
+    realmIds: string[];
+    excludeSensitivities?: Sensitivity[];
+  }): Map<string, number>;
+  lsRealmEntriesUnified(params: {
+    orgId: string;
+    targetRealmId: string;
+    includePhysicalLedger: boolean;
+    includePhysicalSeabed: boolean;
+    includeObjectLinkedOpenMode: boolean;
+    includeSuperseded: boolean;
+    kind?: string;
+    tag?: string;
+    excludeSensitivities?: Sensitivity[];
+    limit: number;
+    offset: number;
+  }): { rows: UnifiedEntryRef[]; total: number };
+  lsEntriesByIdsUnified(params: {
+    orgId: string;
+    entryIds: string[];
+    ledgerRealmIds: string[];
+    seabedRealmIds: string[];
+    includeSuperseded: boolean;
+    kind?: string;
+    tag?: string;
+    excludeSensitivities?: Sensitivity[];
+    limit: number;
+    offset: number;
+  }): { rows: UnifiedEntryRef[]; total: number };
   listAllRecords(): LedgerRecord[];
 
   // Objects, Entry-Object Links & Resource Tags (Migration v3)
   insertObject(obj: MindObject): void;
   getObject(id: string): MindObject | null;
+  getObjectsByIds(ids: string[]): MindObject[];
   listObjects(filter: {
     orgId: string;
     realmIds?: string[];
@@ -178,7 +250,12 @@ export interface DbPort {
   deleteEntryObject(entryId: string, objectId: string): boolean;
   deleteEntryObjectsByEntry(entryId: string): number;
   listObjectIdsForEntry(entryId: string, orgId?: string): string[];
+  listObjectIdsByEntryIds(orgId: string, entryIds: string[]): Map<string, string[]>;
   listObjectRealmIdsForEntry(entryId: string, orgId: string): string[];
+  listObjectRealmIdsByEntryIds(
+    orgId: string,
+    entryIds: string[],
+  ): Map<string, string[]>;
   listEntryIdsForObjects(orgId: string, objectIds: string[]): string[];
   listEntryIdsByObjectRealm(orgId: string, realmId: string): string[];
 
@@ -186,6 +263,10 @@ export interface DbPort {
   deleteResourceTag(entryId: string, tag: string): boolean;
   deleteResourceTagsByEntry(entryId: string): number;
   listResourceTagsForEntry(entryId: string, orgId?: string): string[];
+  listResourceTagsByEntryIds(
+    orgId: string,
+    entryIds: string[],
+  ): Map<string, string[]>;
   listEntryIdsByResourceTag(orgId: string, tag: string): string[];
   listVisibleResourceTags(params: {
     orgId: string;
@@ -235,10 +316,15 @@ export interface DbPort {
     exceptId: string,
   ): void;
   getDistillation(id: string): Distillation | null;
+  getDistillationsByIds(ids: string[]): Distillation[];
   getLatestDistillation(
     realmId: string,
     layer: DistillationLayer,
   ): Distillation | null;
+  getLatestDistillationsByRealms(
+    realmIds: string[],
+    layer: DistillationLayer,
+  ): Map<string, Distillation>;
   listDistillations(filter: {
     realmIds: string[];
     layers?: DistillationLayer[];
@@ -292,14 +378,16 @@ export interface DbPort {
   updateFtsStatus(itemId: string, status: string): void;
   deleteFtsItem(itemId: string): void;
   searchFts(params: {
-    query: string;
+    query?: string;
+    ftsExpression?: string;
     realmIds: string[];
     sourceTypes?: Array<"record" | "seabed" | "distillation">;
     includeSuperseded: boolean;
     limit: number;
   }): FtsMatch[];
   countFts(params: {
-    query: string;
+    query?: string;
+    ftsExpression?: string;
     realmIds: string[];
     sourceTypes?: Array<"record" | "seabed" | "distillation">;
     includeSuperseded: boolean;

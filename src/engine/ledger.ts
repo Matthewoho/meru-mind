@@ -29,10 +29,12 @@ import {
   type SeabedEntry,
   type SeabedKind,
   type Sensitivity,
+  type SupersedeChainResult,
 } from "../types.js";
 import {
   createVisibilityHelpers,
   parseDriveSourceRef,
+  sanitizeRealmsForScope,
 } from "./visibility.js";
 import {
   normalizeResourceTag,
@@ -436,21 +438,17 @@ export class LedgerEngine {
       const effective = params.scopeCeiling
         ? intersectAccessScopes(baseScope, params.scopeCeiling)
         : baseScope;
-      const visibleIds = new Set<string>([
-        ...effective.readableLedgerIds,
-        ...effective.readableDriveIds,
-        ...effective.readableSeabedIds,
-      ]);
-      return orgRealms.filter((r) => visibleIds.has(r.id));
+      const sanitizedMap = sanitizeRealmsForScope(orgRealms, effective);
+      return orgRealms
+        .filter((r) => sanitizedMap.has(r.id))
+        .map((r) => sanitizedMap.get(r.id)!);
     }
 
     if (params.scopeCeiling) {
-      const visibleIds = new Set<string>([
-        ...params.scopeCeiling.readableLedgerIds,
-        ...params.scopeCeiling.readableDriveIds,
-        ...params.scopeCeiling.readableSeabedIds,
-      ]);
-      return orgRealms.filter((r) => visibleIds.has(r.id));
+      const sanitizedMap = sanitizeRealmsForScope(orgRealms, params.scopeCeiling);
+      return orgRealms
+        .filter((r) => sanitizedMap.has(r.id))
+        .map((r) => sanitizedMap.get(r.id)!);
     }
     return orgRealms;
   }
@@ -597,7 +595,7 @@ export class LedgerEngine {
     metadata?: Record<string, unknown>;
     objectIds?: string[];
     resourceTags?: string[];
-    occurredAt?: string;
+    occurredAt?: string | null;
     originSessionId?: string | null;
     sensitivity?: Sensitivity;
     idempotencyKey?: string;
@@ -632,7 +630,11 @@ export class LedgerEngine {
       params.blobContent !== undefined
         ? sha256Buffer(params.blobContent)
         : null;
-    const explicitOccurredAt = params.occurredAt?.trim() || null;
+    const hasExplicitNullOccurredAt = params.occurredAt === null;
+    const explicitOccurredAt =
+      typeof params.occurredAt === "string"
+        ? params.occurredAt.trim() || null
+        : null;
 
     const payloadHash = idempotencyKey
       ? computePayloadHash({
@@ -769,7 +771,9 @@ export class LedgerEngine {
         blobSha256,
         sourceRef: params.sourceRef ?? null,
         metadata,
-        occurredAt: explicitOccurredAt ?? now,
+        occurredAt: hasExplicitNullOccurredAt
+          ? null
+          : (explicitOccurredAt ?? now),
         originSessionId: params.originSessionId ?? null,
         sensitivity,
         redactedAt: null,
@@ -850,7 +854,9 @@ export class LedgerEngine {
     objectIds?: string[];
     resourceTags?: string[];
     supersedesId?: string | null;
-    occurredAt?: string;
+    supersedesIds?: string[];
+    initialStatus?: "active" | "superseded";
+    occurredAt?: string | null;
     originSessionId?: string | null;
     sensitivity?: Sensitivity;
     idempotencyKey?: string;
@@ -860,6 +866,13 @@ export class LedgerEngine {
       throw new MindError(
         "INVALID_INPUT",
         `Invalid record kind: "${String(params.kind)}"`,
+      );
+    }
+    const initialStatus = params.initialStatus ?? "active";
+    if (initialStatus !== "active" && initialStatus !== "superseded") {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Invalid initialStatus "${String(initialStatus)}": only "active" or "superseded" is allowed ("retracted" is reserved for redact())`,
       );
     }
     const sensitivity = validateSensitivity(params.sensitivity);
@@ -890,7 +903,21 @@ export class LedgerEngine {
       (typeof payload.sourceRef === "string" && payload.sourceRef.trim()
         ? payload.sourceRef.trim()
         : null);
-    const explicitOccurredAt = params.occurredAt?.trim() || null;
+    const supersedesList = Array.from(
+      new Set(
+        [
+          ...(params.supersedesIds ?? []),
+          ...(params.supersedesId ? [params.supersedesId] : []),
+        ]
+          .map((s) => s.trim())
+          .filter(Boolean),
+      ),
+    );
+    const hasExplicitNullOccurredAt = params.occurredAt === null;
+    const explicitOccurredAt =
+      typeof params.occurredAt === "string"
+        ? params.occurredAt.trim() || null
+        : null;
 
     const payloadHash = idempotencyKey
       ? computePayloadHash({
@@ -906,7 +933,9 @@ export class LedgerEngine {
           ...(sourceRef ? { sourceRef } : {}),
           ...(objectIds.length > 0 ? { objectIds } : {}),
           ...(resourceTags.length > 0 ? { resourceTags } : {}),
-          supersedesId: params.supersedesId ?? null,
+          supersedesId: supersedesList[0] ?? null,
+          ...(supersedesList.length > 1 ? { supersedesIds: supersedesList } : {}),
+          ...(initialStatus !== "active" ? { initialStatus } : {}),
           occurredAt: explicitOccurredAt,
           originSessionId: params.originSessionId ?? null,
           sensitivity,
@@ -1060,35 +1089,36 @@ export class LedgerEngine {
         );
       }
 
-      // 3. Validate supersede chain inside BEGIN IMMEDIATE
+      // 3. Validate all predecessors inside BEGIN IMMEDIATE (all-or-nothing multi-predecessor DAG CAS)
       // - open mode: allows same-org cross-realm supersedes (prevents dual-active heads across realms)
       // - tree mode: enforces strict same-realm supersedes
-      let oldRecord: LedgerRecord | null = null;
-      if (params.supersedesId) {
-        oldRecord = this.db.getRecord(params.supersedesId);
+      const oldRecords: LedgerRecord[] = [];
+      for (const supId of supersedesList) {
+        const oldRec = this.db.getRecord(supId);
         const allowedSupersedeTarget =
-          oldRecord &&
+          oldRec &&
           (orgPolicy === "open"
-            ? oldRecord.orgId === targetRealm.orgId
-            : oldRecord.realmId === targetRealmId);
-        if (!oldRecord || !allowedSupersedeTarget) {
+            ? oldRec.orgId === targetRealm.orgId
+            : oldRec.realmId === targetRealmId);
+        if (!oldRec || !allowedSupersedeTarget) {
           throw new MindError(
             "NOT_FOUND",
-            `Entry not found in visible scope: ${params.supersedesId}`,
+            `Entry not found in visible scope: ${supId}`,
           );
         }
-        if (oldRecord.kind !== params.kind) {
+        if (oldRec.kind !== params.kind) {
           throw new MindError(
             "INVALID_INPUT",
-            `Superseding record kind "${params.kind}" must match superseded record kind "${oldRecord.kind}"`,
+            `Superseding record kind "${params.kind}" must match superseded record kind "${oldRec.kind}"`,
           );
         }
-        if (oldRecord.status !== "active" || oldRecord.supersededById !== null) {
+        if (oldRec.status !== "active" || oldRec.supersededById !== null) {
           throw new MindError(
             "CONFLICT",
-            `Record "${oldRecord.id}" is already ${oldRecord.status} (supersededBy=${oldRecord.supersededById ?? "none"})`,
+            `Record "${oldRec.id}" is already ${oldRec.status} (supersededBy=${oldRec.supersededById ?? "none"})`,
           );
         }
+        oldRecords.push(oldRec);
       }
 
       const id = makeId("rec");
@@ -1105,8 +1135,9 @@ export class LedgerEngine {
         thingId,
         kind: params.kind,
         extKind,
-        status: "active",
-        supersedesId: oldRecord?.id ?? null,
+        status: initialStatus,
+        supersedesId: oldRecords[0]?.id ?? null,
+        supersedesIds: oldRecords.map((r) => r.id),
         supersededById: null,
         authorId: actor.id,
         authorKind: actor.kind,
@@ -1117,7 +1148,9 @@ export class LedgerEngine {
         refs,
         externalRef,
         sourceRef,
-        occurredAt: explicitOccurredAt ?? now,
+        occurredAt: hasExplicitNullOccurredAt
+          ? null
+          : (explicitOccurredAt ?? now),
         originSessionId: params.originSessionId ?? null,
         sensitivity,
         redactedAt: null,
@@ -1143,21 +1176,21 @@ export class LedgerEngine {
         });
       }
 
-      // 4. Atomic CAS on superseded chain head (assert changes === 1 with org_id guard, else rollback)
-      if (oldRecord) {
+      // 4. Atomic CAS on every superseded predecessor (assert changes === 1 with org_id guard, else rollback entire txn)
+      for (const oldRec of oldRecords) {
         const casOk = this.db.markRecordSuperseded(
-          oldRecord.id,
+          oldRec.id,
           record.id,
           targetRealm.orgId,
         );
         if (!casOk) {
           throw new MindError(
             "CONFLICT",
-            `Concurrent supersede conflict on record "${oldRecord.id}"`,
+            `Concurrent supersede conflict on record "${oldRec.id}"`,
           );
         }
-        this.db.updateFtsStatus(oldRecord.id, "superseded");
-        this.db.updateVectorStatus(oldRecord.id, "superseded");
+        this.db.updateFtsStatus(oldRec.id, "superseded");
+        this.db.updateVectorStatus(oldRec.id, "superseded");
       }
 
       if (idempotencyKey) {
@@ -1196,7 +1229,7 @@ export class LedgerEngine {
         realmId: record.realmId,
         entityType: "record",
         entityId: record.id,
-        op: oldRecord ? "supersede" : "create",
+        op: oldRecords.length > 0 ? "supersede" : "create",
         actorId: actor.id,
         createdAt: now,
       });
@@ -1217,7 +1250,7 @@ export class LedgerEngine {
     refs?: string[];
     objectIds?: string[];
     resourceTags?: string[];
-    occurredAt?: string;
+    occurredAt?: string | null;
     originSessionId?: string | null;
     sensitivity?: Sensitivity;
     idempotencyKey?: string;
@@ -1383,7 +1416,7 @@ export class LedgerEngine {
     viewerRealmId: string;
     recordId: string;
     scopeCeiling?: AccessScope;
-  }): LedgerRecord[] {
+  }): SupersedeChainResult {
     const actor = validateActor(params.actor);
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
@@ -1425,33 +1458,7 @@ export class LedgerEngine {
       );
     }
 
-    // Walk back to oldest ancestor
-    let oldest = start;
-    const seen = new Set<string>([oldest.id]);
-    while (oldest.supersedesId && !seen.has(oldest.supersedesId)) {
-      const prev = this.db.getRecord(oldest.supersedesId);
-      if (!prev) break;
-      seen.add(prev.id);
-      oldest = prev;
-    }
-
-    // Walk forward to newest, filtering out any node outside visible scope
-    const rawChain: LedgerRecord[] = [oldest];
-    let cur = oldest;
-    while (cur.supersededById) {
-      const next = this.db.getRecord(cur.supersededById);
-      if (!next || rawChain.some((c) => c.id === next.id)) break;
-      rawChain.push(next);
-      cur = next;
-    }
-
-    return rawChain
-      .filter(
-        (node) =>
-          vis.canSeeRecord(node) &&
-          (node.sensitivity !== "secret" || node.id === start.id),
-      )
-      .map((node) => vis.sanitizeRecord(node));
+    return vis.traverseSupersedeDag(start);
   }
 
   // ---- Full-Chain Redact (Human-Only Withdrawal + Blob Refcount + FTS Optimize + WAL Checkpoint) ----

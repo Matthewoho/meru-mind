@@ -365,18 +365,25 @@ export class SliceExporter {
     // Export self ledger & drive (strictly excluding secret & confidential)
     const exportRealmData = async (prefix: string, realmId: string, includeDrive: boolean) => {
       const sanitizeList = (items: ReturnType<DbPort["listRecords"]>["items"]) =>
-        items.map((r) => ({
-          ...r,
-          refs: r.refs.filter(isExportableRef),
-          supersedesId:
-            r.supersedesId && isExportableRef(r.supersedesId)
-              ? r.supersedesId
-              : null,
-          supersededById:
-            r.supersededById && isExportableRef(r.supersededById)
-              ? r.supersededById
-              : null,
-        }));
+        items.map((r) => {
+          const visibleSupIds = (
+            r.supersedesIds && r.supersedesIds.length > 0
+              ? r.supersedesIds
+              : r.supersedesId
+                ? [r.supersedesId]
+                : []
+          ).filter(isExportableRef);
+          return {
+            ...r,
+            refs: r.refs.filter(isExportableRef),
+            supersedesId: visibleSupIds[0] ?? null,
+            supersedesIds: visibleSupIds,
+            supersededById:
+              r.supersededById && isExportableRef(r.supersededById)
+                ? r.supersededById
+                : null,
+          };
+        });
 
       const rules = sanitizeList(
         this.db.listRecords({

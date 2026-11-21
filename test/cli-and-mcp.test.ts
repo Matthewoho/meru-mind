@@ -28,11 +28,15 @@ afterEach(() => {
   }
 });
 
-function runCli(homeDir: string, args: string[]): unknown {
+function runCli(
+  homeDir: string,
+  args: string[],
+  extraEnv?: Record<string, string>,
+): unknown {
   const out = execFileSync(
     process.execPath,
     [cliBin, "--home", homeDir, "--json", ...args],
-    { encoding: "utf8" },
+    { encoding: "utf8", env: { ...process.env, ...extraEnv } },
   );
   return JSON.parse(out.trim()) as unknown;
 }
@@ -40,11 +44,13 @@ function runCli(homeDir: string, args: string[]): unknown {
 function runCliExpectFail(
   homeDir: string,
   args: string[],
+  extraEnv?: Record<string, string>,
 ): { status: number; stderr: string } {
   try {
     execFileSync(process.execPath, [cliBin, "--home", homeDir, "--json", ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ...extraEnv },
     });
     throw new Error("Expected CLI command to fail");
   } catch (err: unknown) {
@@ -84,7 +90,6 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     // Default CLI actor is "agent": writing a rule without --as-human MUST fail
     const deniedRule = runCliExpectFail(homeDir, [
       "record",
-      "--realm",
       init.rootRealm.id,
       "--kind",
       "rule",
@@ -97,7 +102,6 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     const rule = runCli(homeDir, [
       "--as-human",
       "record",
-      "--realm",
       init.rootRealm.id,
       "--kind",
       "rule",
@@ -109,7 +113,6 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
 
     const dec1 = runCli(homeDir, [
       "record",
-      "--realm",
       eng.id,
       "--kind",
       "decision",
@@ -120,7 +123,6 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
 
     runCli(homeDir, [
       "capture",
-      "--realm",
       eng.id,
       "--kind",
       "message",
@@ -131,7 +133,6 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     runCli(homeDir, [
       "drive",
       "write",
-      "--realm",
       eng.id,
       "--path",
       "STATE.md",
@@ -139,7 +140,7 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
       "# Engineering Status",
     ]);
 
-    const brief = runCli(homeDir, ["brief", "--realm", eng.id]) as {
+    const brief = runCli(homeDir, ["brief", eng.id]) as {
       upperLedger: { activeDecisions: { items: Array<{ id: string }> } };
       middleMind: { rules: { items: Array<{ id: string; inherited: boolean }> } };
     };
@@ -150,10 +151,9 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
 
     const recall = runCli(homeDir, [
       "recall",
-      "--realm",
-      eng.id,
-      "--query",
       "sqlite-vec",
+      "--focus",
+      eng.id,
     ]) as { items: Array<{ sourceType: string }> };
     expect(recall.items.length).toBeGreaterThan(0);
 
@@ -185,7 +185,7 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     ]) as { policy: string };
     expect(updatedOrg.policy).toBe("tree");
 
-    // redact CLI requires --as-human
+    // redact CLI requires --as-human (permitted in tree org without MERU_MIND_VIEWER_REALM_ID)
     const deniedRedact = runCliExpectFail(homeDir, ["redact", "--id", dec1.id]);
     expect(deniedRedact.stderr).toContain("ACCESS_DENIED");
     const redacted = runCli(homeDir, [
@@ -200,13 +200,11 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     expect(typeof redacted.walCheckpoint.busy).toBe("number");
 
     const sliceDir = makeTempDir("meru-mind-cli-slice-");
-    const exported = runCli(homeDir, [
-      "export-slice",
-      "--realm",
-      eng.id,
-      "--out",
-      sliceDir,
-    ]) as { fileCount: number };
+    const exported = runCli(
+      homeDir,
+      ["export-slice", eng.id, "--out", sliceDir],
+      { MERU_MIND_VIEWER_REALM_ID: eng.id },
+    ) as { fileCount: number };
     expect(exported.fileCount).toBeGreaterThan(0);
 
     const rebuilt = runCli(homeDir, ["rebuild"]) as {
@@ -255,16 +253,19 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
       "Beta",
     ]) as { id: string };
 
-    // Plant a secret canary in alpha via CLI
-    runCli(homeDir, [
-      "capture",
-      "--realm",
-      alpha.id,
-      "--kind",
-      "message",
-      "--text",
-      "Alpha launch code MCP_ALPHA_409",
-    ]);
+    // Plant a secret canary in alpha via CLI (tree org requires MERU_MIND_VIEWER_REALM_ID)
+    runCli(
+      homeDir,
+      [
+        "capture",
+        alpha.id,
+        "--kind",
+        "message",
+        "--text",
+        "Alpha launch code MCP_ALPHA_409",
+      ],
+      { MERU_MIND_VIEWER_REALM_ID: alpha.id },
+    );
 
     // Boot MCP server bound to beta in SecureOrg
     const transport = new StdioClientTransport({
@@ -322,11 +323,11 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
       expect(listedIds).toContain(beta.id);
       expect(listedIds).not.toContain(alpha.id);
 
-      // Attempting to switch viewerRealmId to sibling alpha MUST be rejected
+      // Attempting to switch focus to sibling alpha MUST be rejected
       const switchAttempt = await client.callTool({
         name: "mind_recall",
         arguments: {
-          viewerRealmId: alpha.id,
+          focus: alpha.id,
           query: "MCP_ALPHA_409",
         },
       });

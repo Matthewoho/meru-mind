@@ -110,7 +110,7 @@ export interface SeabedEntry {
   blobSha256: string | null;
   sourceRef: string | null;
   metadata: Record<string, unknown>;
-  occurredAt: string;
+  occurredAt: string | null;
   originSessionId: string | null;
   sensitivity: Sensitivity;
   redactedAt: string | null;
@@ -168,6 +168,7 @@ export interface LedgerRecord {
   extKind: string | null;
   status: RecordStatus;
   supersedesId: string | null;
+  supersedesIds: string[];
   supersededById: string | null;
   authorId: string;
   authorKind: ActorKind;
@@ -178,7 +179,7 @@ export interface LedgerRecord {
   refs: string[];
   externalRef: string | null;
   sourceRef: string | null;
-  occurredAt: string;
+  occurredAt: string | null;
   originSessionId: string | null;
   sensitivity: Sensitivity;
   redactedAt: string | null;
@@ -223,11 +224,18 @@ export interface DriveFileContent extends DriveFileMeta {
   content: string;
 }
 
+export interface SupersedeChainResult {
+  nodes: LedgerRecord[];
+  currentHeadId: string | null;
+  orphanSuperseded: boolean;
+}
+
 export interface BriefBudget {
   recentMessages?: number;
   maxQuestions?: number;
   maxActiveThings?: number;
   maxDecisions?: number;
+  maxRecentConclusions?: number;
   maxRules?: number;
   maxChildSummaries?: number;
 }
@@ -251,11 +259,14 @@ export interface ChildRealmSummary {
 export interface BriefOutput {
   realm: Realm;
   generatedAt: string;
+  kindHistogram: Record<string, number>;
   buckets?: {
     rules: number;
     conclusions: number;
     raw: number;
   };
+  recentConclusions: BriefSection<LedgerRecord>;
+  omittedChildRealmsCount: number;
   surface: {
     recentMessages: BriefSection<SeabedEntry>;
   };
@@ -308,6 +319,8 @@ export interface RecallQuery {
   includeDescendantSeabed?: boolean;
   /** Optional process-level ceiling scope (e.g. MCP bound viewer intersection) */
   scopeCeiling?: AccessScope;
+  /** Optional opt-in intra-band focus tie-breaker (default: false) */
+  focusBoost?: boolean;
   /** Stage 3 & 4: Keyword (FTS5) + Semantic (sqlite-vec) query */
   query?: string;
   limit?: number;
@@ -328,12 +341,15 @@ export interface RecallItem {
   snippet: string;
   authorId: string;
   createdAt: string;
-  occurredAt?: string;
+  occurredAt: string | null;
   sourceRefs: string[];
   supersedesId?: string | null;
+  supersedesIds?: string[];
   supersededById?: string | null;
-  /** When item is superseded, 1-hop pointer to the visible active chain head (null if retracted or invisible) */
+  /** When item is superseded, 1-hop pointer to the visible active chain head (null if retracted, invisible, or orphan) */
   currentHeadId?: string | null;
+  /** True when status === "superseded" and supersededById === null (orphan superseded record) */
+  orphanSuperseded?: boolean;
   matchedBy: Array<"id" | "filter" | "fts" | "vector">;
   score: number;
 }
@@ -443,8 +459,22 @@ export interface ObjectTreeNode {
   children: ObjectTreeNode[];
 }
 
+export interface RealmTreeCounts {
+  directRules: number;
+  directConclusions: number;
+  directRaw: number | null;
+  directObjects: number;
+  subtreeRules: number | null;
+  subtreeConclusions: number | null;
+  subtreeRaw: number | null;
+  subtreeObjects: number | null;
+  linkedViaObjects: number | null;
+  childRealmsCount: number;
+}
+
 export interface RealmTreeNode {
   realm: Realm;
+  counts: RealmTreeCounts;
   objects: ObjectTreeNode[];
   children: RealmTreeNode[];
 }
@@ -452,6 +482,10 @@ export interface RealmTreeNode {
 export interface TreeResult {
   org: Organization;
   viewerRealmId: string;
+  targetRealmId: string;
+  depth: number | "all";
+  includeObjects: boolean;
+  lineLimit: number;
   realms: Realm[];
   objects: MindObject[];
   realmTree: RealmTreeNode[];
@@ -474,12 +508,13 @@ export interface LsEntry {
   snippet: string;
   authorId: string;
   confirmedByHuman: boolean;
-  occurredAt: string;
+  occurredAt: string | null;
   createdAt: string;
   externalRef: string | null;
   sourceRef: string | null;
   refs: string[];
   supersedesId: string | null;
+  supersedesIds?: string[];
   supersededById: string | null;
   objectIds: string[];
   resourceTags: string[];
@@ -493,6 +528,7 @@ export interface LsResult {
   items: LsEntry[];
   totalMatched: number;
   omittedCount: number;
+  subRealms?: Array<{ id: string; path: string; name: string; slug: string }>;
   driveFiles?: DriveFileMeta[];
 }
 
@@ -505,6 +541,7 @@ export type CatResult =
       objectIds: string[];
       resourceTags: string[];
       currentHeadId: string | null;
+      orphanSuperseded: boolean;
     }
   | {
       kind: "seabed";
@@ -531,7 +568,8 @@ export interface ReplayResult {
   anchorId: string;
   anchorBehaviorClass: BehaviorClass;
   anchorRealmId: string;
-  anchorOccurredAt: string;
+  anchorOccurredAt: string | null;
+  timeBasis: "occurred_at" | "created_at";
   window: number;
   supersedeChain: LedgerRecord[];
   before: LsEntry[];
@@ -569,11 +607,13 @@ export interface ImportMdResult {
   skippedUnchanged: number;
   skippedRedacted: number;
   skippedSecret: number;
+  undatedCount: number;
+  defaultRealmCount: number;
   items: ImportMdItemResult[];
   embeddingsSynced?: SyncEmbeddingsResult;
 }
 
-export interface JsonlMappingConfig {
+export interface ImportMappingConfig {
   /** Destination table: "record" (default) or "seabed" */
   target?: "record" | "seabed";
   /** Dot-path for source item ID */
@@ -588,8 +628,15 @@ export interface JsonlMappingConfig {
   title?: string | string[];
   /** Dot-path(s) for body/text */
   body?: string | string[];
-  /** Dot-path(s) for occurredAt timestamp */
+  /** Dot-path(s) or frontmatter field names for occurredAt timestamp */
   occurredAt?: string | string[];
+  /** Optional explicit opt-in regex pattern (with 1st capture group) to extract a declared date from filenames */
+  filenameDatePattern?: string;
+  /** Dot-path or frontmatter field for lifecycle status + map strictly targeting "active" | "superseded" */
+  status?: string;
+  statusMap?: Record<string, string>;
+  /** Dot-path(s) or frontmatter field for expiry ISO timestamp; values < now become initialStatus="superseded" */
+  validUntil?: string | string[];
   /** Dot-path for realm path or key + optional lookup map + default */
   realmPath?: string;
   realmMap?: Record<string, string>;
@@ -604,7 +651,7 @@ export interface JsonlMappingConfig {
   thingRef?: string;
   /** Dot-path for external_ref on thing records */
   externalRef?: string;
-  /** Dot-path for supersedes reference */
+  /** Dot-path for supersedes reference (supports scalar string or string[]) */
   supersedes?: string;
   /** Dot-path for refs array */
   refs?: string;
@@ -620,6 +667,9 @@ export interface JsonlMappingConfig {
   idempotencyPrefix?: string;
 }
 
+/** Backward-compatible alias for unified ImportMappingConfig */
+export type JsonlMappingConfig = ImportMappingConfig;
+
 export interface ImportJsonlResult {
   totalRows: number;
   imported: number;
@@ -627,7 +677,27 @@ export interface ImportJsonlResult {
   skippedSecret: number;
   skippedRedacted: number;
   treeDegradedCrossRealmSupersedes: number;
+  undatedCount: number;
+  defaultRealmCount: number;
   idMap: Record<string, string>;
   entryIds: string[];
   embeddingsSynced?: SyncEmbeddingsResult;
+}
+
+export interface ImportConsistencyMismatch {
+  sourceRef: string;
+  recordId: string | null;
+  expected: string | null;
+  actual: string | null;
+  reason: string;
+}
+
+export interface ImportConsistencyResult {
+  passed: boolean;
+  totalChecked: number;
+  missingCount: number;
+  undatedCount: number;
+  defaultRealmFallbackCount: number;
+  activeSupersededMismatches: ImportConsistencyMismatch[];
+  timestampMismatches: ImportConsistencyMismatch[];
 }

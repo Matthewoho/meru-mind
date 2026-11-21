@@ -38,14 +38,23 @@ afterEach(async () => {
 const humanAlice: Actor = { id: "alice", kind: "human" };
 const agentBot: Actor = { id: "importer-bot", kind: "agent", family: "gemini" };
 
-function runCliRaw(homeDir: string, args: string[]): string {
+function runCliRaw(
+  homeDir: string,
+  args: string[],
+  extraEnv?: Record<string, string>,
+): string {
   return execFileSync(process.execPath, [cliBin, "--home", homeDir, ...args], {
     encoding: "utf8",
+    env: { ...process.env, ...extraEnv },
   });
 }
 
-function runCliJson(homeDir: string, args: string[]): unknown {
-  const out = runCliRaw(homeDir, ["--json", ...args]);
+function runCliJson(
+  homeDir: string,
+  args: string[],
+  extraEnv?: Record<string, string>,
+): unknown {
+  const out = runCliRaw(homeDir, ["--json", ...args], extraEnv);
   return JSON.parse(out.trim()) as unknown;
 }
 
@@ -76,7 +85,7 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
     const resAgent = runCliJson(homeDir, [
       "import-md",
       docA,
-      "--realm",
+      "--target",
       init.rootRealm.id,
       "--source-ref",
       "docs/agent-note.md",
@@ -85,8 +94,6 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
     const recAgent = runCliJson(homeDir, [
       "cat",
       resAgent.items[0]!.recordId,
-      "--realm",
-      init.rootRealm.id,
     ]) as { record: { authorKind: string; confirmedByHuman: boolean } };
     expect(recAgent.record.authorKind).toBe("agent");
     expect(recAgent.record.confirmedByHuman).toBe(false);
@@ -96,7 +103,7 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
       "--as-human",
       "import-md",
       docB,
-      "--realm",
+      "--target",
       init.rootRealm.id,
       "--source-ref",
       "docs/human-note.md",
@@ -105,8 +112,6 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
     const recHuman = runCliJson(homeDir, [
       "cat",
       resHuman.items[0]!.recordId,
-      "--realm",
-      init.rootRealm.id,
     ]) as { record: { authorKind: string; confirmedByHuman: boolean } };
     expect(recHuman.record.authorKind).toBe("human");
     expect(recHuman.record.confirmedByHuman).toBe(true);
@@ -115,7 +120,7 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
     const mdOut = runCliRaw(homeDir, [
       "import-md",
       docA,
-      "--realm",
+      "--target",
       init.rootRealm.id,
       "--source-ref",
       "docs/agent-note.md",
@@ -207,7 +212,7 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
       viewerRealmId: rootRealm.id,
       recordId: v3Id,
     });
-    expect(chain.map((c) => c.id)).toEqual([v1Id, v2Id, v3Id]);
+    expect(chain.nodes.map((c) => c.id)).toEqual([v1Id, v2Id, v3Id]);
   });
 
   it("3. import-md in open mode reassigning a file to another realm supersedes old realm head (#21 P2)", async () => {
@@ -312,8 +317,9 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
     expect(r1.created).toBe(1);
     const dirtyId = r1.items[0]!.recordId!;
     const dirtyRec = engine.db.getRecord(dirtyId)!;
-    // OccurredAt MUST NOT be 2010 (mtime ignored!)
-    expect(dirtyRec.occurredAt.startsWith("2010-")).toBe(false);
+    // Undated Markdown file MUST persist occurredAt === null (NEVER mtime and NEVER fabricated import time!)
+    expect(dirtyRec.occurredAt).toBeNull();
+    expect(r1.undatedCount).toBe(1);
 
     // Human redacts the dirty imported record -> populates redacted_blocklist with (org, source_ref, contentSha256)
     engine.ledger.redact({
@@ -589,14 +595,11 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
       "utf8",
     );
 
-    const treeCliRes = runCliJson(treeHome, [
-      "import-jsonl",
-      treeJsonlPath,
-      "--map",
-      mapPath,
-      "--realm",
-      treeChild.id,
-    ]) as {
+    const treeCliRes = runCliJson(
+      treeHome,
+      ["import-jsonl", treeJsonlPath, "--map", mapPath],
+      { MERU_MIND_VIEWER_REALM_ID: treeChild.id },
+    ) as {
       imported: number;
       superseded: number;
       treeDegradedCrossRealmSupersedes: number;

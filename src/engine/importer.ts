@@ -6,10 +6,12 @@ import type { DbPort } from "../ports.js";
 import {
   MindError,
   type Actor,
+  type ImportConsistencyMismatch,
+  type ImportConsistencyResult,
   type ImportJsonlResult,
+  type ImportMappingConfig,
   type ImportMdItemResult,
   type ImportMdResult,
-  type JsonlMappingConfig,
   type OrgPolicy,
   type Realm,
   type RecordKind,
@@ -69,6 +71,90 @@ function normalizeDeclaredTimestamp(raw: unknown): string | null {
   const parsed = new Date(candidate);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString();
+}
+
+function validateMappingConfig(mapping?: ImportMappingConfig): RegExp | null {
+  if (!mapping) return null;
+  if (mapping.statusMap) {
+    for (const [src, target] of Object.entries(mapping.statusMap)) {
+      const normalized = String(target).trim().toLowerCase();
+      if (normalized !== "active" && normalized !== "superseded") {
+        throw new MindError(
+          "INVALID_INPUT",
+          `Invalid statusMap target "${String(target)}" for source status "${src}": only "active" or "superseded" is permitted ("retracted" is reserved exclusively for redact())`,
+        );
+      }
+    }
+  }
+  if (mapping.filenameDatePattern) {
+    try {
+      return new RegExp(mapping.filenameDatePattern);
+    } catch (err) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Invalid filenameDatePattern regex "${mapping.filenameDatePattern}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return null;
+}
+
+function resolveMappedInitialStatus(params: {
+  rawStatus: unknown;
+  rawValidUntil: unknown;
+  statusMap?: Record<string, string>;
+  nowIso: string;
+}): "active" | "superseded" {
+  let mapped: "active" | "superseded" | null = null;
+  if (
+    params.rawStatus !== undefined &&
+    params.rawStatus !== null &&
+    String(params.rawStatus).trim()
+  ) {
+    const rawStr = String(params.rawStatus).trim();
+    const rawLower = rawStr.toLowerCase();
+    let targetVal: string | undefined;
+    if (params.statusMap) {
+      if (rawStr in params.statusMap) {
+        targetVal = params.statusMap[rawStr];
+      } else {
+        for (const [k, v] of Object.entries(params.statusMap)) {
+          if (k.toLowerCase() === rawLower) {
+            targetVal = v;
+            break;
+          }
+        }
+      }
+    }
+    const candidate = (targetVal ?? rawLower).trim().toLowerCase();
+    if (candidate === "retracted") {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Source status "${rawStr}" cannot map to "retracted" ("retracted" is reserved exclusively for redact())`,
+      );
+    }
+    if (candidate === "superseded") {
+      mapped = "superseded";
+    } else if (candidate === "active") {
+      mapped = "active";
+    } else if (targetVal !== undefined) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Invalid mapped status "${targetVal}" for "${rawStr}": expected "active" or "superseded"`,
+      );
+    }
+  }
+
+  if (mapped === "superseded") {
+    return "superseded";
+  }
+
+  const validUntilIso = normalizeDeclaredTimestamp(params.rawValidUntil);
+  if (validUntilIso && validUntilIso < params.nowIso) {
+    return "superseded";
+  }
+
+  return mapped ?? "active";
 }
 
 export interface ParsedMarkdownDoc {
@@ -207,7 +293,7 @@ export function parseMarkdownDocument(
     }
   }
 
-  // 4. Summary: frontmatter summary -> explicit Summary/Overview/Abstract/TL;DR/摘要 section -> first paragraph
+  // 4. Summary: frontmatter summary -> explicit Summary/Overview/Abstract/TL;DR section -> first paragraph
   let summary =
     typeof frontmatter.summary === "string" && frontmatter.summary.trim()
       ? frontmatter.summary.trim()
@@ -365,8 +451,6 @@ function deriveDefaultSourceRef(params: {
       .join("/");
     return rel || path.basename(params.filePath);
   }
-  // Single-file import without explicit baseDir/sourceRef:
-  // include parent directory segment so identically named files in different folders do not collide.
   const parentName = path.basename(path.dirname(params.filePath));
   const baseName = path.basename(params.filePath);
   return parentName ? `${parentName}/${baseName}` : baseName;
@@ -401,13 +485,28 @@ function getFirstField(
 function toStringArray(val: unknown): string[] {
   if (Array.isArray(val)) {
     return val
-      .map((item) => (typeof item === "string" ? item.trim() : String(item ?? "").trim()))
+      .map((item) =>
+        typeof item === "string" ? item.trim() : String(item ?? "").trim(),
+      )
       .filter(Boolean);
   }
   if (typeof val === "string" && val.trim()) {
     return [val.trim()];
   }
   return [];
+}
+
+function extractFilenameDate(
+  regex: RegExp | null,
+  filePath: string,
+  sourceRef: string,
+): string | null {
+  if (!regex) return null;
+  const base = path.basename(filePath);
+  const m = regex.exec(base) ?? regex.exec(sourceRef);
+  if (!m) return null;
+  const raw = m[1] ?? m[0];
+  return normalizeDeclaredTimestamp(raw);
 }
 
 export class ImporterEngine {
@@ -424,19 +523,8 @@ export class ImporterEngine {
 
   /**
    * Imports a Markdown file or directory of Markdown files into the ledger.
-   *
-   * Semantics:
-   * - Defaults to agent actor (confirmedByHuman = false unless caller explicitly supplies actor.kind === "human").
-   * - All writes pass through LedgerEngine.appendRecord() transactions.
-   * - Extracts declared timestamps only; NEVER reads filesystem mtime.
-   * - Skips files whose (org_id, source_ref, content_sha256) matches redacted_blocklist.
-   * - Active chain head lookup:
-   *   - `open` mode: looks up active head by (org_id, source_ref) across the organization.
-   *   - `tree` mode: looks up active head by (org_id, realm_id, source_ref).
-   * - If head matches newSha256 and target realm -> skip without writing.
-   * - If no head -> initial insert with key `import-md:${sourceRef}:init:${newSha256}`.
-   * - If content changed (including rollback v1 -> v2 -> v1) or open-mode realm moved ->
-   *   supersede `head.id` with key `import-md:${sourceRef}:after:${head.id}:${newSha256}`.
+   * Supports unified ImportMappingConfig, never fabricates timestamps for undated sources
+   * (persists occurredAt: null), enforces statusMap & validUntil, and skips redacted_blocklist hits.
    */
   async importMd(params: {
     actor?: Actor;
@@ -451,10 +539,13 @@ export class ImporterEngine {
     skipSecret?: boolean;
     objectIds?: string[];
     resourceTags?: string[];
+    mapping?: ImportMappingConfig;
     syncEmbeddings?: boolean;
   }): Promise<ImportMdResult> {
     const actor: Actor = params.actor ?? { id: "importer", kind: "agent" };
-    const skipSecret = params.skipSecret ?? true;
+    const mapping = params.mapping;
+    const filenameDateRe = validateMappingConfig(mapping);
+    const skipSecret = params.skipSecret ?? mapping?.skipSecret ?? true;
 
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
@@ -471,14 +562,30 @@ export class ImporterEngine {
       includeDescendantSeabed: false,
     });
 
-    const targetRealm: Realm = params.targetRealmRef
+    const defaultRealm: Realm = params.targetRealmRef
       ? resolveVisibleRealm({
           realms,
           orgId: viewerRealm.orgId,
           ref: params.targetRealmRef,
           scope,
         })
-      : viewerRealm;
+      : mapping?.defaultRealm
+        ? resolveVisibleRealm({
+            realms,
+            orgId: viewerRealm.orgId,
+            ref: mapping.defaultRealm,
+            scope,
+          })
+        : viewerRealm;
+
+    const orgObjects = this.db.listObjects({
+      orgId: viewerRealm.orgId,
+      realmIds: scope.readableLedgerIds,
+    });
+    const objectsById = new Map(orgObjects.map((o) => [o.id, o]));
+    const objectsByKindName = new Map(
+      orgObjects.map((o) => [`${o.kind.toLowerCase()}:${o.name.toLowerCase()}`, o]),
+    );
 
     const { baseDir, isSingleFile, files } = collectMarkdownFiles(
       params.inputPath,
@@ -501,6 +608,9 @@ export class ImporterEngine {
     let skippedUnchanged = 0;
     let skippedRedacted = 0;
     let skippedSecret = 0;
+    let undatedCount = 0;
+    let defaultRealmCount = 0;
+    const nowIso = new Date().toISOString();
 
     for (const filePath of files) {
       const rawContent = fs.readFileSync(filePath, "utf8");
@@ -516,8 +626,62 @@ export class ImporterEngine {
       const fallbackTitle = path.basename(filePath, path.extname(filePath));
 
       const parsed = parseMarkdownDocument(rawContent, fallbackTitle);
+      const fm = parsed.frontmatter;
+
+      // Mapped occurredAt -> parsed frontmatter/header occurredAt -> opt-in filenameDatePattern -> null
+      const mappedOccurred = mapping?.occurredAt
+        ? normalizeDeclaredTimestamp(getFirstField(fm, mapping.occurredAt))
+        : null;
+      const occurredAt: string | null =
+        mappedOccurred ??
+        parsed.occurredAt ??
+        extractFilenameDate(filenameDateRe, filePath, sourceRef);
+
+      if (occurredAt === null) {
+        undatedCount += 1;
+      }
+
+      // Sensitivity resolution
+      const rawMappedSens = mapping?.sensitivity
+        ? getFieldByPath(fm, mapping.sensitivity)
+        : undefined;
+      const mappedSens =
+        typeof rawMappedSens === "string" &&
+        VALID_SENSITIVITIES.has(rawMappedSens.trim().toLowerCase())
+          ? (rawMappedSens.trim().toLowerCase() as Sensitivity)
+          : null;
       const sensitivity: Sensitivity =
-        params.sensitivity ?? parsed.sensitivity ?? "internal";
+        params.sensitivity ??
+        mappedSens ??
+        parsed.sensitivity ??
+        mapping?.defaultSensitivity ??
+        "internal";
+
+      // Realm resolution via mapping.realmPath + realmMap, else defaultRealm
+      let targetRealm = defaultRealm;
+      let usedDefaultRealm = true;
+      if (mapping?.realmPath) {
+        const rawRealmVal = getFieldByPath(fm, mapping.realmPath);
+        const rawRealmStr =
+          rawRealmVal !== undefined && rawRealmVal !== null
+            ? String(rawRealmVal).trim()
+            : "";
+        const mappedRealmRef = rawRealmStr
+          ? (mapping.realmMap?.[rawRealmStr] ?? rawRealmStr)
+          : "";
+        if (mappedRealmRef) {
+          targetRealm = resolveVisibleRealm({
+            realms,
+            orgId: viewerRealm.orgId,
+            ref: mappedRealmRef,
+            scope,
+          });
+          usedDefaultRealm = false;
+        }
+      }
+      if (usedDefaultRealm) {
+        defaultRealmCount += 1;
+      }
 
       if (skipSecret && sensitivity === "secret") {
         skippedSecret += 1;
@@ -529,7 +693,7 @@ export class ImporterEngine {
           recordId: null,
           supersedesId: null,
           realmId: targetRealm.id,
-          occurredAt: parsed.occurredAt,
+          occurredAt,
         });
         continue;
       }
@@ -545,10 +709,24 @@ export class ImporterEngine {
           recordId: null,
           supersedesId: null,
           realmId: targetRealm.id,
-          occurredAt: parsed.occurredAt,
+          occurredAt,
         });
         continue;
       }
+
+      // Status & validUntil resolution (strictly active | superseded; rejects retracted)
+      const rawStatus = mapping?.status
+        ? getFieldByPath(fm, mapping.status)
+        : fm.status;
+      const rawValidUntil = mapping?.validUntil
+        ? getFirstField(fm, mapping.validUntil)
+        : (fm.valid_until ?? fm.validUntil);
+      const initialStatus = resolveMappedInitialStatus({
+        rawStatus,
+        rawValidUntil,
+        statusMap: mapping?.statusMap,
+        nowIso,
+      });
 
       // Active chain head lookup:
       // - open mode: (org_id, source_ref) so realm reassignment supersedes old head cleanly
@@ -567,7 +745,12 @@ export class ImporterEngine {
           ? head.payload.contentSha256
           : null;
 
-      if (head && headSha === newSha256 && head.realmId === targetRealm.id) {
+      if (
+        head &&
+        headSha === newSha256 &&
+        head.realmId === targetRealm.id &&
+        head.status === initialStatus
+      ) {
         skippedUnchanged += 1;
         items.push({
           filePath,
@@ -577,25 +760,88 @@ export class ImporterEngine {
           recordId: head.id,
           supersedesId: null,
           realmId: targetRealm.id,
-          occurredAt: parsed.occurredAt,
+          occurredAt,
         });
         continue;
       }
 
+      // Kind resolution
+      let mappedKind: RecordKind | null = null;
+      if (mapping?.kind) {
+        const rawK = getFieldByPath(fm, mapping.kind);
+        if (typeof rawK === "string" && rawK.trim()) {
+          const kVal = mapping.kindMap?.[rawK.trim()] ?? rawK.trim();
+          if (VALID_RECORD_KINDS.has(kVal)) {
+            mappedKind = kVal as RecordKind;
+          }
+        }
+      }
+      const defaultMappingKind =
+        mapping?.defaultKind && VALID_RECORD_KINDS.has(mapping.defaultKind)
+          ? (mapping.defaultKind as RecordKind)
+          : null;
       const desiredKind: RecordKind =
-        head?.kind ?? params.kind ?? parsed.kind ?? "claim";
-      const mergedTags = Array.from(new Set([...extraTags, ...parsed.tags]));
+        head?.kind ??
+        params.kind ??
+        mappedKind ??
+        parsed.kind ??
+        defaultMappingKind ??
+        "claim";
+
+      // Object references & tags from mapping
+      const mappedObjIds: string[] = [...(params.objectIds ?? [])];
+      if (mapping?.objectRefs) {
+        for (const ref of toStringArray(getFieldByPath(fm, mapping.objectRefs))) {
+          const m = mapping.objectMap?.[ref] ?? ref;
+          if (objectsById.has(m)) mappedObjIds.push(m);
+          else {
+            const byName = objectsByKindName.get(m.toLowerCase());
+            if (byName) mappedObjIds.push(byName.id);
+          }
+        }
+      }
+      const mappedTags: string[] = [];
+      if (mapping?.resourceTags) {
+        for (const t of toStringArray(getFieldByPath(fm, mapping.resourceTags))) {
+          const candidate =
+            !t.includes(":") && mapping.defaultTagType
+              ? `${mapping.defaultTagType}:${t}`
+              : t;
+          mappedTags.push(normalizeResourceTag(candidate));
+        }
+      }
+      const mergedTags = Array.from(
+        new Set([...extraTags, ...parsed.tags, ...mappedTags]),
+      );
+
       const payload: Record<string, unknown> = {
         summary: parsed.summary,
         body: parsed.body,
         sourceRef,
         contentSha256: newSha256,
-        ...(Object.keys(parsed.frontmatter).length > 0
-          ? { frontmatter: parsed.frontmatter }
-          : {}),
+        ...(Object.keys(fm).length > 0 ? { frontmatter: fm } : {}),
       };
+      if (mapping?.extractFields && mapping.extractFields.length > 0) {
+        for (const fp of mapping.extractFields) {
+          const val = getFieldByPath(fm, fp);
+          if (val !== undefined) {
+            payload[fp.replace(/\./g, "_")] = val;
+          }
+        }
+      }
 
-      if (!head) {
+      // Optional explicit supersedes list from frontmatter
+      const explicitSupersedes = mapping?.supersedes
+        ? toStringArray(getFieldByPath(fm, mapping.supersedes))
+        : [];
+      const supersedesIds = Array.from(
+        new Set([
+          ...(head ? [head.id] : []),
+          ...explicitSupersedes,
+        ]),
+      );
+
+      if (supersedesIds.length === 0) {
         const rec = await this.ledger.appendRecord({
           actor,
           viewerRealmId: viewerRealm.id,
@@ -606,11 +852,12 @@ export class ImporterEngine {
           payload,
           externalRef: parsed.externalRef,
           sourceRef,
-          objectIds: params.objectIds,
+          objectIds: Array.from(new Set(mappedObjIds)),
           resourceTags: mergedTags,
-          occurredAt: parsed.occurredAt ?? undefined,
+          initialStatus,
+          occurredAt,
           sensitivity,
-          idempotencyKey: `import-md:${sourceRef}:init:${newSha256}`,
+          idempotencyKey: `import-md:${sourceRef}:init:${newSha256}:${initialStatus}`,
         });
         created += 1;
         items.push({
@@ -634,12 +881,13 @@ export class ImporterEngine {
           payload,
           externalRef: parsed.externalRef,
           sourceRef,
-          objectIds: params.objectIds,
+          objectIds: Array.from(new Set(mappedObjIds)),
           resourceTags: mergedTags,
-          supersedesId: head.id,
-          occurredAt: parsed.occurredAt ?? undefined,
+          supersedesIds,
+          initialStatus,
+          occurredAt,
           sensitivity,
-          idempotencyKey: `import-md:${sourceRef}:after:${head.id}:${newSha256}`,
+          idempotencyKey: `import-md:${sourceRef}:after:${supersedesIds.join(",")}:${newSha256}:${initialStatus}`,
         });
         superseded += 1;
         items.push({
@@ -648,7 +896,7 @@ export class ImporterEngine {
           contentSha256: newSha256,
           action: "superseded",
           recordId: rec.id,
-          supersedesId: head.id,
+          supersedesId: supersedesIds[0] ?? null,
           realmId: rec.realmId,
           occurredAt: rec.occurredAt,
         });
@@ -666,6 +914,8 @@ export class ImporterEngine {
       skippedUnchanged,
       skippedRedacted,
       skippedSecret,
+      undatedCount,
+      defaultRealmCount,
       items,
       ...(embeddingsSynced ? { embeddingsSynced } : {}),
     };
@@ -673,26 +923,21 @@ export class ImporterEngine {
 
   /**
    * Generic field-mapped JSONL importer (100% open-source clean, zero private schemas).
-   *
-   * Semantics:
-   * - Defaults to agent actor (confirmedByHuman = false unless actor.kind === "human").
-   * - Sorts entire batch by occurred_at ascending (with same-timestamp supersede topological order).
-   * - All writes go through LedgerEngine.appendRecord() or LedgerEngine.captureSeabed().
-   * - `open` mode: same-org cross-realm supersedes run normal atomic CAS.
-   * - `tree` mode: cross-realm supersedes degrade to `refs` (if visible) + `payload.crossRealmSupersedes`
-   *   and increment `treeDegradedCrossRealmSupersedes`.
-   * - Supports `extractFields`, `skipSecret`, `redacted_blocklist`, and optional `syncEmbeddings`.
+   * Supports unified ImportMappingConfig, nullable undated occurredAt, status/statusMap/validUntil,
+   * scalar and array supersedes (all-or-nothing atomic DAG CAS), and tree-mode cross-realm degradation.
    */
   async importJsonl(params: {
     actor?: Actor;
     viewerRealmId: string;
     targetRealmRef?: string;
     jsonlPath: string;
-    mapping: JsonlMappingConfig;
+    mapping: ImportMappingConfig;
     syncEmbeddings?: boolean;
   }): Promise<ImportJsonlResult> {
     const actor: Actor = params.actor ?? { id: "importer", kind: "agent" };
     const mapping = params.mapping;
+    validateMappingConfig(mapping);
+
     const skipSecret = mapping.skipSecret ?? true;
     const targetMode = mapping.target ?? "record";
     const idempotencyPrefix = mapping.idempotencyPrefix?.trim() || "import-jsonl";
@@ -754,7 +999,7 @@ export class ImporterEngine {
       lineNumber: number;
       row: Record<string, unknown>;
       sourceId: string | null;
-      supersedesSourceId: string | null;
+      supersedesSourceIds: string[];
       occurredAt: string | null;
     }
 
@@ -783,11 +1028,9 @@ export class ImporterEngine {
         rawId !== undefined && rawId !== null && String(rawId).trim()
           ? String(rawId).trim()
           : null;
-      const rawSup = getFieldByPath(row, mapping.supersedes);
-      const supersedesSourceId =
-        rawSup !== undefined && rawSup !== null && String(rawSup).trim()
-          ? String(rawSup).trim()
-          : null;
+      const supersedesSourceIds = Array.from(
+        new Set(toStringArray(getFieldByPath(row, mapping.supersedes))),
+      );
       const occurredAt = normalizeDeclaredTimestamp(
         getFirstField(row, mapping.occurredAt),
       );
@@ -796,13 +1039,12 @@ export class ImporterEngine {
         lineNumber: i + 1,
         row,
         sourceId,
-        supersedesSourceId,
+        supersedesSourceIds,
         occurredAt,
       });
     }
 
-    // 2. Sort ascending by occurred_at (rows without occurred_at go last),
-    //    then ensure any supersedes parent appears before its successor.
+    // 2. Sort ascending by occurred_at (undated rows go last), then topological pass over all supersedes edges
     parsedRows.sort((a, b) => {
       if (a.occurredAt && b.occurredAt && a.occurredAt !== b.occurredAt) {
         return a.occurredAt.localeCompare(b.occurredAt);
@@ -812,7 +1054,6 @@ export class ImporterEngine {
       return a.lineNumber - b.lineNumber;
     });
 
-    // Topological pass for equal-timestamp or out-of-order supersedes within the batch
     const rowBySourceId = new Map<string, ParsedRow>();
     for (const item of parsedRows) {
       if (item.sourceId) rowBySourceId.set(item.sourceId, item);
@@ -823,8 +1064,8 @@ export class ImporterEngine {
     const visit = (item: ParsedRow) => {
       if (visited.has(item) || visiting.has(item)) return;
       visiting.add(item);
-      if (item.supersedesSourceId) {
-        const parent = rowBySourceId.get(item.supersedesSourceId);
+      for (const predSourceId of item.supersedesSourceIds) {
+        const parent = rowBySourceId.get(predSourceId);
         if (parent) visit(parent);
       }
       visiting.delete(item);
@@ -842,14 +1083,23 @@ export class ImporterEngine {
     let skippedSecret = 0;
     let skippedRedacted = 0;
     let treeDegradedCrossRealmSupersedes = 0;
+    let undatedCount = 0;
+    let defaultRealmCount = 0;
+    const nowIso = new Date().toISOString();
 
     for (const item of orderedRows) {
-      const { row, sourceId, supersedesSourceId, occurredAt, lineNumber } = item;
+      const { row, sourceId, supersedesSourceIds, occurredAt, lineNumber } =
+        item;
+
+      if (occurredAt === null) {
+        undatedCount += 1;
+      }
 
       // Sensitivity resolution & secret skip
       const rawSens = getFieldByPath(row, mapping.sensitivity);
       const sensCandidate =
-        typeof rawSens === "string" && VALID_SENSITIVITIES.has(rawSens.trim().toLowerCase())
+        typeof rawSens === "string" &&
+        VALID_SENSITIVITIES.has(rawSens.trim().toLowerCase())
           ? (rawSens.trim().toLowerCase() as Sensitivity)
           : (mapping.defaultSensitivity ?? "internal");
 
@@ -884,14 +1134,18 @@ export class ImporterEngine {
       const mappedRealmRef = rawRealmStr
         ? (mapping.realmMap?.[rawRealmStr] ?? rawRealmStr)
         : "";
-      const targetRealm = mappedRealmRef
-        ? resolveVisibleRealm({
-            realms,
-            orgId: viewerRealm.orgId,
-            ref: mappedRealmRef,
-            scope,
-          })
-        : defaultRealm;
+      let targetRealm: Realm;
+      if (mappedRealmRef) {
+        targetRealm = resolveVisibleRealm({
+          realms,
+          orgId: viewerRealm.orgId,
+          ref: mappedRealmRef,
+          scope,
+        });
+      } else {
+        targetRealm = defaultRealm;
+        defaultRealmCount += 1;
+      }
 
       // Object references resolution
       const rawObjectRefs = toStringArray(
@@ -937,7 +1191,7 @@ export class ImporterEngine {
             ? bodyStr.slice(0, 120)
             : sourceId || `Imported row #${lineNumber}`;
 
-      // Payload construction (honoring extractFields allowlist to drop noisy fields)
+      // Payload construction (honoring extractFields allowlist)
       const payload: Record<string, unknown> = {
         sourceRef,
         contentSha256,
@@ -980,7 +1234,7 @@ export class ImporterEngine {
           metadata: payload,
           objectIds,
           resourceTags,
-          occurredAt: occurredAt ?? undefined,
+          occurredAt,
           sensitivity: sensCandidate,
           idempotencyKey,
         });
@@ -990,7 +1244,16 @@ export class ImporterEngine {
         continue;
       }
 
-      // Record target
+      // Record target: resolve status/validUntil strictly ("active" | "superseded")
+      const initialStatus = resolveMappedInitialStatus({
+        rawStatus: mapping.status ? getFieldByPath(row, mapping.status) : undefined,
+        rawValidUntil: mapping.validUntil
+          ? getFirstField(row, mapping.validUntil)
+          : undefined,
+        statusMap: mapping.statusMap,
+        nowIso,
+      });
+
       const rawKind = getFieldByPath(row, mapping.kind);
       const mappedKind =
         typeof rawKind === "string" && rawKind.trim()
@@ -1067,50 +1330,46 @@ export class ImporterEngine {
         }
       }
 
-      // Supersedes resolution with open vs tree semantics
-      let supersedesId: string | undefined;
-      if (supersedesSourceId) {
-        const targetSupId = idMap[supersedesSourceId] ?? supersedesSourceId;
+      // Multi-predecessor supersedes resolution with open vs tree semantics
+      const resolvedSupersedesIds: string[] = [];
+      const degradedCrossRealmIds: string[] = [];
+      for (const supSourceId of supersedesSourceIds) {
+        const targetSupId = idMap[supSourceId] ?? supSourceId;
         const oldRec = this.db.getRecord(targetSupId);
-        const existingIdemp = this.db.getIdempotencyKey(
-          viewerRealm.orgId,
-          idempotencyKey,
-        );
-        const canSupersedeStatus =
-          oldRec !== null &&
-          oldRec.kind === recordKind &&
-          (oldRec.status === "active" || existingIdemp !== null);
-
-        if (oldRec && oldRec.orgId === viewerRealm.orgId) {
-          if (orgPolicy === "open") {
-            // open mode: allow same-org cross-realm supersede via atomic CAS
-            if (canSupersedeStatus) {
-              supersedesId = oldRec.id;
+        if (!oldRec || oldRec.orgId !== viewerRealm.orgId) {
+          continue;
+        }
+        if (orgPolicy === "open") {
+          if (oldRec.kind === recordKind) {
+            resolvedSupersedesIds.push(oldRec.id);
+          }
+        } else {
+          if (oldRec.realmId === targetRealm.id) {
+            if (oldRec.kind === recordKind) {
+              resolvedSupersedesIds.push(oldRec.id);
             }
           } else {
-            // tree mode: same-realm supersedes normally; visible cross-realm degrades to refs + payload.crossRealmSupersedes
-            if (oldRec.realmId === targetRealm.id) {
-              if (canSupersedeStatus) {
-                supersedesId = oldRec.id;
-              }
-            } else {
-              const oldAccess = resolveAccess({
-                realms,
-                mounts,
-                actor,
-                viewerRealmId: viewerRealm.id,
-                targetRealmId: oldRec.realmId,
-                assetKind: oldRec.kind === "rule" ? "rule" : "ledger",
-                orgPolicy,
-              });
-              if (oldAccess !== "none") {
-                treeDegradedCrossRealmSupersedes += 1;
-                payload.crossRealmSupersedes = oldRec.id;
-                resolvedRefs.push(oldRec.id);
-              }
+            const oldAccess = resolveAccess({
+              realms,
+              mounts,
+              actor,
+              viewerRealmId: viewerRealm.id,
+              targetRealmId: oldRec.realmId,
+              assetKind: oldRec.kind === "rule" ? "rule" : "ledger",
+              orgPolicy,
+            });
+            if (oldAccess !== "none") {
+              treeDegradedCrossRealmSupersedes += 1;
+              degradedCrossRealmIds.push(oldRec.id);
+              resolvedRefs.push(oldRec.id);
             }
           }
         }
+      }
+      if (degradedCrossRealmIds.length === 1) {
+        payload.crossRealmSupersedes = degradedCrossRealmIds[0];
+      } else if (degradedCrossRealmIds.length > 1) {
+        payload.crossRealmSupersedes = degradedCrossRealmIds;
       }
 
       const rec = await this.ledger.appendRecord({
@@ -1127,8 +1386,10 @@ export class ImporterEngine {
         sourceRef,
         objectIds,
         resourceTags,
-        supersedesId,
-        occurredAt: occurredAt ?? undefined,
+        supersedesIds:
+          resolvedSupersedesIds.length > 0 ? resolvedSupersedesIds : undefined,
+        initialStatus,
+        occurredAt,
         sensitivity: sensCandidate,
         idempotencyKey,
       });
@@ -1136,7 +1397,7 @@ export class ImporterEngine {
       if (sourceId) idMap[sourceId] = rec.id;
       entryIds.push(rec.id);
       imported += 1;
-      if (supersedesId) superseded += 1;
+      if (resolvedSupersedesIds.length > 0) superseded += 1;
     }
 
     const embeddingsSynced = params.syncEmbeddings
@@ -1150,9 +1411,298 @@ export class ImporterEngine {
       skippedSecret,
       skippedRedacted,
       treeDegradedCrossRealmSupersedes,
+      undatedCount,
+      defaultRealmCount,
       idMap,
       entryIds,
       ...(embeddingsSynced ? { embeddingsSynced } : {}),
+    };
+  }
+
+  /**
+   * Verifies DB rows against mapped source expectations (Markdown file/dir or JSONL file).
+   * Fails on active-vs-superseded mismatches, timestamp mismatches, or missing rows,
+   * and reports exact undatedCount and defaultRealmFallbackCount.
+   */
+  verifyImportConsistency(params: {
+    viewerRealmId: string;
+    sourcePath: string;
+    mapping?: ImportMappingConfig;
+    baseDir?: string;
+    targetRealmRef?: string;
+  }): ImportConsistencyResult {
+    const mapping = params.mapping;
+    const filenameDateRe = validateMappingConfig(mapping);
+    const skipSecret = mapping?.skipSecret ?? true;
+
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+    const scope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy,
+      includeDescendantSeabed: false,
+    });
+
+    const abs = path.resolve(params.sourcePath);
+    if (!fs.existsSync(abs)) {
+      throw new MindError("NOT_FOUND", `Source path not found: ${params.sourcePath}`);
+    }
+    const stat = fs.statSync(abs);
+    const isJsonl = stat.isFile() && /\.jsonl$/i.test(abs);
+
+    const nowIso = new Date().toISOString();
+    let totalChecked = 0;
+    let missingCount = 0;
+    let undatedCount = 0;
+    let defaultRealmFallbackCount = 0;
+    const activeSupersededMismatches: ImportConsistencyMismatch[] = [];
+    const timestampMismatches: ImportConsistencyMismatch[] = [];
+
+    const checkRecordRow = (item: {
+      sourceRef: string;
+      expectedStatus: "active" | "superseded";
+      expectedOccurredAt: string | null;
+      realmId?: string;
+    }) => {
+      totalChecked += 1;
+      const rec =
+        orgPolicy === "open"
+          ? this.db.findLatestRecordBySourceRef(
+              viewerRealm.orgId,
+              item.sourceRef,
+            )
+          : this.db.findLatestRecordBySourceRef(
+              viewerRealm.orgId,
+              item.sourceRef,
+              item.realmId,
+            );
+      if (!rec) {
+        missingCount += 1;
+        return;
+      }
+      if (item.expectedStatus === "superseded" && rec.status === "active") {
+        activeSupersededMismatches.push({
+          sourceRef: item.sourceRef,
+          recordId: rec.id,
+          expected: "superseded",
+          actual: rec.status,
+          reason: "Source mapped as superseded/expired but DB row is active",
+        });
+      } else if (
+        item.expectedStatus === "active" &&
+        rec.status === "superseded" &&
+        rec.supersededById === null
+      ) {
+        activeSupersededMismatches.push({
+          sourceRef: item.sourceRef,
+          recordId: rec.id,
+          expected: "active",
+          actual: rec.status,
+          reason:
+            "Source mapped as active but DB row is orphan superseded with no successor",
+        });
+      }
+      if (rec.occurredAt !== item.expectedOccurredAt) {
+        timestampMismatches.push({
+          sourceRef: item.sourceRef,
+          recordId: rec.id,
+          expected: item.expectedOccurredAt,
+          actual: rec.occurredAt,
+          reason: "Stored occurred_at differs from declared source timestamp",
+        });
+      }
+    };
+
+    if (isJsonl) {
+      if (!mapping) {
+        throw new MindError(
+          "INVALID_INPUT",
+          "import-verify requires --map <mapping.json> for JSONL sources",
+        );
+      }
+      const idempotencyPrefix =
+        mapping.idempotencyPrefix?.trim() || "import-jsonl";
+      const rawLines = fs
+        .readFileSync(abs, "utf8")
+        .replace(/\r\n/g, "\n")
+        .split("\n");
+      for (let i = 0; i < rawLines.length; i += 1) {
+        const line = rawLines[i]!.trim();
+        if (!line) continue;
+        const row = JSON.parse(line) as Record<string, unknown>;
+        const rawSens = getFieldByPath(row, mapping.sensitivity);
+        const sensCandidate =
+          typeof rawSens === "string" &&
+          VALID_SENSITIVITIES.has(rawSens.trim().toLowerCase())
+            ? (rawSens.trim().toLowerCase() as Sensitivity)
+            : (mapping.defaultSensitivity ?? "internal");
+        if (skipSecret && sensCandidate === "secret") continue;
+
+        const rawId = getFieldByPath(row, mapping.id);
+        const sourceId =
+          rawId !== undefined && rawId !== null && String(rawId).trim()
+            ? String(rawId).trim()
+            : null;
+        const rawSourceRef = getFieldByPath(row, mapping.sourceRef);
+        const sourceRef =
+          typeof rawSourceRef === "string" && rawSourceRef.trim()
+            ? rawSourceRef.trim()
+            : sourceId
+              ? `${idempotencyPrefix}:${sourceId}`
+              : `${idempotencyPrefix}:line-${i + 1}`;
+        const contentSha256 = computePayloadHash(row);
+        if (
+          this.db.isRedactedBlocked(viewerRealm.orgId, sourceRef, contentSha256)
+        ) {
+          continue;
+        }
+
+        const expectedOccurredAt = normalizeDeclaredTimestamp(
+          getFirstField(row, mapping.occurredAt),
+        );
+        if (expectedOccurredAt === null) undatedCount += 1;
+
+        const rawRealmVal = getFieldByPath(row, mapping.realmPath);
+        const rawRealmStr =
+          rawRealmVal !== undefined && rawRealmVal !== null
+            ? String(rawRealmVal).trim()
+            : "";
+        const mappedRealmRef = rawRealmStr
+          ? (mapping.realmMap?.[rawRealmStr] ?? rawRealmStr)
+          : "";
+        let realmId = viewerRealm.id;
+        if (mappedRealmRef) {
+          realmId = resolveVisibleRealm({
+            realms,
+            orgId: viewerRealm.orgId,
+            ref: mappedRealmRef,
+            scope,
+          }).id;
+        } else {
+          defaultRealmFallbackCount += 1;
+        }
+
+        const expectedStatus = resolveMappedInitialStatus({
+          rawStatus: mapping.status
+            ? getFieldByPath(row, mapping.status)
+            : undefined,
+          rawValidUntil: mapping.validUntil
+            ? getFirstField(row, mapping.validUntil)
+            : undefined,
+          statusMap: mapping.statusMap,
+          nowIso,
+        });
+
+        checkRecordRow({
+          sourceRef,
+          expectedStatus,
+          expectedOccurredAt,
+          realmId,
+        });
+      }
+    } else {
+      const { baseDir, isSingleFile, files } = collectMarkdownFiles(
+        params.sourcePath,
+        params.baseDir,
+      );
+      const hasExplicitBaseDir = Boolean(params.baseDir?.trim());
+      for (const filePath of files) {
+        const rawContent = fs.readFileSync(filePath, "utf8");
+        const sha = sha256Text(rawContent);
+        const sourceRef = deriveDefaultSourceRef({
+          filePath,
+          baseDir,
+          isSingleFile,
+          hasExplicitBaseDir,
+        });
+        const fallbackTitle = path.basename(filePath, path.extname(filePath));
+        const parsed = parseMarkdownDocument(rawContent, fallbackTitle);
+        const fm = parsed.frontmatter;
+        const rawMappedSens = mapping?.sensitivity
+          ? getFieldByPath(fm, mapping.sensitivity)
+          : undefined;
+        const mappedSens =
+          typeof rawMappedSens === "string" &&
+          VALID_SENSITIVITIES.has(rawMappedSens.trim().toLowerCase())
+            ? (rawMappedSens.trim().toLowerCase() as Sensitivity)
+            : null;
+        const sens =
+          mappedSens ?? parsed.sensitivity ?? mapping?.defaultSensitivity ?? "internal";
+        if (skipSecret && sens === "secret") continue;
+        if (this.db.isRedactedBlocked(viewerRealm.orgId, sourceRef, sha)) {
+          continue;
+        }
+
+        const mappedOccurred = mapping?.occurredAt
+          ? normalizeDeclaredTimestamp(getFirstField(fm, mapping.occurredAt))
+          : null;
+        const expectedOccurredAt =
+          mappedOccurred ??
+          parsed.occurredAt ??
+          extractFilenameDate(filenameDateRe, filePath, sourceRef);
+        if (expectedOccurredAt === null) undatedCount += 1;
+
+        let realmId = viewerRealm.id;
+        let usedDefault = true;
+        if (mapping?.realmPath) {
+          const rawRealmVal = getFieldByPath(fm, mapping.realmPath);
+          const rawRealmStr =
+            rawRealmVal !== undefined && rawRealmVal !== null
+              ? String(rawRealmVal).trim()
+              : "";
+          const mappedRealmRef = rawRealmStr
+            ? (mapping.realmMap?.[rawRealmStr] ?? rawRealmStr)
+            : "";
+          if (mappedRealmRef) {
+            realmId = resolveVisibleRealm({
+              realms,
+              orgId: viewerRealm.orgId,
+              ref: mappedRealmRef,
+              scope,
+            }).id;
+            usedDefault = false;
+          }
+        }
+        if (usedDefault) defaultRealmFallbackCount += 1;
+
+        const expectedStatus = resolveMappedInitialStatus({
+          rawStatus: mapping?.status
+            ? getFieldByPath(fm, mapping.status)
+            : fm.status,
+          rawValidUntil: mapping?.validUntil
+            ? getFirstField(fm, mapping.validUntil)
+            : (fm.valid_until ?? fm.validUntil),
+          statusMap: mapping?.statusMap,
+          nowIso,
+        });
+
+        checkRecordRow({
+          sourceRef,
+          expectedStatus,
+          expectedOccurredAt,
+          realmId,
+        });
+      }
+    }
+
+    return {
+      passed:
+        missingCount === 0 &&
+        activeSupersededMismatches.length === 0 &&
+        timestampMismatches.length === 0,
+      totalChecked,
+      missingCount,
+      undatedCount,
+      defaultRealmFallbackCount,
+      activeSupersededMismatches,
+      timestampMismatches,
     };
   }
 }

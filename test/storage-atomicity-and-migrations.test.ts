@@ -280,9 +280,9 @@ describe("Storage migrations, org policy backfill, atomic CAS, idempotency, chan
     };
     expect(Number(sdRow.secure_delete)).toBe(1);
 
-    // Schema migrations recorded [1, 2, 3] and meta.change_log_generation = '1'
+    // Schema migrations recorded [1, 2, 3, 4] and meta.change_log_generation = '1'
     const migrations = engine.db.listSchemaMigrations();
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4]);
     expect(engine.db.getMeta("change_log_generation")).toBe("1");
 
     // Existing V0.1 org MUST be backfilled to 'tree' (never silently opened) — check BOTH raw SQL column & mapOrg
@@ -418,7 +418,7 @@ describe("Storage migrations, org policy backfill, atomic CAS, idempotency, chan
           if (org?.policy !== "tree") {
             throw new Error("expected tree policy, got " + String(org?.policy));
           }
-          if (migrations.join(",") !== "1,2,3") {
+          if (migrations.join(",") !== "1,2,3,4") {
             throw new Error("bad migrations: " + migrations.join(","));
           }
           if (!rec || rec.orgId !== "org_v01") {
@@ -607,7 +607,6 @@ describe("Storage migrations, org policy backfill, atomic CAS, idempotency, chan
 
     const base = await runCli([
       "record",
-      "--realm",
       rootId,
       "--kind",
       "decision",
@@ -622,7 +621,6 @@ describe("Storage migrations, org policy backfill, atomic CAS, idempotency, chan
       Array.from({ length: 6 }, (_, i) =>
         runCli([
           "record",
-          "--realm",
           rootId,
           "--kind",
           "decision",

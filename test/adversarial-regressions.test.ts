@@ -549,7 +549,6 @@ describe("Adversarial security & invariant regressions", () => {
     const first = await run([
       "drive",
       "write",
-      "--realm",
       rootId,
       "--path",
       "race.md",
@@ -565,7 +564,6 @@ describe("Adversarial security & invariant regressions", () => {
         run([
           "drive",
           "write",
-          "--realm",
           rootId,
           "--path",
           "race.md",
