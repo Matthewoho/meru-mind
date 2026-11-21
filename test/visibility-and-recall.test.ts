@@ -208,8 +208,10 @@ describe("MindRealm visibility & MindSea 4-stage hybrid recall", () => {
     });
     expect(ftsSelf.items.some((i) => i.id === c2Dec.id)).toBe(true);
 
-    // 4. Semantic sqlite-vec recall: query "slow response" shares NO keyword with c2Dec ("p99"),
+    // 4. Semantic sqlite-vec recall: sync pending embeddings first (writes never block on embed()),
+    //    then query "slow response" shares NO keyword with c2Dec ("p99"),
     //    matches c2Dec via ConceptVectorEmbedder[0], and MUST NOT leak c1Dec (which ALSO has vec[0] + exact words!)
+    await engine.sea.syncEmbeddings();
     const vecSearch = await engine.sea.recall({
       actor: agentWorker,
       viewerRealmId: C2.id,

@@ -11,6 +11,10 @@ export class NoopEmbedder implements EmbedderPort {
   async embed(_text: string): Promise<Float32Array | null> {
     return null;
   }
+
+  async embedBatch(texts: string[]): Promise<Array<Float32Array | null>> {
+    return texts.map(() => null);
+  }
 }
 
 export interface OpenAICompatibleEmbedderOptions {
@@ -43,8 +47,22 @@ export class OpenAICompatibleEmbedder implements EmbedderPort {
   }
 
   async embed(text: string): Promise<Float32Array | null> {
-    const trimmed = text.trim();
-    if (!trimmed) return null;
+    const res = await this.embedBatch([text]);
+    return res[0] ?? null;
+  }
+
+  async embedBatch(texts: string[]): Promise<Array<Float32Array | null>> {
+    const results: Array<Float32Array | null> = texts.map(() => null);
+    const nonEmpty: Array<{ idx: number; text: string }> = [];
+    for (let i = 0; i < texts.length; i += 1) {
+      const trimmed = texts[i]?.trim() ?? "";
+      if (trimmed) {
+        nonEmpty.push({ idx: i, text: trimmed });
+      }
+    }
+    if (nonEmpty.length === 0) {
+      return results;
+    }
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -57,24 +75,34 @@ export class OpenAICompatibleEmbedder implements EmbedderPort {
         },
         body: JSON.stringify({
           model: this.model,
-          input: trimmed,
+          input:
+            nonEmpty.length === 1
+              ? nonEmpty[0]!.text
+              : nonEmpty.map((e) => e.text),
           dimensions: this.dimensions,
         }),
         signal: controller.signal,
       });
       if (!res.ok) {
-        return null;
+        return results;
       }
       const data = (await res.json()) as {
-        data?: Array<{ embedding?: number[] }>;
+        data?: Array<{ index?: number; embedding?: number[] }>;
       };
-      const vec = data.data?.[0]?.embedding;
-      if (!Array.isArray(vec) || vec.length !== this.dimensions) {
-        return null;
+      const items = data.data ?? [];
+      for (let i = 0; i < items.length; i += 1) {
+        const entry = items[i];
+        const pos =
+          typeof entry?.index === "number" ? entry.index : i;
+        const target = nonEmpty[pos];
+        const vec = entry?.embedding;
+        if (target && Array.isArray(vec) && vec.length === this.dimensions) {
+          results[target.idx] = Float32Array.from(vec);
+        }
       }
-      return Float32Array.from(vec);
+      return results;
     } catch {
-      return null;
+      return results;
     } finally {
       clearTimeout(timer);
     }

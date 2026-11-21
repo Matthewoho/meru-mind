@@ -92,6 +92,8 @@ describe("Adversarial security & invariant regressions", () => {
       title: "Viewer target decision",
     });
 
+    await engine.sea.syncEmbeddings();
+
     // Direct DbPort vector query MUST exclude sibHidden before Top-K
     const vecHits = engine.db.searchVectors({
       embedding: new Float32Array([1, 0, 0, 0]),
@@ -144,6 +146,8 @@ describe("Adversarial security & invariant regressions", () => {
         text: `STARVATION_KEY noisy child log line ${i}`,
       });
     }
+
+    await engine.sea.syncEmbeddings();
 
     const parentRecall = await engine.sea.recall({
       actor: humanAlice,
@@ -224,29 +228,29 @@ describe("Adversarial security & invariant regressions", () => {
       }
     };
 
-    // 1. verdict payload.proposalId must return identical NOT_FOUND for hidden vs missing
-    const eHiddenVerdict = await captureErr(() =>
+    // 1. supersedesId must return identical NOT_FOUND for hidden sibling vs missing
+    const eHiddenSupersede = await captureErr(() =>
       engine.ledger.appendRecord({
         actor: agentGemini,
         viewerRealmId: sib2.id,
-        kind: "verdict",
-        title: "Probe",
-        payload: { proposalId: hiddenProp.id, outcome: "pass" },
+        kind: "proposal",
+        title: "Probe supersede",
+        supersedesId: hiddenProp.id,
       }),
     );
-    const eMissingVerdict = await captureErr(() =>
+    const eMissingSupersede = await captureErr(() =>
       engine.ledger.appendRecord({
         actor: agentGemini,
         viewerRealmId: sib2.id,
-        kind: "verdict",
-        title: "Probe",
-        payload: { proposalId: "rec_doesnotexist", outcome: "pass" },
+        kind: "proposal",
+        title: "Probe supersede",
+        supersedesId: "rec_doesnotexist",
       }),
     );
-    expect(eHiddenVerdict?.code).toBe("NOT_FOUND");
-    expect(eMissingVerdict?.code).toBe("NOT_FOUND");
-    expect(eHiddenVerdict?.message?.replace(hiddenProp.id, "X")).toBe(
-      eMissingVerdict?.message?.replace("rec_doesnotexist", "X"),
+    expect(eHiddenSupersede?.code).toBe("NOT_FOUND");
+    expect(eMissingSupersede?.code).toBe("NOT_FOUND");
+    expect(eHiddenSupersede?.message?.replace(hiddenProp.id, "X")).toBe(
+      eMissingSupersede?.message?.replace("rec_doesnotexist", "X"),
     );
 
     // 2. getSupersedeChain must return identical NOT_FOUND
@@ -365,34 +369,24 @@ describe("Adversarial security & invariant regressions", () => {
       }),
     ).toThrow(/positive integer/);
 
-    // Whitespace family & uppercase REJECT verdict invariants
+    // Generic verdict records with optional extKind are accepted without hardcoded cross-family rules
     const prop = await engine.ledger.appendRecord({
       actor: agentGemini,
       viewerRealmId: rootRealm.id,
       kind: "proposal",
+      extKind: "design_proposal",
       title: "Work done",
     });
-    await expect(
-      engine.ledger.appendRecord({
-        actor: { id: "v", kind: "agent", family: "gemini " },
-        viewerRealmId: rootRealm.id,
-        kind: "verdict",
-        title: "Whitespace bypass attempt",
-        payload: { proposalId: prop.id, outcome: "pass" },
-        refs: [prop.id],
-      }),
-    ).rejects.toMatchObject({ code: "VERDICT_INVARIANT" });
-
-    await expect(
-      engine.ledger.appendRecord({
-        actor: agentDeepseek,
-        viewerRealmId: rootRealm.id,
-        kind: "verdict",
-        title: "Uppercase reject without basis",
-        payload: { proposalId: prop.id, outcome: "REJECT" },
-        refs: [prop.id],
-      }),
-    ).rejects.toMatchObject({ code: "VERDICT_INVARIANT" });
+    const verdict = await engine.ledger.appendRecord({
+      actor: agentDeepseek,
+      viewerRealmId: rootRealm.id,
+      kind: "verdict",
+      extKind: "review_verdict",
+      title: "Generic verdict note",
+      payload: { proposalId: prop.id, outcome: "REJECT" },
+      refs: [prop.id],
+    });
+    expect(verdict.extKind).toBe("review_verdict");
   });
 
   it("rolls back LayerFS workspace file cleanly on Conflict so winner content stays intact", async () => {

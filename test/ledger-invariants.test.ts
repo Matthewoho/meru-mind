@@ -131,7 +131,7 @@ describe("Ledger invariants: supersede chains, human-only rules, verdicts & blin
     expect(rule.kind).toBe("rule");
   });
 
-  it("enforces cross-family verdicts and requires rejections to cite a public decision or rule", async () => {
+  it("treats verdicts as generic ledger records (no hardcoded cross-family rules) while preserving extKind and refs visibility", async () => {
     const engine = await createMindEngine({
       homeDir: makeTempDir("meru-mind-verdict-"),
     });
@@ -150,44 +150,37 @@ describe("Ledger invariants: supersede chains, human-only rules, verdicts & blin
       actor: agentGemini,
       viewerRealmId: rootRealm.id,
       kind: "proposal",
+      extKind: "perf_proposal",
       title: "Delivered optimized endpoint",
       refs: [dec.id],
     });
+    expect(proposal.extKind).toBe("perf_proposal");
+    expect(proposal.confirmedByHuman).toBe(false);
+    expect(dec.confirmedByHuman).toBe(true);
 
-    // Same model family cannot judge
-    await expect(
-      engine.ledger.appendRecord({
-        actor: agentGeminiOther,
-        viewerRealmId: rootRealm.id,
-        kind: "verdict",
-        title: "Self-approval attempt",
-        payload: { proposalId: proposal.id, outcome: "pass" },
-        refs: [proposal.id],
-      }),
-    ).rejects.toMatchObject({ code: "VERDICT_INVARIANT" });
+    // Same model family verdict is allowed in core engine (policy delegated to host)
+    const sameFamilyVerdict = await engine.ledger.appendRecord({
+      actor: agentGeminiOther,
+      viewerRealmId: rootRealm.id,
+      kind: "verdict",
+      extKind: "qa_review",
+      title: "Same-family review note",
+      payload: { proposalId: proposal.id, outcome: "pass" },
+      refs: [proposal.id],
+    });
+    expect(sameFamilyVerdict.kind).toBe("verdict");
+    expect(sameFamilyVerdict.extKind).toBe("qa_review");
 
-    // Cross-family reject WITHOUT citing decision/rule fails
-    await expect(
-      engine.ledger.appendRecord({
-        actor: agentDeepseek,
-        viewerRealmId: rootRealm.id,
-        kind: "verdict",
-        title: "Uncited rejection",
-        payload: { proposalId: proposal.id, outcome: "reject" },
-        refs: [proposal.id],
-      }),
-    ).rejects.toMatchObject({ code: "VERDICT_INVARIANT" });
-
-    // Cross-family reject WITH cited decision succeeds
-    const reject = await engine.ledger.appendRecord({
+    // Reject verdict without citing a rule/decision is also accepted in core engine
+    const uncitedReject = await engine.ledger.appendRecord({
       actor: agentDeepseek,
       viewerRealmId: rootRealm.id,
       kind: "verdict",
-      title: "Measured 450ms p99, violates 200ms decision",
+      title: "Measured 450ms p99",
       payload: { proposalId: proposal.id, outcome: "reject" },
-      refs: [proposal.id, dec.id],
+      refs: [proposal.id],
     });
-    expect(reject.kind).toBe("verdict");
+    expect(uncitedReject.kind).toBe("verdict");
   });
 
   it("prevents blind-ID probing of hidden sibling records via refs", async () => {

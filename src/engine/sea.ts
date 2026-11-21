@@ -11,6 +11,7 @@ import {
   type Actor,
   type BriefBudget,
   type BriefOutput,
+  type ChangeLogEntry,
   type ChildRealmSummary,
   type Distillation,
   type DistillationLayer,
@@ -20,6 +21,7 @@ import {
   type RecallResult,
   type RebuildResult,
   type SeabedEntry,
+  type SyncEmbeddingsResult,
 } from "../types.js";
 
 function makeId(prefix: string): string {
@@ -694,125 +696,128 @@ export class SeaEngine {
         `Invalid distillation layer: "${String(params.layer)}"`,
       );
     }
-    const targetRealmId = params.targetRealmId ?? params.viewerRealmId;
-    const realms = this.db.listRealms();
-    const mounts = this.db.listMounts();
-
-    assertAccess({
-      realms,
-      mounts,
-      actor: params.actor,
-      viewerRealmId: params.viewerRealmId,
-      targetRealmId,
-      assetKind: "ledger",
-      required: "write",
-    });
-
     const periodKey = params.periodKey.trim();
     if (!periodKey) {
       throw new MindError("INVALID_INPUT", "periodKey cannot be empty");
     }
+    const targetRealmId = params.targetRealmId ?? params.viewerRealmId;
 
-    // Compute deterministic hard facts purely from canonical truth
-    const activeRecords = this.db.listRecords({
-      realmIds: [targetRealmId],
-      includeSuperseded: false,
-      limit: 1000,
-    });
-    const recentSeabed = this.db.listSeabedEntries({
-      realmIds: [targetRealmId],
-      limit: 500,
-    });
+    return this.db.transaction(() => {
+      const realms = this.db.listRealms();
+      const mounts = this.db.listMounts();
 
-    const countsByKind: Record<string, number> = {};
-    const authors = new Set<string>();
-    for (const rec of activeRecords.items) {
-      countsByKind[rec.kind] = (countsByKind[rec.kind] ?? 0) + 1;
-      authors.add(rec.authorId);
-    }
-    for (const sea of recentSeabed.items) {
-      authors.add(sea.authorId);
-    }
+      assertAccess({
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: params.viewerRealmId,
+        targetRealmId,
+        assetKind: "ledger",
+        required: "write",
+      });
 
-    const activeDecisionIds = activeRecords.items
-      .filter((r) => r.kind === "decision")
-      .map((r) => r.id);
-    const activeRuleIds = activeRecords.items
-      .filter((r) => r.kind === "rule")
-      .map((r) => r.id);
-    const activeThingIds = activeRecords.items
-      .filter((r) => r.kind === "thing")
-      .map((r) => r.id);
+      const targetRealm = realms.find((r) => r.id === targetRealmId)!;
 
-    // Validate caller-supplied sourceIds or collect canonical defaults
-    let sourceIds: string[];
-    if (params.sourceIds && params.sourceIds.length > 0) {
-      sourceIds = Array.from(new Set(params.sourceIds));
-      for (const sid of sourceIds) {
-        const rec = this.db.getRecord(sid);
-        const sea = rec ? null : this.db.getSeabedEntry(sid);
-        const dist = rec || sea ? null : this.db.getDistillation(sid);
-        const target = rec ?? sea ?? dist;
-        const access = target
-          ? resolveAccess({
-              realms,
-              mounts,
-              actor: params.actor,
-              viewerRealmId: params.viewerRealmId,
-              targetRealmId: target.realmId,
-              assetKind: sea ? "seabed" : "ledger",
-              explicitDescendantDive: true,
-            })
-          : "none";
-        if (!target || access === "none") {
-          throw new MindError(
-            "NOT_FOUND",
-            `Entry not found in visible scope: ${sid}`,
-          );
-        }
+      // Compute deterministic hard facts purely from canonical truth
+      const activeRecords = this.db.listRecords({
+        realmIds: [targetRealmId],
+        includeSuperseded: false,
+        limit: 1000,
+      });
+      const recentSeabed = this.db.listSeabedEntries({
+        realmIds: [targetRealmId],
+        limit: 500,
+      });
+
+      const countsByKind: Record<string, number> = {};
+      const authors = new Set<string>();
+      for (const rec of activeRecords.items) {
+        countsByKind[rec.kind] = (countsByKind[rec.kind] ?? 0) + 1;
+        authors.add(rec.authorId);
       }
-    } else {
-      sourceIds = [
-        ...activeRecords.items.slice(0, 50).map((r) => r.id),
-        ...recentSeabed.items.slice(0, 50).map((s) => s.id),
-      ];
-    }
+      for (const sea of recentSeabed.items) {
+        authors.add(sea.authorId);
+      }
 
-    const hardFacts: Record<string, unknown> = {
-      realmId: targetRealmId,
-      layer: params.layer,
-      periodKey,
-      activeRecordCount: activeRecords.total,
-      seabedEntryCount: recentSeabed.total,
-      countsByKind,
-      activeDecisionIds,
-      activeRuleIds,
-      activeThingIds,
-      participants: Array.from(authors).sort(),
-      computedAt: new Date().toISOString(),
-    };
+      const activeDecisionIds = activeRecords.items
+        .filter((r) => r.kind === "decision")
+        .map((r) => r.id);
+      const activeRuleIds = activeRecords.items
+        .filter((r) => r.kind === "rule")
+        .map((r) => r.id);
+      const activeThingIds = activeRecords.items
+        .filter((r) => r.kind === "thing")
+        .map((r) => r.id);
 
-    const defaultNarrative = [
-      `Realm snapshot (${params.layer} / ${periodKey}):`,
-      `- Active things: ${activeThingIds.length}`,
-      `- Active decisions: ${activeDecisionIds.length}${activeDecisionIds.length > 0 ? ` [${activeDecisionIds.slice(0, 5).join(", ")}]` : ""}`,
-      `- Active rules: ${activeRuleIds.length}`,
-      `- Seabed entries: ${recentSeabed.total}`,
-    ].join("\n");
+      // Validate caller-supplied sourceIds or collect canonical defaults
+      let sourceIds: string[];
+      if (params.sourceIds && params.sourceIds.length > 0) {
+        sourceIds = Array.from(new Set(params.sourceIds));
+        for (const sid of sourceIds) {
+          const rec = this.db.getRecord(sid);
+          const sea = rec ? null : this.db.getSeabedEntry(sid);
+          const dist = rec || sea ? null : this.db.getDistillation(sid);
+          const target = rec ?? sea ?? dist;
+          const access = target
+            ? resolveAccess({
+                realms,
+                mounts,
+                actor: params.actor,
+                viewerRealmId: params.viewerRealmId,
+                targetRealmId: target.realmId,
+                assetKind: sea ? "seabed" : "ledger",
+                explicitDescendantDive: true,
+              })
+            : "none";
+          if (!target || access === "none") {
+            throw new MindError(
+              "NOT_FOUND",
+              `Entry not found in visible scope: ${sid}`,
+            );
+          }
+        }
+      } else {
+        sourceIds = [
+          ...activeRecords.items.slice(0, 50).map((r) => r.id),
+          ...recentSeabed.items.slice(0, 50).map((s) => s.id),
+        ];
+      }
 
-    const distillation: Distillation = {
-      id: makeId("dist"),
-      realmId: targetRealmId,
-      layer: params.layer,
-      periodKey,
-      status: "active",
-      hardFacts,
-      narrativeMd: params.narrativeMd?.trim() || defaultNarrative,
-      sourceIds,
-      createdAt: new Date().toISOString(),
-    };
+      const now = new Date().toISOString();
+      const hardFacts: Record<string, unknown> = {
+        realmId: targetRealmId,
+        layer: params.layer,
+        periodKey,
+        activeRecordCount: activeRecords.total,
+        seabedEntryCount: recentSeabed.total,
+        countsByKind,
+        activeDecisionIds,
+        activeRuleIds,
+        activeThingIds,
+        participants: Array.from(authors).sort(),
+        computedAt: now,
+      };
 
-    this.db.transaction(() => {
+      const defaultNarrative = [
+        `Realm snapshot (${params.layer} / ${periodKey}):`,
+        `- Active things: ${activeThingIds.length}`,
+        `- Active decisions: ${activeDecisionIds.length}${activeDecisionIds.length > 0 ? ` [${activeDecisionIds.slice(0, 5).join(", ")}]` : ""}`,
+        `- Active rules: ${activeRuleIds.length}`,
+        `- Seabed entries: ${recentSeabed.total}`,
+      ].join("\n");
+
+      const distillation: Distillation = {
+        id: makeId("dist"),
+        realmId: targetRealmId,
+        layer: params.layer,
+        periodKey,
+        status: "active",
+        hardFacts,
+        narrativeMd: params.narrativeMd?.trim() || defaultNarrative,
+        sourceIds,
+        createdAt: now,
+      };
+
       this.db.insertDistillation(distillation);
       this.db.supersedeActiveDistillations(
         targetRealmId,
@@ -820,151 +825,312 @@ export class SeaEngine {
         periodKey,
         distillation.id,
       );
-    });
 
-    const indexText = `${distillation.layer} ${distillation.periodKey}\n${distillation.narrativeMd}`;
-    this.db.upsertFtsItem({
-      itemId: distillation.id,
-      sourceType: "distillation",
-      realmId: distillation.realmId,
-      status: distillation.status,
-      title: `${distillation.layer}:${distillation.periodKey}`,
-      body: distillation.narrativeMd,
-    });
-
-    if (this.db.vecEnabled && this.embedder.configured) {
-      const vec = await this.embedder.embed(indexText);
-      if (vec) {
-        this.db.upsertVectorItem({
-          itemId: distillation.id,
-          sourceType: "distillation",
-          realmId: distillation.realmId,
-          status: distillation.status,
-          embedding: vec,
-        });
-      } else {
-        this.db.markVectorPending({
-          itemId: distillation.id,
-          sourceType: "distillation",
-          realmId: distillation.realmId,
-          status: distillation.status,
-          text: indexText,
-        });
-      }
-    } else {
-      this.db.markVectorPending({
+      const title = `${distillation.layer}:${distillation.periodKey}`;
+      this.db.upsertFtsItem({
         itemId: distillation.id,
         sourceType: "distillation",
         realmId: distillation.realmId,
         status: distillation.status,
-        text: indexText,
+        title,
+        body: distillation.narrativeMd,
       });
-    }
 
-    return distillation;
+      const indexText = `${title}\n${distillation.narrativeMd}`.trim();
+      if (indexText) {
+        this.db.markVectorPending({
+          itemId: distillation.id,
+          sourceType: "distillation",
+          orgId: targetRealm.orgId,
+          realmId: distillation.realmId,
+          status: distillation.status,
+          text: indexText,
+          queuedAt: now,
+        });
+      }
+
+      this.db.appendChangeLog({
+        orgId: targetRealm.orgId,
+        realmId: distillation.realmId,
+        entityType: "distillation",
+        entityId: distillation.id,
+        op: "settle",
+        actorId: params.actor.id,
+        createdAt: now,
+      });
+
+      return distillation;
+    });
   }
 
-  // ---- Rebuild (Destroy & Reconstruct All Derived Indexes + Drive from Canonical Truth) ----
+  // ---- Batch Embedding Sync (Off-Write-Path, Race-Safe 3-Point Recheck) ----
 
-  async rebuild(options?: { restoreDrive?: boolean }): Promise<RebuildResult> {
-    this.db.clearFtsIndex();
-    this.db.clearVectorIndex();
+  async syncEmbeddings(options?: {
+    batchSize?: number;
+    maxItems?: number;
+  }): Promise<SyncEmbeddingsResult> {
+    if (!this.db.vecEnabled || !this.embedder.configured) {
+      return {
+        processed: 0,
+        indexed: 0,
+        skipped: 0,
+        failed: 0,
+        remaining: this.db.countPendingVectors(),
+      };
+    }
 
-    const seabed = this.db.listAllSeabedEntries();
-    const records = this.db.listAllRecords();
-    const distillations = this.db.listAllDistillations();
+    const batchSize = Math.max(1, Math.min(options?.batchSize ?? 64, 512));
+    const maxItems = options?.maxItems ?? Number.POSITIVE_INFINITY;
 
-    let ftsIndexed = 0;
-    let vectorsIndexed = 0;
-    let vectorsPending = 0;
+    let processed = 0;
+    let indexed = 0;
+    let skipped = 0;
+    let failed = 0;
+    let failedOffset = 0;
 
-    const indexOne = async (item: {
-      itemId: string;
-      sourceType: "record" | "seabed" | "distillation";
-      realmId: string;
-      status: string;
-      title: string;
-      body: string;
-    }) => {
-      this.db.upsertFtsItem(item);
-      ftsIndexed += 1;
-      const text = `${item.title}\n${item.body}`.trim();
-      if (!text) return;
-      if (this.db.vecEnabled && this.embedder.configured) {
-        const vec = await this.embedder.embed(text);
-        if (vec) {
-          this.db.upsertVectorItem({
-            itemId: item.itemId,
-            sourceType: item.sourceType,
-            realmId: item.realmId,
-            status: item.status,
-            embedding: vec,
-          });
-          vectorsIndexed += 1;
-          return;
+    while (processed < maxItems) {
+      const limit = Math.min(batchSize, maxItems - processed);
+      const batch = this.db.listPendingVectors(limit, failedOffset);
+      if (batch.length === 0) break;
+
+      const texts = batch.map((item) => item.text);
+      let vectors: Array<Float32Array | null>;
+      if (typeof this.embedder.embedBatch === "function") {
+        try {
+          const out = await this.embedder.embedBatch(texts);
+          vectors = batch.map((_, idx) => out[idx] ?? null);
+        } catch {
+          vectors = batch.map(() => null);
         }
-      }
-      this.db.markVectorPending({
-        itemId: item.itemId,
-        sourceType: item.sourceType,
-        realmId: item.realmId,
-        status: item.status,
-        text,
-      });
-      vectorsPending += 1;
-    };
-
-    for (const s of seabed) {
-      await indexOne({
-        itemId: s.id,
-        sourceType: "seabed",
-        realmId: s.realmId,
-        status: "evidence",
-        title: `${s.kind}:${s.topicId ?? s.realmId}`,
-        body: s.text,
-      });
-    }
-
-    for (const r of records) {
-      const payloadText = Object.entries(r.payload)
-        .map(
-          ([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
-        )
-        .join("\n");
-      await indexOne({
-        itemId: r.id,
-        sourceType: "record",
-        realmId: r.realmId,
-        status: r.status,
-        title: r.title,
-        body: payloadText,
-      });
-    }
-
-    // Verify distillations against canonical truth
-    const existingIds = new Set<string>([
-      ...seabed.map((s) => s.id),
-      ...records.map((r) => r.id),
-      ...distillations.map((d) => d.id),
-    ]);
-    const distillationMismatches: string[] = [];
-
-    for (const d of distillations) {
-      const missing = d.sourceIds.filter((id) => !existingIds.has(id));
-      if (missing.length > 0) {
-        distillationMismatches.push(
-          `${d.id}: missing sourceIds [${missing.join(", ")}]`,
+      } else {
+        vectors = await Promise.all(
+          texts.map((t) => this.embedder.embed(t).catch(() => null)),
         );
       }
-      await indexOne({
-        itemId: d.id,
-        sourceType: "distillation",
-        realmId: d.realmId,
-        status: d.status,
-        title: `${d.layer}:${d.periodKey}`,
-        body: d.narrativeMd,
+
+      // Write back inside BEGIN IMMEDIATE with strict 3-point per-item recheck:
+      // 1) vec_pending row still exists
+      // 2) canonical row still exists, not redacted, not secret, not retracted
+      // 3) use live status from canonical row when writing vec_items, then delete vec_pending
+      this.db.transaction(() => {
+        for (let i = 0; i < batch.length; i += 1) {
+          const pending = batch[i]!;
+          const vec = vectors[i] ?? null;
+          processed += 1;
+
+          const stillPending = this.db.getPendingVector(pending.itemId);
+          if (
+            !stillPending ||
+            stillPending.queuedAt !== pending.queuedAt ||
+            stillPending.text !== pending.text
+          ) {
+            skipped += 1;
+            continue;
+          }
+
+          let liveStatus: string | null = null;
+          let liveRealmId: string | null = null;
+
+          if (pending.sourceType === "record") {
+            const rec = this.db.getRecord(pending.itemId);
+            if (
+              !rec ||
+              rec.redactedAt !== null ||
+              rec.sensitivity === "secret" ||
+              rec.status === "retracted"
+            ) {
+              this.db.deletePendingVector(pending.itemId);
+              skipped += 1;
+              continue;
+            }
+            liveStatus = rec.status;
+            liveRealmId = rec.realmId;
+          } else if (pending.sourceType === "seabed") {
+            const sea = this.db.getSeabedEntry(pending.itemId);
+            if (
+              !sea ||
+              sea.redactedAt !== null ||
+              sea.sensitivity === "secret"
+            ) {
+              this.db.deletePendingVector(pending.itemId);
+              skipped += 1;
+              continue;
+            }
+            liveStatus = "evidence";
+            liveRealmId = sea.realmId;
+          } else {
+            const dist = this.db.getDistillation(pending.itemId);
+            if (!dist || (dist.status as string) === "retracted") {
+              this.db.deletePendingVector(pending.itemId);
+              skipped += 1;
+              continue;
+            }
+            liveStatus = dist.status;
+            liveRealmId = dist.realmId;
+          }
+
+          if (!vec) {
+            failed += 1;
+            failedOffset += 1;
+            continue;
+          }
+
+          this.db.upsertVectorItem({
+            itemId: pending.itemId,
+            sourceType: pending.sourceType,
+            realmId: liveRealmId,
+            status: liveStatus,
+            embedding: vec,
+          });
+          indexed += 1;
+        }
       });
     }
+
+    return {
+      processed,
+      indexed,
+      skipped,
+      failed,
+      remaining: this.db.countPendingVectors(),
+    };
+  }
+
+  // ---- Change Log Helpers ----
+
+  listChangeLog(params?: {
+    orgId?: string;
+    sinceSeq?: number;
+    limit?: number;
+  }): { generation: number; entries: ChangeLogEntry[] } {
+    return this.db.listChangeLog(params);
+  }
+
+  resetChangeLog(): { generation: number; clearedCount: number } {
+    return this.db.resetChangeLog();
+  }
+
+  // ---- Rebuild (Destroy & Reconstruct Derived Indexes + Drive; Preserves change_log & generation) ----
+
+  async rebuild(options?: { restoreDrive?: boolean }): Promise<RebuildResult> {
+    let ftsIndexed = 0;
+    let distillationsVerified = 0;
+    const distillationMismatches: string[] = [];
+
+    this.db.transaction(() => {
+      // Rebuild NEVER clears change_log or bumps change_log_generation.
+      this.db.clearFtsIndex();
+      this.db.clearVectorIndex();
+
+      const now = new Date().toISOString();
+      const realmsById = new Map(
+        this.db.listRealms().map((r) => [r.id, r]),
+      );
+      const seabed = this.db.listAllSeabedEntries();
+      const records = this.db.listAllRecords();
+      const distillations = this.db.listAllDistillations();
+
+      const indexOneSync = (item: {
+        itemId: string;
+        sourceType: "record" | "seabed" | "distillation";
+        orgId: string;
+        realmId: string;
+        status: string;
+        title: string;
+        body: string;
+      }) => {
+        this.db.upsertFtsItem({
+          itemId: item.itemId,
+          sourceType: item.sourceType,
+          realmId: item.realmId,
+          status: item.status,
+          title: item.title,
+          body: item.body,
+        });
+        ftsIndexed += 1;
+        const text = `${item.title}\n${item.body}`.trim();
+        if (!text) return;
+        this.db.markVectorPending({
+          itemId: item.itemId,
+          sourceType: item.sourceType,
+          orgId: item.orgId,
+          realmId: item.realmId,
+          status: item.status,
+          text,
+          queuedAt: now,
+        });
+      };
+
+      for (const s of seabed) {
+        if (s.redactedAt !== null || s.sensitivity === "secret") continue;
+        const orgId = s.orgId || realmsById.get(s.realmId)?.orgId || "";
+        indexOneSync({
+          itemId: s.id,
+          sourceType: "seabed",
+          orgId,
+          realmId: s.realmId,
+          status: "evidence",
+          title: `${s.kind}:${s.topicId ?? s.realmId}`,
+          body: s.text,
+        });
+      }
+
+      for (const r of records) {
+        if (
+          r.redactedAt !== null ||
+          r.sensitivity === "secret" ||
+          r.status === "retracted"
+        ) {
+          continue;
+        }
+        const orgId = r.orgId || realmsById.get(r.realmId)?.orgId || "";
+        const payloadText = Object.entries(r.payload)
+          .map(
+            ([k, v]) =>
+              `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
+          )
+          .join("\n");
+        indexOneSync({
+          itemId: r.id,
+          sourceType: "record",
+          orgId,
+          realmId: r.realmId,
+          status: r.status,
+          title: r.title,
+          body: payloadText,
+        });
+      }
+
+      // Verify distillations against canonical truth
+      const existingIds = new Set<string>([
+        ...seabed.map((s) => s.id),
+        ...records.map((r) => r.id),
+        ...distillations.map((d) => d.id),
+      ]);
+      distillationsVerified = distillations.length;
+
+      for (const d of distillations) {
+        const missing = d.sourceIds.filter((id) => !existingIds.has(id));
+        if (missing.length > 0) {
+          distillationMismatches.push(
+            `${d.id}: missing sourceIds [${missing.join(", ")}]`,
+          );
+        }
+        if ((d.status as string) === "retracted") continue;
+        const orgId = realmsById.get(d.realmId)?.orgId ?? "";
+        indexOneSync({
+          itemId: d.id,
+          sourceType: "distillation",
+          orgId,
+          realmId: d.realmId,
+          status: d.status,
+          title: `${d.layer}:${d.periodKey}`,
+          body: d.narrativeMd,
+        });
+      }
+    });
+
+    const syncRes = await this.syncEmbeddings();
 
     // Restore DrivePort from canonical SQLite drive_files + BlobPort snapshots
     let driveFilesRestored = 0;
@@ -984,10 +1150,10 @@ export class SeaEngine {
 
     return {
       ftsIndexed,
-      vectorsIndexed,
-      vectorsPending,
+      vectorsIndexed: syncRes.indexed,
+      vectorsPending: syncRes.remaining,
       driveFilesRestored,
-      distillationsVerified: distillations.length,
+      distillationsVerified,
       distillationMismatches,
     };
   }

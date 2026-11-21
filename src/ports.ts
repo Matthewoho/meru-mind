@@ -1,13 +1,17 @@
 import type {
+  ChangeLogEntry,
   Distillation,
   DistillationLayer,
   DriveFileContent,
   DriveFileMeta,
+  IdempotencyRecord,
   LedgerRecord,
   Organization,
+  OrgPolicy,
   Realm,
   RealmMount,
   RecordKind,
+  SchemaMigrationRecord,
   SeabedEntry,
   SeabedKind,
 } from "./types.js";
@@ -31,14 +35,22 @@ export interface VectorMatch {
 export interface PendingVectorItem {
   itemId: string;
   sourceType: "record" | "seabed" | "distillation";
+  orgId: string;
   realmId: string;
   status: string;
   text: string;
+  queuedAt?: string;
 }
 
 /**
  * Thin persistence port. Local implementation uses Node 22 node:sqlite (WAL + FTS5 + sqlite-vec);
  * cloud implementations can swap in D1/Postgres+pgvector without changing core logic.
+ *
+ * NOTE on `change_log.seq` monotonicity:
+ * Gap-free, strictly monotonic `change_log.seq` relies on SQLite single-writer
+ * `BEGIN IMMEDIATE` transactions (serialized writers and transactional rollback of
+ * `sqlite_sequence`). Multi-writer cloud backends swapping in Postgres/D1 must either
+ * serialize `change_log` appends or explicitly tolerate sequence gaps when polling cursors.
  */
 export interface DbPort {
   readonly vecEnabled: boolean;
@@ -47,10 +59,16 @@ export interface DbPort {
   close(): void;
   transaction<T>(fn: () => T): T;
 
+  // Schema & Meta
+  listSchemaMigrations(): SchemaMigrationRecord[];
+  getMeta(key: string): string | null;
+  setMeta(key: string, value: string): void;
+
   // Organizations & Realms
   insertOrg(org: Organization): void;
   getOrg(id: string): Organization | null;
   listOrgs(): Organization[];
+  updateOrgPolicy(orgId: string, policy: OrgPolicy): boolean;
 
   insertRealm(realm: Realm): void;
   getRealm(id: string): Realm | null;
@@ -78,7 +96,8 @@ export interface DbPort {
 
   // Records (truth source 2: append-only ledger with supersede chains)
   insertRecord(record: LedgerRecord): void;
-  markRecordSuperseded(oldId: string, newId: string): void;
+  /** Atomic CAS supersede: returns true iff the target row was active and unsuperseded (changes === 1). */
+  markRecordSuperseded(oldId: string, newId: string): boolean;
   getRecord(id: string): LedgerRecord | null;
   listRecords(filter: {
     realmIds: string[];
@@ -120,6 +139,22 @@ export interface DbPort {
   getDriveFileMeta(realmId: string, relPath: string): DriveFileMeta | null;
   listDriveFilesMeta(realmIds: string[]): DriveFileMeta[];
 
+  // Idempotency keys (org-scoped, shared across records & seabed_entries)
+  getIdempotencyKey(orgId: string, key: string): IdempotencyRecord | null;
+  insertIdempotencyKey(record: IdempotencyRecord): void;
+
+  // Change log (append-only operational event log; never cleared by rebuild())
+  getChangeLogGeneration(): number;
+  appendChangeLog(
+    entry: Omit<ChangeLogEntry, "seq" | "generation">,
+  ): ChangeLogEntry;
+  listChangeLog(params?: {
+    orgId?: string;
+    sinceSeq?: number;
+    limit?: number;
+  }): { generation: number; entries: ChangeLogEntry[] };
+  resetChangeLog(): { generation: number; clearedCount: number };
+
   // Rebuildable FTS5 index
   upsertFtsItem(item: {
     itemId: string;
@@ -130,6 +165,7 @@ export interface DbPort {
     body: string;
   }): void;
   updateFtsStatus(itemId: string, status: string): void;
+  deleteFtsItem(itemId: string): void;
   searchFts(params: {
     query: string;
     realmIds: string[];
@@ -148,8 +184,12 @@ export interface DbPort {
     embedding: Float32Array;
   }): void;
   markVectorPending(item: PendingVectorItem): void;
+  getPendingVector(itemId: string): PendingVectorItem | null;
+  deletePendingVector(itemId: string): void;
+  countPendingVectors(): number;
   updateVectorStatus(itemId: string, status: string): void;
-  listPendingVectors(limit?: number): PendingVectorItem[];
+  deleteVectorItem(itemId: string): void;
+  listPendingVectors(limit?: number, offset?: number): PendingVectorItem[];
   searchVectors(params: {
     embedding: Float32Array;
     realmIds: string[];

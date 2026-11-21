@@ -36,7 +36,7 @@ export {
   type LayerFSRuntimeLike,
   type LayerFSWorkspaceHandle,
 } from "./adapters/layerfs-drive.js";
-export { LedgerEngine } from "./engine/ledger.js";
+export { LedgerEngine, computePayloadHash } from "./engine/ledger.js";
 export { SeaEngine } from "./engine/sea.js";
 export {
   SliceExporter,

@@ -4,6 +4,7 @@ export type MindErrorCode =
   | "INVALID_INPUT"
   | "NOT_FOUND"
   | "CONFLICT"
+  | "IDEMPOTENCY_MISMATCH"
   | "VERDICT_INVARIANT"
   | "FORBIDDEN_HOME_PATH"
   | "SLICE_VIOLATION"
@@ -34,10 +35,15 @@ export interface Actor {
   family?: string;
 }
 
+export type OrgPolicy = "open" | "tree";
+
+export type Sensitivity = "public" | "internal" | "confidential" | "secret";
+
 export interface Organization {
   id: string;
   name: string;
   isPersonalRoot: boolean;
+  policy: OrgPolicy;
   createdAt: string;
 }
 
@@ -87,6 +93,7 @@ export type SeabedKind = "message" | "artifact" | "evidence" | "signal";
 
 export interface SeabedEntry {
   id: string;
+  orgId: string;
   realmId: string;
   topicId: string | null;
   kind: SeabedKind;
@@ -97,6 +104,12 @@ export interface SeabedEntry {
   blobSha256: string | null;
   sourceRef: string | null;
   metadata: Record<string, unknown>;
+  occurredAt: string;
+  originSessionId: string | null;
+  sensitivity: Sensitivity;
+  redactedAt: string | null;
+  redactedBy: string | null;
+  redactedReason: string | null;
   createdAt: string;
 }
 
@@ -113,18 +126,27 @@ export type RecordStatus = "active" | "superseded" | "retracted";
 
 export interface LedgerRecord {
   id: string;
+  orgId: string;
   realmId: string;
   thingId: string | null;
   kind: RecordKind;
+  extKind: string | null;
   status: RecordStatus;
   supersedesId: string | null;
   supersededById: string | null;
   authorId: string;
   authorKind: ActorKind;
   authorFamily: string | null;
+  confirmedByHuman: boolean;
   title: string;
   payload: Record<string, unknown>;
   refs: string[];
+  occurredAt: string;
+  originSessionId: string | null;
+  sensitivity: Sensitivity;
+  redactedAt: string | null;
+  redactedBy: string | null;
+  redactedReason: string | null;
   createdAt: string;
 }
 
@@ -292,4 +314,40 @@ export interface RebuildResult {
   driveFilesRestored: number;
   distillationsVerified: number;
   distillationMismatches: string[];
+}
+
+export interface SchemaMigrationRecord {
+  version: number;
+  name: string;
+  appliedAt: string;
+}
+
+export interface IdempotencyRecord {
+  orgId: string;
+  key: string;
+  targetTable: "records" | "seabed_entries";
+  targetId: string;
+  realmId: string;
+  payloadHash: string;
+  createdAt: string;
+}
+
+export interface ChangeLogEntry {
+  seq: number;
+  generation: number;
+  orgId: string;
+  realmId: string;
+  entityType: string;
+  entityId: string;
+  op: string;
+  actorId: string;
+  createdAt: string;
+}
+
+export interface SyncEmbeddingsResult {
+  processed: number;
+  indexed: number;
+  skipped: number;
+  failed: number;
+  remaining: number;
 }

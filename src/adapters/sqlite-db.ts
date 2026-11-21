@@ -10,16 +10,21 @@ import type {
 } from "../ports.js";
 import {
   MindError,
+  type ChangeLogEntry,
   type Distillation,
   type DistillationLayer,
   type DriveFileMeta,
+  type IdempotencyRecord,
   type LedgerRecord,
   type Organization,
+  type OrgPolicy,
   type Realm,
   type RealmMount,
   type RecordKind,
+  type SchemaMigrationRecord,
   type SeabedEntry,
   type SeabedKind,
+  type Sensitivity,
 } from "../types.js";
 
 export interface SqliteDbOptions {
@@ -78,6 +83,17 @@ function toVecBlob(embedding: Float32Array): Uint8Array {
   return new Uint8Array(unit.buffer, unit.byteOffset, unit.byteLength);
 }
 
+function sleepSyncMs(ms: number): void {
+  const sab = new SharedArrayBuffer(4);
+  const view = new Int32Array(sab);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+function isSqliteBusyError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /database is locked|SQLITE_BUSY/i.test(msg);
+}
+
 export class SqliteDb implements DbPort {
   private readonly db: DatabaseSync;
   readonly vecEnabled: boolean;
@@ -105,9 +121,10 @@ export class SqliteDb implements DbPort {
       allowExtension: wantVec,
     });
 
-    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA busy_timeout = 10000;");
+    this.execPragmaWithBusyRetry("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
-    this.db.exec("PRAGMA busy_timeout = 5000;");
+    this.db.exec("PRAGMA secure_delete = ON;");
 
     let loadedVec = false;
     if (wantVec) {
@@ -122,127 +139,455 @@ export class SqliteDb implements DbPort {
     this.initSchema();
   }
 
-  private initSchema(): void {
+  private execPragmaWithBusyRetry(sql: string, maxAttempts = 25): void {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        this.db.exec(sql);
+        return;
+      } catch (err) {
+        if (!isSqliteBusyError(err) || attempt === maxAttempts) {
+          throw err;
+        }
+        sleepSyncMs(5 + Math.floor(Math.random() * 20));
+      }
+    }
+  }
+
+  private hasColumn(table: string, column: string): boolean {
+    const rows = this.db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all() as Array<{ name: string }>;
+    return rows.some((r) => String(r.name) === column);
+  }
+
+  private ensureColumn(
+    table: string,
+    column: string,
+    definition: string,
+  ): void {
+    if (!this.hasColumn(table, column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
+    }
+  }
+
+  private tableExists(name: string): boolean {
+    const row = this.db
+      .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE name = ? LIMIT 1`)
+      .get(name) as { ok: number } | undefined;
+    return Boolean(row);
+  }
+
+  private createVecItemsTable(): void {
+    if (!this.vecEnabled) return;
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS orgs (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        is_personal_root INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS realms (
-        id TEXT PRIMARY KEY,
-        org_id TEXT NOT NULL REFERENCES orgs(id),
-        parent_id TEXT REFERENCES realms(id),
-        slug TEXT NOT NULL,
-        path TEXT NOT NULL,
-        name TEXT NOT NULL,
-        archived_at TEXT,
-        created_at TEXT NOT NULL,
-        UNIQUE(org_id, path)
-      );
-      CREATE INDEX IF NOT EXISTS idx_realms_org_parent ON realms(org_id, parent_id);
-
-      CREATE TABLE IF NOT EXISTS realm_mounts (
-        id TEXT PRIMARY KEY,
-        viewer_realm_id TEXT NOT NULL REFERENCES realms(id),
-        target_realm_id TEXT NOT NULL REFERENCES realms(id),
-        scope TEXT NOT NULL,
-        mounted_by TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        UNIQUE(viewer_realm_id, target_realm_id)
-      );
-      CREATE INDEX IF NOT EXISTS idx_mounts_viewer ON realm_mounts(viewer_realm_id);
-
-      CREATE TABLE IF NOT EXISTS seabed_entries (
-        id TEXT PRIMARY KEY,
-        realm_id TEXT NOT NULL REFERENCES realms(id),
-        topic_id TEXT,
-        kind TEXT NOT NULL,
-        author_id TEXT NOT NULL,
-        author_kind TEXT NOT NULL,
-        author_family TEXT,
-        text TEXT NOT NULL,
-        blob_sha256 TEXT,
-        source_ref TEXT,
-        metadata_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_seabed_realm_time ON seabed_entries(realm_id, created_at DESC);
-
-      CREATE TABLE IF NOT EXISTS records (
-        id TEXT PRIMARY KEY,
-        realm_id TEXT NOT NULL REFERENCES realms(id),
-        thing_id TEXT,
-        kind TEXT NOT NULL,
-        status TEXT NOT NULL,
-        supersedes_id TEXT REFERENCES records(id),
-        superseded_by_id TEXT REFERENCES records(id),
-        author_id TEXT NOT NULL,
-        author_kind TEXT NOT NULL,
-        author_family TEXT,
-        title TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        refs_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_records_realm_kind_status ON records(realm_id, kind, status, created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_records_thing ON records(thing_id, created_at ASC);
-
-      CREATE TABLE IF NOT EXISTS distillations (
-        id TEXT PRIMARY KEY,
-        realm_id TEXT NOT NULL REFERENCES realms(id),
-        layer TEXT NOT NULL,
-        period_key TEXT NOT NULL,
-        status TEXT NOT NULL,
-        hard_facts_json TEXT NOT NULL,
-        narrative_md TEXT NOT NULL,
-        source_ids_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_distill_realm_layer ON distillations(realm_id, layer, status, created_at DESC);
-
-      CREATE TABLE IF NOT EXISTS drive_files (
-        realm_id TEXT NOT NULL REFERENCES realms(id),
-        rel_path TEXT NOT NULL,
-        sha256 TEXT NOT NULL,
-        version INTEGER NOT NULL,
-        updated_by TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (realm_id, rel_path)
-      );
-
-      CREATE VIRTUAL TABLE IF NOT EXISTS fts_index USING fts5(
-        item_id UNINDEXED,
-        source_type UNINDEXED,
-        realm_id UNINDEXED,
-        status UNINDEXED,
-        title,
-        body,
-        tokenize = 'unicode61'
-      );
-
-      CREATE TABLE IF NOT EXISTS vec_pending (
+      CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
         item_id TEXT PRIMARY KEY,
-        source_type TEXT NOT NULL,
-        realm_id TEXT NOT NULL,
-        status TEXT NOT NULL,
-        text TEXT NOT NULL
+        realm_id TEXT PARTITION KEY,
+        status TEXT,
+        source_type TEXT,
+        embedding FLOAT[${this.vectorDimensions}]
       );
     `);
+  }
 
-    if (this.vecEnabled) {
+  private initSchema(): void {
+    this.transaction(() => {
+      const now = new Date().toISOString();
+
       this.db.exec(`
-        CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
-          item_id TEXT PRIMARY KEY,
-          realm_id TEXT PARTITION KEY,
-          status TEXT,
-          source_type TEXT,
-          embedding FLOAT[${this.vectorDimensions}]
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          name TEXT NOT NULL,
+          applied_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
         );
       `);
-    }
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO meta (key, value) VALUES ('change_log_generation', '1')`,
+        )
+        .run();
+
+      const applied = new Set<number>(
+        (
+          this.db
+            .prepare(`SELECT version FROM schema_migrations`)
+            .all() as Array<{ version: number }>
+        ).map((r) => Number(r.version)),
+      );
+
+      // Migration v1: V0.1 baseline schema
+      if (!applied.has(1)) {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS orgs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            is_personal_root INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+          );
+
+          CREATE TABLE IF NOT EXISTS realms (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES orgs(id),
+            parent_id TEXT REFERENCES realms(id),
+            slug TEXT NOT NULL,
+            path TEXT NOT NULL,
+            name TEXT NOT NULL,
+            archived_at TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(org_id, path)
+          );
+          CREATE INDEX IF NOT EXISTS idx_realms_org_parent ON realms(org_id, parent_id);
+
+          CREATE TABLE IF NOT EXISTS realm_mounts (
+            id TEXT PRIMARY KEY,
+            viewer_realm_id TEXT NOT NULL REFERENCES realms(id),
+            target_realm_id TEXT NOT NULL REFERENCES realms(id),
+            scope TEXT NOT NULL,
+            mounted_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(viewer_realm_id, target_realm_id)
+          );
+          CREATE INDEX IF NOT EXISTS idx_mounts_viewer ON realm_mounts(viewer_realm_id);
+
+          CREATE TABLE IF NOT EXISTS seabed_entries (
+            id TEXT PRIMARY KEY,
+            realm_id TEXT NOT NULL REFERENCES realms(id),
+            topic_id TEXT,
+            kind TEXT NOT NULL,
+            author_id TEXT NOT NULL,
+            author_kind TEXT NOT NULL,
+            author_family TEXT,
+            text TEXT NOT NULL,
+            blob_sha256 TEXT,
+            source_ref TEXT,
+            metadata_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_seabed_realm_time ON seabed_entries(realm_id, created_at DESC);
+
+          CREATE TABLE IF NOT EXISTS records (
+            id TEXT PRIMARY KEY,
+            realm_id TEXT NOT NULL REFERENCES realms(id),
+            thing_id TEXT,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            supersedes_id TEXT REFERENCES records(id),
+            superseded_by_id TEXT REFERENCES records(id),
+            author_id TEXT NOT NULL,
+            author_kind TEXT NOT NULL,
+            author_family TEXT,
+            title TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            refs_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_records_realm_kind_status ON records(realm_id, kind, status, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_records_thing ON records(thing_id, created_at ASC);
+
+          CREATE TABLE IF NOT EXISTS distillations (
+            id TEXT PRIMARY KEY,
+            realm_id TEXT NOT NULL REFERENCES realms(id),
+            layer TEXT NOT NULL,
+            period_key TEXT NOT NULL,
+            status TEXT NOT NULL,
+            hard_facts_json TEXT NOT NULL,
+            narrative_md TEXT NOT NULL,
+            source_ids_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_distill_realm_layer ON distillations(realm_id, layer, status, created_at DESC);
+
+          CREATE TABLE IF NOT EXISTS drive_files (
+            realm_id TEXT NOT NULL REFERENCES realms(id),
+            rel_path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            updated_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (realm_id, rel_path)
+          );
+
+          CREATE VIRTUAL TABLE IF NOT EXISTS fts_index USING fts5(
+            item_id UNINDEXED,
+            source_type UNINDEXED,
+            realm_id UNINDEXED,
+            status UNINDEXED,
+            title,
+            body,
+            tokenize = 'unicode61'
+          );
+
+          CREATE TABLE IF NOT EXISTS vec_pending (
+            item_id TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL,
+            realm_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            text TEXT NOT NULL
+          );
+        `);
+
+        this.createVecItemsTable();
+
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, 'v0.1_baseline', ?)`,
+          )
+          .run(now);
+      }
+
+      // Migration v2: V0.2a Slice 1a (org policy, provenance/sensitivity/redaction columns,
+      // idempotency_keys, change_log, redacted_blocklist, vec_pending rebuild + re-enqueue)
+      if (!applied.has(2)) {
+        // 1. orgs.policy: nullable column, existing V0.1 orgs backfilled to 'tree'
+        this.ensureColumn("orgs", "policy", "TEXT");
+        this.db.exec(`UPDATE orgs SET policy = 'tree' WHERE policy IS NULL;`);
+
+        // 2. seabed_entries incremental columns + backfills + indexes
+        this.ensureColumn("seabed_entries", "org_id", "TEXT");
+        this.ensureColumn("seabed_entries", "occurred_at", "TEXT");
+        this.ensureColumn("seabed_entries", "origin_session_id", "TEXT");
+        this.ensureColumn(
+          "seabed_entries",
+          "sensitivity",
+          "TEXT NOT NULL DEFAULT 'internal'",
+        );
+        this.ensureColumn("seabed_entries", "redacted_at", "TEXT");
+        this.ensureColumn("seabed_entries", "redacted_by", "TEXT");
+        this.ensureColumn("seabed_entries", "redacted_reason", "TEXT");
+
+        this.db.exec(`
+          UPDATE seabed_entries
+          SET org_id = (SELECT realms.org_id FROM realms WHERE realms.id = seabed_entries.realm_id)
+          WHERE org_id IS NULL;
+          UPDATE seabed_entries
+          SET occurred_at = created_at
+          WHERE occurred_at IS NULL;
+          CREATE INDEX IF NOT EXISTS idx_seabed_org ON seabed_entries(org_id, occurred_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_seabed_realm_occurred ON seabed_entries(realm_id, occurred_at DESC);
+        `);
+
+        // 3. records incremental columns + backfills + indexes
+        this.ensureColumn("records", "org_id", "TEXT");
+        this.ensureColumn("records", "occurred_at", "TEXT");
+        this.ensureColumn("records", "origin_session_id", "TEXT");
+        this.ensureColumn(
+          "records",
+          "sensitivity",
+          "TEXT NOT NULL DEFAULT 'internal'",
+        );
+        this.ensureColumn("records", "redacted_at", "TEXT");
+        this.ensureColumn("records", "redacted_by", "TEXT");
+        this.ensureColumn("records", "redacted_reason", "TEXT");
+        this.ensureColumn(
+          "records",
+          "confirmed_by_human",
+          "INTEGER NOT NULL DEFAULT 0",
+        );
+        this.ensureColumn("records", "ext_kind", "TEXT");
+
+        this.db.exec(`
+          UPDATE records
+          SET org_id = (SELECT realms.org_id FROM realms WHERE realms.id = records.realm_id)
+          WHERE org_id IS NULL;
+          UPDATE records
+          SET occurred_at = created_at
+          WHERE occurred_at IS NULL;
+          UPDATE records
+          SET confirmed_by_human = 1
+          WHERE author_kind = 'human' AND confirmed_by_human = 0;
+          CREATE INDEX IF NOT EXISTS idx_records_org ON records(org_id, occurred_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_records_realm_occurred ON records(realm_id, occurred_at DESC);
+        `);
+
+        // 4. idempotency_keys, change_log, redacted_blocklist
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS idempotency_keys (
+            org_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            target_table TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            realm_id TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (org_id, key)
+          );
+
+          CREATE TABLE IF NOT EXISTS change_log (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            generation INTEGER NOT NULL,
+            org_id TEXT NOT NULL,
+            realm_id TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            op TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_change_log_org_seq ON change_log(org_id, seq ASC);
+
+          CREATE TABLE IF NOT EXISTS redacted_blocklist (
+            org_id TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            reason TEXT,
+            redacted_at TEXT NOT NULL,
+            PRIMARY KEY (org_id, source_ref, content_sha256)
+          );
+        `);
+
+        // 5. Explicit vec_pending rebuild + C2 re-enqueue all non-secret, non-redacted entries missing from vec_items
+        this.db.exec(`
+          DROP TABLE IF EXISTS vec_pending;
+          CREATE TABLE vec_pending (
+            item_id TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            realm_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            text TEXT NOT NULL,
+            queued_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_vec_pending_queued ON vec_pending(queued_at ASC, item_id ASC);
+        `);
+
+        const existingVecIds = new Set<string>();
+        if (this.vecEnabled && this.tableExists("vec_items")) {
+          const vecRows = this.db
+            .prepare(`SELECT item_id FROM vec_items`)
+            .all() as Array<{ item_id: string }>;
+          for (const vr of vecRows) {
+            existingVecIds.add(String(vr.item_id));
+          }
+        }
+
+        const insertPendingStmt = this.db.prepare(
+          `INSERT OR REPLACE INTO vec_pending
+           (item_id, source_type, org_id, realm_id, status, text, queued_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        );
+
+        const recRows = this.db
+          .prepare(
+            `SELECT id, org_id, realm_id, status, title, payload_json
+             FROM records
+             WHERE redacted_at IS NULL AND sensitivity != 'secret' AND status != 'retracted'`,
+          )
+          .all() as Array<{
+          id: string;
+          org_id: string;
+          realm_id: string;
+          status: string;
+          title: string;
+          payload_json: string;
+        }>;
+        for (const r of recRows) {
+          if (existingVecIds.has(r.id)) continue;
+          let payloadText = "";
+          try {
+            const parsed = JSON.parse(String(r.payload_json)) as Record<
+              string,
+              unknown
+            >;
+            payloadText = Object.entries(parsed)
+              .map(
+                ([k, v]) =>
+                  `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
+              )
+              .join("\n");
+          } catch {
+            payloadText = "";
+          }
+          const embedText = `${r.title}\n${payloadText}`.trim();
+          if (!embedText) continue;
+          insertPendingStmt.run(
+            r.id,
+            "record",
+            r.org_id,
+            r.realm_id,
+            r.status,
+            embedText,
+            now,
+          );
+        }
+
+        const seaRows = this.db
+          .prepare(
+            `SELECT id, org_id, realm_id, topic_id, kind, text
+             FROM seabed_entries
+             WHERE redacted_at IS NULL AND sensitivity != 'secret'`,
+          )
+          .all() as Array<{
+          id: string;
+          org_id: string;
+          realm_id: string;
+          topic_id: string | null;
+          kind: string;
+          text: string;
+        }>;
+        for (const s of seaRows) {
+          if (existingVecIds.has(s.id)) continue;
+          const title = `${s.kind}:${s.topic_id ?? s.realm_id}`;
+          const embedText = `${title}\n${s.text}`.trim();
+          if (!embedText) continue;
+          insertPendingStmt.run(
+            s.id,
+            "seabed",
+            s.org_id,
+            s.realm_id,
+            "evidence",
+            embedText,
+            now,
+          );
+        }
+
+        const distRows = this.db
+          .prepare(
+            `SELECT d.id, r.org_id, d.realm_id, d.layer, d.period_key, d.status, d.narrative_md
+             FROM distillations d
+             JOIN realms r ON r.id = d.realm_id
+             WHERE d.status != 'retracted'`,
+          )
+          .all() as Array<{
+          id: string;
+          org_id: string;
+          realm_id: string;
+          layer: string;
+          period_key: string;
+          status: string;
+          narrative_md: string;
+        }>;
+        for (const d of distRows) {
+          if (existingVecIds.has(d.id)) continue;
+          const embedText =
+            `${d.layer}:${d.period_key}\n${d.narrative_md}`.trim();
+          if (!embedText) continue;
+          insertPendingStmt.run(
+            d.id,
+            "distillation",
+            d.org_id,
+            d.realm_id,
+            d.status,
+            embedText,
+            now,
+          );
+        }
+
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (2, 'v0.2a_slice1a', ?)`,
+          )
+          .run(now);
+      }
+
+      if (this.vecEnabled && !this.tableExists("vec_items")) {
+        this.createVecItemsTable();
+      }
+    });
   }
 
   close(): void {
@@ -271,15 +616,52 @@ export class SqliteDb implements DbPort {
     }
   }
 
+  // ---- Schema & Meta ----
+
+  listSchemaMigrations(): SchemaMigrationRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC`,
+      )
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      version: Number(r.version),
+      name: String(r.name),
+      appliedAt: String(r.applied_at),
+    }));
+  }
+
+  getMeta(key: string): string | null {
+    const row = this.db
+      .prepare(`SELECT value FROM meta WHERE key = ?`)
+      .get(key) as { value: string } | undefined;
+    return row ? String(row.value) : null;
+  }
+
+  setMeta(key: string, value: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(key, value);
+  }
+
   // ---- Organizations ----
 
   insertOrg(org: Organization): void {
     this.db
       .prepare(
-        `INSERT INTO orgs (id, name, is_personal_root, created_at)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO orgs (id, name, is_personal_root, policy, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(org.id, org.name, org.isPersonalRoot ? 1 : 0, org.createdAt);
+      .run(
+        org.id,
+        org.name,
+        org.isPersonalRoot ? 1 : 0,
+        org.policy,
+        org.createdAt,
+      );
   }
 
   getOrg(id: string): Organization | null {
@@ -296,11 +678,21 @@ export class SqliteDb implements DbPort {
     return rows.map((r) => this.mapOrg(r));
   }
 
+  updateOrgPolicy(orgId: string, policy: OrgPolicy): boolean {
+    const res = this.db
+      .prepare(`UPDATE orgs SET policy = ? WHERE id = ?`)
+      .run(policy, orgId);
+    return Number(res.changes) > 0;
+  }
+
   private mapOrg(row: Record<string, unknown>): Organization {
     return {
       id: String(row.id),
       name: String(row.name),
       isPersonalRoot: Number(row.is_personal_root) === 1,
+      policy: (row.policy === "open" || row.policy === "tree"
+        ? row.policy
+        : "tree") as OrgPolicy,
       createdAt: String(row.created_at),
     };
   }
@@ -422,11 +814,12 @@ export class SqliteDb implements DbPort {
     this.db
       .prepare(
         `INSERT INTO seabed_entries
-         (id, realm_id, topic_id, kind, author_id, author_kind, author_family, text, blob_sha256, source_ref, metadata_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, org_id, realm_id, topic_id, kind, author_id, author_kind, author_family, text, blob_sha256, source_ref, metadata_json, occurred_at, origin_session_id, sensitivity, redacted_at, redacted_by, redacted_reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         entry.id,
+        entry.orgId,
         entry.realmId,
         entry.topicId,
         entry.kind,
@@ -437,6 +830,12 @@ export class SqliteDb implements DbPort {
         entry.blobSha256,
         entry.sourceRef,
         JSON.stringify(entry.metadata),
+        entry.occurredAt,
+        entry.originSessionId,
+        entry.sensitivity,
+        entry.redactedAt,
+        entry.redactedBy,
+        entry.redactedReason,
         entry.createdAt,
       );
   }
@@ -516,6 +915,7 @@ export class SqliteDb implements DbPort {
   private mapSeabed(row: Record<string, unknown>): SeabedEntry {
     return {
       id: String(row.id),
+      orgId: String(row.org_id ?? ""),
       realmId: String(row.realm_id),
       topicId: row.topic_id ? String(row.topic_id) : null,
       kind: String(row.kind) as SeabedKind,
@@ -526,6 +926,16 @@ export class SqliteDb implements DbPort {
       blobSha256: row.blob_sha256 ? String(row.blob_sha256) : null,
       sourceRef: row.source_ref ? String(row.source_ref) : null,
       metadata: JSON.parse(String(row.metadata_json)) as Record<string, unknown>,
+      occurredAt: String(row.occurred_at ?? row.created_at),
+      originSessionId: row.origin_session_id
+        ? String(row.origin_session_id)
+        : null,
+      sensitivity: (row.sensitivity
+        ? String(row.sensitivity)
+        : "internal") as Sensitivity,
+      redactedAt: row.redacted_at ? String(row.redacted_at) : null,
+      redactedBy: row.redacted_by ? String(row.redacted_by) : null,
+      redactedReason: row.redacted_reason ? String(row.redacted_reason) : null,
       createdAt: String(row.created_at),
     };
   }
@@ -536,33 +946,45 @@ export class SqliteDb implements DbPort {
     this.db
       .prepare(
         `INSERT INTO records
-         (id, realm_id, thing_id, kind, status, supersedes_id, superseded_by_id, author_id, author_kind, author_family, title, payload_json, refs_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, org_id, realm_id, thing_id, kind, ext_kind, status, supersedes_id, superseded_by_id, author_id, author_kind, author_family, confirmed_by_human, title, payload_json, refs_json, occurred_at, origin_session_id, sensitivity, redacted_at, redacted_by, redacted_reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
+        record.orgId,
         record.realmId,
         record.thingId,
         record.kind,
+        record.extKind,
         record.status,
         record.supersedesId,
         record.supersededById,
         record.authorId,
         record.authorKind,
         record.authorFamily,
+        record.confirmedByHuman ? 1 : 0,
         record.title,
         JSON.stringify(record.payload),
         JSON.stringify(record.refs),
+        record.occurredAt,
+        record.originSessionId,
+        record.sensitivity,
+        record.redactedAt,
+        record.redactedBy,
+        record.redactedReason,
         record.createdAt,
       );
   }
 
-  markRecordSuperseded(oldId: string, newId: string): void {
-    this.db
+  markRecordSuperseded(oldId: string, newId: string): boolean {
+    const res = this.db
       .prepare(
-        `UPDATE records SET status = 'superseded', superseded_by_id = ? WHERE id = ?`,
+        `UPDATE records
+         SET superseded_by_id = ?, status = 'superseded'
+         WHERE id = ? AND status = 'active' AND superseded_by_id IS NULL`,
       )
       .run(newId, oldId);
+    return Number(res.changes) === 1;
   }
 
   getRecord(id: string): LedgerRecord | null {
@@ -644,9 +1066,11 @@ export class SqliteDb implements DbPort {
   private mapRecord(row: Record<string, unknown>): LedgerRecord {
     return {
       id: String(row.id),
+      orgId: String(row.org_id ?? ""),
       realmId: String(row.realm_id),
       thingId: row.thing_id ? String(row.thing_id) : null,
       kind: String(row.kind) as RecordKind,
+      extKind: row.ext_kind ? String(row.ext_kind) : null,
       status: String(row.status) as LedgerRecord["status"],
       supersedesId: row.supersedes_id ? String(row.supersedes_id) : null,
       supersededById: row.superseded_by_id
@@ -655,9 +1079,20 @@ export class SqliteDb implements DbPort {
       authorId: String(row.author_id),
       authorKind: String(row.author_kind) as LedgerRecord["authorKind"],
       authorFamily: row.author_family ? String(row.author_family) : null,
+      confirmedByHuman: Number(row.confirmed_by_human ?? 0) === 1,
       title: String(row.title),
       payload: JSON.parse(String(row.payload_json)) as Record<string, unknown>,
       refs: JSON.parse(String(row.refs_json)) as string[],
+      occurredAt: String(row.occurred_at ?? row.created_at),
+      originSessionId: row.origin_session_id
+        ? String(row.origin_session_id)
+        : null,
+      sensitivity: (row.sensitivity
+        ? String(row.sensitivity)
+        : "internal") as Sensitivity,
+      redactedAt: row.redacted_at ? String(row.redacted_at) : null,
+      redactedBy: row.redacted_by ? String(row.redacted_by) : null,
+      redactedReason: row.redacted_reason ? String(row.redacted_reason) : null,
       createdAt: String(row.created_at),
     };
   }
@@ -850,6 +1285,134 @@ export class SqliteDb implements DbPort {
     };
   }
 
+  // ---- Idempotency Keys ----
+
+  getIdempotencyKey(orgId: string, key: string): IdempotencyRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM idempotency_keys WHERE org_id = ? AND key = ?`,
+      )
+      .get(orgId, key) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      orgId: String(row.org_id),
+      key: String(row.key),
+      targetTable: String(row.target_table) as IdempotencyRecord["targetTable"],
+      targetId: String(row.target_id),
+      realmId: String(row.realm_id),
+      payloadHash: String(row.payload_hash),
+      createdAt: String(row.created_at),
+    };
+  }
+
+  insertIdempotencyKey(record: IdempotencyRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO idempotency_keys
+         (org_id, key, target_table, target_id, realm_id, payload_hash, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.orgId,
+        record.key,
+        record.targetTable,
+        record.targetId,
+        record.realmId,
+        record.payloadHash,
+        record.createdAt,
+      );
+  }
+
+  // ---- Change Log ----
+
+  getChangeLogGeneration(): number {
+    const raw = this.getMeta("change_log_generation");
+    const parsed = raw ? Number.parseInt(raw, 10) : 1;
+    return Number.isInteger(parsed) && parsed >= 1 ? parsed : 1;
+  }
+
+  appendChangeLog(
+    entry: Omit<ChangeLogEntry, "seq" | "generation">,
+  ): ChangeLogEntry {
+    const generation = this.getChangeLogGeneration();
+    const res = this.db
+      .prepare(
+        `INSERT INTO change_log
+         (generation, org_id, realm_id, entity_type, entity_id, op, actor_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        generation,
+        entry.orgId,
+        entry.realmId,
+        entry.entityType,
+        entry.entityId,
+        entry.op,
+        entry.actorId,
+        entry.createdAt,
+      );
+    return {
+      seq: Number(res.lastInsertRowid),
+      generation,
+      ...entry,
+    };
+  }
+
+  listChangeLog(params?: {
+    orgId?: string;
+    sinceSeq?: number;
+    limit?: number;
+  }): { generation: number; entries: ChangeLogEntry[] } {
+    const generation = this.getChangeLogGeneration();
+    const where: string[] = [];
+    const sqlParams: SQLInputValue[] = [];
+    if (params?.orgId) {
+      where.push(`org_id = ?`);
+      sqlParams.push(params.orgId);
+    }
+    if (params?.sinceSeq !== undefined) {
+      where.push(`seq > ?`);
+      sqlParams.push(params.sinceSeq);
+    }
+    const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const limit = params?.limit ?? 200;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM change_log ${whereSql} ORDER BY seq ASC LIMIT ?`,
+      )
+      .all(...sqlParams, limit) as Array<Record<string, unknown>>;
+
+    return {
+      generation,
+      entries: rows.map((r) => ({
+        seq: Number(r.seq),
+        generation: Number(r.generation),
+        orgId: String(r.org_id),
+        realmId: String(r.realm_id),
+        entityType: String(r.entity_type),
+        entityId: String(r.entity_id),
+        op: String(r.op),
+        actorId: String(r.actor_id),
+        createdAt: String(r.created_at),
+      })),
+    };
+  }
+
+  resetChangeLog(): { generation: number; clearedCount: number } {
+    return this.transaction(() => {
+      const countRow = this.db
+        .prepare(`SELECT COUNT(*) AS c FROM change_log`)
+        .get() as { c: number };
+      this.db.exec(`DELETE FROM change_log;`);
+      const nextGen = this.getChangeLogGeneration() + 1;
+      this.setMeta("change_log_generation", String(nextGen));
+      return {
+        generation: nextGen,
+        clearedCount: Number(countRow.c),
+      };
+    });
+  }
+
   // ---- Rebuildable FTS5 Index ----
 
   upsertFtsItem(item: {
@@ -892,6 +1455,10 @@ export class SqliteDb implements DbPort {
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
       .run(itemId, row.source_type, row.realm_id, status, row.title, row.body);
+  }
+
+  deleteFtsItem(itemId: string): void {
+    this.db.prepare(`DELETE FROM fts_index WHERE item_id = ?`).run(itemId);
   }
 
   searchFts(params: {
@@ -976,15 +1543,55 @@ export class SqliteDb implements DbPort {
   }
 
   markVectorPending(item: PendingVectorItem): void {
+    const queuedAt = item.queuedAt ?? new Date().toISOString();
     this.db
       .prepare(
-        `INSERT INTO vec_pending (item_id, source_type, realm_id, status, text)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO vec_pending (item_id, source_type, org_id, realm_id, status, text, queued_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(item_id) DO UPDATE SET
+           source_type = excluded.source_type,
+           org_id = excluded.org_id,
+           realm_id = excluded.realm_id,
            status = excluded.status,
-           text = excluded.text`,
+           text = excluded.text,
+           queued_at = excluded.queued_at`,
       )
-      .run(item.itemId, item.sourceType, item.realmId, item.status, item.text);
+      .run(
+        item.itemId,
+        item.sourceType,
+        item.orgId,
+        item.realmId,
+        item.status,
+        item.text,
+        queuedAt,
+      );
+  }
+
+  getPendingVector(itemId: string): PendingVectorItem | null {
+    const row = this.db
+      .prepare(`SELECT * FROM vec_pending WHERE item_id = ?`)
+      .get(itemId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      itemId: String(row.item_id),
+      sourceType: String(row.source_type) as PendingVectorItem["sourceType"],
+      orgId: String(row.org_id),
+      realmId: String(row.realm_id),
+      status: String(row.status),
+      text: String(row.text),
+      queuedAt: String(row.queued_at),
+    };
+  }
+
+  deletePendingVector(itemId: string): void {
+    this.db.prepare(`DELETE FROM vec_pending WHERE item_id = ?`).run(itemId);
+  }
+
+  countPendingVectors(): number {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS c FROM vec_pending`)
+      .get() as { c: number };
+    return Number(row.c);
   }
 
   updateVectorStatus(itemId: string, status: string): void {
@@ -1011,16 +1618,27 @@ export class SqliteDb implements DbPort {
       .run(itemId, row.realm_id, status, row.source_type, row.embedding);
   }
 
-  listPendingVectors(limit = 200): PendingVectorItem[] {
+  deleteVectorItem(itemId: string): void {
+    this.db.prepare(`DELETE FROM vec_pending WHERE item_id = ?`).run(itemId);
+    if (this.vecEnabled) {
+      this.db.prepare(`DELETE FROM vec_items WHERE item_id = ?`).run(itemId);
+    }
+  }
+
+  listPendingVectors(limit = 200, offset = 0): PendingVectorItem[] {
     const rows = this.db
-      .prepare(`SELECT * FROM vec_pending LIMIT ?`)
-      .all(limit) as Array<Record<string, unknown>>;
+      .prepare(
+        `SELECT * FROM vec_pending ORDER BY queued_at ASC, item_id ASC LIMIT ? OFFSET ?`,
+      )
+      .all(limit, offset) as Array<Record<string, unknown>>;
     return rows.map((r) => ({
       itemId: String(r.item_id),
       sourceType: String(r.source_type) as PendingVectorItem["sourceType"],
+      orgId: String(r.org_id),
       realmId: String(r.realm_id),
       status: String(r.status),
       text: String(r.text),
+      queuedAt: String(r.queued_at),
     }));
   }
 

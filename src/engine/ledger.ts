@@ -15,11 +15,13 @@ import {
   type LedgerRecord,
   type MountScope,
   type Organization,
+  type OrgPolicy,
   type Realm,
   type RealmMount,
   type RecordKind,
   type SeabedEntry,
   type SeabedKind,
+  type Sensitivity,
 } from "../types.js";
 
 const VALID_SEABED_KINDS = new Set<string>([
@@ -39,6 +41,63 @@ const VALID_RECORD_KINDS = new Set<string>([
 ]);
 const VALID_MOUNT_SCOPES = new Set<string>(["all", "ledger", "drive"]);
 const VALID_ACTOR_KINDS = new Set<string>(["human", "agent", "system"]);
+const VALID_ORG_POLICIES = new Set<string>(["open", "tree"]);
+const VALID_SENSITIVITIES = new Set<string>([
+  "public",
+  "internal",
+  "confidential",
+  "secret",
+]);
+
+function canonicalizeJson(value: unknown): unknown {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalizeJson(item));
+  }
+  const obj = value as Record<string, unknown>;
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(obj).sort()) {
+    const v = obj[key];
+    if (v !== undefined) {
+      sorted[key] = canonicalizeJson(v);
+    }
+  }
+  return sorted;
+}
+
+export function computePayloadHash(value: unknown): string {
+  const canonical = JSON.stringify(canonicalizeJson(value));
+  return crypto.createHash("sha256").update(canonical).digest("hex");
+}
+
+function validateSensitivity(raw?: Sensitivity): Sensitivity {
+  const sensitivity = raw ?? "internal";
+  if (!VALID_SENSITIVITIES.has(sensitivity)) {
+    throw new MindError(
+      "INVALID_INPUT",
+      `Invalid sensitivity: "${String(sensitivity)}"`,
+    );
+  }
+  return sensitivity;
+}
+
+function normalizeIdempotencyKey(raw?: string): string | null {
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new MindError(
+      "INVALID_INPUT",
+      "idempotencyKey cannot be empty when provided",
+    );
+  }
+  return trimmed;
+}
+
+function sha256Buffer(content: Buffer | string): string {
+  return crypto.createHash("sha256").update(content).digest("hex");
+}
 
 function validateActor(actor: Actor): Actor {
   if (!actor || !actor.id?.trim()) {
@@ -81,40 +140,41 @@ export class LedgerEngine {
     private readonly db: DbPort,
     private readonly blobs: BlobPort,
     private readonly drive: DrivePort,
-    private readonly embedder: EmbedderPort,
+    _embedder?: EmbedderPort,
   ) {}
 
-  private async indexItem(params: {
+  private upsertFtsSync(params: {
     itemId: string;
     sourceType: "record" | "seabed" | "distillation";
+    orgId: string;
     realmId: string;
     status: string;
     title: string;
     body: string;
-  }): Promise<void> {
-    this.db.upsertFtsItem(params);
-    const embedText = `${params.title}\n${params.body}`.trim();
-    if (!embedText) return;
-
-    if (this.db.vecEnabled && this.embedder.configured) {
-      const vec = await this.embedder.embed(embedText);
-      if (vec) {
-        this.db.upsertVectorItem({
-          itemId: params.itemId,
-          sourceType: params.sourceType,
-          realmId: params.realmId,
-          status: params.status,
-          embedding: vec,
-        });
-        return;
-      }
+    sensitivity: Sensitivity;
+    queuedAt: string;
+  }): void {
+    if (params.sensitivity === "secret") {
+      return;
     }
-    this.db.markVectorPending({
+    this.db.upsertFtsItem({
       itemId: params.itemId,
       sourceType: params.sourceType,
       realmId: params.realmId,
       status: params.status,
+      title: params.title,
+      body: params.body,
+    });
+    const embedText = `${params.title}\n${params.body}`.trim();
+    if (!embedText) return;
+    this.db.markVectorPending({
+      itemId: params.itemId,
+      sourceType: params.sourceType,
+      orgId: params.orgId,
+      realmId: params.realmId,
+      status: params.status,
       text: embedText,
+      queuedAt: params.queuedAt,
     });
   }
 
@@ -124,10 +184,18 @@ export class LedgerEngine {
     id?: string;
     name: string;
     isPersonalRoot?: boolean;
+    policy?: OrgPolicy;
   }): { org: Organization; rootRealm: Realm } {
     const name = params.name.trim();
     if (!name) {
       throw new MindError("INVALID_INPUT", "Organization name cannot be empty");
+    }
+    const policy = params.policy ?? "open";
+    if (!VALID_ORG_POLICIES.has(policy)) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Invalid organization policy: "${String(policy)}"`,
+      );
     }
     const orgId = params.id?.trim() || makeId("org");
     assertSafeIdentifier(orgId, "orgId");
@@ -136,6 +204,7 @@ export class LedgerEngine {
       id: orgId,
       name,
       isPersonalRoot: Boolean(params.isPersonalRoot),
+      policy,
       createdAt: now,
     };
     const rootRealm: Realm = {
@@ -154,6 +223,52 @@ export class LedgerEngine {
       this.db.insertRealm(rootRealm);
     });
     return { org, rootRealm };
+  }
+
+  setOrgPolicy(params: {
+    orgId: string;
+    policy: OrgPolicy;
+    actor: Actor;
+  }): Organization {
+    const actor = validateActor(params.actor);
+    if (actor.kind !== "human") {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Only human actors can change organization policy (actor "${actor.id}" is "${actor.kind}")`,
+      );
+    }
+    if (!VALID_ORG_POLICIES.has(params.policy)) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Invalid organization policy: "${String(params.policy)}"`,
+      );
+    }
+
+    return this.db.transaction(() => {
+      const existing = this.db.getOrg(params.orgId);
+      if (!existing) {
+        throw new MindError(
+          "NOT_FOUND",
+          `Organization not found: ${params.orgId}`,
+        );
+      }
+      this.db.updateOrgPolicy(existing.id, params.policy);
+      const rootRealm = this.db.getRealmByPath(existing.id, "/");
+      const now = new Date().toISOString();
+      this.db.appendChangeLog({
+        orgId: existing.id,
+        realmId: rootRealm?.id ?? "",
+        entityType: "org",
+        entityId: existing.id,
+        op: "org_policy_change",
+        actorId: actor.id,
+        createdAt: now,
+      });
+      return {
+        ...existing,
+        policy: params.policy,
+      };
+    });
   }
 
   listOrgs(): Organization[] {
@@ -284,24 +399,21 @@ export class LedgerEngine {
     blobContent?: Buffer | string;
     sourceRef?: string | null;
     metadata?: Record<string, unknown>;
+    occurredAt?: string;
+    originSessionId?: string | null;
+    sensitivity?: Sensitivity;
+    idempotencyKey?: string;
   }): Promise<SeabedEntry> {
     const actor = validateActor(params.actor);
     if (!VALID_SEABED_KINDS.has(params.kind)) {
-      throw new MindError("INVALID_INPUT", `Invalid seabed kind: "${String(params.kind)}"`);
+      throw new MindError(
+        "INVALID_INPUT",
+        `Invalid seabed kind: "${String(params.kind)}"`,
+      );
     }
+    const sensitivity = validateSensitivity(params.sensitivity);
+    const idempotencyKey = normalizeIdempotencyKey(params.idempotencyKey);
     const targetRealmId = params.targetRealmId ?? params.viewerRealmId;
-    const realms = this.db.listRealms();
-    const mounts = this.db.listMounts();
-
-    assertAccess({
-      realms,
-      mounts,
-      actor,
-      viewerRealmId: params.viewerRealmId,
-      targetRealmId,
-      assetKind: "seabed",
-      required: "write",
-    });
 
     const text = params.text.trim();
     if (!text && !params.blobContent) {
@@ -311,37 +423,168 @@ export class LedgerEngine {
       );
     }
 
-    let blobSha256: string | null = null;
-    if (params.blobContent !== undefined) {
-      blobSha256 = this.blobs.put(params.blobContent).sha256;
-    }
+    const metadata = params.metadata ?? {};
+    const pendingBlobSha256 =
+      params.blobContent !== undefined
+        ? sha256Buffer(params.blobContent)
+        : null;
+    const explicitOccurredAt = params.occurredAt?.trim() || null;
 
-    const entry: SeabedEntry = {
-      id: makeId("sea"),
-      realmId: targetRealmId,
-      topicId: params.topicId ?? null,
-      kind: params.kind,
-      authorId: actor.id,
-      authorKind: actor.kind,
-      authorFamily: actor.family ?? null,
-      text,
-      blobSha256,
-      sourceRef: params.sourceRef ?? null,
-      metadata: params.metadata ?? {},
-      createdAt: new Date().toISOString(),
-    };
+    const payloadHash = idempotencyKey
+      ? computePayloadHash({
+          targetTable: "seabed_entries",
+          targetRealmId,
+          kind: params.kind,
+          topicId: params.topicId ?? null,
+          text,
+          blobSha256: pendingBlobSha256,
+          sourceRef: params.sourceRef ?? null,
+          metadata,
+          occurredAt: explicitOccurredAt,
+          originSessionId: params.originSessionId ?? null,
+          sensitivity,
+        })
+      : "";
 
-    this.db.insertSeabedEntry(entry);
-    await this.indexItem({
-      itemId: entry.id,
-      sourceType: "seabed",
-      realmId: entry.realmId,
-      status: "evidence",
-      title: `${entry.kind}:${entry.topicId ?? entry.realmId}`,
-      body: entry.text,
+    return this.db.transaction(() => {
+      const realms = this.db.listRealms();
+      const mounts = this.db.listMounts();
+      const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+
+      // 1. Idempotency check at the very start of BEGIN IMMEDIATE
+      if (idempotencyKey && viewerRealm) {
+        const existingKey = this.db.getIdempotencyKey(
+          viewerRealm.orgId,
+          idempotencyKey,
+        );
+        if (existingKey) {
+          const existingAccess =
+            existingKey.targetTable === "seabed_entries"
+              ? resolveAccess({
+                  realms,
+                  mounts,
+                  actor,
+                  viewerRealmId: params.viewerRealmId,
+                  targetRealmId: existingKey.realmId,
+                  assetKind: "seabed",
+                  explicitDescendantDive: false,
+                })
+              : (() => {
+                  const rec = this.db.getRecord(existingKey.targetId);
+                  return resolveAccess({
+                    realms,
+                    mounts,
+                    actor,
+                    viewerRealmId: params.viewerRealmId,
+                    targetRealmId: existingKey.realmId,
+                    assetKind: rec?.kind === "rule" ? "rule" : "ledger",
+                  });
+                })();
+
+          if (existingAccess === "none") {
+            throw new MindError(
+              "NOT_FOUND",
+              "Entry not found in visible scope",
+            );
+          }
+          if (
+            existingKey.targetTable !== "seabed_entries" ||
+            existingKey.payloadHash !== payloadHash
+          ) {
+            throw new MindError(
+              "IDEMPOTENCY_MISMATCH",
+              `Idempotency key "${idempotencyKey}" already exists with a different payload`,
+            );
+          }
+          const existingEntry = this.db.getSeabedEntry(existingKey.targetId);
+          if (!existingEntry) {
+            throw new MindError(
+              "NOT_FOUND",
+              "Entry not found in visible scope",
+            );
+          }
+          return existingEntry;
+        }
+      }
+
+      assertAccess({
+        realms,
+        mounts,
+        actor,
+        viewerRealmId: params.viewerRealmId,
+        targetRealmId,
+        assetKind: "seabed",
+        required: "write",
+      });
+
+      const targetRealm = realms.find((r) => r.id === targetRealmId)!;
+
+      let blobSha256: string | null = null;
+      if (params.blobContent !== undefined) {
+        blobSha256 = this.blobs.put(params.blobContent).sha256;
+      }
+
+      const now = new Date().toISOString();
+      const entry: SeabedEntry = {
+        id: makeId("sea"),
+        orgId: targetRealm.orgId,
+        realmId: targetRealmId,
+        topicId: params.topicId ?? null,
+        kind: params.kind,
+        authorId: actor.id,
+        authorKind: actor.kind,
+        authorFamily: actor.family ?? null,
+        text,
+        blobSha256,
+        sourceRef: params.sourceRef ?? null,
+        metadata,
+        occurredAt: explicitOccurredAt ?? now,
+        originSessionId: params.originSessionId ?? null,
+        sensitivity,
+        redactedAt: null,
+        redactedBy: null,
+        redactedReason: null,
+        createdAt: now,
+      };
+
+      this.db.insertSeabedEntry(entry);
+
+      if (idempotencyKey) {
+        this.db.insertIdempotencyKey({
+          orgId: targetRealm.orgId,
+          key: idempotencyKey,
+          targetTable: "seabed_entries",
+          targetId: entry.id,
+          realmId: entry.realmId,
+          payloadHash,
+          createdAt: now,
+        });
+      }
+
+      this.upsertFtsSync({
+        itemId: entry.id,
+        sourceType: "seabed",
+        orgId: entry.orgId,
+        realmId: entry.realmId,
+        status: "evidence",
+        title: `${entry.kind}:${entry.topicId ?? entry.realmId}`,
+        body: entry.text,
+        sensitivity: entry.sensitivity,
+        queuedAt: now,
+      });
+
+      this.db.appendChangeLog({
+        orgId: entry.orgId,
+        realmId: entry.realmId,
+        entityType: "seabed",
+        entityId: entry.id,
+        op: "create",
+        actorId: actor.id,
+        createdAt: now,
+      });
+
+      return entry;
     });
-
-    return entry;
   }
 
   // ---- Ledger Records (Truth Source 2) ----
@@ -352,203 +595,289 @@ export class LedgerEngine {
     targetRealmId?: string;
     thingId?: string | null;
     kind: RecordKind;
+    extKind?: string | null;
     title: string;
     payload?: Record<string, unknown>;
     refs?: string[];
     supersedesId?: string | null;
+    occurredAt?: string;
+    originSessionId?: string | null;
+    sensitivity?: Sensitivity;
+    idempotencyKey?: string;
   }): Promise<LedgerRecord> {
     const actor = validateActor(params.actor);
     if (!VALID_RECORD_KINDS.has(params.kind)) {
-      throw new MindError("INVALID_INPUT", `Invalid record kind: "${String(params.kind)}"`);
+      throw new MindError(
+        "INVALID_INPUT",
+        `Invalid record kind: "${String(params.kind)}"`,
+      );
     }
+    const sensitivity = validateSensitivity(params.sensitivity);
+    const idempotencyKey = normalizeIdempotencyKey(params.idempotencyKey);
     const targetRealmId = params.targetRealmId ?? params.viewerRealmId;
-    const realms = this.db.listRealms();
-    const mounts = this.db.listMounts();
-
-    assertAccess({
-      realms,
-      mounts,
-      actor,
-      viewerRealmId: params.viewerRealmId,
-      targetRealmId,
-      assetKind: params.kind === "rule" ? "rule" : "ledger",
-      required: "write",
-    });
 
     const title = params.title.trim();
     if (!title) {
       throw new MindError("INVALID_INPUT", "Record title cannot be empty");
     }
 
+    const extKind = params.extKind?.trim() || null;
     const payload = params.payload ?? {};
     const refs = Array.from(new Set(params.refs ?? []));
+    const explicitOccurredAt = params.occurredAt?.trim() || null;
 
-    const resolveVisibleRecord = (id: string): LedgerRecord | null => {
-      const rec = this.db.getRecord(id);
-      if (!rec) return null;
-      const access = resolveAccess({
+    const payloadHash = idempotencyKey
+      ? computePayloadHash({
+          targetTable: "records",
+          targetRealmId,
+          thingId: params.thingId ?? null,
+          kind: params.kind,
+          extKind,
+          title,
+          payload,
+          refs,
+          supersedesId: params.supersedesId ?? null,
+          occurredAt: explicitOccurredAt,
+          originSessionId: params.originSessionId ?? null,
+          sensitivity,
+        })
+      : "";
+
+    return this.db.transaction(() => {
+      const realms = this.db.listRealms();
+      const mounts = this.db.listMounts();
+      const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+
+      // 1. Idempotency check at the very start of BEGIN IMMEDIATE
+      if (idempotencyKey && viewerRealm) {
+        const existingKey = this.db.getIdempotencyKey(
+          viewerRealm.orgId,
+          idempotencyKey,
+        );
+        if (existingKey) {
+          const existingAccess =
+            existingKey.targetTable === "seabed_entries"
+              ? resolveAccess({
+                  realms,
+                  mounts,
+                  actor,
+                  viewerRealmId: params.viewerRealmId,
+                  targetRealmId: existingKey.realmId,
+                  assetKind: "seabed",
+                  explicitDescendantDive: false,
+                })
+              : (() => {
+                  const rec = this.db.getRecord(existingKey.targetId);
+                  return resolveAccess({
+                    realms,
+                    mounts,
+                    actor,
+                    viewerRealmId: params.viewerRealmId,
+                    targetRealmId: existingKey.realmId,
+                    assetKind: rec?.kind === "rule" ? "rule" : "ledger",
+                  });
+                })();
+
+          if (existingAccess === "none") {
+            throw new MindError(
+              "NOT_FOUND",
+              "Entry not found in visible scope",
+            );
+          }
+          if (
+            existingKey.targetTable !== "records" ||
+            existingKey.payloadHash !== payloadHash
+          ) {
+            throw new MindError(
+              "IDEMPOTENCY_MISMATCH",
+              `Idempotency key "${idempotencyKey}" already exists with a different payload`,
+            );
+          }
+          const existingRecord = this.db.getRecord(existingKey.targetId);
+          if (!existingRecord) {
+            throw new MindError(
+              "NOT_FOUND",
+              "Entry not found in visible scope",
+            );
+          }
+          return existingRecord;
+        }
+      }
+
+      // 2. Access control & all validations inside BEGIN IMMEDIATE (zero TOCTOU)
+      assertAccess({
         realms,
         mounts,
         actor,
         viewerRealmId: params.viewerRealmId,
-        targetRealmId: rec.realmId,
-        assetKind: rec.kind === "rule" ? "rule" : "ledger",
+        targetRealmId,
+        assetKind: params.kind === "rule" ? "rule" : "ledger",
+        required: "write",
       });
-      return access === "none" ? null : rec;
-    };
 
-    const resolveVisibleSeabed = (id: string): SeabedEntry | null => {
-      const sea = this.db.getSeabedEntry(id);
-      if (!sea) return null;
-      const access = resolveAccess({
-        realms,
-        mounts,
-        actor,
-        viewerRealmId: params.viewerRealmId,
-        targetRealmId: sea.realmId,
-        assetKind: "seabed",
-        explicitDescendantDive: true,
-      });
-      return access === "none" ? null : sea;
-    };
+      const targetRealm = realms.find((r) => r.id === targetRealmId)!;
 
-    // Opaque existence & visibility check: nonexistent and hidden-sibling IDs produce
-    // the exact same error code and message (zero blind-ID oracle).
-    const citedRecords: LedgerRecord[] = [];
-    for (const refId of refs) {
-      const rec = resolveVisibleRecord(refId);
-      if (rec) {
-        citedRecords.push(rec);
-        continue;
-      }
-      const sea = resolveVisibleSeabed(refId);
-      if (sea) {
-        continue;
-      }
-      throw new MindError(
-        "NOT_FOUND",
-        `Entry not found in visible scope: ${refId}`,
-      );
-    }
+      const resolveVisibleRecord = (id: string): LedgerRecord | null => {
+        const rec = this.db.getRecord(id);
+        if (!rec) return null;
+        const access = resolveAccess({
+          realms,
+          mounts,
+          actor,
+          viewerRealmId: params.viewerRealmId,
+          targetRealmId: rec.realmId,
+          assetKind: rec.kind === "rule" ? "rule" : "ledger",
+        });
+        return access === "none" ? null : rec;
+      };
 
-    // Validate supersede chain
-    let oldRecord: LedgerRecord | null = null;
-    if (params.supersedesId) {
-      oldRecord = this.db.getRecord(params.supersedesId);
-      if (!oldRecord || oldRecord.realmId !== targetRealmId) {
+      const resolveVisibleSeabed = (id: string): SeabedEntry | null => {
+        const sea = this.db.getSeabedEntry(id);
+        if (!sea) return null;
+        const access = resolveAccess({
+          realms,
+          mounts,
+          actor,
+          viewerRealmId: params.viewerRealmId,
+          targetRealmId: sea.realmId,
+          assetKind: "seabed",
+          explicitDescendantDive: true,
+        });
+        return access === "none" ? null : sea;
+      };
+
+      // Opaque existence & visibility check: nonexistent and hidden-sibling IDs produce
+      // the exact same error code and message (zero blind-ID oracle).
+      for (const refId of refs) {
+        const rec = resolveVisibleRecord(refId);
+        if (rec) {
+          continue;
+        }
+        const sea = resolveVisibleSeabed(refId);
+        if (sea) {
+          continue;
+        }
         throw new MindError(
           "NOT_FOUND",
-          `Entry not found in visible scope: ${params.supersedesId}`,
+          `Entry not found in visible scope: ${refId}`,
         );
       }
-      if (oldRecord.kind !== params.kind) {
-        throw new MindError(
-          "INVALID_INPUT",
-          `Superseding record kind "${params.kind}" must match superseded record kind "${oldRecord.kind}"`,
-        );
-      }
-      if (oldRecord.status !== "active") {
-        throw new MindError(
-          "CONFLICT",
-          `Record "${oldRecord.id}" is already ${oldRecord.status} (supersededBy=${oldRecord.supersededById ?? "none"})`,
-        );
-      }
-    }
 
-    // Verdict invariants: scoped proposal lookup, cross-family check, and cited rejection
-    if (params.kind === "verdict") {
-      const proposalId =
-        typeof payload.proposalId === "string"
-          ? payload.proposalId
-          : citedRecords.find((r) => r.kind === "proposal")?.id;
-      if (proposalId) {
-        const proposal = resolveVisibleRecord(proposalId);
-        if (!proposal) {
+      // 3. Validate supersede chain inside BEGIN IMMEDIATE
+      let oldRecord: LedgerRecord | null = null;
+      if (params.supersedesId) {
+        oldRecord = this.db.getRecord(params.supersedesId);
+        if (!oldRecord || oldRecord.realmId !== targetRealmId) {
           throw new MindError(
             "NOT_FOUND",
-            `Entry not found in visible scope: ${proposalId}`,
+            `Entry not found in visible scope: ${params.supersedesId}`,
           );
         }
-        if (proposal.authorKind === "agent" && actor.kind === "agent") {
-          const verifierFam = actor.family?.trim().toLowerCase() ?? "";
-          const proposalFam = proposal.authorFamily?.trim().toLowerCase() ?? "";
-          if (!verifierFam || !proposalFam) {
-            throw new MindError(
-              "VERDICT_INVARIANT",
-              "Agent verdicts on agent proposals require explicit model family stamps on both actors",
-            );
-          }
-          if (verifierFam === proposalFam) {
-            throw new MindError(
-              "VERDICT_INVARIANT",
-              `Same-family self-verification is forbidden: proposal family "${proposal.authorFamily}" matches verifier family "${actor.family}"`,
-            );
-          }
-        }
-      }
-
-      const normalizedOutcome =
-        typeof payload.outcome === "string"
-          ? payload.outcome.trim().toLowerCase()
-          : "";
-      if (normalizedOutcome === "reject") {
-        const hasBasis = citedRecords.some(
-          (r) =>
-            (r.kind === "decision" || r.kind === "rule") &&
-            r.status === "active",
-        );
-        if (!hasBasis) {
+        if (oldRecord.kind !== params.kind) {
           throw new MindError(
-            "VERDICT_INVARIANT",
-            "A reject verdict must cite at least one active public decision or rule in refs; if no rule/decision exists, open a question proposal instead.",
+            "INVALID_INPUT",
+            `Superseding record kind "${params.kind}" must match superseded record kind "${oldRecord.kind}"`,
+          );
+        }
+        if (oldRecord.status !== "active" || oldRecord.supersededById !== null) {
+          throw new MindError(
+            "CONFLICT",
+            `Record "${oldRecord.id}" is already ${oldRecord.status} (supersededBy=${oldRecord.supersededById ?? "none"})`,
           );
         }
       }
-    }
 
-    const id = makeId("rec");
-    const thingId =
-      params.kind === "thing" ? (params.thingId ?? id) : (params.thingId ?? null);
+      const id = makeId("rec");
+      const thingId =
+        params.kind === "thing"
+          ? (params.thingId ?? id)
+          : (params.thingId ?? null);
+      const now = new Date().toISOString();
 
-    const record: LedgerRecord = {
-      id,
-      realmId: targetRealmId,
-      thingId,
-      kind: params.kind,
-      status: "active",
-      supersedesId: oldRecord?.id ?? null,
-      supersededById: null,
-      authorId: actor.id,
-      authorKind: actor.kind,
-      authorFamily: actor.family ?? null,
-      title,
-      payload,
-      refs,
-      createdAt: new Date().toISOString(),
-    };
+      const record: LedgerRecord = {
+        id,
+        orgId: targetRealm.orgId,
+        realmId: targetRealmId,
+        thingId,
+        kind: params.kind,
+        extKind,
+        status: "active",
+        supersedesId: oldRecord?.id ?? null,
+        supersededById: null,
+        authorId: actor.id,
+        authorKind: actor.kind,
+        authorFamily: actor.family ?? null,
+        confirmedByHuman: actor.kind === "human",
+        title,
+        payload,
+        refs,
+        occurredAt: explicitOccurredAt ?? now,
+        originSessionId: params.originSessionId ?? null,
+        sensitivity,
+        redactedAt: null,
+        redactedBy: null,
+        redactedReason: null,
+        createdAt: now,
+      };
 
-    this.db.transaction(() => {
       this.db.insertRecord(record);
+
+      // 4. Atomic CAS on superseded chain head (assert changes === 1, else rollback)
       if (oldRecord) {
-        this.db.markRecordSuperseded(oldRecord.id, record.id);
+        const casOk = this.db.markRecordSuperseded(oldRecord.id, record.id);
+        if (!casOk) {
+          throw new MindError(
+            "CONFLICT",
+            `Concurrent supersede conflict on record "${oldRecord.id}"`,
+          );
+        }
         this.db.updateFtsStatus(oldRecord.id, "superseded");
         this.db.updateVectorStatus(oldRecord.id, "superseded");
       }
-    });
 
-    const payloadText = Object.entries(record.payload)
-      .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
-      .join("\n");
-    await this.indexItem({
-      itemId: record.id,
-      sourceType: "record",
-      realmId: record.realmId,
-      status: record.status,
-      title: record.title,
-      body: payloadText,
-    });
+      if (idempotencyKey) {
+        this.db.insertIdempotencyKey({
+          orgId: targetRealm.orgId,
+          key: idempotencyKey,
+          targetTable: "records",
+          targetId: record.id,
+          realmId: record.realmId,
+          payloadHash,
+          createdAt: now,
+        });
+      }
 
-    return record;
+      const payloadText = Object.entries(record.payload)
+        .map(
+          ([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
+        )
+        .join("\n");
+
+      // 5. Synchronous FTS5 + vec_pending + change_log in the same transaction (zero sync embed())
+      this.upsertFtsSync({
+        itemId: record.id,
+        sourceType: "record",
+        orgId: record.orgId,
+        realmId: record.realmId,
+        status: record.status,
+        title: record.title,
+        body: payloadText,
+        sensitivity: record.sensitivity,
+        queuedAt: now,
+      });
+
+      this.db.appendChangeLog({
+        orgId: record.orgId,
+        realmId: record.realmId,
+        entityType: "record",
+        entityId: record.id,
+        op: oldRecord ? "supersede" : "create",
+        actorId: actor.id,
+        createdAt: now,
+      });
+
+      return record;
+    });
   }
 
   getSupersedeChain(params: {
