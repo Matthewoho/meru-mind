@@ -1,0 +1,243 @@
+import type { DbPort } from "../ports.js";
+import {
+  MindError,
+  type AccessScope,
+  type Actor,
+  type LedgerRecord,
+  type Realm,
+  type RealmMount,
+  type RecordKind,
+  type Sensitivity,
+} from "../types.js";
+import {
+  buildWriteRecordPayload,
+  computePayloadHash,
+  REDACTED_CONTENT_BLOCKED_MSG,
+  REDACTED_CONTENT_TRY_HINT,
+} from "./content-hash.js";
+import type { LedgerEngine } from "./ledger.js";
+import { resolveAboutRefsForWrite } from "./refs.js";
+import { createVisibilityHelpers } from "./visibility.js";
+
+export const EVERYDAY_WRITE_KINDS = new Set<string>([
+  "decision",
+  "finding",
+  "claim",
+  "proposal",
+  "verdict",
+]);
+
+const VALID_SENSITIVITIES = new Set<string>([
+  "public",
+  "internal",
+  "confidential",
+  "secret",
+]);
+
+export interface SurfaceWriteParams {
+  db: DbPort;
+  ledger: LedgerEngine;
+  realms: Realm[];
+  mounts: RealmMount[];
+  scope: AccessScope;
+  actor: Actor;
+  viewerRealmId: string;
+  targetRealmId: string;
+  title: string;
+  body: string;
+  kind?: string;
+  extKind?: string | null;
+  about?: string[];
+  supersedes?: string[];
+  because?: string[];
+  occurredAt?: string | null;
+  sensitivity?: Sensitivity;
+  explicitIdempotencyKey?: string;
+  /** Human-only CLI override; NEVER exposed in MCP */
+  allowRedactedReingest?: boolean;
+  /** Optional clock override for deterministic bucket tests */
+  now?: Date;
+}
+
+/**
+ * Shared everyday conclusion write path for CLI `write` and MCP `mind_write`.
+ * Enforces:
+ * - Rejects `kind: "rule"` with `RULE_REQUIRES_HUMAN` (wire `forbidden`)
+ * - Single canonical payload shape via `buildWriteRecordPayload()`
+ * - Unified `--about` resolution (`objects` / `thing` / `resourceTags` / `AMBIGUOUS_REF`)
+ * - Full-field auto-idempotency with 1-minute UTC bucket when `occurredAt` is omitted
+ * - `superseded` hit derives `:after:<headOrId>` for clean `A -> B -> A` rollback
+ * - `retracted` hit immediately throws `ACCESS_DENIED` (wire `forbidden`), NEVER derives `:after:`
+ */
+export async function writeEverydayConclusion(
+  params: SurfaceWriteParams,
+): Promise<LedgerRecord> {
+  const rawKind = (params.kind ?? "finding").trim().toLowerCase();
+  if (rawKind === "rule") {
+    throw new MindError(
+      "RULE_REQUIRES_HUMAN",
+      'Rules cannot be written via everyday write; rules are human-only.',
+      {
+        try: 'meru-mind rule add --in / --title "<title>" --body "<body>" --as-human',
+      },
+    );
+  }
+  if (!EVERYDAY_WRITE_KINDS.has(rawKind)) {
+    throw new MindError(
+      "INVALID_INPUT",
+      `Invalid write kind "${params.kind}". Allowed kinds: decision, finding, claim, proposal, verdict`,
+      {
+        try: 'meru-mind write --in / --kind finding --title "<title>" --body "<body>"',
+      },
+    );
+  }
+  const kind = rawKind as RecordKind;
+
+  const sensitivity: Sensitivity = params.sensitivity ?? "internal";
+  if (!VALID_SENSITIVITIES.has(sensitivity)) {
+    throw new MindError(
+      "INVALID_INPUT",
+      `Invalid sensitivity "${String(sensitivity)}". Allowed: public, internal, confidential, secret`,
+    );
+  }
+
+  const title = params.title.trim();
+  if (!title) {
+    throw new MindError("INVALID_INPUT", "Record title cannot be empty");
+  }
+  const body = params.body.trim();
+  if (!body) {
+    throw new MindError("INVALID_INPUT", "Record body cannot be empty");
+  }
+
+  const targetRealm = params.realms.find((r) => r.id === params.targetRealmId);
+  if (!targetRealm) {
+    throw new MindError("NOT_FOUND", "Realm not found in visible scope");
+  }
+
+  const vis = createVisibilityHelpers({
+    db: params.db,
+    realms: params.realms,
+    mounts: params.mounts,
+    actor: params.actor,
+    viewerRealmId: params.viewerRealmId,
+    scope: params.scope,
+    includeDescendantSeabed: false,
+  });
+
+  const resolvedAbout = resolveAboutRefsForWrite({
+    db: params.db,
+    realms: params.realms,
+    orgId: targetRealm.orgId,
+    about: params.about ?? [],
+    scope: params.scope,
+    vis,
+  });
+
+  const supersedesIds = Array.from(
+    new Set((params.supersedes ?? []).map((s) => s.trim()).filter(Boolean)),
+  ).sort();
+  const becauseRefs = Array.from(
+    new Set((params.because ?? []).map((s) => s.trim()).filter(Boolean)),
+  ).sort();
+
+  // Single canonical payload construction (Rule 2)
+  const payload = buildWriteRecordPayload(body);
+
+  const allowHumanOverride =
+    params.allowRedactedReingest === true && params.actor.kind === "human";
+
+  let idempotencyKey = params.explicitIdempotencyKey?.trim() || undefined;
+  if (!idempotencyKey) {
+    const nowIso = (params.now ?? new Date()).toISOString();
+    const timeSlot =
+      params.occurredAt === undefined
+        ? `bucket:${nowIso.slice(0, 16)}`
+        : params.occurredAt === null
+          ? "null"
+          : params.occurredAt.trim();
+
+    const baseHash = computePayloadHash({
+      orgId: targetRealm.orgId,
+      targetRealmId: params.targetRealmId,
+      kind,
+      extKind: params.extKind?.trim() || null,
+      title,
+      payload,
+      objectIds: resolvedAbout.objectIds,
+      resourceTags: resolvedAbout.resourceTags,
+      thingId: resolvedAbout.thingId ?? null,
+      supersedesIds,
+      refs: becauseRefs,
+      sensitivity,
+      timeSlot,
+    });
+
+    let candidateKey = `auto:v1:${baseHash}`;
+    const visitedKeys = new Set<string>();
+
+    while (!visitedKeys.has(candidateKey)) {
+      visitedKeys.add(candidateKey);
+      const existing = params.db.getIdempotencyKey(
+        targetRealm.orgId,
+        candidateKey,
+      );
+      if (!existing) {
+        break;
+      }
+      if (existing.targetTable !== "records") {
+        break;
+      }
+      const existingRec = params.db.getRecord(existing.targetId);
+      if (!existingRec) {
+        break;
+      }
+      if (existingRec.status === "retracted" || existingRec.redactedAt !== null) {
+        if (allowHumanOverride) {
+          candidateKey = `auto:v1:${baseHash}:human-override:${existingRec.id}`;
+          continue;
+        }
+        throw new MindError("ACCESS_DENIED", REDACTED_CONTENT_BLOCKED_MSG, {
+          reason: "redacted_blocklist",
+          try: REDACTED_CONTENT_TRY_HINT,
+        });
+      }
+      if (existingRec.status === "superseded") {
+        // Walk forward along superseded_by_id to find the current chain head (or existingRec.id)
+        let cur = existingRec;
+        const visitedIds = new Set<string>([cur.id]);
+        while (cur.supersededById && !visitedIds.has(cur.supersededById)) {
+          visitedIds.add(cur.supersededById);
+          const next = params.db.getRecord(cur.supersededById);
+          if (!next) break;
+          cur = next;
+        }
+        candidateKey = `auto:v1:${baseHash}:after:${cur.id}`;
+        continue;
+      }
+      // Active record: reuse candidateKey so appendRecord returns it idempotently
+      break;
+    }
+
+    idempotencyKey = candidateKey;
+  }
+
+  return params.ledger.appendRecord({
+    actor: params.actor,
+    viewerRealmId: params.viewerRealmId,
+    targetRealmId: params.targetRealmId,
+    thingId: resolvedAbout.thingId,
+    kind,
+    extKind: params.extKind,
+    title,
+    payload,
+    refs: becauseRefs,
+    objectIds: resolvedAbout.objectIds,
+    resourceTags: resolvedAbout.resourceTags,
+    supersedesIds: supersedesIds.length > 0 ? supersedesIds : undefined,
+    occurredAt: params.occurredAt,
+    sensitivity,
+    idempotencyKey,
+    allowRedactedReingest: allowHumanOverride,
+  });
+}

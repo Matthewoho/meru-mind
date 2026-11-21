@@ -43,6 +43,12 @@ export function normalizeResourceTag(raw: string): string {
     );
   }
   const typePart = m[1]!.toLowerCase();
+  if (typePart === "file") {
+    throw new MindError(
+      "INVALID_INPUT",
+      'Tag prefix "file:" is reserved for file:<path> references and cannot be used as an object or tag kind',
+    );
+  }
   const namePart = m[2]!;
   return `${typePart}:${namePart}`;
 }
@@ -253,6 +259,12 @@ export class ObjectEngine {
     const kind = params.kind.trim();
     if (!kind) {
       throw new MindError("INVALID_INPUT", "Object kind cannot be empty");
+    }
+    if (kind.toLowerCase() === "file") {
+      throw new MindError(
+        "INVALID_INPUT",
+        'Object kind "file" is reserved for file:<path> references',
+      );
     }
     const name = params.name.trim();
     if (!name) {
@@ -616,6 +628,83 @@ export class ObjectEngine {
         createdAt: new Date().toISOString(),
       });
       return link;
+    });
+  }
+
+  unlinkEntryObject(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    entryId: string;
+    objectId: string;
+    scopeCeiling?: AccessScope;
+  }): boolean {
+    if (!params.actor?.id?.trim()) {
+      throw new MindError("INVALID_INPUT", "Actor id cannot be empty");
+    }
+    return this.db.transaction(() => {
+      const { viewerRealm, orgPolicy, realms, scope } = this.resolveScope({
+        viewerRealmId: params.viewerRealmId,
+        scopeCeiling: params.scopeCeiling,
+      });
+      const mounts = this.db.listMounts();
+
+      const rec = this.db.getRecord(params.entryId);
+      const sea = rec ? null : this.db.getSeabedEntry(params.entryId);
+      if (!rec && !sea) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      const entryOrgId = rec ? rec.orgId : sea!.orgId;
+      const entryRealmId = rec ? rec.realmId : sea!.realmId;
+      const assetKind = rec ? (rec.kind === "rule" ? "rule" : "ledger") : "seabed";
+
+      if (entryOrgId !== viewerRealm.orgId) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      const readLevel = resolveAccess({
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        targetRealmId: entryRealmId,
+        assetKind,
+        orgPolicy,
+      });
+      if (readLevel === "none") {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      assertAccess({
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        targetRealmId: entryRealmId,
+        assetKind,
+        required: "write",
+        orgPolicy,
+      });
+
+      const obj = this.db.getObject(params.objectId);
+      if (
+        !obj ||
+        obj.orgId !== viewerRealm.orgId ||
+        !scope.readableLedgerIds.includes(obj.realmId)
+      ) {
+        throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
+      }
+
+      const removed = this.db.deleteEntryObject(params.entryId, obj.id);
+      if (removed) {
+        this.db.appendChangeLog({
+          orgId: viewerRealm.orgId,
+          realmId: entryRealmId,
+          entityType: "entry_object",
+          entityId: `${params.entryId}:${obj.id}`,
+          op: "unlink",
+          actorId: params.actor.id,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      return removed;
     });
   }
 

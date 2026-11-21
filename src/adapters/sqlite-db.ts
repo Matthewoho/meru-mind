@@ -1109,6 +1109,19 @@ export class SqliteDb implements DbPort {
           .run(now);
       }
 
+      // Migration v5: V0.2a-Surface (global content-hash blocklist index for O(1) write-path enforcement)
+      if (!applied.has(5)) {
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_redacted_blocklist_org_sha
+            ON redacted_blocklist(org_id, content_sha256);
+        `);
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (5, 'v0.2a_surface', ?)`,
+          )
+          .run(now);
+      }
+
       if (this.vecEnabled && !this.tableExists("vec_items")) {
         this.createVecItemsTable();
       }
@@ -2114,11 +2127,24 @@ export class SqliteDb implements DbPort {
     includeObjectLinkedOpenMode: boolean;
     includeSuperseded: boolean;
     kind?: string;
+    kinds?: string[];
     tag?: string;
+    since?: string;
+    until?: string;
+    entryIdsFilter?: string[];
     excludeSensitivities?: Sensitivity[];
     limit: number;
     offset: number;
   }): { rows: UnifiedEntryRef[]; total: number } {
+    if (params.entryIdsFilter && params.entryIdsFilter.length === 0) {
+      return { rows: [], total: 0 };
+    }
+    const kindList =
+      params.kinds && params.kinds.length > 0
+        ? params.kinds
+        : params.kind
+          ? [params.kind]
+          : [];
     const excludeSens = params.excludeSensitivities ?? ["secret"];
     const branches: string[] = [];
     const sqlParams: SQLInputValue[] = [];
@@ -2138,15 +2164,30 @@ export class SqliteDb implements DbPort {
         where.push(`r.sensitivity NOT IN (${placeholders(excludeSens.length)})`);
         bParams.push(...excludeSens);
       }
-      if (params.kind) {
+      if (kindList.length === 1) {
         where.push(`r.kind = ?`);
-        bParams.push(params.kind);
+        bParams.push(kindList[0]!);
+      } else if (kindList.length > 1) {
+        where.push(`r.kind IN (${placeholders(kindList.length)})`);
+        bParams.push(...kindList);
       }
       if (params.tag) {
         where.push(
           `EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.org_id = r.org_id AND rt.entry_id = r.id AND rt.tag = ?)`,
         );
         bParams.push(params.tag);
+      }
+      if (params.since) {
+        where.push(`r.occurred_at IS NOT NULL AND r.occurred_at >= ?`);
+        bParams.push(params.since);
+      }
+      if (params.until) {
+        where.push(`r.occurred_at IS NOT NULL AND r.occurred_at <= ?`);
+        bParams.push(params.until);
+      }
+      if (params.entryIdsFilter && params.entryIdsFilter.length > 0) {
+        where.push(`r.id IN (${placeholders(params.entryIdsFilter.length)})`);
+        bParams.push(...params.entryIdsFilter);
       }
       branches.push(
         `SELECT r.id AS id, 'record' AS source_type, r.occurred_at AS occurred_at, r.created_at AS created_at FROM records r WHERE ${where.join(" AND ")}`,
@@ -2165,15 +2206,30 @@ export class SqliteDb implements DbPort {
         where.push(`s.sensitivity NOT IN (${placeholders(excludeSens.length)})`);
         bParams.push(...excludeSens);
       }
-      if (params.kind) {
+      if (kindList.length === 1) {
         where.push(`s.kind = ?`);
-        bParams.push(params.kind);
+        bParams.push(kindList[0]!);
+      } else if (kindList.length > 1) {
+        where.push(`s.kind IN (${placeholders(kindList.length)})`);
+        bParams.push(...kindList);
       }
       if (params.tag) {
         where.push(
           `EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.org_id = s.org_id AND rt.entry_id = s.id AND rt.tag = ?)`,
         );
         bParams.push(params.tag);
+      }
+      if (params.since) {
+        where.push(`s.occurred_at IS NOT NULL AND s.occurred_at >= ?`);
+        bParams.push(params.since);
+      }
+      if (params.until) {
+        where.push(`s.occurred_at IS NOT NULL AND s.occurred_at <= ?`);
+        bParams.push(params.until);
+      }
+      if (params.entryIdsFilter && params.entryIdsFilter.length > 0) {
+        where.push(`s.id IN (${placeholders(params.entryIdsFilter.length)})`);
+        bParams.push(...params.entryIdsFilter);
       }
       branches.push(
         `SELECT s.id AS id, 'seabed' AS source_type, s.occurred_at AS occurred_at, s.created_at AS created_at FROM seabed_entries s WHERE ${where.join(" AND ")}`,
@@ -2235,7 +2291,10 @@ export class SqliteDb implements DbPort {
     seabedRealmIds: string[];
     includeSuperseded: boolean;
     kind?: string;
+    kinds?: string[];
     tag?: string;
+    since?: string;
+    until?: string;
     excludeSensitivities?: Sensitivity[];
     limit: number;
     offset: number;
@@ -2244,6 +2303,12 @@ export class SqliteDb implements DbPort {
     if (uniqueIds.length === 0) {
       return { rows: [], total: 0 };
     }
+    const kindList =
+      params.kinds && params.kinds.length > 0
+        ? params.kinds
+        : params.kind
+          ? [params.kind]
+          : [];
     const excludeSens = params.excludeSensitivities ?? ["secret"];
     const branches: string[] = [];
     const sqlParams: SQLInputValue[] = [];
@@ -2268,15 +2333,26 @@ export class SqliteDb implements DbPort {
         where.push(`r.sensitivity NOT IN (${placeholders(excludeSens.length)})`);
         bParams.push(...excludeSens);
       }
-      if (params.kind) {
+      if (kindList.length === 1) {
         where.push(`r.kind = ?`);
-        bParams.push(params.kind);
+        bParams.push(kindList[0]!);
+      } else if (kindList.length > 1) {
+        where.push(`r.kind IN (${placeholders(kindList.length)})`);
+        bParams.push(...kindList);
       }
       if (params.tag) {
         where.push(
           `EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.org_id = r.org_id AND rt.entry_id = r.id AND rt.tag = ?)`,
         );
         bParams.push(params.tag);
+      }
+      if (params.since) {
+        where.push(`r.occurred_at IS NOT NULL AND r.occurred_at >= ?`);
+        bParams.push(params.since);
+      }
+      if (params.until) {
+        where.push(`r.occurred_at IS NOT NULL AND r.occurred_at <= ?`);
+        bParams.push(params.until);
       }
       branches.push(
         `SELECT r.id AS id, 'record' AS source_type, r.occurred_at AS occurred_at, r.created_at AS created_at FROM records r WHERE ${where.join(" AND ")}`,
@@ -2300,15 +2376,26 @@ export class SqliteDb implements DbPort {
         where.push(`s.sensitivity NOT IN (${placeholders(excludeSens.length)})`);
         bParams.push(...excludeSens);
       }
-      if (params.kind) {
+      if (kindList.length === 1) {
         where.push(`s.kind = ?`);
-        bParams.push(params.kind);
+        bParams.push(kindList[0]!);
+      } else if (kindList.length > 1) {
+        where.push(`s.kind IN (${placeholders(kindList.length)})`);
+        bParams.push(...kindList);
       }
       if (params.tag) {
         where.push(
           `EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.org_id = s.org_id AND rt.entry_id = s.id AND rt.tag = ?)`,
         );
         bParams.push(params.tag);
+      }
+      if (params.since) {
+        where.push(`s.occurred_at IS NOT NULL AND s.occurred_at >= ?`);
+        bParams.push(params.since);
+      }
+      if (params.until) {
+        where.push(`s.occurred_at IS NOT NULL AND s.occurred_at <= ?`);
+        bParams.push(params.until);
       }
       branches.push(
         `SELECT s.id AS id, 'seabed' AS source_type, s.occurred_at AS occurred_at, s.created_at AS created_at FROM seabed_entries s WHERE ${where.join(" AND ")}`,
@@ -2487,6 +2574,17 @@ export class SqliteDb implements DbPort {
          LIMIT 1`,
       )
       .get(orgId, sourceRef, contentSha256) as { ok: number } | undefined;
+    return Boolean(row);
+  }
+
+  isContentShaBlocked(orgId: string, contentSha256: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS ok FROM redacted_blocklist
+         WHERE org_id = ? AND content_sha256 = ?
+         LIMIT 1`,
+      )
+      .get(orgId, contentSha256) as { ok: number } | undefined;
     return Boolean(row);
   }
 
@@ -3254,6 +3352,57 @@ export class SqliteDb implements DbPort {
       : (this.db
           .prepare(`SELECT COALESCE(MAX(seq), 0) AS s FROM change_log`)
           .get() as { s: number });
+    return Number(row.s ?? 0);
+  }
+
+  getLatestVisibleChangeLogSeq(params: {
+    orgId: string;
+    ledgerRealmIds: string[];
+    seabedRealmIds: string[];
+    includeSecret?: boolean;
+  }): number {
+    const visClauses: string[] = [`cl.realm_id = '__org__'`];
+    const sqlParams: SQLInputValue[] = [params.orgId];
+
+    if (params.ledgerRealmIds.length > 0) {
+      visClauses.push(
+        `(cl.entity_type != 'seabed' AND cl.realm_id IN (${placeholders(params.ledgerRealmIds.length)}))`,
+      );
+      sqlParams.push(...params.ledgerRealmIds);
+    }
+    if (params.seabedRealmIds.length > 0) {
+      visClauses.push(
+        `(cl.entity_type = 'seabed' AND cl.realm_id IN (${placeholders(params.seabedRealmIds.length)}))`,
+      );
+      sqlParams.push(...params.seabedRealmIds);
+    }
+
+    const where: string[] = [
+      `cl.org_id = ?`,
+      `(${visClauses.join(" OR ")})`,
+    ];
+    if (!params.includeSecret) {
+      where.push(`NOT (
+        cl.entity_type = 'record'
+        AND EXISTS (
+          SELECT 1 FROM records r
+          WHERE r.id = cl.entity_id AND r.sensitivity = 'secret'
+        )
+      )`);
+      where.push(`NOT (
+        cl.entity_type = 'seabed'
+        AND EXISTS (
+          SELECT 1 FROM seabed_entries s
+          WHERE s.id = cl.entity_id AND s.sensitivity = 'secret'
+        )
+      )`);
+    }
+
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(cl.seq), 0) AS s FROM change_log cl WHERE ${where.join(" AND ")}`,
+      )
+      .get(...sqlParams) as { s: number };
     return Number(row.s ?? 0);
   }
 

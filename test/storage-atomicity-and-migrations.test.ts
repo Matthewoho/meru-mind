@@ -280,9 +280,9 @@ describe("Storage migrations, org policy backfill, atomic CAS, idempotency, chan
     };
     expect(Number(sdRow.secure_delete)).toBe(1);
 
-    // Schema migrations recorded [1, 2, 3, 4] and meta.change_log_generation = '1'
+    // Schema migrations recorded [1, 2, 3, 4, 5] and meta.change_log_generation = '1'
     const migrations = engine.db.listSchemaMigrations();
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5]);
     expect(engine.db.getMeta("change_log_generation")).toBe("1");
 
     // Existing V0.1 org MUST be backfilled to 'tree' (never silently opened) — check BOTH raw SQL column & mapOrg
@@ -418,7 +418,7 @@ describe("Storage migrations, org policy backfill, atomic CAS, idempotency, chan
           if (org?.policy !== "tree") {
             throw new Error("expected tree policy, got " + String(org?.policy));
           }
-          if (migrations.join(",") !== "1,2,3,4") {
+          if (migrations.join(",") !== "1,2,3,4,5") {
             throw new Error("bad migrations: " + migrations.join(","));
           }
           if (!rec || rec.orgId !== "org_v01") {
@@ -600,18 +600,21 @@ describe("Storage migrations, org policy backfill, atomic CAS, idempotency, chan
         },
       );
 
-    const init = await runCli(["init", "--org", "CasOrg"]);
+    const init = await runCli(["admin", "init", "--org", "CasOrg"]);
     expect(init.code).toBe(0);
     const rootId = (JSON.parse(init.stdout) as { rootRealm: { id: string } })
       .rootRealm.id;
 
     const base = await runCli([
-      "record",
-      rootId,
+      "write",
+      "--in",
+      "/",
       "--kind",
       "decision",
       "--title",
       "Base chain head v1",
+      "--body",
+      "Initial decision body",
     ]);
     expect(base.code).toBe(0);
     const baseId = (JSON.parse(base.stdout) as { id: string }).id;
@@ -620,12 +623,15 @@ describe("Storage migrations, org policy backfill, atomic CAS, idempotency, chan
     const racers = await Promise.all(
       Array.from({ length: 6 }, (_, i) =>
         runCli([
-          "record",
-          rootId,
+          "write",
+          "--in",
+          "/",
           "--kind",
           "decision",
           "--title",
           `Supersede contender ${i}`,
+          "--body",
+          `Contender body ${i}`,
           "--supersedes",
           baseId,
         ]),
@@ -634,7 +640,7 @@ describe("Storage migrations, org policy backfill, atomic CAS, idempotency, chan
 
     const winners = racers.filter((r) => r.code === 0);
     const conflicts = racers.filter(
-      (r) => r.code !== 0 && r.stderr.includes("CONFLICT"),
+      (r) => r.code !== 0 && r.stderr.includes('"conflict"'),
     );
 
     expect(winners).toHaveLength(1);

@@ -2,85 +2,58 @@
 
 ## Purpose
 
-Define the open-source-clean, domain-agnostic Markdown (`import-md`) and JSONL (`import-jsonl`) importers sharing a unified `ImportMappingConfig`, enforcing cooperative trust defaults, canonical write-path transactions, nullable undated timestamps without fabrication, `redacted_blocklist` enforcement, rollback-safe chain-head revisioning, multi-predecessor supersedes, and full-corpus consistency verification (`import-verify`).
+Define the open-source-clean Markdown (`import md`) and JSONL (`import jsonl`) importers sharing `ImportMappingConfig`, cooperative trust defaults, canonical write-path transactions, nullable undated timestamps, global content-hash `redacted_blocklist` enforcement, rollback-safe revisioning, multi-predecessor supersedes, and consistency verification (`import verify`).
 
 ## Requirements
 
 ### Requirement: Importer Trust Defaults and Canonical Write Path
-`ImporterEngine.importMd()` and `ImporterEngine.importJsonl()` SHALL default to `actor.kind = 'agent'` (`confirmedByHuman = false`), elevating to `confirmedByHuman = true` ONLY when explicitly invoked with a human actor (such as CLI `--as-human`). Every imported item SHALL be persisted exclusively through `LedgerEngine.appendRecord()` or `LedgerEngine.captureSeabed()` transactions so idempotency keys, CAS supersedes, FTS5, `vec_pending`, `change_log`, and visibility invariants always apply.
+`ImporterEngine.importMd()` and `ImporterEngine.importJsonl()` SHALL default to `actor.kind = 'agent'` (`confirmedByHuman = false`), setting `confirmedByHuman = true` only when explicitly invoked with a human actor (such as CLI `--as-human`). Every imported item SHALL persist through `LedgerEngine.appendRecord()` or `LedgerEngine.captureSeabed()` transactions so all storage, index, and visibility invariants apply.
 
 #### Scenario: Default import marks records as agent-authored while --as-human sets confirmedByHuman
-- **WHEN** `import-md` runs via CLI without `--as-human`
-- **THEN** every created record has `authorKind = "agent"` and `confirmedByHuman = false`
-- **AND** when run with `--as-human`, created records have `authorKind = "human"` and `confirmedByHuman = true`
+- **WHEN** `meru-mind import md` runs without `--as-human`
+- **THEN** created records have `authorKind = "agent"` and `confirmedByHuman = false`
+- **AND** with `--as-human`, created records have `authorKind = "human"` and `confirmedByHuman = true`
 
 ### Requirement: Never Fabricate Timestamps for Undated Sources
-When a Markdown file or JSONL row has no declared timestamp in frontmatter, header metadata, mapped fields, or explicit opt-in `filenameDatePattern`, importers SHALL pass `occurredAt: null` explicitly so SQLite stores `NULL` (NEVER filesystem `mtime` and NEVER import time `now()`). `ImportMdResult` and `ImportJsonlResult` SHALL report exact `undatedCount` and `defaultRealmCount`.
+When a Markdown file or JSONL row has no declared timestamp in frontmatter, header metadata, mapped fields, or explicit opt-in `filenameDatePattern`, importers SHALL pass `occurredAt: null` explicitly (never filesystem `mtime` and never `now()`). `ImportMdResult` and `ImportJsonlResult` SHALL report exact `undatedCount` and `defaultRealmCount`.
 
-#### Scenario: Undated Markdown file and JSONL row persist null occurredAt without reading filesystem mtime
-- **WHEN** a Markdown file without a declared timestamp has its filesystem `mtime` set to `2010-01-01` and is imported via `importMd()`
-- **THEN** the persisted record has `occurredAt === null` (neither `2010-01-01` nor import time)
-- **AND** `ImportMdResult.undatedCount` is `1`
+#### Scenario: Undated Markdown file persists null occurredAt without reading filesystem mtime
+- **WHEN** a Markdown file without a declared date has filesystem `mtime` set to `2010-01-01` and is imported via `importMd()`
+- **THEN** the persisted record has `occurredAt === null` and `ImportMdResult.undatedCount` is `1`
 
-### Requirement: Unified Domain-Agnostic Mapping Contract for Both Importers
-`ImporterEngine.importMd()` and `ImporterEngine.importJsonl()` SHALL share a unified `ImportMappingConfig` (re-exporting `JsonlMappingConfig` as a backward-compatible type alias) with zero hardcoded private schemas or private status strings:
-- `occurredAt` (dot-paths or frontmatter/header field names, plus optional explicit `filenameDatePattern` regex opt-in via mapping).
-- `status` and `statusMap` mapping source lifecycle values strictly to `'active' | 'superseded'`; any mapping value targeting `'retracted'` or an unknown status SHALL throw `INVALID_INPUT`.
-- `validUntil` (dot-path or frontmatter field for ISO expiry date; if `< now` at import time and not already mapped superseded, writes `initialStatus: 'superseded'` through `appendRecord()`).
-- `supersedes` supporting both scalar `string` and `string[]` arrays, passing normalized `supersedesIds` through `LedgerEngine.appendRecord()` (degrading visible cross-realm predecessors in `tree` mode to `refs` plus `payload.crossRealmSupersedes` while still atomically superseding same-realm predecessors).
-- `realmPath` / `realmMap` / `defaultRealm`, `objectRefs` / `objectMap`, `resourceTags`, `kind` / `kindMap`, `sensitivity`, `sourceRef`, `thingRef`, `externalRef`, and `extractFields`.
+### Requirement: Unified Domain-Agnostic Mapping Contract
+`importMd()` and `importJsonl()` SHALL share `ImportMappingConfig` (`JsonlMappingConfig` re-exported as alias) with zero hardcoded private schemas, supporting `occurredAt`, optional `filenameDatePattern`, `realmPath`/`realmMap`/`defaultRealm`, `objectRefs`/`objectMap`, `resourceTags`, `kind`/`kindMap`, `sensitivity`, `sourceRef`, `thingRef`, `externalRef`, and `extractFields`.
 
-#### Scenario: Mapping a source status to retracted is rejected with INVALID_INPUT
-- **WHEN** `importJsonl()` or `importMd()` receives a mapping whose `statusMap` maps any source status to `'retracted'`
-- **THEN** the importer rejects the call with `MindError("INVALID_INPUT")` before writing any rows
+#### Scenario: Shared mapping config maps realms, objects, tags, and extracted fields cleanly
+- **WHEN** `importMd()` or `importJsonl()` runs with an `ImportMappingConfig`
+- **THEN** records are routed to mapped realms, linked to mapped objects/tags, and preserve allowlisted `extractFields`
 
-#### Scenario: Source mapped as superseded or expired persists as orphan superseded
-- **WHEN** a JSONL row or Markdown file maps to `status: 'superseded'` (or has `validUntil` in the past)
-- **THEN** it is written via `appendRecord({ initialStatus: 'superseded' })` with `status = 'superseded'`, `supersededById = null`, excluded from default `recall()` and `ls`, and reports `currentHeadId: null, orphanSuperseded: true`
+### Requirement: Lifecycle Status Mapping, `validUntil`, and Multi-Predecessor Supersedes
+`status` and `statusMap` SHALL map source lifecycle values strictly to `'active' | 'superseded'`, rejecting `'retracted'` or unknown targets with `INVALID_INPUT`. Past `validUntil` timestamps SHALL write `initialStatus: 'superseded'` via `appendRecord()`. `supersedes` SHALL accept scalar `string` or `string[]`, atomically superseding predecessors (degrading visible cross-realm predecessors in `tree` mode to `refs` + `payload.crossRealmSupersedes`).
 
-#### Scenario: Array supersedes atomically marks all predecessors or rolls back on conflict
-- **WHEN** a JSONL row specifies `supersedes: ["s1", "s2"]` in an `open` organization
-- **THEN** both `s1` and `s2` become `'superseded'` pointing to the new record
-- **AND** if `s2` is already superseded, the entire write rolls back with `CONFLICT` leaving `s1` active
+#### Scenario: Mapping to retracted fails while expired or array-superseding items persist atomically
+- **WHEN** a mapping maps any status to `'retracted'`
+- **THEN** the importer throws `INVALID_INPUT` before writing
+- **AND** expired `validUntil` items persist as orphan `'superseded'`, while `supersedes: ["s1", "s2"]` supersedes both atomically or rolls back on conflict
 
-### Requirement: Markdown Importer Redaction Blocklist and Rollback-Safe Revisioning
-`ImporterEngine.importMd()` SHALL:
-- Skip any file whose `(org_id, source_ref, content_sha256)` matches `redacted_blocklist` while allowing re-import once content changes to a new SHA-256.
-- Look up the current active chain head via indexed `records.source_ref`: in `open` mode across `(org_id, source_ref)` and in `tree` mode within `(org_id, realm_id, source_ref)`.
-- Skip with zero writes when `head.payload.contentSha256 === newSha256` and `head.realmId === targetRealmId`.
-- Insert an initial record with idempotency key `import-md:${sourceRef}:init:${newSha256}` when no active head exists.
-- Create a superseding revision (`supersedesId = head.id`) with idempotency key `import-md:${sourceRef}:after:${head.id}:${newSha256}` whenever content changes (including rollback `v1 -> v2 -> v1`) or when `open` mode reassigns the file to a different realm.
+### Requirement: Global Redaction Blocklist and Rollback-Safe Markdown Revisioning
+`importMd()` SHALL check `db.isContentShaBlocked(orgId, sha)` globally regardless of `source_ref`, skipping redacted content (`skippedRedacted += 1`) even if the file was renamed, while allowing sanitized new content. It SHALL skip unchanged active heads (`skippedUnchanged += 1`) and create superseding revisions (`import-md:${sourceRef}:after:${head.id}:${newSha256}`) on edits, `v1 -> v2 -> v1` rollbacks, or `open`-mode realm reassignments.
 
-#### Scenario: Unchanged re-import writes nothing, edits supersede, and v1->v2->v1 rollback succeeds without IDEMPOTENCY_MISMATCH
-- **WHEN** a Markdown file is imported as `v1`, re-imported unchanged, updated to `v2`, and then reverted back to exact `v1` content
-- **THEN** the unchanged re-import performs zero writes (`skippedUnchanged = 1`)
-- **AND** `v2` supersedes `v1`, and the rollback to `v1` creates a new active `v3` superseding `v2` without triggering `IDEMPOTENCY_MISMATCH` and leaving strictly one active record
+#### Scenario: Unchanged re-import skips, v1->v2->v1 rollback succeeds, and renamed redacted file is blocked
+- **WHEN** a Markdown file is imported as `v1`, re-imported unchanged, updated to `v2`, and rolled back to `v1`
+- **THEN** unchanged re-import writes nothing, `v2` supersedes `v1`, and rollback creates active `v3` superseding `v2` without `IDEMPOTENCY_MISMATCH`
+- **AND** after a human redacts a file, re-importing the same bytes even under a brand-new `source_ref` skips with `skippedRedacted = 1`
 
-#### Scenario: Re-importing a file into a different realm in open mode supersedes the old realm head
-- **WHEN** a Markdown file imported into realm `A` in an `open` organization is re-imported with the same `sourceRef` into realm `B`
-- **THEN** `importMd()` finds the active head in realm `A`, creates a new active record in realm `B` superseding realm `A`'s head, and leaves zero dual-active heads
+### Requirement: Chronological JSONL Ordering and Global Blocklist Enforcement
+`importJsonl()` SHALL sort batches ascending by `occurred_at` (undated rows last) with topological sorting for `supersedes` dependencies before writing, skip `secret` rows by default, and skip any row whose row hash or canonical entry hash hits `db.isContentShaBlocked(orgId, sha)` regardless of `source_ref` (`skippedRedacted += 1`).
 
-#### Scenario: Redacted content hash is blocked while sanitized new content is imported
-- **WHEN** an imported Markdown record is redacted by a human and the identical file is re-imported
-- **THEN** `importMd()` skips it (`skippedRedacted = 1`)
-- **AND** after editing the file to remove the sensitive text (changing its SHA-256), `importMd()` imports the new revision cleanly
+#### Scenario: Out-of-order JSONL builds chronological chains and blocks redacted rows across renamed files
+- **WHEN** a JSONL batch lists a superseding row before its predecessor
+- **THEN** `importJsonl()` sorts chronologically so the predecessor is written first, degrades cross-realm supersedes in `tree` mode, and skips redacted rows even under a new `source_ref`
 
-### Requirement: Chronological Batch Ordering and Policy-Aware Cross-Realm Supersedes
-`ImporterEngine.importJsonl()` SHALL sort the entire batch ascending by `occurred_at` (with undated rows ordered after dated rows and topological ordering for `supersedes` dependencies) before writing, execute atomic cross-realm supersedes in `open` mode, degrade visible cross-realm supersedes in `tree` mode to `refs` plus `payload.crossRealmSupersedes` counted in `treeDegradedCrossRealmSupersedes`, skip `secret` rows by default, and skip `redacted_blocklist` hits.
-
-#### Scenario: Out-of-order JSONL batch builds chronological supersede chains with policy-aware cross-realm handling
-- **WHEN** a JSONL file lists a superseding event before the earlier event it replaces
-- **THEN** `importJsonl()` sorts by `occurred_at` ascending so the base record is created first
-- **AND** in an `open` organization, a cross-realm `supersedes` marks the older record `'superseded'` atomically
-- **AND** in a `tree` organization, a visible cross-realm `supersedes` is degraded to `refs` + `payload.crossRealmSupersedes` with `treeDegradedCrossRealmSupersedes = 1`
-
-### Requirement: Full-Corpus Import Consistency Verification (`verifyImportConsistency`)
-`ImporterEngine.verifyImportConsistency()` and CLI `import-verify --source <file|dir> [--map <path>]` SHALL verify database rows against mapped source expectations and fail when:
-- Any source item mapped as `superseded` or expired (`validUntil < now`) is still `'active'` in the database (`activeSupersededMismatches`).
-- Any source item's declared timestamp (or undated `null`) differs from the stored `occurred_at` (`timestampMismatches`).
-- It SHALL also report exact `undatedCount` and `defaultRealmFallbackCount`.
+### Requirement: Full-Corpus Import Consistency Verification (`import verify`)
+`ImporterEngine.verifyImportConsistency()` and CLI `meru-mind import verify --source <file|dir> [--map <path>]` SHALL verify DB rows against source expectations, failing on `activeSupersededMismatches` or `timestampMismatches` and reporting exact `undatedCount` and `defaultRealmFallbackCount`.
 
 #### Scenario: Consistency checker detects active-vs-superseded and timestamp drift
-- **WHEN** a corpus is imported and verified with `verifyImportConsistency()`
-- **THEN** a clean import passes with zero `activeSupersededMismatches` and zero `timestampMismatches`
-- **AND** if a mapped-superseded item is manually flipped to `'active'` or a declared `occurred_at` is altered in SQLite, `verifyImportConsistency()` fails and identifies the exact mismatched source items
+- **WHEN** a corpus is verified cleanly and then a mapped-superseded row is flipped to `'active'` in SQLite
+- **THEN** `verifyImportConsistency()` passes before mutation and fails after mutation identifying the drifted item

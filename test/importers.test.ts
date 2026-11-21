@@ -63,7 +63,7 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
     const homeDir = makeTempDir("meru-mind-imp-human-");
     const docsDir = makeTempDir("meru-mind-imp-docs-");
 
-    const init = runCliJson(homeDir, ["init", "--org", "ImportOrg"]) as {
+    const init = runCliJson(homeDir, ["admin", "init", "--org", "ImportOrg"]) as {
       rootRealm: { id: string };
     };
 
@@ -81,47 +81,50 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
       "utf8",
     );
 
-    // Default CLI import-md -> agent, confirmedByHuman=false
+    // Default CLI import md -> agent, confirmedByHuman=false
     const resAgent = runCliJson(homeDir, [
-      "import-md",
+      "import",
+      "md",
       docA,
-      "--target",
-      init.rootRealm.id,
+      "--in",
+      "/",
       "--source-ref",
       "docs/agent-note.md",
     ]) as { created: number; items: Array<{ recordId: string }> };
     expect(resAgent.created).toBe(1);
     const recAgent = runCliJson(homeDir, [
-      "cat",
+      "show",
       resAgent.items[0]!.recordId,
-    ]) as { record: { authorKind: string; confirmedByHuman: boolean } };
-    expect(recAgent.record.authorKind).toBe("agent");
-    expect(recAgent.record.confirmedByHuman).toBe(false);
+    ]) as { entry: { record: { authorKind: string; confirmedByHuman: boolean } } };
+    expect(recAgent.entry.record.authorKind).toBe("agent");
+    expect(recAgent.entry.record.confirmedByHuman).toBe(false);
 
     // Explicit --as-human -> human, confirmedByHuman=true
     const resHuman = runCliJson(homeDir, [
       "--as-human",
-      "import-md",
+      "import",
+      "md",
       docB,
-      "--target",
-      init.rootRealm.id,
+      "--in",
+      "/",
       "--source-ref",
       "docs/human-note.md",
     ]) as { created: number; items: Array<{ recordId: string }> };
     expect(resHuman.created).toBe(1);
     const recHuman = runCliJson(homeDir, [
-      "cat",
+      "show",
       resHuman.items[0]!.recordId,
-    ]) as { record: { authorKind: string; confirmedByHuman: boolean } };
-    expect(recHuman.record.authorKind).toBe("human");
-    expect(recHuman.record.confirmedByHuman).toBe(true);
+    ]) as { entry: { record: { authorKind: string; confirmedByHuman: boolean } } };
+    expect(recHuman.entry.record.authorKind).toBe("human");
+    expect(recHuman.entry.record.confirmedByHuman).toBe(true);
 
     // Default Markdown output (without --json) is readable
     const mdOut = runCliRaw(homeDir, [
-      "import-md",
+      "import",
+      "md",
       docA,
-      "--target",
-      init.rootRealm.id,
+      "--in",
+      "/",
       "--source-ref",
       "docs/agent-note.md",
     ]);
@@ -597,7 +600,7 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
 
     const treeCliRes = runCliJson(
       treeHome,
-      ["import-jsonl", treeJsonlPath, "--map", mapPath],
+      ["import", "jsonl", treeJsonlPath, "--map", mapPath],
       { MERU_MIND_VIEWER_REALM_ID: treeChild.id },
     ) as {
       imported: number;

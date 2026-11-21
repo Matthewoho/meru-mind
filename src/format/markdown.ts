@@ -1,3 +1,7 @@
+import {
+  computeDuplicateObjectKeys,
+  formatCanonicalObjectRef,
+} from "../engine/refs.js";
 import type {
   BehaviorClass,
   BriefOutput,
@@ -16,7 +20,10 @@ import type {
   RecallResult,
   ReplayResult,
   ResourceTagSummary,
+  SearchResult,
+  ShowResult,
   TreeResult,
+  WhoamiResult,
 } from "../types.js";
 
 export function formatBehaviorBadge(
@@ -58,20 +65,36 @@ function formatCountsTag(counts: RealmTreeCounts, collapsedChildren: number): st
 
 function renderObjectTreeLines(
   nodes: ObjectTreeNode[],
+  realmPathById: Map<string, string>,
+  duplicateKeys: Set<string>,
   indent = "",
 ): string[] {
   const lines: string[] = [];
   for (const node of nodes) {
     const o = node.object;
-    lines.push(`${indent}- \`${o.kind}\` **${o.name}** (\`${o.id}\`)`);
+    const rPath = realmPathById.get(o.realmId) ?? "/";
+    const canonicalRef = formatCanonicalObjectRef(o, rPath, duplicateKeys);
+    lines.push(`${indent}- \`${canonicalRef}\` (\`${o.id}\`)`);
     if (node.children.length > 0) {
-      lines.push(...renderObjectTreeLines(node.children, `${indent}  `));
+      lines.push(
+        ...renderObjectTreeLines(
+          node.children,
+          realmPathById,
+          duplicateKeys,
+          `${indent}  `,
+        ),
+      );
     }
   }
   return lines;
 }
 
-function renderRealmTreeLines(nodes: RealmTreeNode[], indent = ""): string[] {
+function renderRealmTreeLines(
+  nodes: RealmTreeNode[],
+  realmPathById: Map<string, string>,
+  duplicateKeys: Set<string>,
+  indent = "",
+): string[] {
   const lines: string[] = [];
   for (const node of nodes) {
     const r = node.realm;
@@ -84,16 +107,32 @@ function renderRealmTreeLines(nodes: RealmTreeNode[], indent = ""): string[] {
       `${indent}- **${r.path}** — ${r.name} (\`${r.id}\`) ${countsStr}`,
     );
     if (node.objects.length > 0) {
-      lines.push(...renderObjectTreeLines(node.objects, `${indent}  `));
+      lines.push(
+        ...renderObjectTreeLines(
+          node.objects,
+          realmPathById,
+          duplicateKeys,
+          `${indent}  `,
+        ),
+      );
     }
     if (node.children.length > 0) {
-      lines.push(...renderRealmTreeLines(node.children, `${indent}  `));
+      lines.push(
+        ...renderRealmTreeLines(
+          node.children,
+          realmPathById,
+          duplicateKeys,
+          `${indent}  `,
+        ),
+      );
     }
   }
   return lines;
 }
 
 export function formatTreeMarkdown(res: TreeResult): string {
+  const realmPathById = new Map(res.realms.map((r) => [r.id, r.path]));
+  const duplicateKeys = computeDuplicateObjectKeys(res.objects);
   const lines: string[] = [
     `# Tree: ${res.org.name} (\`${res.org.id}\`, policy: \`${res.org.policy}\`, depth: \`${String(res.depth)}\`)`,
     "",
@@ -102,14 +141,16 @@ export function formatTreeMarkdown(res: TreeResult): string {
   if (res.realmTree.length === 0) {
     lines.push("- _(none)_");
   } else {
-    lines.push(...renderRealmTreeLines(res.realmTree));
+    lines.push(...renderRealmTreeLines(res.realmTree, realmPathById, duplicateKeys));
   }
   if (res.includeObjects) {
     lines.push("", `## Objects (${res.objects.length})`);
     if (res.objectTree.length === 0) {
       lines.push("- _(none)_");
     } else {
-      lines.push(...renderObjectTreeLines(res.objectTree));
+      lines.push(
+        ...renderObjectTreeLines(res.objectTree, realmPathById, duplicateKeys),
+      );
     }
   }
 
@@ -139,31 +180,42 @@ function formatLsEntryLine(item: LsEntry): string {
 export function formatLsMarkdown(res: LsResult): string {
   const lines: string[] = [
     `# ls ${res.targetType}: \`${res.target}\` (resolved: \`${res.resolvedId}\`)`,
-    `Showing ${res.items.length} of ${res.totalMatched} (omitted: ${res.omittedCount})`,
   ];
+  if (!res.only || res.only === "entries") {
+    lines.push(
+      `Showing ${res.items.length} of ${res.totalMatched} (omitted: ${res.omittedCount})`,
+    );
+  }
   if (res.subRealms && res.subRealms.length > 0) {
     lines.push(
       `Sub-realms (${res.subRealms.length}): ${res.subRealms.map((s) => `\`${s.path}\``).join(", ")}`,
     );
   }
-  lines.push("");
-  if (res.items.length === 0) {
-    lines.push("_(empty)_");
-  } else {
-    for (const item of res.items) {
-      lines.push(formatLsEntryLine(item));
-    }
-    if (res.omittedCount > 0) {
-      const pageSize = Math.max(1, res.items.length);
-      lines.push(
-        `... and ${res.omittedCount} more (next page: meru-mind ls ${res.target} --offset ${res.items.length} --limit ${pageSize}; inspect: meru-mind cat <id>)`,
-      );
+  if (res.objects && res.objects.length > 0) {
+    lines.push(
+      `Objects (${res.objects.length}): ${res.objects.map((o) => `\`${o.ref}\``).join(", ")}`,
+    );
+  }
+  if (!res.only || res.only === "entries") {
+    lines.push("");
+    if (res.items.length === 0) {
+      lines.push("_(empty)_");
+    } else {
+      for (const item of res.items) {
+        lines.push(formatLsEntryLine(item));
+      }
+      if (res.omittedCount > 0 && res.nextCursor) {
+        const pageSize = Math.max(1, res.items.length);
+        lines.push(
+          `... and ${res.omittedCount} more (next page: meru-mind ls ${res.target} --cursor ${res.nextCursor} --limit ${pageSize}; inspect: meru-mind show <ref>)`,
+        );
+      }
     }
   }
   if (res.driveFiles && res.driveFiles.length > 0) {
-    lines.push("", `## Drive Files (${res.driveFiles.length})`);
+    lines.push("", `## Files (${res.driveFiles.length})`);
     for (const df of res.driveFiles) {
-      lines.push(`- \`${df.relPath}\` (v${df.version}, updated ${df.updatedAt})`);
+      lines.push(`- \`${df.ref}\` (v${df.version}, updated ${df.updatedAt})`);
     }
   }
   return lines.join("\n");
@@ -404,7 +456,7 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
     }
     if (brief.omittedChildRealmsCount > 0) {
       lines.push(
-        `... and ${brief.omittedChildRealmsCount} more (explore: meru-mind tree ${brief.realm.path} -L 1, or meru-mind brief ${brief.realm.path} --max-children ${brief.middleMind.childSummaries.totalCount})`,
+        `... and ${brief.omittedChildRealmsCount} more (explore: meru-mind tree ${brief.realm.path} -L 1)`,
       );
     }
   }
@@ -655,4 +707,119 @@ export function formatGenericMarkdown(title: string, data: unknown): string {
   return [`# ${title}`, "", "```json", JSON.stringify(data, null, 2), "```"].join(
     "\n",
   );
+}
+
+export function formatWhoamiMarkdown(res: WhoamiResult): string {
+  return [
+    `# Whoami: ${res.org.name} (\`${res.org.id}\`, policy: \`${res.org.policy}\`)`,
+    `- **Actor**: \`${res.actor.id}\` (${res.actor.kind}${res.actor.family ? `, ${res.actor.family}` : ""})`,
+    `- **Bound Realm**: \`${res.bound.realmPath}\` (\`${res.bound.realmId}\`, source: ${res.bound.source})`,
+    `- **Read**: policy=\`${res.read.policy}\`, realms=${res.read.ledgerRealms}, drive=${res.read.driveRealms}, raw=${res.read.seabedRealms}`,
+    `- **Write**: ${res.write.allowed}`,
+    `- **Corpus**: realms=${res.corpus.realms}, objects=${res.corpus.objects}, rules=${res.corpus.rules}, conclusions=${res.corpus.conclusions}, raw=${res.corpus.raw}, files=${res.corpus.files}`,
+    `- **Latest Seq**: ${res.latestSeq} (version ${res.version}, schema v${res.schemaVersion})`,
+    `- **Store (local-only)**: \`${res.store.path}\``,
+    `- **Next**: \`${res.next}\``,
+  ].join("\n");
+}
+
+export function formatShowMarkdown(res: ShowResult): string {
+  if (res.refType === "realm") {
+    return formatBriefMarkdown(res.brief);
+  }
+  if (res.refType === "object") {
+    const c = res.card;
+    const lines: string[] = [
+      `# Object: \`${c.ref}\``,
+      `- **Kind**: \`${c.kind}\``,
+      `- **Name**: ${c.name}`,
+    ];
+    if (c.object) {
+      lines.push(`- **ID**: \`${c.object.id}\``);
+    }
+    if (c.realmPath) {
+      lines.push(`- **Realm**: \`${c.realmPath}\``);
+    }
+    lines.push(
+      `- **Entries**: total=${c.counts.total} (object=${c.counts.viaObject}, tag=${c.counts.viaTag}, thing=${c.counts.viaThing})`,
+      "",
+      `## Recent Entries (${c.recentEntries.length}/${c.counts.total})`,
+    );
+    if (c.recentEntries.length === 0) {
+      lines.push("_(none)_");
+    } else {
+      for (const item of c.recentEntries) {
+        lines.push(formatLsEntryLine(item));
+      }
+    }
+    lines.push("", `Next: \`${c.try}\``);
+    return lines.join("\n");
+  }
+  if (res.refType === "file") {
+    const f = res.file;
+    return [
+      `# [raw/file] \`${res.ref}\` (v${f.version})`,
+      "",
+      `- **Realm**: \`${res.realmPath}\` (\`${f.realmId}\`)`,
+      `- **Updated**: ${f.updatedAt} by \`${f.updatedBy}\``,
+      `- **SHA-256**: \`${f.sha256}\``,
+      "",
+      f.content,
+    ].join("\n");
+  }
+  const sections: string[] = [formatCatMarkdown(res.entry)];
+  if (res.history && res.history.nodes.length > 0) {
+    sections.push(
+      "",
+      `## History (${res.history.nodes.length}, head: \`${res.history.currentHeadId ?? "none"}\`)`,
+      ...res.history.nodes.map(
+        (n) =>
+          `- \`${n.id}\` (${n.status}) ${n.title} @ ${formatDateLabel(n.occurredAt)}`,
+      ),
+    );
+  }
+  if (res.context) {
+    sections.push("", formatReplayMarkdown(res.context));
+  }
+  return sections.join("\n");
+}
+
+export function formatSearchMarkdown(res: SearchResult): string {
+  const scopeParts: string[] = [];
+  if (res.in) scopeParts.push(`in=\`${res.in}\``);
+  if (res.about) scopeParts.push(`about=\`${res.about}\``);
+  const scopeSuffix = scopeParts.length > 0 ? ` [${scopeParts.join(", ")}]` : "";
+  const lines: string[] = [
+    `# Search "${res.query}"${scopeSuffix} (${res.items.length}/${res.totalMatched}, omitted: ${res.omittedCount})`,
+    "",
+  ];
+  if (res.items.length === 0) {
+    lines.push("_(no matches)_");
+  } else {
+    for (const item of res.items) {
+      const cls: BehaviorClass =
+        item.behaviorClass ??
+        (item.sourceType === "seabed"
+          ? "raw"
+          : item.kind === "rule"
+            ? "rule"
+            : "conclusion");
+      const badge = formatBehaviorBadge(cls, item.kind);
+      const headHint = item.orphanSuperseded
+        ? " (orphan superseded)"
+        : item.currentHeadId !== undefined
+          ? ` -> head:\`${item.currentHeadId ?? "none"}\``
+          : "";
+      const realmLabel = item.realmPath ? ` in \`${item.realmPath}\`` : "";
+      lines.push(
+        `- ${badge} \`${item.id}\` **${item.title}**${realmLabel} (${item.status}${headHint}, @ ${formatDateLabel(item.occurredAt)}) — ${item.snippet}`,
+      );
+    }
+    if (res.omittedCount > 0 && res.nextCursor) {
+      lines.push(
+        `... and ${res.omittedCount} more (next page: meru-mind search "${res.query}" --cursor ${res.nextCursor}; inspect: meru-mind show <id>)`,
+      );
+    }
+  }
+  return lines.join("\n");
 }

@@ -1185,16 +1185,17 @@ describe("V0.2a-Polish: P0-1 zero-leak, O(1) queries, CJK bigrams, lexicographic
     expect(orphanRecall.items[0]?.orphanSuperseded).toBe(true);
     expect(orphanRecall.items[0]?.currentHeadId).toBeNull();
 
-    // CLI --occurred-at none & MCP occurredAt: null
+    // CLI --occurred-at none & MCP occurred_at: null
     const cliNull = runCliJson(homeDir, [
       "write",
+      "--in",
       rootRealm.path,
-      "--class",
-      "conclusion",
       "--kind",
       "decision",
       "--title",
       "CLI Undated Entry",
+      "--body",
+      "CLI undated decision body.",
       "--occurred-at",
       "none",
     ]) as { occurredAt: string | null };
@@ -1214,12 +1215,13 @@ describe("V0.2a-Polish: P0-1 zero-leak, O(1) queries, CJK bigrams, lexicographic
     await mcpClient.connect(mcpTransport);
     try {
       const mcpRes = await mcpClient.callTool({
-        name: "mind_write_conclusion",
+        name: "mind_write",
         arguments: {
-          target: rootRealm.path,
+          in: rootRealm.path,
           kind: "decision",
           title: "MCP Undated Entry",
-          occurredAt: null,
+          body: "MCP undated decision body.",
+          occurred_at: null,
         },
       });
       const parsed = JSON.parse(
@@ -1310,7 +1312,8 @@ describe("V0.2a-Polish: P0-1 zero-leak, O(1) queries, CJK bigrams, lexicographic
     expect(verifyClean.timestampMismatches).toHaveLength(0);
 
     const cliVerifyClean = runCliJson(homeDir, [
-      "import-verify",
+      "import",
+      "verify",
       "--source",
       srcDir,
       "--map",
@@ -1392,9 +1395,10 @@ describe("V0.2a-Polish: P0-1 zero-leak, O(1) queries, CJK bigrams, lexicographic
     }
   });
 
-  it("7. CLI/MCP unification: --realm removal, tree MERU_MIND_VIEWER_REALM_ID & --as-human whitelist, explicit ls prefixes, tree count semantics (null/—), truncation hints & EPIPE", async () => {
+  it("7. CLI/MCP unification: --realm removal, tree MERU_MIND_VIEWER_REALM_ID & --as-human whitelist, typed ls refs, tree count semantics (null/—), truncation hints & EPIPE", async () => {
     const homeDir = makeTempDir("meru-mind-cli-polish-");
     const init = runCliJson(homeDir, [
+      "admin",
       "init",
       "--org",
       "CliPolishTree",
@@ -1402,20 +1406,21 @@ describe("V0.2a-Polish: P0-1 zero-leak, O(1) queries, CJK bigrams, lexicographic
       "tree",
     ]) as { org: { id: string }; rootRealm: { id: string } };
 
-    // 1) --realm removed everywhere with self-correcting message
+    // 1) --realm removed everywhere with self-correcting unknown_flag message
     const realmFlagErr = runCliFail(homeDir, [
       "tree",
       "--realm",
       init.rootRealm.id,
     ]);
     expect(realmFlagErr.status).not.toBe(0);
-    expect(realmFlagErr.stderr).toContain("INVALID_INPUT");
+    expect(realmFlagErr.stderr).toContain('"unknown_flag"');
     expect(realmFlagErr.stderr).toContain("--realm");
-    expect(realmFlagErr.stderr).toContain("--focus");
+    expect(realmFlagErr.stderr).toContain("--in");
 
     // 2) Missing MERU_MIND_VIEWER_REALM_ID in tree org fails on normal commands with non-root self-correcting hint
     const missingEnvErr = runCliFail(homeDir, ["tree"]);
     expect(missingEnvErr.status).not.toBe(0);
+    expect(missingEnvErr.stderr).toContain('"not_bound"');
     expect(missingEnvErr.stderr).toContain("MERU_MIND_VIEWER_REALM_ID");
     expect(missingEnvErr.stderr).not.toContain("MERU_MIND_VIEWER_REALM_ID=/ ");
     expect(missingEnvErr.stderr).toContain("/team/project");
@@ -1436,22 +1441,20 @@ describe("V0.2a-Polish: P0-1 zero-leak, O(1) queries, CJK bigrams, lexicographic
     ]) as { id: string; path: string };
     expect(child.path).toBe("/ops");
 
-    // 4) Bare unknown ls target rejected with explicit prefix hint
+    // 4) Bare unknown ls target rejected with invalid_ref hint
     const bareLsErr = runCliFail(homeDir, ["ls", "ambiguous-bare-name"], {
       MERU_MIND_VIEWER_REALM_ID: child.id,
     });
     expect(bareLsErr.status).not.toBe(0);
-    expect(bareLsErr.stderr).toContain("INVALID_INPUT");
-    expect(bareLsErr.stderr).toContain("obj:");
-    expect(bareLsErr.stderr).toContain("tag:");
+    expect(bareLsErr.stderr).toContain('"invalid_ref"');
 
-    // 4b) cat obj:<ref> gives purely syntactic INVALID_INPUT hint (zero DB existence oracle)
-    const catObjErr = runCliFail(homeDir, ["cat", "obj:nonexistent-service"], {
+    // 4b) Removed legacy `cat` command returns unknown_command with exact show replacement
+    const catLegacyErr = runCliFail(homeDir, ["cat", "rec_nonexistent"], {
       MERU_MIND_VIEWER_REALM_ID: child.id,
     });
-    expect(catObjErr.status).not.toBe(0);
-    expect(catObjErr.stderr).toContain("INVALID_INPUT");
-    expect(catObjErr.stderr).toContain("meru-mind ls obj:nonexistent-service");
+    expect(catLegacyErr.status).not.toBe(0);
+    expect(catLegacyErr.stderr).toContain('"unknown_command"');
+    expect(catLegacyErr.stderr).toContain("meru-mind show");
 
     // 5) tree count semantics:
     // - Viewing from child `/ops`: ancestor `/` is direct-only (subtreeConclusions === null), self `/ops` has directRaw === 1 & subtreeConclusions === 0
@@ -1459,10 +1462,10 @@ describe("V0.2a-Polish: P0-1 zero-leak, O(1) queries, CJK bigrams, lexicographic
     runCliJson(
       homeDir,
       [
-        "write",
-        child.path,
-        "--class",
         "raw",
+        "add",
+        "--in",
+        child.path,
         "--kind",
         "message",
         "--text",

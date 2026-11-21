@@ -51,6 +51,40 @@ export {
   computePayloadHash,
 } from "./engine/ledger.js";
 export {
+  canonicalizeJson,
+  sha256Bytes,
+  computeRecordContentSha256,
+  computeSeabedContentSha256,
+  computeFileContentSha256,
+  buildWriteRecordPayload,
+  REDACTED_CONTENT_BLOCKED_MSG,
+  REDACTED_CONTENT_TRY_HINT,
+} from "./engine/content-hash.js";
+export {
+  OPAQUE_FILE_NOT_FOUND,
+  parseRefSyntax,
+  formatCanonicalFileRef,
+  formatStoredSourceRef,
+  formatRealmQualifiedObjectRef,
+  computeDuplicateObjectKeys,
+  formatCanonicalObjectRef,
+  resolveFileRef,
+  resolveUnifiedObjectRead,
+  resolveAboutRefsForWrite,
+  type ParsedRef,
+  type UnifiedObjectResolution,
+} from "./engine/refs.js";
+export {
+  writeEverydayConclusion,
+  EVERYDAY_WRITE_KINDS,
+  type SurfaceWriteParams,
+} from "./engine/surface-write.js";
+export {
+  mapMindErrorCodeToWire,
+  toSurfaceError,
+  formatSurfaceErrorText,
+} from "./format/errors.js";
+export {
   ObjectEngine,
   normalizeResourceTag,
   normalizeRealmPath,
@@ -96,9 +130,12 @@ export {
   formatObjectsMarkdown,
   formatRecallMarkdown,
   formatReplayMarkdown,
+  formatSearchMarkdown,
+  formatShowMarkdown,
   formatTagsMarkdown,
   formatThingsMarkdown,
   formatTreeMarkdown,
+  formatWhoamiMarkdown,
 } from "./format/markdown.js";
 
 export interface MindEngineOptions {

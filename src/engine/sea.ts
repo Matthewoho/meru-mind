@@ -3,6 +3,7 @@ import { parseSearchQuery, type SearchConcept } from "../adapters/sqlite-db.js";
 import { buildSnippet, extractReadableText } from "../format/snippet.js";
 import {
   assertAccess,
+  getDescendantIds,
   intersectAccessScopes,
   resolveAccess,
   resolveAccessScope,
@@ -28,10 +29,14 @@ import {
   type Distillation,
   type DistillationLayer,
   type LedgerRecord,
+  type LsDriveFileItem,
   type LsEntry,
+  type LsObjectSummary,
+  type LsOnlyFilter,
   type LsResult,
   type LsTargetType,
   type MindObject,
+  type ObjectCard,
   type ObjectTreeNode,
   type OrgPolicy,
   type Realm,
@@ -45,9 +50,13 @@ import {
   type RecordKind,
   type ReplayResult,
   type SeabedEntry,
+  type SeabedKind,
+  type SearchResult,
   type Sensitivity,
+  type ShowResult,
   type SyncEmbeddingsResult,
   type TreeResult,
+  type WhoamiResult,
 } from "../types.js";
 import {
   getDescendantObjectIds,
@@ -57,6 +66,16 @@ import {
   OPAQUE_REALM_NOT_FOUND,
   resolveVisibleRealm,
 } from "./objects.js";
+import {
+  computeDuplicateObjectKeys,
+  formatCanonicalFileRef,
+  formatCanonicalObjectRef,
+  formatStoredSourceRef,
+  OPAQUE_FILE_NOT_FOUND,
+  parseRefSyntax,
+  resolveFileRef,
+  resolveUnifiedObjectRead,
+} from "./refs.js";
 import {
   createVisibilityHelpers,
   parseDriveSourceRef,
@@ -85,6 +104,34 @@ const NON_RULE_RECORD_KINDS: RecordKind[] = [
   "finding",
   "decision",
 ];
+
+const VALID_RECORD_KINDS_SET = new Set<string>([
+  "thing",
+  "claim",
+  "proposal",
+  "verdict",
+  "finding",
+  "decision",
+  "rule",
+]);
+
+const VALID_SEABED_KINDS_SET = new Set<string>([
+  "message",
+  "artifact",
+  "evidence",
+  "signal",
+]);
+
+function parseNumericCursor(cursor?: string): number {
+  if (cursor === undefined || cursor === null || cursor.trim() === "") return 0;
+  if (!/^\d+$/.test(cursor.trim())) {
+    throw new MindError(
+      "INVALID_INPUT",
+      `Invalid cursor "${cursor}": expected non-negative integer offset`,
+    );
+  }
+  return Number.parseInt(cursor.trim(), 10);
+}
 
 function clampBudget(value: number | undefined, fallback: number): number {
   if (value === undefined) return fallback;
@@ -560,17 +607,26 @@ export class SeaEngine {
     const allowedLedgerSet = new Set(scope.readableLedgerIds);
     const allowedSeabedSet = new Set(scope.readableSeabedIds);
 
-    // Narrow to targetRealmId if specified (never widens visibility!)
+    // Narrow to targetRealmId or realmIdsFilter if specified (never widens visibility!)
     let ledgerRealmIds = scope.readableLedgerIds;
     let seabedRealmIds = scope.readableSeabedIds;
+    if (query.realmIdsFilter) {
+      const filterSet = new Set(query.realmIdsFilter);
+      ledgerRealmIds = ledgerRealmIds.filter((id) => filterSet.has(id));
+      seabedRealmIds = seabedRealmIds.filter((id) => filterSet.has(id));
+    }
     if (query.targetRealmId) {
-      ledgerRealmIds = allowedLedgerSet.has(query.targetRealmId)
+      ledgerRealmIds = ledgerRealmIds.includes(query.targetRealmId)
         ? [query.targetRealmId]
         : [];
-      seabedRealmIds = allowedSeabedSet.has(query.targetRealmId)
+      seabedRealmIds = seabedRealmIds.includes(query.targetRealmId)
         ? [query.targetRealmId]
         : [];
     }
+    const allowedEntrySet =
+      query.allowedEntryIds !== undefined
+        ? new Set(query.allowedEntryIds)
+        : null;
 
     const vis = this.buildVisibilityHelpers({
       realms,
@@ -603,6 +659,7 @@ export class SeaEngine {
         sourceType: "record",
         kind: clean.kind,
         realmId: clean.realmId,
+        realmPath: vis.getSanitizedRealmPath(clean.realmId),
         status: clean.status,
         title: clean.title,
         snippet: buildSnippet({
@@ -636,13 +693,21 @@ export class SeaEngine {
         sourceType: "seabed",
         kind: clean.kind,
         realmId: clean.realmId,
+        realmPath: vis.getSanitizedRealmPath(clean.realmId),
         status: clean.redactedAt ? "retracted" : "evidence",
         title: `${clean.kind}${clean.topicId ? ` (${clean.topicId})` : ""}`,
         snippet: buildSnippet({ text: clean.text, concepts }),
         authorId: clean.authorId,
         createdAt: clean.createdAt,
         occurredAt: clean.occurredAt,
-        sourceRefs: clean.sourceRef ? [clean.sourceRef] : [],
+        sourceRefs: clean.sourceRef
+          ? [
+              formatStoredSourceRef(
+                clean.sourceRef,
+                vis.getSanitizedRealmPath,
+              ) ?? clean.sourceRef,
+            ]
+          : [],
         matchedBy,
         score,
       };
@@ -661,6 +726,7 @@ export class SeaEngine {
         sourceType: "distillation",
         kind: clean.layer,
         realmId: clean.realmId,
+        realmPath: vis.getSanitizedRealmPath(clean.realmId),
         status: clean.status,
         title: `${clean.layer} (${clean.periodKey})`,
         snippet: buildSnippet({
@@ -1196,6 +1262,9 @@ export class SeaEngine {
     const candidates: RankedCandidate[] = [];
 
     for (const [itemId, sourceType] of candidateSourceMap.entries()) {
+      if (allowedEntrySet && !allowedEntrySet.has(itemId)) {
+        continue;
+      }
       if (sourceType === "record") {
         const rec = hydratedRecords.get(itemId);
         if (!rec || rec.sensitivity === "secret" || !vis.canSeeRecord(rec)) {
@@ -1453,6 +1522,7 @@ export class SeaEngine {
         query.authorId ||
         query.since ||
         query.until ||
+        allowedEntrySet ||
         droppedByIdentifierBoundary,
     );
     const totalMatched = hasPostFilter
@@ -1639,6 +1709,10 @@ export class SeaEngine {
           continue;
         }
         const clean = params.vis.sanitizeSeabed(sea);
+        const canonicalSourceRef = formatStoredSourceRef(
+          clean.sourceRef,
+          params.vis.getSanitizedRealmPath,
+        );
         out.push({
           id: clean.id,
           behaviorClass: "raw",
@@ -1655,8 +1729,8 @@ export class SeaEngine {
           occurredAt: clean.occurredAt,
           createdAt: clean.createdAt,
           externalRef: null,
-          sourceRef: clean.sourceRef,
-          refs: clean.sourceRef ? [clean.sourceRef] : [],
+          sourceRef: canonicalSourceRef,
+          refs: canonicalSourceRef ? [canonicalSourceRef] : [],
           supersedesId: null,
           supersedesIds: [],
           supersededById: null,
@@ -1910,14 +1984,22 @@ export class SeaEngine {
   async ls(params: {
     actor: Actor;
     viewerRealmId: string;
+    ref?: string;
     target?: string;
     targetType?: LsTargetType;
+    only?: LsOnlyFilter;
     kind?: string;
+    kinds?: string[];
     tag?: string;
+    about?: string;
+    since?: string;
+    until?: string;
+    history?: boolean;
     includeSuperseded?: boolean;
     includeDescendantSeabed?: boolean;
     limit?: number;
     offset?: number;
+    cursor?: string;
     scopeCeiling?: AccessScope;
   }): Promise<LsResult> {
     const realms = this.db.listRealms();
@@ -1928,11 +2010,52 @@ export class SeaEngine {
       throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
     }
     const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
-    const includeSuperseded = Boolean(params.includeSuperseded);
+    const includeSuperseded = Boolean(
+      params.includeSuperseded || params.history,
+    );
     const includeDescendantSeabed = Boolean(params.includeDescendantSeabed);
     const limit = Math.max(1, Math.min(params.limit ?? 20, 200));
-    const offset = Math.max(0, params.offset ?? 0);
-    const kindFilter = params.kind?.trim() || undefined;
+    const offset =
+      params.cursor !== undefined
+        ? parseNumericCursor(params.cursor)
+        : Math.max(0, params.offset ?? 0);
+
+    const onlyFilter = params.only;
+    if (
+      onlyFilter !== undefined &&
+      onlyFilter !== "realms" &&
+      onlyFilter !== "objects" &&
+      onlyFilter !== "entries" &&
+      onlyFilter !== "files"
+    ) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Invalid --only filter "${String(onlyFilter)}". Allowed: realms, objects, entries, files`,
+      );
+    }
+
+    const kindList = Array.from(
+      new Set(
+        [
+          ...(params.kinds ?? []),
+          ...(params.kind
+            ? params.kind
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : []),
+        ].map((k) => k.toLowerCase()),
+      ),
+    );
+    for (const k of kindList) {
+      if (!VALID_RECORD_KINDS_SET.has(k) && !VALID_SEABED_KINDS_SET.has(k)) {
+        throw new MindError(
+          "INVALID_INPUT",
+          `Invalid kind filter "${k}". Allowed record kinds: decision, finding, claim, proposal, verdict, thing, rule; raw kinds: message, artifact, evidence, signal`,
+        );
+      }
+    }
+
     const tagFilter = params.tag?.trim()
       ? normalizeResourceTag(params.tag.trim())
       : undefined;
@@ -1962,11 +2085,17 @@ export class SeaEngine {
       includeDescendantSeabed,
     });
 
-    const rawTarget = params.target?.trim() || viewerRealm.id;
+    const rawTarget = (params.ref ?? params.target)?.trim() || viewerRealm.id;
 
-    // Explicit target prefixes ONLY (no DB existence-probe guessing)
-    let targetType: LsTargetType;
+    // Support both legacy explicit SDK prefixes (realm:, obj:, thing:, tag:)
+    // AND the canonical 4-shape V0.2a-Surface ref grammar (/realm, @mounted/alias, <kind>:<name>, /realm/<kind>:<name>, obj_..., rec_.../sea_..., file:...).
+    let targetType: LsTargetType | "unified_object";
     let normalizedRef = rawTarget;
+    let parsedUnifiedObj: Extract<
+      ReturnType<typeof parseRefSyntax>,
+      { kind: "object" }
+    > | null = null;
+
     if (params.targetType) {
       targetType = params.targetType;
       if (targetType === "realm" && normalizedRef.startsWith("realm:")) {
@@ -1978,36 +2107,62 @@ export class SeaEngine {
       } else if (targetType === "resource" && normalizedRef.startsWith("tag:")) {
         normalizedRef = normalizedRef.slice("tag:".length).trim();
       }
-    } else if (
-      rawTarget.startsWith("/") ||
-      rawTarget.toLowerCase().startsWith("@mounted/") ||
-      rawTarget.startsWith("realm_")
-    ) {
-      targetType = "realm";
     } else if (rawTarget.startsWith("realm:")) {
       targetType = "realm";
       normalizedRef = rawTarget.slice("realm:".length).trim();
     } else if (rawTarget.startsWith("obj:")) {
       targetType = "object";
       normalizedRef = rawTarget.slice("obj:".length).trim();
-    } else if (rawTarget.startsWith("obj_")) {
-      targetType = "object";
-    } else if (rawTarget.startsWith("thing:")) {
-      targetType = "thing";
-      normalizedRef = rawTarget.slice("thing:".length).trim();
     } else if (rawTarget.startsWith("tag:")) {
       targetType = "resource";
       normalizedRef = rawTarget.slice("tag:".length).trim();
     } else {
-      throw new MindError(
-        "INVALID_INPUT",
-        `Ambiguous ls target "${rawTarget}". Use an explicit prefix: /path, @mounted/<alias>, realm:<id>, obj:<id|name>, thing:<ref>, or tag:<type:name>.`,
-      );
+      const parsed = parseRefSyntax(rawTarget);
+      if (parsed.kind === "entry" || parsed.kind === "file") {
+        throw new MindError(
+          "NOT_LISTABLE",
+          `Reference "${rawTarget}" is a ${parsed.kind} and cannot be listed with ls`,
+          { try: `meru-mind show ${rawTarget}` },
+        );
+      }
+      if (parsed.kind === "realm") {
+        targetType = "realm";
+        normalizedRef = parsed.realmRef;
+      } else {
+        targetType = "unified_object";
+        parsedUnifiedObj = parsed;
+      }
+    }
+
+    // Optional --about unified object filter when listing a realm
+    let aboutEntryIdsFilter: string[] | undefined;
+    if (params.about?.trim()) {
+      const aboutParsed = parseRefSyntax(params.about.trim());
+      if (aboutParsed.kind !== "object") {
+        throw new MindError(
+          "INVALID_REF",
+          `Invalid --about reference "${params.about}": expected <kind>:<name>, /<realm>/<kind>:<name>, or obj_...`,
+          { try: `meru-mind ls ${rawTarget} --about service:api` },
+        );
+      }
+      const aboutResolved = resolveUnifiedObjectRead({
+        db: this.db,
+        realms,
+        orgId: viewerRealm.orgId,
+        parsed: aboutParsed,
+        scope,
+        vis,
+        verb: "ls",
+        allowEmpty: true,
+      });
+      aboutEntryIdsFilter = aboutResolved.entryIds;
     }
 
     let resolvedId = normalizedRef;
-    let driveFiles: LsResult["driveFiles"] | undefined;
+    let displayTarget = rawTarget;
+    let driveFiles: LsDriveFileItem[] | undefined;
     let subRealms: LsResult["subRealms"] | undefined;
+    let objectsList: LsObjectSummary[] | undefined;
     let unifiedRes: { rows: UnifiedEntryRef[]; total: number } = {
       rows: [],
       total: 0,
@@ -2021,36 +2176,105 @@ export class SeaEngine {
         scope,
       });
       resolvedId = targetRealm.id;
+      displayTarget = targetRealm.path;
 
-      // Single-query SQL UNION + exact COUNT(*) (no limit: 10_000, no N+1)
-      unifiedRes = this.db.lsRealmEntriesUnified({
+      const wantEntries = !onlyFilter || onlyFilter === "entries";
+      const wantRealms = !onlyFilter || onlyFilter === "realms";
+      const wantObjects = !onlyFilter || onlyFilter === "objects";
+      const wantFiles = !onlyFilter || onlyFilter === "files";
+
+      if (wantEntries) {
+        unifiedRes = this.db.lsRealmEntriesUnified({
+          orgId: viewerRealm.orgId,
+          targetRealmId: targetRealm.id,
+          includePhysicalLedger: readableLedgerSet.has(targetRealm.id),
+          includePhysicalSeabed: readableSeabedSet.has(targetRealm.id),
+          includeObjectLinkedOpenMode: scope.policy === "open",
+          includeSuperseded,
+          kinds: kindList.length > 0 ? kindList : undefined,
+          tag: tagFilter,
+          since: params.since,
+          until: params.until,
+          entryIdsFilter: aboutEntryIdsFilter,
+          excludeSensitivities: ["secret"],
+          limit,
+          offset,
+        });
+      }
+
+      if (wantRealms) {
+        const orgRealms = realms.filter((r) => r.orgId === viewerRealm.orgId);
+        const visibleSanitizedRealms = vis.sanitizeRealms(orgRealms);
+        subRealms = visibleSanitizedRealms
+          .filter((r) => r.parentId === targetRealm.id)
+          .map((r) => ({
+            id: r.id,
+            path: r.path,
+            name: r.name,
+            slug: r.slug,
+          }));
+      }
+
+      if (wantObjects && readableLedgerSet.has(targetRealm.id)) {
+        const allVisObjs = vis.sanitizeObjects(
+          this.db.listObjects({
+            orgId: viewerRealm.orgId,
+            realmIds: scope.readableLedgerIds,
+          }),
+        );
+        const dupKeys = computeDuplicateObjectKeys(allVisObjs);
+        objectsList = allVisObjs
+          .filter((o) => o.realmId === targetRealm.id)
+          .map((o) => ({
+            id: o.id,
+            ref: formatCanonicalObjectRef(o, targetRealm.path, dupKeys),
+            kind: o.kind,
+            name: o.name,
+            realmId: o.realmId,
+            realmPath: targetRealm.path,
+            parentObjectId: o.parentObjectId,
+          }));
+      }
+
+      if (wantFiles && vis.canSeeDriveRealm(targetRealm.id)) {
+        const rawFiles = await this.drive.listFiles(targetRealm.id);
+        driveFiles = rawFiles.map((f) => ({
+          ...f,
+          ref: formatCanonicalFileRef(targetRealm.path, f.relPath),
+          realmPath: targetRealm.path,
+        }));
+      }
+    } else if (targetType === "unified_object" && parsedUnifiedObj) {
+      const resolved = resolveUnifiedObjectRead({
+        db: this.db,
+        realms,
         orgId: viewerRealm.orgId,
-        targetRealmId: targetRealm.id,
-        includePhysicalLedger: readableLedgerSet.has(targetRealm.id),
-        includePhysicalSeabed: readableSeabedSet.has(targetRealm.id),
-        includeObjectLinkedOpenMode: scope.policy === "open",
+        parsed: parsedUnifiedObj,
+        scope,
+        vis,
+        verb: "ls",
+      });
+      resolvedId = resolved.object?.id ?? resolved.canonicalRef;
+      displayTarget = resolved.canonicalRef;
+      let candidateIds = resolved.entryIds;
+      if (aboutEntryIdsFilter !== undefined) {
+        const allowSet = new Set(aboutEntryIdsFilter);
+        candidateIds = candidateIds.filter((id) => allowSet.has(id));
+      }
+      unifiedRes = this.db.lsEntriesByIdsUnified({
+        orgId: viewerRealm.orgId,
+        entryIds: candidateIds,
+        ledgerRealmIds: resolved.ledgerRealmIds,
+        seabedRealmIds: resolved.seabedRealmIds,
         includeSuperseded,
-        kind: kindFilter,
+        kinds: kindList.length > 0 ? kindList : undefined,
         tag: tagFilter,
+        since: params.since,
+        until: params.until,
         excludeSensitivities: ["secret"],
         limit,
         offset,
       });
-
-      const orgRealms = realms.filter((r) => r.orgId === viewerRealm.orgId);
-      const visibleSanitizedRealms = vis.sanitizeRealms(orgRealms);
-      subRealms = visibleSanitizedRealms
-        .filter((r) => r.parentId === targetRealm.id)
-        .map((r) => ({
-          id: r.id,
-          path: r.path,
-          name: r.name,
-          slug: r.slug,
-        }));
-
-      if (vis.canSeeDriveRealm(targetRealm.id)) {
-        driveFiles = await this.drive.listFiles(targetRealm.id);
-      }
     } else if (targetType === "object") {
       const visibleObjects = vis.sanitizeObjects(
         this.db.listObjects({
@@ -2058,7 +2282,7 @@ export class SeaEngine {
           realmIds: scope.readableLedgerIds,
         }),
       );
-      let obj =
+      const obj =
         visibleObjects.find((o) => o.id === normalizedRef) ??
         visibleObjects.find(
           (o) =>
@@ -2084,8 +2308,10 @@ export class SeaEngine {
         ledgerRealmIds: scope.readableLedgerIds,
         seabedRealmIds: scope.readableSeabedIds,
         includeSuperseded,
-        kind: kindFilter,
+        kinds: kindList.length > 0 ? kindList : undefined,
         tag: tagFilter,
+        since: params.since,
+        until: params.until,
         excludeSensitivities: ["secret"],
         limit,
         offset,
@@ -2127,8 +2353,10 @@ export class SeaEngine {
         ledgerRealmIds: scope.readableLedgerIds,
         seabedRealmIds: [],
         includeSuperseded,
-        kind: kindFilter,
+        kinds: kindList.length > 0 ? kindList : undefined,
         tag: tagFilter,
+        since: params.since,
+        until: params.until,
         excludeSensitivities: ["secret"],
         limit,
         offset,
@@ -2146,8 +2374,10 @@ export class SeaEngine {
         ledgerRealmIds: scope.readableLedgerIds,
         seabedRealmIds: scope.readableSeabedIds,
         includeSuperseded,
-        kind: kindFilter,
+        kinds: kindList.length > 0 ? kindList : undefined,
         tag: tagFilter,
+        since: params.since,
+        until: params.until,
         excludeSensitivities: ["secret"],
         limit,
         offset,
@@ -2160,16 +2390,20 @@ export class SeaEngine {
       vis,
       readableLedgerSet,
     });
+    const omittedCount = Math.max(0, unifiedRes.total - offset - page.length);
 
     return {
-      targetType,
-      target: rawTarget,
+      targetType: targetType === "unified_object" ? "object" : targetType,
+      target: displayTarget,
       resolvedId,
       viewerRealmId: viewerRealm.id,
+      ...(onlyFilter ? { only: onlyFilter } : {}),
       items: page,
       totalMatched: unifiedRes.total,
-      omittedCount: Math.max(0, unifiedRes.total - offset - page.length),
+      omittedCount,
+      nextCursor: omittedCount > 0 ? String(offset + page.length) : null,
       ...(subRealms !== undefined ? { subRealms } : {}),
+      ...(objectsList !== undefined ? { objects: objectsList } : {}),
       ...(driveFiles !== undefined ? { driveFiles } : {}),
     };
   }
@@ -2552,6 +2786,7 @@ export class SeaEngine {
   changes(params: {
     actor: Actor;
     viewerRealmId: string;
+    in?: string;
     target?: string;
     sinceSeq?: number;
     limit?: number;
@@ -2580,19 +2815,25 @@ export class SeaEngine {
     let ledgerRealmIds = scope.readableLedgerIds;
     let seabedRealmIds = scope.readableSeabedIds;
     let includeOrgLevel = true;
-    if (params.target) {
+    const realmFilterRef = (params.in ?? params.target)?.trim();
+    if (realmFilterRef) {
       const targetRealm = resolveVisibleRealm({
         realms,
         orgId: viewerRealm.orgId,
-        ref: params.target,
+        ref: realmFilterRef,
         scope,
       });
-      ledgerRealmIds = scope.readableLedgerIds.includes(targetRealm.id)
-        ? [targetRealm.id]
-        : [];
-      seabedRealmIds = scope.readableSeabedIds.includes(targetRealm.id)
-        ? [targetRealm.id]
-        : [];
+      const orgRealms = realms.filter((r) => r.orgId === viewerRealm.orgId);
+      const subtreeSet = new Set<string>([
+        targetRealm.id,
+        ...getDescendantIds(orgRealms, targetRealm.id),
+      ]);
+      ledgerRealmIds = scope.readableLedgerIds.filter((id) =>
+        subtreeSet.has(id),
+      );
+      seabedRealmIds = scope.readableSeabedIds.filter((id) =>
+        subtreeSet.has(id),
+      );
       includeOrgLevel = false;
     }
 
@@ -2709,6 +2950,509 @@ export class SeaEngine {
       sinceSeq,
       latestSeq,
       entries: filtered,
+    };
+  }
+
+  // ---- Everyday Surface Methods (whoami, show, search) ----
+
+  whoami(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    boundSource: string;
+    storePath: string;
+    scopeCeiling?: AccessScope;
+  }): WhoamiResult {
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const org = this.db.getOrg(viewerRealm.orgId);
+    if (!org) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy: org.policy,
+      includeDescendantSeabed: false,
+    });
+    const scope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    const vis = this.buildVisibilityHelpers({
+      realms,
+      mounts,
+      actor: params.actor,
+      viewerRealmId: viewerRealm.id,
+      scope,
+      ledgerRealmIds: scope.readableLedgerIds,
+      seabedRealmIds: scope.readableSeabedIds,
+      includeDescendantSeabed: false,
+    });
+
+    const sanitizedBound = vis.sanitizeRealm(viewerRealm);
+    const orgRealms = realms.filter((r) => r.orgId === org.id);
+    const visibleRealms = vis.sanitizeRealms(orgRealms);
+
+    const recCounts = this.db.countActiveRecordsByRealm({
+      realmIds: scope.readableLedgerIds,
+      excludeSensitivities: ["secret"],
+    });
+    let rulesCount = 0;
+    let conclusionsCount = 0;
+    for (const c of recCounts.values()) {
+      rulesCount += c.rules;
+      conclusionsCount += c.conclusions;
+    }
+
+    const seaCounts = this.db.countSeabedByRealm({
+      realmIds: scope.readableSeabedIds,
+      excludeSensitivities: ["secret"],
+    });
+    let rawCount = 0;
+    for (const c of seaCounts.values()) {
+      rawCount += c;
+    }
+
+    const objCounts = this.db.countObjectsByRealm({
+      orgId: org.id,
+      realmIds: scope.readableLedgerIds,
+    });
+    let objectsCount = 0;
+    for (const c of objCounts.values()) {
+      objectsCount += c;
+    }
+
+    const filesCount = this.db.listDriveFilesMeta(scope.readableDriveIds).length;
+
+    const latestSeq = this.db.getLatestVisibleChangeLogSeq({
+      orgId: org.id,
+      ledgerRealmIds: scope.readableLedgerIds,
+      seabedRealmIds: scope.readableSeabedIds,
+      includeSecret: false,
+    });
+
+    const migrations = this.db.listSchemaMigrations();
+    const schemaVersion = migrations.reduce(
+      (max, m) => (m.version > max ? m.version : max),
+      0,
+    );
+
+    return {
+      org: {
+        id: org.id,
+        name: org.name,
+        policy: org.policy,
+      },
+      actor: params.actor,
+      bound: {
+        realmId: sanitizedBound.id,
+        realmPath: sanitizedBound.path,
+        realmName: sanitizedBound.name,
+        source: params.boundSource,
+      },
+      read: {
+        policy: org.policy,
+        ledgerRealms: scope.readableLedgerIds.length,
+        driveRealms: scope.readableDriveIds.length,
+        seabedRealms: scope.readableSeabedIds.length,
+      },
+      write: {
+        allowed:
+          org.policy === "open"
+            ? "any realm in org (rules human-only)"
+            : `${sanitizedBound.path} (self only; rules human-only)`,
+        canWriteRules: params.actor.kind === "human",
+        canRedact: params.actor.kind === "human",
+      },
+      store: {
+        path: params.storePath,
+        localOnly: true,
+      },
+      corpus: {
+        realms: visibleRealms.length,
+        objects: objectsCount,
+        rules: rulesCount,
+        conclusions: conclusionsCount,
+        raw: rawCount,
+        files: filesCount,
+      },
+      latestSeq,
+      version: "0.2.0",
+      schemaVersion,
+      next:
+        org.policy === "open"
+          ? "meru-mind tree /"
+          : `meru-mind tree ${sanitizedBound.path}`,
+    };
+  }
+
+  async show(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    ref: string;
+    history?: boolean;
+    context?: number;
+    includeDescendantSeabed?: boolean;
+    scopeCeiling?: AccessScope;
+  }): Promise<ShowResult> {
+    if (
+      params.context !== undefined &&
+      (!Number.isInteger(params.context) || params.context < 0)
+    ) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `--context must be a non-negative integer, got ${String(params.context)}`,
+      );
+    }
+
+    const parsed = parseRefSyntax(params.ref);
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+    const includeDescendantSeabed = Boolean(params.includeDescendantSeabed);
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy,
+      includeDescendantSeabed,
+    });
+    const scope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    const vis = this.buildVisibilityHelpers({
+      realms,
+      mounts,
+      actor: params.actor,
+      viewerRealmId: viewerRealm.id,
+      scope,
+      ledgerRealmIds: scope.readableLedgerIds,
+      seabedRealmIds: scope.readableSeabedIds,
+      includeDescendantSeabed,
+    });
+
+    // 1. Realm -> brief
+    if (parsed.kind === "realm") {
+      const brief = this.brief({
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        target: parsed.realmRef,
+        scopeCeiling: scope,
+      });
+      return {
+        refType: "realm",
+        ref: brief.realm.path,
+        brief,
+      };
+    }
+
+    // 2. Unified Object -> object card with top 5 recent entries
+    if (parsed.kind === "object") {
+      const resolved = resolveUnifiedObjectRead({
+        db: this.db,
+        realms,
+        orgId: viewerRealm.orgId,
+        parsed,
+        scope,
+        vis,
+        verb: "show",
+      });
+      const unifiedRes = this.db.lsEntriesByIdsUnified({
+        orgId: viewerRealm.orgId,
+        entryIds: resolved.entryIds,
+        ledgerRealmIds: resolved.ledgerRealmIds,
+        seabedRealmIds: resolved.seabedRealmIds,
+        includeSuperseded: Boolean(params.history),
+        excludeSensitivities: ["secret"],
+        limit: 5,
+        offset: 0,
+      });
+      const recentEntries = this.hydrateLsPage({
+        orgId: viewerRealm.orgId,
+        refs: unifiedRes.rows,
+        vis,
+        readableLedgerSet: new Set(scope.readableLedgerIds),
+      });
+      const card: ObjectCard = {
+        ref: resolved.canonicalRef,
+        kind: resolved.objectKind,
+        name: resolved.objectName,
+        object: resolved.object,
+        realmPath: resolved.realmPath,
+        counts: {
+          total: unifiedRes.total,
+          viaObject: resolved.countsBySource.viaObject,
+          viaTag: resolved.countsBySource.viaTag,
+          viaThing: resolved.countsBySource.viaThing,
+        },
+        recentEntries,
+        try: `meru-mind ls ${resolved.canonicalRef}`,
+      };
+      return {
+        refType: "object",
+        ref: resolved.canonicalRef,
+        card,
+      };
+    }
+
+    // 3. File -> canonical file: read with longest visible realm prefix
+    if (parsed.kind === "file") {
+      const resolvedFile = resolveFileRef({
+        realms,
+        orgId: viewerRealm.orgId,
+        ref: params.ref,
+        scope,
+      });
+      if (!vis.canSeeDriveRealm(resolvedFile.realm.id)) {
+        throw new MindError("NOT_FOUND", OPAQUE_FILE_NOT_FOUND);
+      }
+      const file = await this.drive.readFile(
+        resolvedFile.realm.id,
+        resolvedFile.relPath,
+      );
+      if (!file) {
+        throw new MindError("NOT_FOUND", OPAQUE_FILE_NOT_FOUND);
+      }
+      return {
+        refType: "file",
+        ref: resolvedFile.canonicalRef,
+        realmPath: resolvedFile.realm.path,
+        file,
+      };
+    }
+
+    // 4. Entry -> full entry + optional history DAG + optional context replay window
+    const catRes = await this.cat({
+      actor: params.actor,
+      viewerRealmId: viewerRealm.id,
+      target: parsed.entryId,
+      includeDescendantSeabed,
+      scopeCeiling: scope,
+    });
+
+    // Normalize drive:// sourceRef to canonical file:... for verbatim round-trip
+    if (catRes.kind === "seabed" && catRes.seabed.sourceRef) {
+      catRes.seabed = {
+        ...catRes.seabed,
+        sourceRef: formatStoredSourceRef(
+          catRes.seabed.sourceRef,
+          vis.getSanitizedRealmPath,
+        ),
+      };
+    }
+
+    let historyResult = undefined;
+    if (params.history && catRes.kind === "record") {
+      const rawRec = this.db.getRecord(parsed.entryId);
+      if (rawRec && vis.canSeeRecord(rawRec)) {
+        historyResult = vis.traverseSupersedeDag(rawRec);
+      }
+    }
+
+    let contextResult = undefined;
+    if (
+      params.context !== undefined &&
+      params.context > 0 &&
+      (catRes.kind === "record" || catRes.kind === "seabed")
+    ) {
+      contextResult = this.replay({
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        entryId: parsed.entryId,
+        window: params.context,
+        includeDescendantSeabed,
+        scopeCeiling: scope,
+      });
+    }
+
+    return {
+      refType: "entry",
+      ref: parsed.entryId,
+      entry: catRes,
+      ...(historyResult ? { history: historyResult } : {}),
+      ...(contextResult ? { context: contextResult } : {}),
+    };
+  }
+
+  async search(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    query: string;
+    in?: string;
+    about?: string;
+    kind?: string;
+    kinds?: string[];
+    since?: string;
+    until?: string;
+    history?: boolean;
+    includeDescendantSeabed?: boolean;
+    limit?: number;
+    cursor?: string;
+    scopeCeiling?: AccessScope;
+  }): Promise<SearchResult> {
+    const queryText = params.query?.trim() ?? "";
+    if (!queryText) {
+      throw new MindError(
+        "INVALID_INPUT",
+        "search requires a non-empty <query> string",
+        { try: 'meru-mind search "keyword"' },
+      );
+    }
+
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+    const includeDescendantSeabed = Boolean(params.includeDescendantSeabed);
+
+    const baseScope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy,
+      includeDescendantSeabed,
+    });
+    const boundScope = params.scopeCeiling
+      ? intersectAccessScopes(baseScope, params.scopeCeiling)
+      : baseScope;
+
+    let effectiveScope = boundScope;
+    let realmIdsFilter: string[] | undefined;
+    let inDisplay: string | undefined;
+
+    if (params.in?.trim()) {
+      const targetRealm = resolveVisibleRealm({
+        realms,
+        orgId: viewerRealm.orgId,
+        ref: params.in.trim(),
+        scope: boundScope,
+      });
+      inDisplay = targetRealm.path;
+      const orgRealms = realms.filter((r) => r.orgId === viewerRealm.orgId);
+      const subtreeIds = [
+        targetRealm.id,
+        ...getDescendantIds(orgRealms, targetRealm.id),
+      ];
+      if (orgPolicy === "tree") {
+        const inScope = resolveAccessScope({
+          realms,
+          mounts,
+          viewerRealmId: targetRealm.id,
+          orgPolicy: "tree",
+          includeDescendantSeabed,
+        });
+        effectiveScope = intersectAccessScopes(inScope, boundScope);
+      }
+      realmIdsFilter = subtreeIds;
+    }
+
+    const vis = this.buildVisibilityHelpers({
+      realms,
+      mounts,
+      actor: params.actor,
+      viewerRealmId: viewerRealm.id,
+      scope: effectiveScope,
+      ledgerRealmIds: effectiveScope.readableLedgerIds,
+      seabedRealmIds: effectiveScope.readableSeabedIds,
+      includeDescendantSeabed,
+    });
+
+    let allowedEntryIds: string[] | undefined;
+    let aboutDisplay: string | undefined;
+    if (params.about?.trim()) {
+      const parsedAbout = parseRefSyntax(params.about.trim());
+      if (parsedAbout.kind !== "object") {
+        throw new MindError(
+          "INVALID_REF",
+          `Invalid --about reference "${params.about}": expected <kind>:<name>, /<realm>/<kind>:<name>, or obj_...`,
+          { try: `meru-mind search "${queryText}" --about service:api` },
+        );
+      }
+      const resolved = resolveUnifiedObjectRead({
+        db: this.db,
+        realms,
+        orgId: viewerRealm.orgId,
+        parsed: parsedAbout,
+        scope: effectiveScope,
+        vis,
+        verb: "search",
+        allowEmpty: true,
+      });
+      allowedEntryIds = resolved.entryIds;
+      aboutDisplay = resolved.canonicalRef;
+    }
+
+    const rawKinds = Array.from(
+      new Set(
+        [
+          ...(params.kinds ?? []),
+          ...(params.kind
+            ? params.kind
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : []),
+        ].map((k) => k.toLowerCase()),
+      ),
+    );
+    const recordKinds: RecordKind[] = [];
+    const seabedKinds: SeabedKind[] = [];
+    for (const k of rawKinds) {
+      if (VALID_RECORD_KINDS_SET.has(k)) {
+        recordKinds.push(k as RecordKind);
+      } else if (VALID_SEABED_KINDS_SET.has(k)) {
+        seabedKinds.push(k as SeabedKind);
+      } else {
+        throw new MindError(
+          "INVALID_INPUT",
+          `Invalid kind filter "${k}". Allowed record kinds: decision, finding, claim, proposal, verdict, thing, rule; raw kinds: message, artifact, evidence, signal`,
+        );
+      }
+    }
+
+    const limit = Math.max(1, Math.min(params.limit ?? 10, 200));
+    const offset = parseNumericCursor(params.cursor);
+
+    const recallRes = await this.recall({
+      actor: params.actor,
+      viewerRealmId: viewerRealm.id,
+      scopeCeiling: effectiveScope,
+      realmIdsFilter,
+      allowedEntryIds,
+      query: queryText,
+      recordKinds: recordKinds.length > 0 ? recordKinds : undefined,
+      seabedKinds: seabedKinds.length > 0 ? seabedKinds : undefined,
+      since: params.since,
+      until: params.until,
+      includeHistory: Boolean(params.history),
+      includeDescendantSeabed,
+      focusBoost: false,
+      limit,
+      offset,
+    });
+
+    return {
+      ...recallRes,
+      query: queryText,
+      ...(inDisplay ? { in: inDisplay } : {}),
+      ...(aboutDisplay ? { about: aboutDisplay } : {}),
+      nextCursor:
+        recallRes.omittedCount > 0 ? String(offset + recallRes.items.length) : null,
     };
   }
 

@@ -66,7 +66,7 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
   it("runs full CLI lifecycle with default agent actor and explicit --as-human elevation", () => {
     const homeDir = makeTempDir("meru-mind-cli-");
 
-    const init = runCli(homeDir, ["init", "--org", "Acme"]) as {
+    const init = runCli(homeDir, ["admin", "init", "--org", "Acme"]) as {
       org: { id: string; policy: string };
       rootRealm: { id: string };
     };
@@ -87,43 +87,52 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     ]) as { id: string; path: string };
     expect(eng.path).toBe("/eng");
 
-    // Default CLI actor is "agent": writing a rule without --as-human MUST fail
+    // Default CLI actor is "agent": writing a rule without --as-human MUST fail with wire forbidden
     const deniedRule = runCliExpectFail(homeDir, [
-      "record",
-      init.rootRealm.id,
-      "--kind",
       "rule",
+      "add",
+      "--in",
+      "/",
       "--title",
       "All merges require passing CI",
+      "--body",
+      "CI checks are mandatory",
     ]);
-    expect(deniedRule.stderr).toContain("RULE_REQUIRES_HUMAN");
+    expect(deniedRule.stderr).toContain('"forbidden"');
 
     // Explicit --as-human succeeds for rule
     const rule = runCli(homeDir, [
       "--as-human",
-      "record",
-      init.rootRealm.id,
-      "--kind",
       "rule",
+      "add",
+      "--in",
+      "/",
       "--title",
       "All merges require passing CI",
+      "--body",
+      "CI checks are mandatory",
     ]) as { id: string; confirmedByHuman: boolean };
     expect(rule.id).toMatch(/^rec_/);
     expect(rule.confirmedByHuman).toBe(true);
 
     const dec1 = runCli(homeDir, [
-      "record",
-      eng.id,
+      "write",
+      "--in",
+      "/eng",
       "--kind",
       "decision",
       "--title",
       "Use Node 22 built-in sqlite",
+      "--body",
+      "Zero native compilation overhead.",
     ]) as { id: string; confirmedByHuman: boolean };
     expect(dec1.confirmedByHuman).toBe(false);
 
     runCli(homeDir, [
-      "capture",
-      eng.id,
+      "raw",
+      "add",
+      "--in",
+      "/eng",
       "--kind",
       "message",
       "--text",
@@ -131,34 +140,36 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     ]);
 
     runCli(homeDir, [
-      "drive",
+      "file",
       "write",
-      eng.id,
-      "--path",
-      "STATE.md",
+      "file:/eng/STATE.md",
       "--content",
       "# Engineering Status",
     ]);
 
-    const brief = runCli(homeDir, ["brief", eng.id]) as {
-      upperLedger: { activeDecisions: { items: Array<{ id: string }> } };
-      middleMind: { rules: { items: Array<{ id: string; inherited: boolean }> } };
+    const showEng = runCli(homeDir, ["show", "/eng"]) as {
+      refType: string;
+      brief: {
+        upperLedger: { activeDecisions: { items: Array<{ id: string }> } };
+        middleMind: { rules: { items: Array<{ id: string; inherited: boolean }> } };
+      };
     };
-    expect(brief.upperLedger.activeDecisions.items[0]?.id).toBe(dec1.id);
+    expect(showEng.refType).toBe("realm");
+    expect(showEng.brief.upperLedger.activeDecisions.items[0]?.id).toBe(dec1.id);
     expect(
-      brief.middleMind.rules.items.some((r) => r.id === rule.id && r.inherited),
+      showEng.brief.middleMind.rules.items.some((r) => r.id === rule.id && r.inherited),
     ).toBe(true);
 
-    const recall = runCli(homeDir, [
-      "recall",
+    const search = runCli(homeDir, [
+      "search",
       "sqlite-vec",
-      "--focus",
-      eng.id,
+      "--in",
+      "/eng",
     ]) as { items: Array<{ sourceType: string }> };
-    expect(recall.items.length).toBeGreaterThan(0);
+    expect(search.items.length).toBeGreaterThan(0);
 
-    // sync-embeddings CLI subcommand works cleanly (no embedder configured -> 0 processed)
-    const syncRes = runCli(homeDir, ["sync-embeddings"]) as {
+    // admin sync-embeddings CLI subcommand works cleanly (no embedder configured -> 0 processed)
+    const syncRes = runCli(homeDir, ["admin", "sync-embeddings"]) as {
       processed: number;
       remaining: number;
     };
@@ -173,7 +184,7 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
       "--policy",
       "tree",
     ]);
-    expect(deniedPolicy.stderr).toContain("ACCESS_DENIED");
+    expect(deniedPolicy.stderr).toContain('"forbidden"');
     const updatedOrg = runCli(homeDir, [
       "--as-human",
       "org",
@@ -186,12 +197,11 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     expect(updatedOrg.policy).toBe("tree");
 
     // redact CLI requires --as-human (permitted in tree org without MERU_MIND_VIEWER_REALM_ID)
-    const deniedRedact = runCliExpectFail(homeDir, ["redact", "--id", dec1.id]);
-    expect(deniedRedact.stderr).toContain("ACCESS_DENIED");
+    const deniedRedact = runCliExpectFail(homeDir, ["redact", dec1.id]);
+    expect(deniedRedact.stderr).toContain('"forbidden"');
     const redacted = runCli(homeDir, [
       "--as-human",
       "redact",
-      "--id",
       dec1.id,
       "--reason",
       "cleanup test",
@@ -202,12 +212,12 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     const sliceDir = makeTempDir("meru-mind-cli-slice-");
     const exported = runCli(
       homeDir,
-      ["export-slice", eng.id, "--out", sliceDir],
+      ["admin", "export-slice", "--in", "/eng", "--out", sliceDir],
       { MERU_MIND_VIEWER_REALM_ID: eng.id },
     ) as { fileCount: number };
     expect(exported.fileCount).toBeGreaterThan(0);
 
-    const rebuilt = runCli(homeDir, ["rebuild"]) as {
+    const rebuilt = runCli(homeDir, ["admin", "rebuild"]) as {
       ftsIndexed: number;
       driveFilesRestored: number;
     };
@@ -215,11 +225,12 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     expect(rebuilt.driveFilesRestored).toBe(1);
   });
 
-  it("serves process-bound MCP stdio tools without human/high-risk tools and enforces tree visibility", async () => {
+  it("serves process-bound 7-tool MCP stdio server without human/high-risk tools and enforces tree visibility", async () => {
     const homeDir = makeTempDir("meru-mind-mcp-");
 
     // Provision a 'tree' org + two sibling realms via CLI (--as-human)
     const init = runCli(homeDir, [
+      "admin",
       "init",
       "--org",
       "SecureOrg",
@@ -257,8 +268,10 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
     runCli(
       homeDir,
       [
-        "capture",
-        alpha.id,
+        "raw",
+        "add",
+        "--in",
+        "/alpha",
         "--kind",
         "message",
         "--text",
@@ -288,18 +301,16 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
 
     try {
       const toolsRes = await client.listTools();
-      const toolNames = toolsRes.tools.map((t) => t.name);
-      expect(toolNames).toContain("mind_brief");
-      expect(toolNames).toContain("mind_recall");
-      expect(toolNames).toContain("mind_append_record");
-      // High-risk and human-only tools MUST NOT exist in MCP
-      expect(toolNames).not.toContain("mind_rebuild");
-      expect(toolNames).not.toContain("mind_export_slice");
-      expect(toolNames).not.toContain("mind_create_realm");
-      expect(toolNames).not.toContain("mind_mount_realm");
-      expect(toolNames).not.toContain("mind_unmount_realm");
-      expect(toolNames).not.toContain("mind_redact");
-      expect(toolNames).not.toContain("mind_set_org_policy");
+      const toolNames = toolsRes.tools.map((t) => t.name).sort();
+      expect(toolNames).toEqual([
+        "mind_changes",
+        "mind_ls",
+        "mind_search",
+        "mind_show",
+        "mind_tree",
+        "mind_whoami",
+        "mind_write",
+      ]);
 
       // Zero MCP tools expose actorKind in their input schema
       for (const tool of toolsRes.tools) {
@@ -315,29 +326,29 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
         return JSON.parse(content[0]?.text ?? "{}") as Record<string, unknown>;
       };
 
-      // mind_list_realms only returns bound org's visible realms (root + beta; NEVER alpha)
+      // mind_tree only returns bound org's visible realms (root + beta; NEVER alpha)
       const listed = parseText(
-        await client.callTool({ name: "mind_list_realms", arguments: {} }),
+        await client.callTool({ name: "mind_tree", arguments: {} }),
       ) as { realms: Array<{ id: string }> };
       const listedIds = listed.realms.map((r) => r.id);
       expect(listedIds).toContain(beta.id);
       expect(listedIds).not.toContain(alpha.id);
 
-      // Attempting to switch focus to sibling alpha MUST be rejected
+      // Attempting to search inside sibling alpha MUST be rejected with opaque not_found
       const switchAttempt = await client.callTool({
-        name: "mind_recall",
+        name: "mind_search",
         arguments: {
-          focus: alpha.id,
+          in: alpha.id,
           query: "MCP_ALPHA_409",
         },
       });
       expect(switchAttempt.isError).toBe(true);
-      expect(parseText(switchAttempt).error).toBe("ACCESS_DENIED");
+      expect(parseText(switchAttempt).error).toBe("not_found");
 
-      // Normal recall from bound beta returns 0 hits for alpha's canary
+      // Normal search from bound beta returns 0 hits for alpha's canary
       const leakCheck = parseText(
         await client.callTool({
-          name: "mind_recall",
+          name: "mind_search",
           arguments: { query: "MCP_ALPHA_409" },
         }),
       ) as { items: unknown[] };
@@ -346,10 +357,12 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
       // Writing to bound beta succeeds and is recorded as agent (confirmedByHuman = false)
       const written = parseText(
         await client.callTool({
-          name: "mind_append_record",
+          name: "mind_write",
           arguments: {
+            in: "/beta",
             kind: "decision",
             title: "Beta decision MCP_BETA_202",
+            body: "Verified beta policy.",
           },
         }),
       ) as { id: string; authorKind: string; confirmedByHuman: boolean };
@@ -359,7 +372,7 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
 
       const selfCheck = parseText(
         await client.callTool({
-          name: "mind_recall",
+          name: "mind_search",
           arguments: { query: "MCP_BETA_202" },
         }),
       ) as { items: Array<{ id: string }> };

@@ -18,7 +18,12 @@ import {
   type SeabedKind,
   type Sensitivity,
 } from "../types.js";
-import { computePayloadHash, type LedgerEngine } from "./ledger.js";
+import {
+  computePayloadHash,
+  computeRecordContentSha256,
+  computeSeabedContentSha256,
+} from "./content-hash.js";
+import type { LedgerEngine } from "./ledger.js";
 import {
   normalizeResourceTag,
   OPAQUE_REALM_NOT_FOUND,
@@ -698,8 +703,8 @@ export class ImporterEngine {
         continue;
       }
 
-      // Check redacted_blocklist by exact (org_id, source_ref, content_sha256)
-      if (this.db.isRedactedBlocked(viewerRealm.orgId, sourceRef, newSha256)) {
+      // Check redacted_blocklist globally by (org_id, content_sha256) regardless of source_ref
+      if (this.db.isContentShaBlocked(viewerRealm.orgId, newSha256)) {
         skippedRedacted += 1;
         items.push({
           filePath,
@@ -828,6 +833,26 @@ export class ImporterEngine {
             payload[fp.replace(/\./g, "_")] = val;
           }
         }
+      }
+
+      if (
+        this.db.isContentShaBlocked(
+          viewerRealm.orgId,
+          computeRecordContentSha256(parsed.title, payload),
+        )
+      ) {
+        skippedRedacted += 1;
+        items.push({
+          filePath,
+          sourceRef,
+          contentSha256: newSha256,
+          action: "skipped_redacted",
+          recordId: null,
+          supersedesId: null,
+          realmId: targetRealm.id,
+          occurredAt,
+        });
+        continue;
       }
 
       // Optional explicit supersedes list from frontmatter
@@ -1118,9 +1143,7 @@ export class ImporterEngine {
             : `${idempotencyPrefix}:line-${lineNumber}`;
       const contentSha256 = computePayloadHash(row);
 
-      if (
-        this.db.isRedactedBlocked(viewerRealm.orgId, sourceRef, contentSha256)
-      ) {
+      if (this.db.isContentShaBlocked(viewerRealm.orgId, contentSha256)) {
         skippedRedacted += 1;
         continue;
       }
@@ -1215,6 +1238,16 @@ export class ImporterEngine {
       const idempotencyKey = `${idempotencyPrefix}:${sourceId ?? `line-${lineNumber}`}:${contentSha256}`;
 
       if (targetMode === "seabed") {
+        const seabedText = bodyStr || titleStr;
+        if (
+          this.db.isContentShaBlocked(
+            viewerRealm.orgId,
+            computeSeabedContentSha256(seabedText),
+          )
+        ) {
+          skippedRedacted += 1;
+          continue;
+        }
         const rawKind = getFieldByPath(row, mapping.kind);
         const mappedKind =
           typeof rawKind === "string" && rawKind.trim()
@@ -1229,7 +1262,7 @@ export class ImporterEngine {
           viewerRealmId: viewerRealm.id,
           targetRealmId: targetRealm.id,
           kind: seabedKind,
-          text: bodyStr || titleStr,
+          text: seabedText,
           sourceRef,
           metadata: payload,
           objectIds,
@@ -1241,6 +1274,16 @@ export class ImporterEngine {
         if (sourceId) idMap[sourceId] = sea.id;
         entryIds.push(sea.id);
         imported += 1;
+        continue;
+      }
+
+      if (
+        this.db.isContentShaBlocked(
+          viewerRealm.orgId,
+          computeRecordContentSha256(titleStr, payload),
+        )
+      ) {
+        skippedRedacted += 1;
         continue;
       }
 

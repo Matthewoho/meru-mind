@@ -273,7 +273,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
           const rec = db.getRecord("rec_v2_legacy");
           const bySource = db.findActiveRecordBySourceRef("org_v2", "docs/legacy-note.md");
           const byExt = db.findRecordsByExternalRef("org_v2", "tracker:LEG-99");
-          if (migrations.join(",") !== "1,2,3,4") {
+          if (migrations.join(",") !== "1,2,3,4,5") {
             throw new Error("unexpected migrations: " + migrations.join(","));
           }
           if (!rec || rec.sourceRef !== "docs/legacy-note.md" || rec.externalRef !== "tracker:LEG-99") {
@@ -914,29 +914,16 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
 
     try {
       const toolsRes = await client.listTools();
-      const toolMap = new Map(toolsRes.tools.map((t) => [t.name, t]));
-      for (const expected of [
-        "mind_tree",
-        "mind_ls",
-        "mind_cat",
-        "mind_replay",
+      // Verify strictly 7 everyday tools exist and zero expose actorKind
+      expect(toolsRes.tools.map((t) => t.name).sort()).toEqual([
         "mind_changes",
-        "mind_list_objects",
-        "mind_list_tags",
-        "mind_list_things",
-        "mind_write_conclusion",
-        "mind_write_raw",
-      ]) {
-        expect(toolMap.has(expected)).toBe(true);
-      }
-      // Deprecated aliases clearly mention v0.3.0 removal
-      expect(toolMap.get("mind_append_record")?.description).toContain(
-        "v0.3.0",
-      );
-      expect(toolMap.get("mind_capture_seabed")?.description).toContain(
-        "v0.3.0",
-      );
-      // Zero tools expose actorKind
+        "mind_ls",
+        "mind_search",
+        "mind_show",
+        "mind_tree",
+        "mind_whoami",
+        "mind_write",
+      ]);
       for (const tool of toolsRes.tools) {
         const props = (tool.inputSchema?.properties ?? {}) as Record<
           string,
@@ -945,64 +932,71 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
         expect(props).not.toHaveProperty("actorKind");
       }
 
-      // Narrowing focus to child C2 MUST NOT expose C1's mounted items, C2's seabed (without flag), or secretB2
+      // Listing child C2 from bound B2 MUST NOT expose C1's mounted items, C2's seabed (without flag), or secretB2
       const lsC2 = parseText(
         await client.callTool({
           name: "mind_ls",
-          arguments: { focus: c2.id, target: c2.id },
+          arguments: { ref: "/b2/c2" },
         }),
       ) as { items: Array<{ id: string; refs: string[] }> };
       const c2Item = lsC2.items.find((i) => i.id === recC2.id);
       expect(c2Item).toBeDefined();
       // visibility.ts sanitizer MUST strip hidden C1 ref from C2's record!
       expect(c2Item!.refs).not.toContain(recC1.id);
-      // C2 seabed is blocked by bound B2 ceiling without includeDescendantSeabed
+      // C2 seabed is blocked by bound B2 ceiling without include_descendant_seabed
       expect(lsC2.items.some((i) => i.id === seaC2.id)).toBe(false);
 
-      // mind_cat on C1's record via narrowed focus C2 MUST fail with NOT_FOUND
-      const catC1 = await client.callTool({
-        name: "mind_cat",
-        arguments: { focus: c2.id, target: recC1.id },
+      // mind_show on C1's record from bound B2 MUST fail with opaque not_found
+      const showC1 = await client.callTool({
+        name: "mind_show",
+        arguments: { ref: recC1.id },
       });
-      expect(catC1.isError).toBe(true);
-      expect(parseText(catC1).error).toBe("NOT_FOUND");
+      expect(showC1.isError).toBe(true);
+      expect(parseText(showC1).error).toBe("not_found");
 
-      // mind_list_objects & mind_list_tags via narrowed focus C2 MUST exclude C1 and secretB2
-      const objsC2 = parseText(
+      // mind_tree and mind_show on hidden object/tag MUST exclude C1 and secretB2
+      const treeB2 = parseText(
         await client.callTool({
-          name: "mind_list_objects",
-          arguments: { focus: c2.id },
+          name: "mind_tree",
+          arguments: {},
         }),
-      ) as unknown as Array<{ id: string }>;
-      expect(objsC2.some((o) => o.id === objC1.id)).toBe(false);
+      ) as { objects: Array<{ id: string }> };
+      expect(treeB2.objects.some((o) => o.id === objC1.id)).toBe(false);
 
-      const tagsB2 = parseText(
-        await client.callTool({
-          name: "mind_list_tags",
-          arguments: { focus: c2.id },
-        }),
-      ) as unknown as Array<{ tag: string }>;
-      expect(tagsB2.some((t) => t.tag === "svc:hidden-c1")).toBe(false);
-      expect(tagsB2.some((t) => t.tag === "secret:b2-only")).toBe(false);
+      const showHiddenTag = await client.callTool({
+        name: "mind_show",
+        arguments: { ref: "svc:hidden-c1" },
+      });
+      expect(showHiddenTag.isError).toBe(true);
+      expect(parseText(showHiddenTag).error).toBe("not_found");
 
-      // mind_replay on B2 anchor includes normalB2Before, excludes secretB2
-      const replayB2 = parseText(
+      const showSecretTag = await client.callTool({
+        name: "mind_show",
+        arguments: { ref: "secret:b2-only" },
+      });
+      expect(showSecretTag.isError).toBe(true);
+      expect(parseText(showSecretTag).error).toBe("not_found");
+
+      // mind_show with context on B2 anchor includes normalB2Before, excludes secretB2
+      const showReplayB2 = parseText(
         await client.callTool({
-          name: "mind_replay",
-          arguments: { entryId: normalB2Anchor.id, window: 5 },
+          name: "mind_show",
+          arguments: { ref: normalB2Anchor.id, context: 5 },
         }),
-      ) as { before: Array<{ id: string }>; anchor: { id: string } };
-      expect(replayB2.anchor.id).toBe(normalB2Anchor.id);
-      expect(replayB2.before.some((i) => i.id === normalB2Before.id)).toBe(
-        true,
+      ) as { context: { before: Array<{ id: string }>; anchor: { id: string } } };
+      expect(showReplayB2.context.anchor.id).toBe(normalB2Anchor.id);
+      expect(
+        showReplayB2.context.before.some((i) => i.id === normalB2Before.id),
+      ).toBe(true);
+      expect(showReplayB2.context.before.some((i) => i.id === secretB2.id)).toBe(
+        false,
       );
-      expect(replayB2.before.some((i) => i.id === secretB2.id)).toBe(false);
 
       // mind_changes excludes C1, C2 seabed (no dive), and secretB2
       const changesB2 = parseText(
         await client.callTool({
           name: "mind_changes",
-          arguments: { focus: c2.id, sinceSeq: 0 },
+          arguments: { in: "/b2/c2", since: 0 },
         }),
       ) as { entries: Array<{ entityId: string }> };
       const changeIds = changesB2.entries.map((e) => e.entityId);
@@ -1011,94 +1005,57 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       expect(changeIds).not.toContain(secretB2.id);
 
       // ---- K14 REGRESSION KILLER ----
-      // Bound viewer is B2. Write tools NEVER accept focus/viewer overrides and always bind writes
-      // to boundViewerRealmId (B2), accepting target as path OR ID!
-      const k14Append = await client.callTool({
-        name: "mind_append_record",
+      // Bound viewer is B2. mind_write always binds writes to boundViewerRealmId (B2),
+      // accepting `in` as path OR ID!
+      const k14WriteById = await client.callTool({
+        name: "mind_write",
         arguments: {
-          target: b2.id,
+          in: b2.id,
           kind: "decision",
-          title: "K14 guard append_record",
+          title: "K14 guard write by ID",
+          body: "B2 decision body.",
         },
       });
-      expect(k14Append.isError).toBeFalsy();
-      expect(parseText(k14Append).realmId).toBe(b2.id);
+      expect(k14WriteById.isError).toBeFalsy();
+      expect(parseText(k14WriteById).realmId).toBe(b2.id);
 
-      const k14WriteConc = await client.callTool({
-        name: "mind_write_conclusion",
+      const k14WriteByPath = await client.callTool({
+        name: "mind_write",
         arguments: {
-          target: "/b2",
+          in: "/b2",
           kind: "claim",
-          title: "K14 guard write_conclusion",
+          title: "K14 guard write by path",
+          body: "B2 claim body.",
         },
       });
-      expect(k14WriteConc.isError).toBeFalsy();
+      expect(k14WriteByPath.isError).toBeFalsy();
 
-      const k14Capture = await client.callTool({
-        name: "mind_capture_seabed",
-        arguments: {
-          target: b2.id,
-          kind: "message",
-          text: "K14 guard capture_seabed",
-        },
-      });
-      expect(k14Capture.isError).toBeFalsy();
-
-      const k14WriteRaw = await client.callTool({
-        name: "mind_write_raw",
-        arguments: {
-          target: "/b2",
-          kind: "signal",
-          text: "K14 guard write_raw",
-        },
-      });
-      expect(k14WriteRaw.isError).toBeFalsy();
-
-      const k14Drive = await client.callTool({
-        name: "mind_drive_write",
-        arguments: {
-          target: b2.id,
-          relPath: "k14.md",
-          content: "ok",
-        },
-      });
-      expect(k14Drive.isError).toBeFalsy();
-
-      const k14Settle = await client.callTool({
-        name: "mind_settle",
-        arguments: {
-          target: "/b2",
-          layer: "card_realm",
-          periodKey: "2026-11-21",
-        },
-      });
-      expect(k14Settle.isError).toBeFalsy();
-
-      // AND trying to smuggle C2's private mount (recC1) via refs while writing to B2 MUST be rejected
+      // AND trying to smuggle C2's private mount (recC1) via because while writing to B2 MUST be rejected
       const smuggleRef = await client.callTool({
-        name: "mind_append_record",
+        name: "mind_write",
         arguments: {
-          target: b2.id,
+          in: b2.id,
           kind: "decision",
           title: "Attempt to smuggle C1 ref into B2",
-          refs: [recC1.id],
+          body: "Should be blocked.",
+          because: [recC1.id],
         },
       });
       expect(smuggleRef.isError).toBe(true);
-      expect(parseText(smuggleRef).error).toBe("NOT_FOUND");
+      expect(parseText(smuggleRef).error).toBe("not_found");
     } finally {
       await client.close();
     }
   });
 
-  it("5. CLI defaults to compact Markdown for tree/ls/cat/brief/replay/changes and preserves stable JSON with --json", () => {
+  it("5. CLI defaults to compact Markdown for tree/ls/show/search/changes and preserves stable JSON with --json", () => {
     const homeDir = makeTempDir("meru-mind-cli-md-");
 
-    const init = runCliJson(homeDir, ["init", "--org", "DemoOrg"]) as {
+    const init = runCliJson(homeDir, ["admin", "init", "--org", "DemoOrg"]) as {
       org: { id: string };
       rootRealm: { id: string };
     };
-    const ops = runCliJson(homeDir, [
+    runCliJson(homeDir, [
       "realm",
       "create",
       "--org",
@@ -1109,65 +1066,55 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       "ops",
       "--name",
       "Operations",
-    ]) as { id: string; path: string };
+    ]);
 
-    // Create object, thing, rule, conclusion, raw, and settle card via CLI (positional <targetRealm>, zero --realm)
-    const obj = runCliJson(homeDir, [
+    // Create object, rule, conclusion, raw, and settle card via V0.2a-Surface CLI
+    runCliJson(homeDir, [
       "object",
       "create",
+      "--in",
       "/ops",
       "--kind",
       "service",
       "--name",
       "Gateway",
-    ]) as { id: string };
+    ]);
 
     runCliJson(homeDir, [
       "--as-human",
-      "write",
-      "/ops",
-      "--class",
       "rule",
+      "add",
+      "--in",
+      "/ops",
       "--title",
       "Never skip healthchecks",
+      "--body",
+      "Healthchecks are mandatory before traffic shift.",
     ]);
-
-    const thing = runCliJson(homeDir, [
-      "thing",
-      "create",
-      "/ops",
-      "--title",
-      "Gateway Rollout",
-      "--external-ref",
-      "tracker:OPS-7",
-      "--objects",
-      obj.id,
-      "--tags",
-      "svc:gateway",
-    ]) as { id: string };
 
     const dec1 = runCliJson(homeDir, [
       "write",
+      "--in",
       "/ops",
-      "--class",
-      "conclusion",
       "--kind",
       "decision",
       "--title",
       "Enable canary rollout",
+      "--body",
+      "Roll out 10 percent canary traffic first.",
       "--occurred-at",
       "2026-11-15T09:00:00.000Z",
-      "--objects",
-      obj.id,
-      "--tags",
+      "--about",
+      "service:Gateway",
+      "--about",
       "svc:gateway",
     ]) as { id: string };
 
     runCliJson(homeDir, [
-      "write",
-      "/ops",
-      "--class",
       "raw",
+      "add",
+      "--in",
+      "/ops",
       "--kind",
       "message",
       "--text",
@@ -1179,6 +1126,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
     // Settle a narrative card, then write 1 more entry so changesSinceCard >= 1
     runCliJson(homeDir, [
       "settle",
+      "--in",
       "/ops",
       "--layer",
       "card_realm",
@@ -1190,13 +1138,14 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
 
     const dec2 = runCliJson(homeDir, [
       "write",
+      "--in",
       "/ops",
-      "--class",
-      "conclusion",
       "--kind",
       "decision",
       "--title",
       "Promote canary to 100 percent",
+      "--body",
+      "Canary metrics healthy; promote to 100 percent.",
       "--supersedes",
       dec1.id,
       "--occurred-at",
@@ -1207,7 +1156,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
     const treeMd = runCliRaw(homeDir, ["tree"]);
     expect(treeMd).toContain("# Tree: DemoOrg");
     expect(treeMd).toContain("/ops");
-    expect(treeMd).toContain("Gateway");
+    expect(treeMd).toContain("service:Gateway");
 
     const lsMd = runCliRaw(homeDir, ["ls", "/ops"]);
     expect(lsMd).toContain("# ls realm:");
@@ -1215,53 +1164,53 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
     expect(lsMd).toContain("[conclusion/decision]");
     expect(lsMd).toContain("[raw/message]");
 
-    const catMd = runCliRaw(homeDir, ["cat", dec2.id]);
-    expect(catMd).toContain("# [conclusion/decision] Promote canary to 100 percent");
-    expect(catMd).toContain(dec1.id);
+    const showEntryMd = runCliRaw(homeDir, ["show", dec2.id]);
+    expect(showEntryMd).toContain("# [conclusion/decision] Promote canary to 100 percent");
+    expect(showEntryMd).toContain(dec1.id);
 
-    const briefMd = runCliRaw(homeDir, ["brief", "/ops"]);
-    expect(briefMd).toContain("# Brief: Operations");
-    expect(briefMd).toContain("Buckets:");
-    expect(briefMd).toContain("## Narrative Card (seq:");
-    expect(briefMd).toContain("changes since card:");
+    const showRealmMd = runCliRaw(homeDir, ["show", "/ops"]);
+    expect(showRealmMd).toContain("# Brief: Operations");
+    expect(showRealmMd).toContain("Buckets:");
+    expect(showRealmMd).toContain("## Narrative Card (seq:");
+    expect(showRealmMd).toContain("changes since card:");
 
-    const briefJson = runCliJson(homeDir, ["brief", "/ops"]) as {
-      buckets: { rules: number; conclusions: number; raw: number };
-      middleMind: {
-        realmCardMeta: { cardSeq: number; changesSinceCard: number };
+    const showRealmJson = runCliJson(homeDir, ["show", "/ops"]) as {
+      brief: {
+        buckets: { rules: number; conclusions: number; raw: number };
+        middleMind: {
+          realmCardMeta: { cardSeq: number; changesSinceCard: number };
+        };
       };
     };
-    expect(briefJson.buckets.rules).toBe(1);
-    expect(briefJson.buckets.conclusions).toBeGreaterThanOrEqual(2);
-    expect(briefJson.buckets.raw).toBe(1);
-    expect(briefJson.middleMind.realmCardMeta.cardSeq).toBeGreaterThan(0);
-    expect(briefJson.middleMind.realmCardMeta.changesSinceCard).toBeGreaterThanOrEqual(
-      1,
-    );
+    expect(showRealmJson.brief.buckets.rules).toBe(1);
+    expect(showRealmJson.brief.buckets.conclusions).toBeGreaterThanOrEqual(1);
+    expect(showRealmJson.brief.buckets.raw).toBe(1);
+    expect(showRealmJson.brief.middleMind.realmCardMeta.cardSeq).toBeGreaterThan(0);
+    expect(
+      showRealmJson.brief.middleMind.realmCardMeta.changesSinceCard,
+    ).toBeGreaterThanOrEqual(1);
 
-    const replayMd = runCliRaw(homeDir, [
-      "replay",
+    const showContextMd = runCliRaw(homeDir, [
+      "show",
       dec2.id,
-      "--window",
+      "--history",
+      "--context",
       "5",
     ]);
-    expect(replayMd).toContain("# Replay:");
-    expect(replayMd).toContain("## Supersede Chain (2)");
+    expect(showContextMd).toContain("# Replay:");
+    expect(showContextMd).toContain("## History (2");
 
     const changesMd = runCliRaw(homeDir, [
       "changes",
+      "--in",
       "/ops",
       "--since",
       "0",
     ]);
     expect(changesMd).toContain("# Changes (generation: 1");
 
-    const tagsMd = runCliRaw(homeDir, ["tag", "list", "/ops"]);
-    expect(tagsMd).toContain("svc:gateway");
-
-    const thingsMd = runCliRaw(homeDir, ["thing", "list", "/ops"]);
-    expect(thingsMd).toContain(thing.id);
-    expect(thingsMd).toContain("tracker:OPS-7");
+    const objCardMd = runCliRaw(homeDir, ["show", "svc:gateway"]);
+    expect(objCardMd).toContain("svc:gateway");
   });
 
   it("6. B2 & N3 regressions: changes() pagination never skips visible changes past >2*limit invisible rows, and tree-mode recall never grants entry_objects focus boost", async () => {

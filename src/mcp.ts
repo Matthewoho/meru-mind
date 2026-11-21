@@ -7,11 +7,13 @@ import { z } from "zod";
 import {
   assertAccess,
   createMindEngine,
-  intersectAccessScopes,
   MindError,
   resolveAccessScope,
   resolveRealmByPath,
   resolveVisibleRealm,
+  sanitizeRealmsForScope,
+  toSurfaceError,
+  writeEverydayConclusion,
   type AccessScope,
   type Actor,
   type AssetKind,
@@ -26,14 +28,15 @@ function okResult(data: unknown) {
   };
 }
 
-function errResult(err: unknown) {
-  const payload =
-    err instanceof MindError
-      ? { error: err.code, message: err.message, details: err.details }
-      : {
-          error: "INTERNAL_ERROR",
-          message: err instanceof Error ? err.message : String(err),
-        };
+function errResult(
+  err: unknown,
+  ctx?: { boundRealmPath?: string; orgPolicy?: "open" | "tree" },
+) {
+  const payload = toSurfaceError(err, {
+    surface: "mcp",
+    boundRealmPath: ctx?.boundRealmPath,
+    orgPolicy: ctx?.orgPolicy,
+  });
   return {
     isError: true,
     content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
@@ -75,6 +78,7 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
 
   let boundOrgId: string;
   let boundViewerRealmId: string;
+  let boundSource: string;
 
   try {
     // Auto-bootstrap default personal org on empty home when no explicit org/viewer was pinned
@@ -112,8 +116,11 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
         boundOrg = orgs[0]!;
       } else {
         throw new MindError(
-          "INVALID_INPUT",
+          "NOT_BOUND",
           "MERU_MIND_ORG_ID (or MERU_MIND_VIEWER_REALM_ID) is required when multiple organizations exist",
+          {
+            try: "MERU_MIND_ORG_ID=<orgId> MERU_MIND_VIEWER_REALM_ID=/team/project meru-mind whoami",
+          },
         );
       }
     }
@@ -138,10 +145,16 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
         );
       }
       boundViewerRealmId = vr.id;
+      boundSource = options?.viewerRealmId
+        ? "options.viewerRealmId"
+        : "MERU_MIND_VIEWER_REALM_ID";
     } else if (boundOrg.policy === "tree") {
       throw new MindError(
-        "INVALID_INPUT",
+        "NOT_BOUND",
         `MERU_MIND_VIEWER_REALM_ID is required for 'tree' policy organization "${boundOrgId}"`,
+        {
+          try: "MERU_MIND_VIEWER_REALM_ID=/team/project meru-mind whoami",
+        },
       );
     } else {
       const rootRealm =
@@ -154,6 +167,7 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
         );
       }
       boundViewerRealmId = rootRealm.id;
+      boundSource = "open-default:/";
     }
   } catch (err) {
     await engine.close();
@@ -164,60 +178,14 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
     org: Organization;
     realms: Realm[];
     mounts: RealmMount[];
-    effectiveViewerId: string;
     boundScope: AccessScope;
-    effectiveScope: AccessScope;
+    boundRealmPath: string;
   }
 
-  /**
-   * Resolves a realm reference (path `/ops`, `@mounted/<alias>`, OR realm ID) inside bound scope.
-   */
-  const resolveFocusRealm = (
-    realms: Realm[],
-    boundScope: AccessScope,
-    orgPolicy: Organization["policy"],
-    focusRef?: string,
-  ): string => {
-    const trimmed = focusRef?.trim();
-    if (!trimmed) return boundViewerRealmId;
-    try {
-      const found = resolveVisibleRealm({
-        realms,
-        orgId: boundOrgId,
-        ref: trimmed,
-        scope: boundScope,
-      });
-      if (
-        orgPolicy === "tree" &&
-        !boundScope.readableLedgerIds.includes(found.id)
-      ) {
-        throw new MindError(
-          "ACCESS_DENIED",
-          `Focus realm "${trimmed}" is outside bound viewer scope "${boundViewerRealmId}"`,
-        );
-      }
-      return found.id;
-    } catch (err) {
-      if (err instanceof MindError && err.code === "NOT_FOUND") {
-        throw new MindError(
-          "ACCESS_DENIED",
-          `Focus realm "${trimmed}" is outside bound scope "${boundViewerRealmId}"`,
-        );
-      }
-      throw err;
-    }
-  };
+  let cachedErrorCtx: { boundRealmPath?: string; orgPolicy?: "open" | "tree" } =
+    {};
 
-  /**
-   * Computes effective visibility as `scope(focus) ∩ scope(boundViewer)`:
-   * - Accepts realm path OR ID for `focus`
-   * - Never crosses boundOrgId (in either open or tree mode)
-   * - Never widens past boundViewerRealmId (blocks child @mounts and child seabed bypasses)
-   */
-  const resolveCallContext = (
-    focusRef?: string,
-    includeDescendantSeabed = false,
-  ): CallContext => {
+  const resolveCallContext = (includeDescendantSeabed = false): CallContext => {
     const org = engine.db.getOrg(boundOrgId);
     if (!org) {
       throw new MindError(
@@ -227,7 +195,6 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
     }
     const realms = engine.db.listRealms();
     const mounts = engine.db.listMounts();
-
     const boundScope = resolveAccessScope({
       realms,
       mounts,
@@ -235,43 +202,28 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
       orgPolicy: org.policy,
       includeDescendantSeabed,
     });
-
-    const effectiveViewerId = resolveFocusRealm(
-      realms,
-      boundScope,
-      org.policy,
-      focusRef,
-    );
-
-    const reqScope = resolveAccessScope({
-      realms,
-      mounts,
-      viewerRealmId: effectiveViewerId,
-      orgPolicy: org.policy,
-      includeDescendantSeabed,
-    });
-    const effectiveScope = intersectAccessScopes(reqScope, boundScope);
-
-    return {
-      org,
-      realms,
-      mounts,
-      effectiveViewerId,
-      boundScope,
-      effectiveScope,
-    };
+    const sanitizedRealms = sanitizeRealmsForScope(realms, boundScope);
+    const boundRealmPath =
+      sanitizedRealms.get(boundViewerRealmId)?.path ?? "/";
+    cachedErrorCtx = { boundRealmPath, orgPolicy: org.policy };
+    return { org, realms, mounts, boundScope, boundRealmPath };
   };
 
-  /**
-   * Resolves a realm target (path OR ID) for write tools strictly against boundOrgId/boundScope.
-   */
   const resolveWriteTargetRealmId = (
     ctx: CallContext,
-    targetRef?: string,
+    inRef: string,
   ): string => {
-    const trimmed = targetRef?.trim();
-    if (!trimmed) return boundViewerRealmId;
-    if (trimmed.startsWith("/") || trimmed.toLowerCase().startsWith("@mounted/")) {
+    const trimmed = inRef.trim();
+    if (!trimmed) {
+      throw new MindError(
+        "INVALID_REF",
+        'Parameter "in" is required for mind_write (e.g. "/ops" or realm ID)',
+      );
+    }
+    if (
+      trimmed.startsWith("/") ||
+      trimmed.toLowerCase().startsWith("@mounted/")
+    ) {
       try {
         return resolveVisibleRealm({
           realms: ctx.realms,
@@ -287,51 +239,6 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
       }
     }
     return trimmed;
-  };
-
-  /**
-   * Resolves an optional read target realm (path OR ID) within effectiveScope.
-   */
-  const resolveOptionalReadTargetRealmId = (
-    ctx: CallContext,
-    targetRef?: string,
-  ): string | undefined => {
-    const trimmed = targetRef?.trim();
-    if (!trimmed) return undefined;
-    return resolveVisibleRealm({
-      realms: ctx.realms,
-      orgId: boundOrgId,
-      ref: trimmed,
-      scope: ctx.effectiveScope,
-    }).id;
-  };
-
-  /**
-   * Resolves a drive read/list target realm (path OR ID). Paths resolve via
-   * visible-only realm lookup (opaque NOT_FOUND on hidden paths); explicit IDs
-   * are passed through to ledger access enforcement (ACCESS_DENIED).
-   */
-  const resolveDriveReadTargetRealmId = (
-    ctx: CallContext,
-    targetRef?: string,
-  ): string => {
-    const trimmed = targetRef?.trim();
-    if (!trimmed) return ctx.effectiveViewerId;
-    const normalized = trimmed.startsWith("realm:")
-      ? trimmed.slice("realm:".length)
-      : trimmed;
-    if (
-      normalized.startsWith("/") ||
-      normalized.toLowerCase().startsWith("@mounted/")
-    ) {
-      return resolveVisibleRealm({
-        realms: ctx.realms,
-        orgId: boundOrgId,
-        ref: normalized,
-        scope: ctx.effectiveScope,
-      }).id;
-    }
-    return normalized;
   };
 
   const assertMcpWrite = (
@@ -363,763 +270,248 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
     version: "0.2.0",
   });
 
-  // ---- Read Tools (Unified `target` + `focus` accepting path OR ID) ----
+  // ---- Strictly 7 Everyday Tools (1:1 Mirror of Everyday CLI Verbs) ----
 
   server.tool(
-    "mind_list_realms",
-    "List visible MindRealms (hidden ancestors rewritten to @mounted/<alias>) and mounts within session-bound scope. Optional focus (path or ID) narrows in tree mode.",
-    {
-      focus: z.string().optional(),
-    },
-    async ({ focus }) => {
+    "mind_whoami",
+    "[read] Show bound org, actor, realm scope, visible corpus counts, latestSeq, and next step.",
+    {},
+    async () => {
       try {
-        const ctx = resolveCallContext(focus, false);
-        const realms = engine.ledger.listRealms({
-          orgId: boundOrgId,
-          viewerRealmId: ctx.effectiveViewerId,
-          scopeCeiling: ctx.effectiveScope,
-        });
-        const mounts = engine.ledger.listMounts({
-          orgId: boundOrgId,
-          viewerRealmId: ctx.effectiveViewerId,
-          scopeCeiling: ctx.effectiveScope,
-        });
-        return okResult({
-          org: ctx.org,
-          boundViewerRealmId,
-          realms,
-          mounts,
-        });
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_brief",
-    "Read budgeted realm summary (rules, kindHistogram, recentConclusions, pending questions, active things, recent raw, bounded childSummaries). target/focus accept /path, @mounted/<alias>, or realm ID.",
-    {
-      target: z.string().optional(),
-      focus: z.string().optional(),
-      recentMessages: z.number().int().positive().optional(),
-      maxDecisions: z.number().int().positive().optional(),
-      maxActiveThings: z.number().int().positive().optional(),
-      maxRecentConclusions: z.number().int().positive().optional(),
-      maxChildSummaries: z.number().int().positive().optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(args.focus, false);
+        const ctx = resolveCallContext(false);
         return okResult(
-          engine.sea.brief({
-            actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            target: args.target,
-            scopeCeiling: ctx.effectiveScope,
-            budget: {
-              recentMessages: args.recentMessages,
-              maxDecisions: args.maxDecisions,
-              maxActiveThings: args.maxActiveThings,
-              maxRecentConclusions: args.maxRecentConclusions,
-              maxChildSummaries: args.maxChildSummaries,
-            },
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_recall",
-    "Ranked search (ID -> filters -> FTS5 + vector -> lexicographic rank) returning copy-pasteable rec_.../sea_... handles. target restricts to one realm (/path or ID); focus narrows in tree mode (opt-in focusBoost tie-breaks in open mode).",
-    {
-      query: z.string().optional(),
-      id: z.string().optional(),
-      thingId: z.string().optional(),
-      target: z.string().optional(),
-      focus: z.string().optional(),
-      focusBoost: z.boolean().optional(),
-      recordKinds: z
-        .array(
-          z.enum([
-            "thing",
-            "claim",
-            "proposal",
-            "verdict",
-            "finding",
-            "decision",
-            "rule",
-          ]),
-        )
-        .optional(),
-      seabedKinds: z
-        .array(z.enum(["message", "artifact", "evidence", "signal"]))
-        .optional(),
-      authorId: z.string().optional(),
-      since: z.string().optional(),
-      until: z.string().optional(),
-      includeSuperseded: z.boolean().optional(),
-      includeHistory: z.boolean().optional(),
-      includeDescendantSeabed: z.boolean().optional(),
-      limit: z.number().int().positive().max(200).optional(),
-      offset: z.number().int().nonnegative().optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(
-          args.focus,
-          Boolean(args.includeDescendantSeabed),
-        );
-        const targetRealmId = resolveOptionalReadTargetRealmId(
-          ctx,
-          args.target,
-        );
-        return okResult(
-          await engine.sea.recall({
-            actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            scopeCeiling: ctx.effectiveScope,
-            query: args.query,
-            id: args.id,
-            thingId: args.thingId,
-            targetRealmId,
-            focusBoost: args.focusBoost,
-            recordKinds: args.recordKinds,
-            seabedKinds: args.seabedKinds,
-            authorId: args.authorId,
-            since: args.since,
-            until: args.until,
-            includeSuperseded: args.includeSuperseded,
-            includeHistory: args.includeHistory,
-            includeDescendantSeabed: args.includeDescendantSeabed,
-            limit: args.limit,
-            offset: args.offset,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  // ---- Write Tools (Always bound to boundViewerRealmId; NEVER accept focus/viewer overrides) ----
-
-  server.tool(
-    "mind_capture_seabed",
-    "[DEPRECATED: alias for mind_write_raw; scheduled for removal in v0.3.0] Append an immutable raw entry within bound write scope.",
-    {
-      target: z.string().optional(),
-      kind: z.enum(["message", "artifact", "evidence", "signal"]),
-      text: z.string(),
-      topicId: z.string().optional(),
-      sourceRef: z.string().optional(),
-      objectIds: z.array(z.string()).optional(),
-      resourceTags: z.array(z.string()).optional(),
-      occurredAt: z.string().nullable().optional(),
-      sensitivity: z
-        .enum(["public", "internal", "confidential", "secret"])
-        .optional(),
-      idempotencyKey: z.string().optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(undefined, false);
-        const targetRealmId = resolveWriteTargetRealmId(ctx, args.target);
-        assertMcpWrite(ctx, targetRealmId, "seabed");
-        return okResult(
-          await engine.ledger.captureSeabed({
+          engine.sea.whoami({
             actor: boundActor,
             viewerRealmId: boundViewerRealmId,
-            targetRealmId,
-            kind: args.kind,
-            text: args.text,
-            topicId: args.topicId,
-            sourceRef: args.sourceRef,
-            objectIds: args.objectIds,
-            resourceTags: args.resourceTags,
-            occurredAt: args.occurredAt,
-            sensitivity: args.sensitivity,
-            idempotencyKey: args.idempotencyKey,
+            boundSource,
+            storePath: engine.homeDir,
+            scopeCeiling: ctx.boundScope,
           }),
         );
       } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_write_raw",
-    "Append an immutable [raw] entry (message, artifact, evidence, or signal) within bound write scope.",
-    {
-      target: z.string().optional(),
-      kind: z.enum(["message", "artifact", "evidence", "signal"]),
-      text: z.string(),
-      topicId: z.string().optional(),
-      sourceRef: z.string().optional(),
-      objectIds: z.array(z.string()).optional(),
-      resourceTags: z.array(z.string()).optional(),
-      occurredAt: z.string().nullable().optional(),
-      sensitivity: z
-        .enum(["public", "internal", "confidential", "secret"])
-        .optional(),
-      idempotencyKey: z.string().optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(undefined, false);
-        const targetRealmId = resolveWriteTargetRealmId(ctx, args.target);
-        assertMcpWrite(ctx, targetRealmId, "seabed");
-        return okResult(
-          await engine.ledger.captureSeabed({
-            actor: boundActor,
-            viewerRealmId: boundViewerRealmId,
-            targetRealmId,
-            kind: args.kind,
-            text: args.text,
-            topicId: args.topicId,
-            sourceRef: args.sourceRef,
-            objectIds: args.objectIds,
-            resourceTags: args.resourceTags,
-            occurredAt: args.occurredAt,
-            sensitivity: args.sensitivity,
-            idempotencyKey: args.idempotencyKey,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_append_record",
-    "[DEPRECATED: alias for mind_write_conclusion; scheduled for removal in v0.3.0] Append a non-rule [conclusion] ledger record within bound write scope.",
-    {
-      target: z.string().optional(),
-      kind: z.enum([
-        "thing",
-        "claim",
-        "proposal",
-        "verdict",
-        "finding",
-        "decision",
-      ]),
-      extKind: z.string().optional(),
-      title: z.string(),
-      payload: z.record(z.unknown()).optional(),
-      refs: z.array(z.string()).optional(),
-      externalRef: z.string().optional(),
-      sourceRef: z.string().optional(),
-      objectIds: z.array(z.string()).optional(),
-      resourceTags: z.array(z.string()).optional(),
-      supersedesId: z.string().optional(),
-      supersedesIds: z.array(z.string()).optional(),
-      thingId: z.string().optional(),
-      occurredAt: z.string().nullable().optional(),
-      sensitivity: z
-        .enum(["public", "internal", "confidential", "secret"])
-        .optional(),
-      idempotencyKey: z.string().optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(undefined, false);
-        const targetRealmId = resolveWriteTargetRealmId(ctx, args.target);
-        assertMcpWrite(ctx, targetRealmId, "ledger");
-        return okResult(
-          await engine.ledger.appendRecord({
-            actor: boundActor,
-            viewerRealmId: boundViewerRealmId,
-            targetRealmId,
-            kind: args.kind,
-            extKind: args.extKind,
-            title: args.title,
-            payload: args.payload,
-            refs: args.refs,
-            externalRef: args.externalRef,
-            sourceRef: args.sourceRef,
-            objectIds: args.objectIds,
-            resourceTags: args.resourceTags,
-            supersedesId: args.supersedesId,
-            supersedesIds: args.supersedesIds,
-            thingId: args.thingId,
-            occurredAt: args.occurredAt,
-            sensitivity: args.sensitivity,
-            idempotencyKey: args.idempotencyKey,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_write_conclusion",
-    "Append a non-rule [conclusion] record (thing, claim, proposal, verdict, finding, decision) within bound write scope.",
-    {
-      target: z.string().optional(),
-      kind: z.enum([
-        "thing",
-        "claim",
-        "proposal",
-        "verdict",
-        "finding",
-        "decision",
-      ]),
-      extKind: z.string().optional(),
-      title: z.string(),
-      payload: z.record(z.unknown()).optional(),
-      refs: z.array(z.string()).optional(),
-      externalRef: z.string().optional(),
-      sourceRef: z.string().optional(),
-      objectIds: z.array(z.string()).optional(),
-      resourceTags: z.array(z.string()).optional(),
-      supersedesId: z.string().optional(),
-      supersedesIds: z.array(z.string()).optional(),
-      thingId: z.string().optional(),
-      occurredAt: z.string().nullable().optional(),
-      sensitivity: z
-        .enum(["public", "internal", "confidential", "secret"])
-        .optional(),
-      idempotencyKey: z.string().optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(undefined, false);
-        const targetRealmId = resolveWriteTargetRealmId(ctx, args.target);
-        assertMcpWrite(ctx, targetRealmId, "ledger");
-        return okResult(
-          await engine.ledger.appendRecord({
-            actor: boundActor,
-            viewerRealmId: boundViewerRealmId,
-            targetRealmId,
-            kind: args.kind,
-            extKind: args.extKind,
-            title: args.title,
-            payload: args.payload,
-            refs: args.refs,
-            externalRef: args.externalRef,
-            sourceRef: args.sourceRef,
-            objectIds: args.objectIds,
-            resourceTags: args.resourceTags,
-            supersedesId: args.supersedesId,
-            supersedesIds: args.supersedesIds,
-            thingId: args.thingId,
-            occurredAt: args.occurredAt,
-            sensitivity: args.sensitivity,
-            idempotencyKey: args.idempotencyKey,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_drive_write",
-    "Write a file to the MindRealm shared drive with optimistic concurrency conflict detection.",
-    {
-      target: z.string().optional(),
-      relPath: z.string(),
-      content: z.string(),
-      expectedVersion: z.number().int().nonnegative().optional(),
-      message: z.string().optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(undefined, false);
-        const targetRealmId = resolveWriteTargetRealmId(ctx, args.target);
-        assertMcpWrite(ctx, targetRealmId, "drive");
-        return okResult(
-          await engine.ledger.writeDriveFile({
-            actor: boundActor,
-            viewerRealmId: boundViewerRealmId,
-            targetRealmId,
-            relPath: args.relPath,
-            content: args.content,
-            expectedVersion: args.expectedVersion,
-            message: args.message,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_drive_read",
-    "Read a file from a MindRealm drive within process-bound scope intersection.",
-    {
-      target: z.string().optional(),
-      focus: z.string().optional(),
-      relPath: z.string(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(args.focus, false);
-        const targetRealmId = resolveDriveReadTargetRealmId(ctx, args.target);
-        return okResult(
-          await engine.ledger.readDriveFile({
-            actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            targetRealmId,
-            relPath: args.relPath,
-            scopeCeiling: ctx.effectiveScope,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_drive_list",
-    "List files in a MindRealm shared drive within process-bound scope intersection.",
-    {
-      target: z.string().optional(),
-      focus: z.string().optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(args.focus, false);
-        const targetRealmId = resolveDriveReadTargetRealmId(ctx, args.target);
-        return okResult(
-          await engine.ledger.listDriveFiles({
-            actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            targetRealmId,
-            scopeCeiling: ctx.effectiveScope,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_settle",
-    "Settle current realm state into a MindSea distillation (event slice or cognitive card) with deterministic hard facts.",
-    {
-      target: z.string().optional(),
-      layer: z.enum([
-        "slice_shift",
-        "slice_day",
-        "slice_week",
-        "slice_month",
-        "card_realm",
-        "card_person",
-        "card_progress",
-      ]),
-      periodKey: z.string(),
-      narrativeMd: z.string().optional(),
-      sourceIds: z.array(z.string()).optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(undefined, false);
-        const targetRealmId = resolveWriteTargetRealmId(ctx, args.target);
-        assertMcpWrite(ctx, targetRealmId, "ledger");
-        return okResult(
-          await engine.sea.settle({
-            actor: boundActor,
-            viewerRealmId: boundViewerRealmId,
-            targetRealmId,
-            layer: args.layer,
-            periodKey: args.periodKey,
-            narrativeMd: args.narrativeMd,
-            sourceIds: args.sourceIds,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_get_supersede_chain",
-    "Traverse the chronological supersede DAG for a visible ledger record within bound scope.",
-    {
-      focus: z.string().optional(),
-      recordId: z.string(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(args.focus, false);
-        return okResult(
-          engine.ledger.getSupersedeChain({
-            actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            recordId: args.recordId,
-            scopeCeiling: ctx.effectiveScope,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
+        return errResult(err, cachedErrorCtx);
       }
     },
   );
 
   server.tool(
     "mind_tree",
-    "Explore visible MindRealms and Objects as a tree with direct/subtree counts (default depth=1, unreadable raw=null). target/focus accept /path, @mounted/<alias>, or realm ID.",
+    "[read] Browse visible realm & object tree with counts. Printed refs work verbatim in mind_ls and mind_show.",
     {
-      target: z.string().optional(),
-      focus: z.string().optional(),
-      depth: z.union([z.number().int().nonnegative(), z.literal("all")]).optional(),
-      includeObjects: z.boolean().optional(),
+      ref: z.string().optional(),
+      depth: z
+        .union([z.number().int().nonnegative(), z.literal("all")])
+        .optional(),
+      objects: z.boolean().optional(),
       limit: z.number().int().positive().max(500).optional(),
     },
     async (args) => {
       try {
-        const ctx = resolveCallContext(args.focus, false);
+        const ctx = resolveCallContext(false);
         return okResult(
           engine.sea.tree({
             actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            target: args.target,
+            viewerRealmId: boundViewerRealmId,
+            target: args.ref,
             depth: args.depth,
-            includeObjects: args.includeObjects,
+            includeObjects: args.objects,
             limit: args.limit,
-            scopeCeiling: ctx.effectiveScope,
+            scopeCeiling: ctx.boundScope,
           }),
         );
       } catch (err) {
-        return errResult(err);
+        return errResult(err, cachedErrorCtx);
       }
     },
   );
 
   server.tool(
     "mind_ls",
-    "List visible non-secret entries with explicit target prefixes (/path, @mounted/<alias>, realm:<id>, obj:<id|name>, thing:<ref>, tag:<type:name>). Optional kind/tag filters, pagination, and focus (/path or ID).",
+    "[read] List visible contents of a realm (/path, @mounted/<alias>) or entries about an object (kind:name, /realm/kind:name).",
     {
-      target: z.string().optional(),
-      targetType: z.enum(["realm", "object", "thing", "resource"]).optional(),
-      focus: z.string().optional(),
+      ref: z.string().optional(),
+      only: z.enum(["realms", "objects", "entries", "files"]).optional(),
       kind: z.string().optional(),
-      tag: z.string().optional(),
-      includeSuperseded: z.boolean().optional(),
-      includeDescendantSeabed: z.boolean().optional(),
+      about: z.string().optional(),
+      since: z.string().optional(),
+      until: z.string().optional(),
+      history: z.boolean().optional(),
+      include_descendant_seabed: z.boolean().optional(),
       limit: z.number().int().positive().max(200).optional(),
-      offset: z.number().int().nonnegative().optional(),
+      cursor: z.string().optional(),
     },
     async (args) => {
       try {
-        const ctx = resolveCallContext(
-          args.focus,
-          Boolean(args.includeDescendantSeabed),
-        );
+        const includeDescendantSeabed = Boolean(args.include_descendant_seabed);
+        const ctx = resolveCallContext(includeDescendantSeabed);
         return okResult(
           await engine.sea.ls({
             actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            target: args.target,
-            targetType: args.targetType,
+            viewerRealmId: boundViewerRealmId,
+            ref: args.ref,
+            only: args.only,
             kind: args.kind,
-            tag: args.tag,
-            includeSuperseded: args.includeSuperseded,
-            includeDescendantSeabed: args.includeDescendantSeabed,
+            about: args.about,
+            since: args.since,
+            until: args.until,
+            history: args.history,
+            includeDescendantSeabed,
             limit: args.limit,
-            offset: args.offset,
-            scopeCeiling: ctx.effectiveScope,
+            cursor: args.cursor,
+            scopeCeiling: ctx.boundScope,
           }),
         );
       } catch (err) {
-        return errResult(err);
+        return errResult(err, cachedErrorCtx);
       }
     },
   );
 
   server.tool(
-    "mind_cat",
-    "Inspect full content of one visible entry (rec_..., sea_..., dist_...) or drive relPath (pass targetRealm as /path or ID). Optional focus narrows read perspective.",
+    "mind_show",
+    "[read] Inspect any ref: /realm (brief), kind:name (object card), rec_/sea_ (entry + optional history/context), or file:/realm/path.",
     {
-      target: z.string(),
-      targetRealm: z.string().optional(),
-      focus: z.string().optional(),
-      includeDescendantSeabed: z.boolean().optional(),
+      ref: z.string(),
+      history: z.boolean().optional(),
+      context: z.number().int().nonnegative().max(100).optional(),
+      include_descendant_seabed: z.boolean().optional(),
     },
     async (args) => {
       try {
-        const ctx = resolveCallContext(
-          args.focus,
-          Boolean(args.includeDescendantSeabed),
-        );
+        const includeDescendantSeabed = Boolean(args.include_descendant_seabed);
+        const ctx = resolveCallContext(includeDescendantSeabed);
         return okResult(
-          await engine.sea.cat({
+          await engine.sea.show({
             actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            target: args.target,
-            targetRealmRef: args.targetRealm,
-            includeDescendantSeabed: args.includeDescendantSeabed,
-            scopeCeiling: ctx.effectiveScope,
+            viewerRealmId: boundViewerRealmId,
+            ref: args.ref,
+            history: args.history,
+            context: args.context,
+            includeDescendantSeabed,
+            scopeCeiling: ctx.boundScope,
           }),
         );
       } catch (err) {
-        return errResult(err);
+        return errResult(err, cachedErrorCtx);
       }
     },
   );
 
   server.tool(
-    "mind_replay",
-    "Replay surrounding timeline context entries (occurred_at with created_at fallback for undated anchors) and supersede DAG within bound scope.",
+    "mind_search",
+    "[read] Search visible memory (FTS5 + vector). Optional in (/realm) narrows scope; about (kind:name) filters by object.",
     {
-      entryId: z.string(),
-      focus: z.string().optional(),
-      window: z.number().int().positive().max(100).optional(),
-      includeDescendantSeabed: z.boolean().optional(),
+      query: z.string(),
+      in: z.string().optional(),
+      about: z.string().optional(),
+      kind: z.string().optional(),
+      since: z.string().optional(),
+      until: z.string().optional(),
+      history: z.boolean().optional(),
+      include_descendant_seabed: z.boolean().optional(),
+      limit: z.number().int().positive().max(200).optional(),
+      cursor: z.string().optional(),
     },
     async (args) => {
       try {
-        const ctx = resolveCallContext(
-          args.focus,
-          Boolean(args.includeDescendantSeabed),
-        );
+        const includeDescendantSeabed = Boolean(args.include_descendant_seabed);
+        const ctx = resolveCallContext(includeDescendantSeabed);
         return okResult(
-          engine.sea.replay({
+          await engine.sea.search({
             actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            entryId: args.entryId,
-            window: args.window,
-            includeDescendantSeabed: args.includeDescendantSeabed,
-            scopeCeiling: ctx.effectiveScope,
+            viewerRealmId: boundViewerRealmId,
+            query: args.query,
+            in: args.in,
+            about: args.about,
+            kind: args.kind,
+            since: args.since,
+            until: args.until,
+            history: args.history,
+            includeDescendantSeabed,
+            limit: args.limit,
+            cursor: args.cursor,
+            scopeCeiling: ctx.boundScope,
           }),
         );
       } catch (err) {
-        return errResult(err);
+        return errResult(err, cachedErrorCtx);
       }
     },
   );
 
   server.tool(
     "mind_changes",
-    "Read operational change_log entries since a sequence number, filtered to visible non-secret scope.",
+    "[read] Read incremental visible change log after since seq. Optional in (/realm) filters changes in SQL.",
     {
-      target: z.string().optional(),
-      focus: z.string().optional(),
-      sinceSeq: z.number().int().nonnegative().optional(),
+      since: z.number().int().nonnegative().optional(),
+      in: z.string().optional(),
       limit: z.number().int().positive().max(500).optional(),
-      includeDescendantSeabed: z.boolean().optional(),
+      include_descendant_seabed: z.boolean().optional(),
     },
     async (args) => {
       try {
-        const ctx = resolveCallContext(
-          args.focus,
-          Boolean(args.includeDescendantSeabed),
-        );
+        const includeDescendantSeabed = Boolean(args.include_descendant_seabed);
+        const ctx = resolveCallContext(includeDescendantSeabed);
         return okResult(
           engine.sea.changes({
             actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            target: args.target,
-            sinceSeq: args.sinceSeq,
-            limit: args.limit,
-            includeDescendantSeabed: args.includeDescendantSeabed,
-            scopeCeiling: ctx.effectiveScope,
+            viewerRealmId: boundViewerRealmId,
+            in: args.in,
+            sinceSeq: args.since ?? 0,
+            limit: args.limit ?? 50,
+            includeDescendantSeabed,
+            scopeCeiling: ctx.boundScope,
           }),
         );
       } catch (err) {
-        return errResult(err);
+        return errResult(err, cachedErrorCtx);
       }
     },
   );
 
   server.tool(
-    "mind_list_objects",
-    "List visible single-parent object nodes (hidden parents sanitized to null) within bound scope.",
+    "mind_write",
+    "[write] Record a conclusion (decision|finding|claim|proposal|verdict; rule forbidden) in a writable realm. Auto-idempotent per minute.",
     {
-      target: z.string().optional(),
-      focus: z.string().optional(),
-      parentObjectId: z.string().optional(),
+      in: z.string(),
+      title: z.string(),
+      body: z.string(),
       kind: z.string().optional(),
+      about: z.array(z.string()).optional(),
+      supersedes: z.array(z.string()).optional(),
+      because: z.array(z.string()).optional(),
+      occurred_at: z.string().nullable().optional(),
+      sensitivity: z
+        .enum(["public", "internal", "confidential", "secret"])
+        .optional(),
     },
     async (args) => {
       try {
-        const ctx = resolveCallContext(args.focus, false);
-        return okResult(
-          engine.objects.listObjects({
-            viewerRealmId: ctx.effectiveViewerId,
-            realmRef: args.target,
-            parentObjectId: args.parentObjectId,
-            kind: args.kind,
-            scopeCeiling: ctx.effectiveScope,
-          }),
-        );
+        const ctx = resolveCallContext(false);
+        const targetRealmId = resolveWriteTargetRealmId(ctx, args.in);
+        assertMcpWrite(ctx, targetRealmId, "ledger");
+        const rec = await writeEverydayConclusion({
+          db: engine.db,
+          ledger: engine.ledger,
+          realms: ctx.realms,
+          mounts: ctx.mounts,
+          scope: ctx.boundScope,
+          actor: boundActor,
+          viewerRealmId: boundViewerRealmId,
+          targetRealmId,
+          title: args.title,
+          body: args.body,
+          kind: args.kind,
+          about: args.about,
+          supersedes: args.supersedes,
+          because: args.because,
+          occurredAt: args.occurred_at,
+          sensitivity: args.sensitivity,
+          allowRedactedReingest: false,
+        });
+        return okResult(rec);
       } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_list_tags",
-    "List visible <type>:<name> resource tags (excluding secret/redacted entries) within bound scope.",
-    {
-      target: z.string().optional(),
-      focus: z.string().optional(),
-      prefix: z.string().optional(),
-      includeDescendantSeabed: z.boolean().optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(
-          args.focus,
-          Boolean(args.includeDescendantSeabed),
-        );
-        return okResult(
-          engine.objects.listResourceTags({
-            viewerRealmId: ctx.effectiveViewerId,
-            realmRef: args.target,
-            prefix: args.prefix,
-            includeDescendantSeabed: args.includeDescendantSeabed,
-            scopeCeiling: ctx.effectiveScope,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
-      }
-    },
-  );
-
-  server.tool(
-    "mind_list_things",
-    "List visible thing identity anchors (records.kind='thing') optionally filtered by externalRef.",
-    {
-      target: z.string().optional(),
-      focus: z.string().optional(),
-      externalRef: z.string().optional(),
-      includeSuperseded: z.boolean().optional(),
-      limit: z.number().int().positive().max(200).optional(),
-      offset: z.number().int().nonnegative().optional(),
-    },
-    async (args) => {
-      try {
-        const ctx = resolveCallContext(args.focus, false);
-        return okResult(
-          engine.ledger.listThings({
-            actor: boundActor,
-            viewerRealmId: ctx.effectiveViewerId,
-            targetRealmRef: args.target,
-            externalRef: args.externalRef,
-            includeSuperseded: args.includeSuperseded,
-            limit: args.limit,
-            offset: args.offset,
-            scopeCeiling: ctx.effectiveScope,
-          }),
-        );
-      } catch (err) {
-        return errResult(err);
+        return errResult(err, cachedErrorCtx);
       }
     },
   );
@@ -1127,36 +519,36 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
   return { server, engine, boundOrgId, boundViewerRealmId, boundActor };
 }
 
-function isExecutedDirectly(): boolean {
-  const argv1 = process.argv[1];
-  if (!argv1) return false;
-  try {
-    return (
-      fs.realpathSync(argv1) ===
-      fs.realpathSync(fileURLToPath(import.meta.url))
-    );
-  } catch {
-    return false;
-  }
+async function runStdio(): Promise<void> {
+  const { server, engine } = await createMindMcpServer();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+
+  const shutdown = async () => {
+    await engine.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
-// Start stdio transport when executed directly (including via bin symlinks like meru-mind-mcp)
-if (isExecutedDirectly()) {
-  createMindMcpServer()
-    .then(async ({ server, engine }) => {
-      const transport = new StdioServerTransport();
-      await server.connect(transport);
-      const shutdown = async () => {
-        await engine.close();
-        process.exit(0);
-      };
-      process.on("SIGINT", shutdown);
-      process.on("SIGTERM", shutdown);
-    })
-    .catch((err) => {
-      process.stderr.write(
-        `meru-mind-mcp fatal: ${err instanceof Error ? err.message : String(err)}\n`,
-      );
-      process.exit(1);
-    });
+const isDirectEntry = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return (
+      fs.realpathSync(fileURLToPath(import.meta.url)) ===
+      fs.realpathSync(process.argv[1])
+    );
+  } catch {
+    return fileURLToPath(import.meta.url) === process.argv[1];
+  }
+})();
+
+if (isDirectEntry) {
+  runStdio().catch((err: unknown) => {
+    process.stderr.write(
+      `meru-mind-mcp fatal: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+    process.exit(1);
+  });
 }

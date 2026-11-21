@@ -8,7 +8,33 @@ export type MindErrorCode =
   | "VERDICT_INVARIANT"
   | "FORBIDDEN_HOME_PATH"
   | "SLICE_VIOLATION"
-  | "DRIVE_ERROR";
+  | "DRIVE_ERROR"
+  | "UNKNOWN_COMMAND"
+  | "UNKNOWN_FLAG"
+  | "INVALID_REF"
+  | "AMBIGUOUS_REF"
+  | "NOT_LISTABLE"
+  | "NOT_BOUND";
+
+export type WireErrorCode =
+  | "unknown_command"
+  | "unknown_flag"
+  | "invalid_ref"
+  | "not_found"
+  | "ambiguous_ref"
+  | "not_listable"
+  | "not_bound"
+  | "forbidden"
+  | "conflict"
+  | "idempotency_mismatch"
+  | "invalid_input";
+
+export interface SurfaceErrorPayload {
+  error: WireErrorCode;
+  message: string;
+  candidates?: string[];
+  try?: string;
+}
 
 export class MindError extends Error {
   readonly code: MindErrorCode;
@@ -307,6 +333,10 @@ export interface RecallQuery {
   thingId?: string;
   /** Stage 2: Structured filters */
   targetRealmId?: string;
+  /** Optional narrowed realm IDs (e.g. search --in subtree intersected with scope) */
+  realmIdsFilter?: string[];
+  /** Optional narrowed entry IDs (e.g. search --about unified object) */
+  allowedEntryIds?: string[];
   recordKinds?: RecordKind[];
   seabedKinds?: SeabedKind[];
   authorId?: string;
@@ -336,6 +366,7 @@ export interface RecallItem {
   sourceType: "record" | "seabed" | "distillation";
   kind: string;
   realmId: string;
+  realmPath?: string;
   status: RecallItemStatus;
   title: string;
   snippet: string;
@@ -520,16 +551,126 @@ export interface LsEntry {
   resourceTags: string[];
 }
 
+export type LsOnlyFilter = "realms" | "objects" | "entries" | "files";
+
+export interface LsObjectSummary {
+  id: string;
+  ref: string;
+  kind: string;
+  name: string;
+  realmId: string;
+  realmPath: string;
+  parentObjectId: string | null;
+}
+
+export interface LsDriveFileItem extends DriveFileMeta {
+  ref: string;
+  realmPath: string;
+}
+
 export interface LsResult {
   targetType: LsTargetType;
   target: string;
   resolvedId: string;
   viewerRealmId: string;
+  only?: LsOnlyFilter;
   items: LsEntry[];
   totalMatched: number;
   omittedCount: number;
+  nextCursor?: string | null;
   subRealms?: Array<{ id: string; path: string; name: string; slug: string }>;
-  driveFiles?: DriveFileMeta[];
+  objects?: LsObjectSummary[];
+  driveFiles?: LsDriveFileItem[];
+}
+
+export interface WhoamiResult {
+  org: {
+    id: string;
+    name: string;
+    policy: OrgPolicy;
+  };
+  actor: Actor;
+  bound: {
+    realmId: string;
+    realmPath: string;
+    realmName: string;
+    source: string;
+  };
+  read: {
+    policy: OrgPolicy;
+    ledgerRealms: number;
+    driveRealms: number;
+    seabedRealms: number;
+  };
+  write: {
+    allowed: string;
+    canWriteRules: boolean;
+    canRedact: boolean;
+  };
+  store: {
+    path: string;
+    localOnly: true;
+  };
+  corpus: {
+    realms: number;
+    objects: number;
+    rules: number;
+    conclusions: number;
+    raw: number;
+    files: number;
+  };
+  latestSeq: number;
+  version: string;
+  schemaVersion: number;
+  next: string;
+}
+
+export interface ObjectCard {
+  ref: string;
+  kind: string;
+  name: string;
+  object: MindObject | null;
+  realmPath: string | null;
+  counts: {
+    total: number;
+    viaObject: number;
+    viaTag: number;
+    viaThing: number;
+  };
+  recentEntries: LsEntry[];
+  try: string;
+}
+
+export type ShowResult =
+  | {
+      refType: "realm";
+      ref: string;
+      brief: BriefOutput;
+    }
+  | {
+      refType: "object";
+      ref: string;
+      card: ObjectCard;
+    }
+  | {
+      refType: "entry";
+      ref: string;
+      entry: CatResult;
+      history?: SupersedeChainResult;
+      context?: ReplayResult;
+    }
+  | {
+      refType: "file";
+      ref: string;
+      realmPath: string;
+      file: DriveFileContent;
+    };
+
+export interface SearchResult extends RecallResult {
+  query: string;
+  in?: string;
+  about?: string;
+  nextCursor: string | null;
 }
 
 export type CatResult =

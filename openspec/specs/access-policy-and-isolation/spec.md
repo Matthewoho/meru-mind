@@ -2,93 +2,78 @@
 
 ## Purpose
 
-Define organization-level visibility modes (`open` and `tree`), unambiguous separation of session binding (`MERU_MIND_ORG_ID`, `MERU_MIND_VIEWER_REALM_ID`), positional `<target>`, and `--focus` / `focus` narrowing, complete removal of `--realm`, unified MCP `target` + `focus` schemas, default-safe CLI privilege elevation, sensitivity enforcement, and cross-reference leak sanitization.
+Define organization visibility policies (`open` and `tree`), process-level binding (`MERU_MIND_ORG_ID`, `MERU_MIND_VIEWER_REALM_ID`), the strictly 7-tool MCP surface (`<= 6,000` wire chars), default-safe CLI privilege elevation, sensitivity enforcement, unified sanitization, and local cooperative trust boundaries.
 
 ## Requirements
 
 ### Requirement: Organization Visibility Policies (`open` and `tree`)
-`computeVisibleScope()` SHALL remain exported as a pure tree-visibility function. `resolveAccessScope()`, `resolveAccess()`, `assertAccess()`, and all engine read/write/drive/export entrypoints SHALL enforce the organization's `policy`:
-- Cross-organization access SHALL always resolve to `'none'` in both `open` and `tree` modes.
-- In `tree` mode, visibility follows strict self/ancestor/descendant/explicit-`@mount` rules; descendant raw seabed requires explicit `includeDescendantSeabed`.
-- In `open` mode, `readableLedgerIds`, `readableDriveIds`, and `readableSeabedIds` include all realms within the same organization, while `computeVisibleScope()` provides `focusRealmIds` for optional opt-in intra-band tie-breaking (`focusBoost: true`, default OFF).
+`computeVisibleScope()` SHALL remain exported as a pure tree-visibility function. `resolveAccessScope()`, `resolveAccess()`, and `assertAccess()` SHALL enforce organization `policy`: cross-organization access is always `'none'`; `tree` mode enforces strict self/ancestor/descendant/explicit-`@mount` visibility; `open` mode makes all same-org realms readable while preserving `focusRealmIds` for SDK-only opt-in `focusBoost`.
 
 #### Scenario: Cross-organization isolation holds under open policy
-- **WHEN** two organizations both use `policy = 'open'` and an actor in Organization A attempts to read, search, reference, traverse supersede chains, or access drive files in Organization B
-- **THEN** all access checks return `'none'` / `ACCESS_DENIED` / `NOT_FOUND` and Organization B entries never enter Organization A's results or `totalMatched` / `omittedCount`
+- **WHEN** two `open` organizations exist and an actor in Org A attempts to read, search, reference, or write in Org B
+- **THEN** all checks return `'none'` / `ACCESS_DENIED` / `NOT_FOUND` and Org B entries never enter Org A outputs or counts
 
-### Requirement: Unambiguous Separation of Session Binding, Positional Target, Focus Narrowing, and Removal of `--realm`
-CLI and MCP SHALL strictly separate permission binding, target selection, and optional read focus:
-- **Session Binding (`MERU_MIND_ORG_ID`, `MERU_MIND_VIEWER_REALM_ID`)**:
-  - In `open` organizations: a single organization auto-resolves without `--org`; missing `MERU_MIND_VIEWER_REALM_ID` defaults viewer to `/`.
-  - In `tree` organizations: ALL normal read/write CLI commands (`tree`, `ls`, `brief`, `cat`, `recall`, `replay`, `changes`, `write`, `drive`, `settle`, `object`, `tag`, `thing`, `realm list`, `import-md`, `import-jsonl`, `import-verify`, `export-slice`) AND MCP server startup SHALL STRICTLY REQUIRE `MERU_MIND_VIEWER_REALM_ID` (missing -> `INVALID_INPUT`; NEVER default to `/`).
-  - Explicit human org-admin CLI commands (`--as-human` required): `org set-policy`, `realm create` (explicit `--org` + `--parent`), `mount` / `unmount` (explicit `--viewer` + `--target`), and `redact --id <entryId> --as-human` are permitted without `MERU_MIND_VIEWER_REALM_ID` because they carry explicit admin targets, require `--as-human`, and record `actor.id` and `op` in `change_log`.
-- **Positional `<target>`**:
-  - Read commands accept positional targets (`tree [target]`, `ls [target]`, `brief [target]`, `cat <id|drive-path>`, `replay <id>`, `changes [target]`, `recall [query]`).
-  - Write commands (`write <targetRealm>`, `drive write <targetRealm>`, `settle <targetRealm>`) REQUIRE an explicit positional `<targetRealm>` with no silent root fallback.
-- **Focus (`--focus <realmPath|realmId>` / MCP `focus`) — Distinct Mode Semantics**:
-  - In `tree` mode: `focus` acts strictly as a read sub-scope narrowing filter (`scope(focus) ∩ scope(bound)`), never widening past bound scope and rejecting out-of-scope focus with opaque `NOT_FOUND`/`ACCESS_DENIED`.
-  - In `open` mode: `focus` sets the optional `brief` center or optional intra-band ranking hint (ranking boost remains OFF by default unless `--focus-boost` / `focusBoost: true` is passed; never alters org-wide visibility).
-  - Write commands and MCP write tools SHALL NEVER accept `--focus` / `focus` or per-call viewer overrides; MCP write tools always bind engine writes to `boundViewerRealmId`.
-- **Complete Removal of `--realm`**:
-  - Passing `--realm` to ANY CLI command SHALL exit non-zero with `INVALID_INPUT` and migration guidance pointing to positional `<target>`, `--focus`, or `MERU_MIND_VIEWER_REALM_ID`.
+### Requirement: Session Binding and `not_bound` Enforcement in Tree Organizations
+In `open` orgs, a single org auto-resolves and missing `MERU_MIND_VIEWER_REALM_ID` defaults to `/`. In `tree` orgs, everyday commands, non-admin management commands, and MCP startup SHALL require `MERU_MIND_VIEWER_REALM_ID`, failing with `NOT_BOUND` (wire `not_bound`) and a non-root hint (never `=/`). Explicit `--as-human` org-admin commands (`org set-policy`, `realm create`, `realm mount/unmount`, `redact`) MAY run without viewer binding.
 
-#### Scenario: Passing removed --realm flag or omitting MERU_MIND_VIEWER_REALM_ID in tree mode fails with INVALID_INPUT
-- **WHEN** a caller passes `--realm /ops` to any CLI command
-- **THEN** the CLI exits non-zero with `INVALID_INPUT` explaining the migration to positional `<target>`, `--focus`, or `MERU_MIND_VIEWER_REALM_ID`
-- **AND** running `meru-mind tree` or `meru-mind ls` against a `tree` organization without `MERU_MIND_VIEWER_REALM_ID` exits non-zero with `INVALID_INPUT`
-- **AND** running `meru-mind org set-policy --org <id> --policy open --as-human` without `MERU_MIND_VIEWER_REALM_ID` succeeds and appends an `org_policy_change` record to `change_log`
+#### Scenario: Missing MERU_MIND_VIEWER_REALM_ID in tree org fails with not_bound and non-root hint
+- **WHEN** `meru-mind whoami`, `meru-mind tree`, or `createMindMcpServer()` runs against a `tree` organization without `MERU_MIND_VIEWER_REALM_ID`
+- **THEN** it fails with `NOT_BOUND` (wire `not_bound`) and suggests a non-root realm path (never `=/`)
+- **AND** `meru-mind org set-policy --org <id> --policy open --as-human` succeeds without `MERU_MIND_VIEWER_REALM_ID`
+
+### Requirement: Complete Removal of Legacy Commands and Flags with Self-Correcting Hints
+CLI SHALL expose 7 everyday verbs (`whoami`, `tree`, `ls`, `show`, `search`, `changes`, `write`) and 10 management groups (`realm`, `object`, `file`, `rule`, `raw`, `redact`, `settle`, `import`, `org`, `admin`) with zero aliases. Legacy commands (`recall`, `cat`, `brief`, `replay`, `record`, `capture`, `drive`, `mount`, `thing`, `tag`, `import-*`, `init`, `rebuild`, `status`, `inspect`, `log`, `add`) return `unknown_command` + `try:`; legacy flags return `unknown_flag`.
+
+#### Scenario: Legacy commands and removed flags return self-correcting 4-field errors
+- **WHEN** a caller invokes `meru-mind recall "x"`, `meru-mind status`, or `meru-mind ls / --realm /ops`
+- **THEN** the CLI exits non-zero with `unknown_command` or `unknown_flag` and a runnable replacement command in `try:`
 
 ### Requirement: Realm Topology Authorization and Scoped Realm Listing
-In `tree` mode, `createRealm()`, `mountRealm()`, and `unmountRealm()` SHALL require `actor.kind === 'human'`. In `open` mode, same-organization writers MAY perform realm topology mutations and all mutations SHALL be recorded in `change_log`. `LedgerEngine.listRealms()` SHALL require a non-empty `orgId`, and in `tree` mode SHALL require `viewerRealmId` and return only visible realms sanitized via the P0-1 zero-leak sanitizer.
+In `tree` mode, `createRealm()`, `mountRealm()`, and `unmountRealm()` SHALL require `actor.kind === 'human'`. In `open` mode, same-organization writers MAY mutate realm topology and all mutations SHALL append to `change_log`. `LedgerEngine.listRealms()` SHALL require `orgId`, require `viewerRealmId` in `tree` mode, and return P0-1 sanitized realms only.
 
 #### Scenario: Agent attempts to create or mount a realm in a tree organization
 - **WHEN** an `agent` actor invokes `createRealm()`, `mountRealm()`, or `unmountRealm()` in a `tree` organization
 - **THEN** the engine rejects the operation with `ACCESS_DENIED`
 
-### Requirement: Process-Level MCP Identity, Unified `target` + `focus` Schemas, and Scope Intersection
-`meru-mind-mcp` SHALL bind `MERU_MIND_ORG_ID`, `MERU_MIND_VIEWER_REALM_ID` (mandatory for `tree` organizations; optional default focus for `open` organizations), `MERU_MIND_ACTOR_ID`, and `MERU_MIND_ACTOR_FAMILY` at server startup.
-- MCP SHALL hardcode `actor.kind = 'agent'` and omit `actorKind` from every tool input schema.
-- MCP SHALL NOT expose `rule` writes, `redact`, `setOrgPolicy`, realm topology mutations (`createRealm`/`mountRealm`/`unmountRealm`), `mind_rebuild`, or `mind_export_slice`.
-- All MCP tools SHALL use unified `target` (accepting realm path OR ID) and (on read tools only) `focus` (accepting realm path OR ID), evaluating effective read scope as `scope(focus) ∩ scope(boundViewer)` and binding all write calls to `boundViewerRealmId`.
+### Requirement: Strictly 7-Tool Process-Bound MCP Server and Wire Schema Budget
+`meru-mind-mcp` SHALL bind `MERU_MIND_ORG_ID`, `MERU_MIND_VIEWER_REALM_ID` (required in `tree`), and actor identity with hardcoded `actor.kind = 'agent'`. It SHALL expose strictly 7 tools (`mind_whoami`, `mind_tree`, `mind_ls`, `mind_show`, `mind_search`, `mind_changes`, `mind_write`) with `JSON.stringify(toolsList).length <= 6000` and descriptions `<= 220` chars (`[read]`/`[write]`), excluding `actorKind`, `rule`, `redact`, topology, and admin ops.
 
-#### Scenario: Narrowing MCP focus to a child realm cannot escalate via child mounts or seabed
-- **WHEN** an MCP server is bound to parent realm `B2` in a `tree` organization and child realm `C2` mounts sibling `C1` (`scope: 'all'`) and has its own seabed entries
-- **THEN** calling `mind_recall`, `mind_brief`, `mind_tree`, `mind_ls`, `mind_cat`, `mind_replay`, `mind_changes`, `mind_list_objects`, `mind_list_tags`, `mind_list_things`, `mind_drive_read`, `mind_get_supersede_chain`, or `mind_list_realms` with `focus = C2` (by path or ID) stays strictly within `scope(C2) ∩ scope(B2)`, blocking `C1`'s mounted items and blocking `C2`'s seabed unless `includeDescendantSeabed = true`
+#### Scenario: MCP wire tools/list satisfies 7-tool count, 6000-char budget, and 220-char description cap
+- **WHEN** a client calls `tools/list` on `dist/mcp.js` over stdio JSON-RPC
+- **THEN** `tools.length === 7`, `JSON.stringify(result).length <= 6000`, every `description.length <= 220`, and zero tools expose `actorKind` or `rule` writes
 
-#### Scenario: MCP write tools accept target path or ID and always bind engine writes to boundViewerRealmId
-- **WHEN** an MCP server bound to parent realm `B2` in a `tree` organization receives a write call (`mind_append_record`, `mind_write_conclusion`, `mind_capture_seabed`, `mind_write_raw`, `mind_drive_write`, or `mind_settle`) with `target = "/b2"` (or `B2.id`)
-- **THEN** the MCP server passes `boundViewerRealmId` (`B2`) to the underlying engine so valid writes to `B2` succeed while references to `C2`'s private mounts (such as `C1`) are rejected with `NOT_FOUND`
+### Requirement: MCP Scope Intersection and Bound Write Enforcement
+Every MCP read tool SHALL evaluate visibility strictly within `scope(in/ref) ∩ scope(boundViewer)`, preventing child `@mount` and descendant seabed escalation. `mind_write` SHALL always pass `boundViewerRealmId` to the engine, enforce `assertMcpWrite`, accept `occurred_at: string | null | undefined`, and return 4-field errors using the 11 snake_case wire codes.
 
-### Requirement: Default-Safe CLI Privilege Model
-`meru-mind` CLI SHALL default `--actor-kind` to `'agent'` and reject `--actor-kind human` unless `--as-human` is explicitly passed. Human-only operations (`rule` records, `redact`, `org set-policy`, and `tree`-mode realm mutations) SHALL require `--as-human`.
+#### Scenario: Narrowing MCP reads to a child realm cannot escalate via child mounts or seabed
+- **WHEN** an MCP server bound to parent `B2` in a `tree` org calls `mind_search`, `mind_ls`, `mind_show`, or `mind_changes` targeting child `C2` (which mounts hidden `C1`)
+- **THEN** `C1`'s items remain completely hidden and `C2`'s seabed is blocked unless `include_descendant_seabed: true`
+- **AND** `mind_write` binds writes to `B2` and rejects `because` references pointing to `C1` with `not_found`
+
+### Requirement: Default-Safe CLI Privilege Model and 11 Wire Error Codes
+CLI SHALL default `--actor-kind` to `'agent'`, reject `--actor-kind human` without `--as-human`, and require `--as-human` for `rule add`, `redact`, `org set-policy`, and `tree` realm mutations. CLI and MCP SHALL map errors via `src/format/errors.ts` to 11 codes (`unknown_command`, `unknown_flag`, `invalid_ref`, `not_found`, `ambiguous_ref`, `not_listable`, `not_bound`, `forbidden`, `conflict`, `idempotency_mismatch`, `invalid_input`) in 4 fields (`error`, `message`, `candidates?`, `try`).
 
 #### Scenario: Default CLI invocation attempts a human-only operation
-- **WHEN** `meru-mind` runs `write <target> --class rule`, `redact`, or `org set-policy` without `--as-human`
-- **THEN** the CLI exits non-zero with `RULE_REQUIRES_HUMAN` or `ACCESS_DENIED`
+- **WHEN** `meru-mind` runs `rule add`, `redact`, or `org set-policy` without `--as-human`
+- **THEN** the CLI exits non-zero with wire error `forbidden` and a runnable `try:` hint
 
 ### Requirement: Sensitivity Read-Path and Export Enforcement
-- `secret` entries SHALL be excluded from FTS5, `vec_pending`, `vec_items`, `listRecords`, `listSeabedEntries`, `thingId` timelines, Stage 2 structured filters, `brief`, `tree`, `ls`, `settle` (`sourceIds`), `exportSlice`, and `change_log` summaries; they SHALL only be readable by exact ID lookup within visible scope.
-- `confidential` entries SHALL participate in in-organization recall and `brief`, but SHALL be strictly excluded (along with distillations citing them) from `exportSlice()`.
+Sensitivity SHALL use the kernel enum `public | internal | confidential | secret` (default `internal`). `secret` entries SHALL be excluded from FTS5, `vec_pending`, `vec_items`, `listRecords`, `listSeabedEntries`, `whoami`, `tree`, `ls`, `show` (realm/object), `search`, `changes`, `settle`, and `exportSlice`, remaining readable only by exact entry ID within visible scope. `confidential` entries SHALL be excluded from `exportSlice()`.
 
 #### Scenario: Secret entry is hidden from all list paths yet readable by exact ID
-- **WHEN** a `secret` record or seabed entry exists in a visible realm
-- **THEN** FTS/vector recall, Stage 2 filter, `thingId` timeline, `brief`, `tree`, `ls`, `exportSlice`, and `listChangeLog` omit it completely
-- **AND** `recall({ id })` within visible scope returns the exact entry
-
-#### Scenario: Confidential entry is excluded from sandbox slice exports
-- **WHEN** `exportSlice()` runs on a realm containing `confidential` records, seabed entries, and a cognitive card citing them
-- **THEN** no file in the exported slice directory contains any `confidential` content or ID
+- **WHEN** a `secret` entry exists in a visible realm
+- **THEN** `whoami`, `tree`, `ls`, `search`, `changes`, and `exportSlice` omit it completely while exact ID lookup in visible scope returns it
 
 ### Requirement: Unified Field-Level Reference and Path Sanitization
-`LedgerEngine` (`listRealms()`, `getSupersedeChain()`, `listThings()`, `findThingByExternalRef()`), `ObjectEngine` (`getObject()`, `listObjects()`), and `SeaEngine` (`tree()`, `brief()`, `recall()`, `ls()`, `cat()`, `replay()`, `changes()`) SHALL share a single visibility sanitizer (`createVisibilityHelpers`) that strips invisible or `secret` references (`refs`, `sourceRefs`, `supersedesId`, `supersedesIds`, `supersededById`, `sourceIds`, `seabed.sourceRef`), rewrites hidden-ancestor realm paths to `@mounted/<alias>` with `parentId = null`, and sets `parentObjectId = null` when an object's parent lies outside `scope.readableLedgerIds`.
+All engine read methods SHALL share `createVisibilityHelpers` to strip invisible or `secret` references (`refs`, `sourceRefs`, `supersedesId`, `supersedesIds`, `supersededById`, `sourceIds`, `seabed.sourceRef`), rewrite hidden-ancestor realm paths to `@mounted/<alias>` with `parentId = null`, and set `parentObjectId = null` when an object's parent lies outside `scope.readableLedgerIds`.
 
 #### Scenario: Ledger-mounted viewer traverses a supersede chain referencing hidden descendant seabed
 - **WHEN** realm `B` has a record citing descendant `C`'s seabed, and realm `X` mounts only `B`'s `ledger`
-- **THEN** calling `getSupersedeChain()` or `recall({ id })` from `X` returns `B`'s record with `C`'s seabed ID removed from `refs` and `sourceRefs`
+- **THEN** `getSupersedeChain()` and `show` from `X` strip `C`'s seabed ID from `refs` and `sourceRefs`
 
-### Requirement: Local Cooperative Trust Model Boundary
-In local single-host CLI/SQLite mode, `--as-human`, TTY prompts, and `confirmedByHuman` SHALL be treated strictly as cooperative workflow markers to prevent accidental agent noise or misuse, NOT as cryptographic security boundaries against an agent possessing local shell or filesystem access. Hard enforcement of human identity and isolation against untrusted local agents requires process-separated server custody or an authoritative host harness.
+### Requirement: Local Cooperative Trust Model and Content-Hash Blocklist Boundary
+In local single-host CLI/SQLite mode, `--as-human`, `confirmedByHuman`, `whoami.store` (local-only metadata, never exposed in remote/HTTP mode), and the global `(org_id, content_sha256)` redaction blocklist SHALL be treated strictly as cooperative safeguards against accidental agent noise or exact-match re-ingestion, NOT as cryptographic security or DLP boundaries (a 1-character edit bypasses exact-hash matching). Hard isolation against untrusted agents requires process-separated server custody.
 
-#### Scenario: Cooperative marker is not relied upon as a security boundary
-- **WHEN** an embedded orchestrator or multi-party verification workflow requires authoritative human verification
-- **THEN** the caller supplies authenticated `Actor` identity from its own trusted control plane rather than relying on local CLI `--as-human` flags or unauthenticated `confirmedByHuman` markers
+#### Scenario: Cooperative markers and exact-hash blocklist are documented as non-cryptographic safeguards
+- **WHEN** an operator evaluates local CLI mode or exact-hash redaction blocking
+- **THEN** exact duplicate re-writes are blocked automatically, while modified text is accepted and authoritative security boundaries remain in process-separated control planes

@@ -37,10 +37,21 @@ import {
   sanitizeRealmsForScope,
 } from "./visibility.js";
 import {
+  computeFileContentSha256,
+  computePayloadHash,
+  computeRecordContentSha256,
+  computeSeabedContentSha256,
+  REDACTED_CONTENT_BLOCKED_MSG,
+  REDACTED_CONTENT_TRY_HINT,
+  sha256Bytes,
+} from "./content-hash.js";
+import {
   normalizeResourceTag,
   OPAQUE_OBJECT_NOT_FOUND,
   resolveVisibleRealm,
 } from "./objects.js";
+
+export { computePayloadHash };
 
 const VALID_SEABED_KINDS = new Set<string>([
   "message",
@@ -67,29 +78,6 @@ const VALID_SENSITIVITIES = new Set<string>([
   "secret",
 ]);
 
-function canonicalizeJson(value: unknown): unknown {
-  if (value === null || typeof value !== "object") {
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => canonicalizeJson(item));
-  }
-  const obj = value as Record<string, unknown>;
-  const sorted: Record<string, unknown> = {};
-  for (const key of Object.keys(obj).sort()) {
-    const v = obj[key];
-    if (v !== undefined) {
-      sorted[key] = canonicalizeJson(v);
-    }
-  }
-  return sorted;
-}
-
-export function computePayloadHash(value: unknown): string {
-  const canonical = JSON.stringify(canonicalizeJson(value));
-  return crypto.createHash("sha256").update(canonical).digest("hex");
-}
-
 function validateSensitivity(raw?: Sensitivity): Sensitivity {
   const sensitivity = raw ?? "internal";
   if (!VALID_SENSITIVITIES.has(sensitivity)) {
@@ -111,10 +99,6 @@ function normalizeIdempotencyKey(raw?: string): string | null {
     );
   }
   return trimmed;
-}
-
-function sha256Buffer(content: Buffer | string): string {
-  return crypto.createHash("sha256").update(content).digest("hex");
 }
 
 function validateActor(actor: Actor): Actor {
@@ -599,6 +583,8 @@ export class LedgerEngine {
     originSessionId?: string | null;
     sensitivity?: Sensitivity;
     idempotencyKey?: string;
+    /** Explicit human-only override to allow writing content matching redacted_blocklist */
+    allowRedactedReingest?: boolean;
   }): Promise<SeabedEntry> {
     const actor = validateActor(params.actor);
     if (!VALID_SEABED_KINDS.has(params.kind)) {
@@ -628,7 +614,7 @@ export class LedgerEngine {
     ).sort();
     const pendingBlobSha256 =
       params.blobContent !== undefined
-        ? sha256Buffer(params.blobContent)
+        ? sha256Bytes(params.blobContent)
         : null;
     const hasExplicitNullOccurredAt = params.occurredAt === null;
     const explicitOccurredAt =
@@ -730,6 +716,31 @@ export class LedgerEngine {
       });
 
       const targetRealm = realms.find((r) => r.id === targetRealmId)!;
+
+      // Global content-hash redaction blocklist check across org regardless of source_ref
+      const allowRedacted =
+        params.allowRedactedReingest === true && actor.kind === "human";
+      if (!allowRedacted) {
+        const textSha = text ? computeSeabedContentSha256(text) : null;
+        const metaSha =
+          typeof metadata.contentSha256 === "string" &&
+          metadata.contentSha256.trim()
+            ? metadata.contentSha256.trim()
+            : null;
+        if (
+          (textSha !== null &&
+            this.db.isContentShaBlocked(targetRealm.orgId, textSha)) ||
+          (pendingBlobSha256 !== null &&
+            this.db.isContentShaBlocked(targetRealm.orgId, pendingBlobSha256)) ||
+          (metaSha !== null &&
+            this.db.isContentShaBlocked(targetRealm.orgId, metaSha))
+        ) {
+          throw new MindError("ACCESS_DENIED", REDACTED_CONTENT_BLOCKED_MSG, {
+            reason: "redacted_blocklist",
+            try: REDACTED_CONTENT_TRY_HINT,
+          });
+        }
+      }
 
       if (objectIds.length > 0) {
         const callerScope = resolveAccessScope({
@@ -860,6 +871,8 @@ export class LedgerEngine {
     originSessionId?: string | null;
     sensitivity?: Sensitivity;
     idempotencyKey?: string;
+    /** Explicit human-only override to allow writing content matching redacted_blocklist */
+    allowRedactedReingest?: boolean;
   }): Promise<LedgerRecord> {
     const actor = validateActor(params.actor);
     if (!VALID_RECORD_KINDS.has(params.kind)) {
@@ -1019,6 +1032,28 @@ export class LedgerEngine {
       });
 
       const targetRealm = realms.find((r) => r.id === targetRealmId)!;
+
+      // Global content-hash redaction blocklist check across org regardless of source_ref
+      const allowRedacted =
+        params.allowRedactedReingest === true && actor.kind === "human";
+      if (!allowRedacted) {
+        const recordSha = computeRecordContentSha256(title, payload);
+        const payloadContentSha =
+          typeof payload.contentSha256 === "string" &&
+          payload.contentSha256.trim()
+            ? payload.contentSha256.trim()
+            : null;
+        if (
+          this.db.isContentShaBlocked(targetRealm.orgId, recordSha) ||
+          (payloadContentSha !== null &&
+            this.db.isContentShaBlocked(targetRealm.orgId, payloadContentSha))
+        ) {
+          throw new MindError("ACCESS_DENIED", REDACTED_CONTENT_BLOCKED_MSG, {
+            reason: "redacted_blocklist",
+            try: REDACTED_CONTENT_TRY_HINT,
+          });
+        }
+      }
 
       if (objectIds.length > 0) {
         const callerScope = resolveAccessScope({
@@ -1505,9 +1540,9 @@ export class LedgerEngine {
       const residualLocations: string[] = [];
       let blobToDelete: string | null = null;
 
-      // Compute blocklist key (org_id, source_ref, content_sha256) before wiping content
+      // Compute canonical content hashes before wiping content
       let sourceRef: string;
-      let contentSha256: string;
+      const contentHashes = new Set<string>();
       let blobSha256: string | null = null;
 
       if (rec) {
@@ -1517,13 +1552,13 @@ export class LedgerEngine {
           rec.payload.sourceRef.trim()
             ? rec.payload.sourceRef.trim()
             : `record://${rec.id}`);
-        contentSha256 =
+        contentHashes.add(computeRecordContentSha256(rec.title, rec.payload));
+        if (
           typeof rec.payload.contentSha256 === "string" &&
           rec.payload.contentSha256.trim()
-            ? rec.payload.contentSha256.trim()
-            : sha256Buffer(
-                `${rec.title}\n${JSON.stringify(canonicalizeJson(rec.payload))}`,
-              );
+        ) {
+          contentHashes.add(rec.payload.contentSha256.trim());
+        }
         this.db.redactRecordRow({
           id: rec.id,
           redactedAt: now,
@@ -1534,12 +1569,18 @@ export class LedgerEngine {
         const s = sea!;
         blobSha256 = s.blobSha256;
         sourceRef = s.sourceRef?.trim() || `seabed://${s.id}`;
-        contentSha256 =
-          s.blobSha256 ??
-          (typeof s.metadata.contentSha256 === "string" &&
+        if (s.blobSha256) {
+          contentHashes.add(s.blobSha256);
+        }
+        if (
+          typeof s.metadata.contentSha256 === "string" &&
           s.metadata.contentSha256.trim()
-            ? s.metadata.contentSha256.trim()
-            : sha256Buffer(s.text));
+        ) {
+          contentHashes.add(s.metadata.contentSha256.trim());
+        }
+        if (s.text.trim()) {
+          contentHashes.add(computeSeabedContentSha256(s.text));
+        }
         this.db.redactSeabedRow({
           id: s.id,
           redactedAt: now,
@@ -1598,14 +1639,16 @@ export class LedgerEngine {
       }
       residualLocations.push(...Array.from(residualSet).sort());
 
-      // Record exact (org_id, source_ref, content_sha256) in redacted_blocklist
-      this.db.insertRedactedBlocklist({
-        orgId,
-        sourceRef,
-        contentSha256,
-        reason,
-        redactedAt: now,
-      });
+      // Record exact (org_id, source_ref, content_sha256) entries in redacted_blocklist
+      for (const contentSha256 of contentHashes) {
+        this.db.insertRedactedBlocklist({
+          orgId,
+          sourceRef,
+          contentSha256,
+          reason,
+          redactedAt: now,
+        });
+      }
 
       // Record redact op in change_log
       this.db.appendChangeLog({
@@ -1660,6 +1703,8 @@ export class LedgerEngine {
     content: string;
     expectedVersion?: number;
     message?: string;
+    /** Explicit human-only override to allow writing content matching redacted_blocklist */
+    allowRedactedReingest?: boolean;
   }): Promise<{ meta: DriveFileMeta; commitId?: string; artifactId: string }> {
     const targetRealmId = params.targetRealmId ?? params.viewerRealmId;
     const realms = this.db.listRealms();
@@ -1677,6 +1722,19 @@ export class LedgerEngine {
       required: "write",
       orgPolicy,
     });
+
+    const targetRealm = realms.find((r) => r.id === targetRealmId)!;
+    const allowRedacted =
+      params.allowRedactedReingest === true && params.actor.kind === "human";
+    if (!allowRedacted) {
+      const fileSha = computeFileContentSha256(params.content);
+      if (this.db.isContentShaBlocked(targetRealm.orgId, fileSha)) {
+        throw new MindError("ACCESS_DENIED", REDACTED_CONTENT_BLOCKED_MSG, {
+          reason: "redacted_blocklist",
+          try: REDACTED_CONTENT_TRY_HINT,
+        });
+      }
+    }
 
     // Write via DrivePort (LayerFS or LocalFs) with optimistic conflict detection
     const res = await this.drive.writeFile({
@@ -1711,6 +1769,7 @@ export class LedgerEngine {
         sha256: meta.sha256,
         commitId: res.commitId ?? null,
       },
+      allowRedactedReingest: params.allowRedactedReingest,
     });
 
     return { meta, commitId: res.commitId, artifactId: artifact.id };

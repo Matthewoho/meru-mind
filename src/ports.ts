@@ -213,7 +213,11 @@ export interface DbPort {
     includeObjectLinkedOpenMode: boolean;
     includeSuperseded: boolean;
     kind?: string;
+    kinds?: string[];
     tag?: string;
+    since?: string;
+    until?: string;
+    entryIdsFilter?: string[];
     excludeSensitivities?: Sensitivity[];
     limit: number;
     offset: number;
@@ -225,7 +229,10 @@ export interface DbPort {
     seabedRealmIds: string[];
     includeSuperseded: boolean;
     kind?: string;
+    kinds?: string[];
     tag?: string;
+    since?: string;
+    until?: string;
     excludeSensitivities?: Sensitivity[];
     limit: number;
     offset: number;
@@ -304,6 +311,8 @@ export interface DbPort {
     sourceRef: string,
     contentSha256: string,
   ): boolean;
+  /** O(1) indexed global content-hash blocklist check across an organization regardless of source_ref */
+  isContentShaBlocked(orgId: string, contentSha256: string): boolean;
   listRedactedBlocklist(orgId: string): RedactedBlocklistEntry[];
   optimizeFtsAndCheckpoint(): WalCheckpointResult;
 
@@ -346,6 +355,12 @@ export interface DbPort {
   // Change log (append-only operational event log; never cleared by rebuild())
   getChangeLogGeneration(): number;
   getLatestChangeLogSeq(orgId?: string): number;
+  getLatestVisibleChangeLogSeq(params: {
+    orgId: string;
+    ledgerRealmIds: string[];
+    seabedRealmIds: string[];
+    includeSecret?: boolean;
+  }): number;
   getChangeLogSeqForEntity(entityType: string, entityId: string): number | null;
   countChangeLogSince(params: {
     orgId: string;

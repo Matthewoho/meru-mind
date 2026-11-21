@@ -542,16 +542,13 @@ describe("Adversarial security & invariant regressions", () => {
         child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
       });
 
-    const init = await run(["init", "--org", "Acme"]);
+    const init = await run(["admin", "init", "--org", "Acme"]);
     expect(init.code).toBe(0);
-    const rootId = (JSON.parse(init.stdout) as { rootRealm: { id: string } }).rootRealm.id;
 
     const first = await run([
-      "drive",
+      "file",
       "write",
-      rootId,
-      "--path",
-      "race.md",
+      "file:/race.md",
       "--content",
       "v1",
       "--expected-version",
@@ -562,11 +559,9 @@ describe("Adversarial security & invariant regressions", () => {
     const racers = await Promise.all(
       Array.from({ length: 6 }, (_, i) =>
         run([
-          "drive",
+          "file",
           "write",
-          rootId,
-          "--path",
-          "race.md",
+          "file:/race.md",
           "--content",
           `winner-${i}`,
           "--expected-version",
@@ -577,7 +572,7 @@ describe("Adversarial security & invariant regressions", () => {
 
     const wins = racers.filter((r) => r.code === 0);
     const conflicts = racers.filter(
-      (r) => r.code !== 0 && r.stderr.includes("CONFLICT"),
+      (r) => r.code !== 0 && r.stderr.includes('"conflict"'),
     );
     expect(wins).toHaveLength(1);
     expect(conflicts).toHaveLength(5);
@@ -598,8 +593,15 @@ describe("Adversarial security & invariant regressions", () => {
     await client.connect(transport);
     try {
       const tools = await client.listTools();
-      expect(tools.tools.some((t) => t.name === "mind_get_supersede_chain")).toBe(true);
-      expect(tools.tools.some((t) => t.name === "mind_drive_list")).toBe(true);
+      expect(tools.tools.map((t) => t.name).sort()).toEqual([
+        "mind_changes",
+        "mind_ls",
+        "mind_search",
+        "mind_show",
+        "mind_tree",
+        "mind_whoami",
+        "mind_write",
+      ]);
     } finally {
       await client.close();
     }
