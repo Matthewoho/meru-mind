@@ -31,6 +31,26 @@ export interface FtsMatch {
   rank: number;
 }
 
+export interface UnifiedFtsSearchParams {
+  ftsExpression: string;
+  ledgerRealmIds: string[];
+  seabedRealmIds: string[];
+  includeSuperseded: boolean;
+  recordKinds?: RecordKind[];
+  seabedKinds?: SeabedKind[];
+  since?: string;
+  until?: string;
+  allowedEntryIds?: string[];
+  perBucketLimit: number;
+}
+
+export interface UnifiedFtsSearchResult {
+  rows: FtsMatch[];
+  total: number;
+  ledgerCount: number;
+  seabedCount: number;
+}
+
 export interface VectorMatch {
   itemId: string;
   sourceType: "record" | "seabed" | "distillation";
@@ -119,6 +139,7 @@ export interface DbPort {
     offset?: number;
   }): { items: SeabedEntry[]; total: number };
   listAllSeabedEntries(): SeabedEntry[];
+  listSeabedEntriesBatch(afterId: string, limit: number): SeabedEntry[];
 
   // Records (truth source 2: append-only ledger with supersede chains)
   insertRecord(record: LedgerRecord): void;
@@ -238,6 +259,7 @@ export interface DbPort {
     offset: number;
   }): { rows: UnifiedEntryRef[]; total: number };
   listAllRecords(): LedgerRecord[];
+  listRecordsBatch(afterId: string, limit: number): LedgerRecord[];
 
   // Objects, Entry-Object Links & Resource Tags (Migration v3)
   insertObject(obj: MindObject): void;
@@ -342,6 +364,8 @@ export interface DbPort {
     offset?: number;
   }): { items: Distillation[]; total: number };
   listAllDistillations(): Distillation[];
+  listDistillationsBatch(afterId: string, limit: number): Distillation[];
+  listAllCanonicalIds(): Set<string>;
 
   // Drive file metadata index (tracks latest canonical blob sha256 per realm+path)
   upsertDriveFileMeta(meta: DriveFileMeta): void;
@@ -384,9 +408,12 @@ export interface DbPort {
   // Rebuildable FTS5 index
   upsertFtsItem(item: {
     itemId: string;
+    orgId: string;
     sourceType: "record" | "seabed" | "distillation";
     realmId: string;
     status: string;
+    kind: string;
+    occurredAt: string | null;
     title: string;
     body: string;
   }): void;
@@ -407,6 +434,7 @@ export interface DbPort {
     sourceTypes?: Array<"record" | "seabed" | "distillation">;
     includeSuperseded: boolean;
   }): number;
+  searchFtsUnified(params: UnifiedFtsSearchParams): UnifiedFtsSearchResult;
   clearFtsIndex(): void;
 
   // Rebuildable sqlite-vec index

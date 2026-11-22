@@ -24,7 +24,7 @@ import {
 
 function okResult(data: unknown) {
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+    content: [{ type: "text" as const, text: JSON.stringify(data) }],
   };
 }
 
@@ -39,7 +39,7 @@ function errResult(
   });
   return {
     isError: true,
-    content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+    content: [{ type: "text" as const, text: JSON.stringify(payload) }],
   };
 }
 
@@ -369,9 +369,13 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
 
   server.tool(
     "mind_show",
-    "[read] Inspect any ref: /realm (brief), kind:name (object card), rec_/sea_ (entry + optional history/context), or file:/realm/path.",
+    "[read] Inspect any ref: /realm (brief), kind:name (object card), rec_/sea_ (bounded window + optional history/context), or file:/realm/path.",
     {
       ref: z.string(),
+      around: z.string().optional(),
+      cursor: z.string().optional(),
+      limit: z.number().int().positive().max(200000).optional(),
+      full: z.boolean().optional(),
       history: z.boolean().optional(),
       context: z.number().int().nonnegative().max(100).optional(),
       include_descendant_seabed: z.boolean().optional(),
@@ -385,6 +389,10 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
             actor: boundActor,
             viewerRealmId: boundViewerRealmId,
             ref: args.ref,
+            around: args.around,
+            cursor: args.cursor,
+            limit: args.limit,
+            full: args.full,
             history: args.history,
             context: args.context,
             includeDescendantSeabed,

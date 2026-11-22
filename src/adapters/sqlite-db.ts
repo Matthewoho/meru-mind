@@ -2,12 +2,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
+import { buildRecordFtsBody } from "../format/snippet.js";
 import type {
   DbPort,
   FtsMatch,
   PendingVectorItem,
   RealmRecordCountRow,
   UnifiedEntryRef,
+  UnifiedFtsSearchParams,
+  UnifiedFtsSearchResult,
   VectorMatch,
 } from "../ports.js";
 import {
@@ -42,15 +45,37 @@ export interface SqliteDbOptions {
 }
 
 const DEFAULT_VECTOR_DIM = 1536;
+const DEFAULT_BUSY_TIMEOUT_MS = 30000;
+
+const CJK_CHAR_RE =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const CJK_RUN_RE =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 
 /**
  * Normalizes mixed CJK + Latin text for SQLite FTS5 unicode61:
- * preserves Latin/numeric words while spacing individual CJK ideographs
- * so Chinese/Japanese/Korean phrases match reliably without external tokenizers.
+ * - Preserves Latin/numeric words and exact word boundaries.
+ * - Inserts spaces at CJK <-> Latin/digit boundaries so tokens never fuse.
+ * - For contiguous CJK runs (Han/Hiragana/Katakana/Hangul):
+ *   - L === 1: emits the single character (e.g. "锁").
+ *   - L >= 2: emits overlapping 2-char bigram tokens plus the trailing character
+ *     (e.g. "发布平台" -> "发布 布平 平台 台") for single-token posting lookups
+ *     with zero cross-punctuation false positives.
  */
 export function normalizeForFts(text: string): string {
   return text
-    .replace(/([\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}])/gu, " $1 ")
+    .replace(CJK_RUN_RE, (run) => {
+      const chars = Array.from(run);
+      if (chars.length === 1) {
+        return ` ${chars[0]!} `;
+      }
+      const tokens: string[] = [];
+      for (let i = 0; i < chars.length - 1; i += 1) {
+        tokens.push(`${chars[i]!}${chars[i + 1]!}`);
+      }
+      tokens.push(chars[chars.length - 1]!);
+      return ` ${tokens.join(" ")} `;
+    })
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -133,9 +158,8 @@ const CJK_BIGRAM_STOPWORDS = new Set([
   "了没",
 ]);
 
-const CJK_CHAR_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
 const SEGMENT_RE =
-  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]+|[A-Za-z0-9_]+(?:[-/:.][A-Za-z0-9_]+)*/gu;
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+|[A-Za-z0-9_]+(?:[-/:.][A-Za-z0-9_]+)*/gu;
 
 export const CJK_COVERAGE_THRESHOLD = 0.75;
 
@@ -144,14 +168,14 @@ export interface SearchConcept {
   ftsPhrase: string;
   /** Retained terms for matching (2-char bigrams for CJK len>=3, [raw] for len 1-2 or non-CJK) */
   terms: string[];
-  /** FTS5 expression for this concept: `"t"` or `("b 1" OR "b 2" ...)` */
+  /** FTS5 expression for this concept: `"t"`, `"c"*`, or `("b1" OR "b2" ...)` */
   ftsGroupExpr: string;
   isCjk: boolean;
   isIdentifier: boolean;
-  /** Continuous coverage score in [0, 1] */
-  scoreText(text: string): number;
+  /** Continuous coverage score in [0, 1]; optional pre-lowercased text avoids repeated .toLowerCase() */
+  scoreText(text: string, lowerText?: string): number;
   /** Covered per pre-registered threshold (>= 0.75 for CJK, 1.0 for non-CJK) */
-  matchText(text: string): boolean;
+  matchText(text: string, lowerText?: string): boolean;
 }
 
 export interface ParsedSearchQuery {
@@ -173,6 +197,15 @@ function quoteFtsPhrase(phrase: string): string {
   return `"${phrase.replace(/"/g, '""')}"`;
 }
 
+function formatCjkFtsTerm(term: string): string {
+  const chars = Array.from(term);
+  if (chars.length === 1) {
+    // Prefix match catches every bigram starting with this character PLUS the trailing single character
+    return `${quoteFtsPhrase(term)}*`;
+  }
+  return quoteFtsPhrase(term);
+}
+
 function generateOverlappingBigrams(segment: string): string[] {
   const chars = Array.from(segment);
   if (chars.length <= 2) return [segment];
@@ -187,8 +220,6 @@ function makeCjkConcept(raw: string): SearchConcept | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   const chars = Array.from(trimmed);
-  const ftsPhrase = normalizeForFts(trimmed);
-  if (!ftsPhrase) return null;
 
   let terms: string[];
   if (chars.length <= 2) {
@@ -199,14 +230,15 @@ function makeCjkConcept(raw: string): SearchConcept | null {
     terms = filtered.length > 0 ? filtered : allBigrams;
   }
 
+  const ftsPhrase = terms.join(" ");
   const lowerRaw = trimmed.toLowerCase();
   const lowerTerms = terms.map((t) => t.toLowerCase());
-  const ftsPhrases = terms.map((t) => quoteFtsPhrase(normalizeForFts(t)));
+  const ftsTokens = terms.map((t) => formatCjkFtsTerm(t));
   const ftsGroupExpr =
-    ftsPhrases.length === 1 ? ftsPhrases[0]! : `(${ftsPhrases.join(" OR ")})`;
+    ftsTokens.length === 1 ? ftsTokens[0]! : `(${ftsTokens.join(" OR ")})`;
 
-  const scoreText = (text: string): number => {
-    const lowerText = text.toLowerCase();
+  const scoreText = (text: string, preLower?: string): number => {
+    const lowerText = preLower ?? text.toLowerCase();
     if (lowerText.includes(lowerRaw)) {
       return 1.0;
     }
@@ -230,7 +262,8 @@ function makeCjkConcept(raw: string): SearchConcept | null {
     isCjk: true,
     isIdentifier: false,
     scoreText,
-    matchText: (text: string) => scoreText(text) >= CJK_COVERAGE_THRESHOLD,
+    matchText: (text: string, preLower?: string) =>
+      scoreText(text, preLower) >= CJK_COVERAGE_THRESHOLD,
   };
 }
 
@@ -362,10 +395,10 @@ export function parseSearchQuery(rawQuery: string): ParsedSearchQuery {
   for (const c of concepts) {
     if (c.isCjk) {
       for (const t of c.terms) {
-        const phrase = quoteFtsPhrase(normalizeForFts(t));
-        if (!seenOr.has(phrase)) {
-          seenOr.add(phrase);
-          orClauses.push(phrase);
+        const tokenExpr = formatCjkFtsTerm(t);
+        if (!seenOr.has(tokenExpr)) {
+          seenOr.add(tokenExpr);
+          orClauses.push(tokenExpr);
         }
       }
     } else {
@@ -393,6 +426,29 @@ export function buildFtsMatchExpression(rawQuery: string): string | null {
 
 function placeholders(count: number): string {
   return Array.from({ length: count }, () => "?").join(", ");
+}
+
+function appendSensitivityExclusion(
+  where: string[],
+  params: SQLInputValue[],
+  column: string,
+  excludeSensitivities: Sensitivity[],
+): void {
+  const unique = Array.from(new Set(excludeSensitivities));
+  for (const s of unique) {
+    if (s === "secret") {
+      where.push(`${column} != 'secret'`);
+    } else if (s === "confidential") {
+      where.push(`${column} != 'confidential'`);
+    } else if (s === "internal") {
+      where.push(`${column} != 'internal'`);
+    } else if (s === "public") {
+      where.push(`${column} != 'public'`);
+    } else {
+      where.push(`${column} != ?`);
+      params.push(s);
+    }
+  }
 }
 
 function normalizeL2(embedding: Float32Array): Float32Array {
@@ -488,7 +544,7 @@ export class SqliteDb implements DbPort {
       },
     };
 
-    this.db.exec("PRAGMA busy_timeout = 10000;");
+    this.db.exec(`PRAGMA busy_timeout = ${DEFAULT_BUSY_TIMEOUT_MS};`);
     this.execPragmaWithBusyRetry("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec("PRAGMA secure_delete = ON;");
@@ -565,7 +621,24 @@ export class SqliteDb implements DbPort {
     `);
   }
 
+  private assertMinSqliteVersion(minMajor: number, minMinor: number): void {
+    const row = this.db
+      .prepare(`SELECT sqlite_version() AS v`)
+      .get() as { v: string } | undefined;
+    const raw = String(row?.v ?? "0.0.0");
+    const parts = raw.split(".").map((p) => Number.parseInt(p, 10) || 0);
+    const major = parts[0] ?? 0;
+    const minor = parts[1] ?? 0;
+    if (major < minMajor || (major === minMajor && minor < minMinor)) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `SQLite >= ${minMajor}.${minMinor}.0 is required for contentless_delete FTS5; got ${raw}`,
+      );
+    }
+  }
+
   private initSchema(): void {
+    this.assertMinSqliteVersion(3, 43);
     this.transaction(() => {
       const now = new Date().toISOString();
 
@@ -1122,6 +1195,204 @@ export class SqliteDb implements DbPort {
           .run(now);
       }
 
+      // Migration v6: V0.2a-Perf (fts_docs metadata side-table + contentless_delete CJK-bigram FTS5
+      // + partial covering indexes + streaming keyset-batched backfill)
+      if (!applied.has(6)) {
+        this.assertMinSqliteVersion(3, 43);
+
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS fts_docs (
+            docid INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id TEXT NOT NULL UNIQUE,
+            org_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            realm_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            occurred_at TEXT
+          );
+          CREATE INDEX IF NOT EXISTS idx_fts_docs_realm_type_status
+            ON fts_docs(realm_id, source_type, status);
+          CREATE INDEX IF NOT EXISTS idx_fts_docs_org
+            ON fts_docs(org_id);
+          DELETE FROM fts_docs;
+
+          DROP TABLE IF EXISTS fts_index;
+          CREATE VIRTUAL TABLE fts_index USING fts5(
+            title,
+            body,
+            content='',
+            contentless_delete=1,
+            tokenize='unicode61'
+          );
+          INSERT INTO fts_index(fts_index, rank) VALUES('secure-delete', 1);
+
+          CREATE INDEX IF NOT EXISTS idx_records_live_ls ON records(
+            realm_id, (occurred_at IS NULL), occurred_at DESC, created_at DESC, id DESC, kind, org_id, sensitivity, status, redacted_at
+          ) WHERE status = 'active' AND redacted_at IS NULL AND sensitivity != 'secret';
+
+          CREATE INDEX IF NOT EXISTS idx_records_live_counts ON records(
+            realm_id, kind, sensitivity, status, redacted_at
+          ) WHERE status = 'active' AND redacted_at IS NULL AND sensitivity != 'secret';
+
+          CREATE INDEX IF NOT EXISTS idx_seabed_live_ls ON seabed_entries(
+            realm_id, (occurred_at IS NULL), occurred_at DESC, created_at DESC, id DESC, kind, org_id, sensitivity, redacted_at
+          ) WHERE redacted_at IS NULL AND sensitivity != 'secret';
+        `);
+
+        const BATCH = 500;
+        const insertDocStmt = this.db.prepare(
+          `INSERT INTO fts_docs (item_id, org_id, source_type, realm_id, status, kind, occurred_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        );
+        const insertFtsStmt = this.db.prepare(
+          `INSERT INTO fts_index (rowid, title, body) VALUES (?, ?, ?)`,
+        );
+
+        // 1) Stream records via keyset pagination (WHERE id > ? ORDER BY id ASC LIMIT 500)
+        const selectRecBatch = this.db.prepare(
+          `SELECT r.id, COALESCE(r.org_id, rl.org_id, '') AS org_id, r.realm_id, r.status, r.kind, r.occurred_at, r.title, r.payload_json
+           FROM records r
+           LEFT JOIN realms rl ON rl.id = r.realm_id
+           WHERE r.id > ? AND r.sensitivity != 'secret' AND r.status != 'retracted' AND r.redacted_at IS NULL
+           ORDER BY r.id ASC
+           LIMIT ?`,
+        );
+        let lastRecId = "";
+        while (true) {
+          const rows = selectRecBatch.all(lastRecId, BATCH) as Array<{
+            id: string;
+            org_id: string;
+            realm_id: string;
+            status: string;
+            kind: string;
+            occurred_at: string | null;
+            title: string;
+            payload_json: string;
+          }>;
+          if (rows.length === 0) break;
+          for (const r of rows) {
+            let payload: Record<string, unknown> = {};
+            try {
+              payload = JSON.parse(String(r.payload_json)) as Record<
+                string,
+                unknown
+              >;
+            } catch {
+              payload = {};
+            }
+            const body = buildRecordFtsBody(payload);
+            const info = insertDocStmt.run(
+              r.id,
+              String(r.org_id ?? ""),
+              "record",
+              r.realm_id,
+              r.status,
+              r.kind,
+              r.occurred_at == null ? null : String(r.occurred_at),
+            );
+            insertFtsStmt.run(
+              Number(info.lastInsertRowid),
+              normalizeForFts(String(r.title)),
+              normalizeForFts(body),
+            );
+          }
+          lastRecId = String(rows[rows.length - 1]!.id);
+          if (rows.length < BATCH) break;
+        }
+
+        // 2) Stream seabed_entries via keyset pagination
+        const selectSeaBatch = this.db.prepare(
+          `SELECT s.id, COALESCE(s.org_id, rl.org_id, '') AS org_id, s.realm_id, s.kind, s.topic_id, s.occurred_at, s.text
+           FROM seabed_entries s
+           LEFT JOIN realms rl ON rl.id = s.realm_id
+           WHERE s.id > ? AND s.sensitivity != 'secret' AND s.redacted_at IS NULL
+           ORDER BY s.id ASC
+           LIMIT ?`,
+        );
+        let lastSeaId = "";
+        while (true) {
+          const rows = selectSeaBatch.all(lastSeaId, BATCH) as Array<{
+            id: string;
+            org_id: string;
+            realm_id: string;
+            kind: string;
+            topic_id: string | null;
+            occurred_at: string | null;
+            text: string;
+          }>;
+          if (rows.length === 0) break;
+          for (const s of rows) {
+            const title = `${s.kind}:${s.topic_id ?? s.realm_id}`;
+            const info = insertDocStmt.run(
+              s.id,
+              String(s.org_id ?? ""),
+              "seabed",
+              s.realm_id,
+              "evidence",
+              s.kind,
+              s.occurred_at == null ? null : String(s.occurred_at),
+            );
+            insertFtsStmt.run(
+              Number(info.lastInsertRowid),
+              normalizeForFts(title),
+              normalizeForFts(String(s.text)),
+            );
+          }
+          lastSeaId = String(rows[rows.length - 1]!.id);
+          if (rows.length < BATCH) break;
+        }
+
+        // 3) Stream distillations via keyset pagination (org_id from realm, kind = layer, occurred_at = created_at)
+        const selectDistBatch = this.db.prepare(
+          `SELECT d.id, r.org_id, d.realm_id, d.layer, d.period_key, d.status, d.narrative_md, d.created_at
+           FROM distillations d
+           JOIN realms r ON r.id = d.realm_id
+           WHERE d.id > ? AND d.status != 'retracted'
+           ORDER BY d.id ASC
+           LIMIT ?`,
+        );
+        let lastDistId = "";
+        while (true) {
+          const rows = selectDistBatch.all(lastDistId, BATCH) as Array<{
+            id: string;
+            org_id: string;
+            realm_id: string;
+            layer: string;
+            period_key: string;
+            status: string;
+            narrative_md: string;
+            created_at: string;
+          }>;
+          if (rows.length === 0) break;
+          for (const d of rows) {
+            const title = `${d.layer}:${d.period_key}`;
+            const info = insertDocStmt.run(
+              d.id,
+              String(d.org_id ?? ""),
+              "distillation",
+              d.realm_id,
+              d.status,
+              d.layer,
+              String(d.created_at),
+            );
+            insertFtsStmt.run(
+              Number(info.lastInsertRowid),
+              normalizeForFts(title),
+              normalizeForFts(String(d.narrative_md)),
+            );
+          }
+          lastDistId = String(rows[rows.length - 1]!.id);
+          if (rows.length < BATCH) break;
+        }
+
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (6, 'v0.2a_perf_fts_docs', ?)`,
+          )
+          .run(now);
+      }
+
       if (this.vecEnabled && !this.tableExists("vec_items")) {
         this.createVecItemsTable();
       }
@@ -1420,14 +1691,12 @@ export class SqliteDb implements DbPort {
     }
     const where: string[] = [
       `realm_id IN (${placeholders(filter.realmIds.length)})`,
+      `redacted_at IS NULL`,
     ];
     const params: SQLInputValue[] = [...filter.realmIds];
 
     const excludeSens = filter.excludeSensitivities ?? ["secret"];
-    if (excludeSens.length > 0) {
-      where.push(`sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-      params.push(...excludeSens);
-    }
+    appendSensitivityExclusion(where, params, "sensitivity", excludeSens);
 
     if (filter.kinds && filter.kinds.length > 0) {
       where.push(`kind IN (${placeholders(filter.kinds.length)})`);
@@ -1473,6 +1742,15 @@ export class SqliteDb implements DbPort {
     const rows = this.db
       .prepare(`SELECT * FROM seabed_entries ORDER BY created_at ASC, rowid ASC`)
       .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapSeabed(r));
+  }
+
+  listSeabedEntriesBatch(afterId: string, limit: number): SeabedEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM seabed_entries WHERE id > ? ORDER BY id ASC LIMIT ?`,
+      )
+      .all(afterId, limit) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapSeabed(r));
   }
 
@@ -1661,12 +1939,7 @@ export class SqliteDb implements DbPort {
       where.push(`realm_id IN (${placeholders(realmIds.length)})`);
       params.push(...realmIds);
     }
-    if (excludeSensitivities.length > 0) {
-      where.push(
-        `sensitivity NOT IN (${placeholders(excludeSensitivities.length)})`,
-      );
-      params.push(...excludeSensitivities);
-    }
+    appendSensitivityExclusion(where, params, "sensitivity", excludeSensitivities);
     const rows = this.db
       .prepare(
         `SELECT * FROM records WHERE ${where.join(" AND ")} ORDER BY created_at DESC, rowid DESC`,
@@ -1697,13 +1970,11 @@ export class SqliteDb implements DbPort {
     const params: SQLInputValue[] = [...filter.realmIds];
 
     const excludeSens = filter.excludeSensitivities ?? ["secret"];
-    if (excludeSens.length > 0) {
-      where.push(`sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-      params.push(...excludeSens);
-    }
+    appendSensitivityExclusion(where, params, "sensitivity", excludeSens);
 
     if (!filter.includeSuperseded) {
       where.push(`status = 'active'`);
+      where.push(`redacted_at IS NULL`);
     }
     if (filter.thingId) {
       where.push(`thing_id = ?`);
@@ -1772,10 +2043,7 @@ export class SqliteDb implements DbPort {
       where.push(`occurred_at IS NOT NULL`);
     }
     const sqlParams: SQLInputValue[] = [...params.realmIds, params.anchorId];
-    if (excludeSens.length > 0) {
-      where.push(`sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-      sqlParams.push(...excludeSens);
-    }
+    appendSensitivityExclusion(where, sqlParams, "sensitivity", excludeSens);
     if (params.direction === "before") {
       where.push(`(${timeCol} < ? OR (${timeCol} = ? AND id < ?))`);
       sqlParams.push(params.anchorTime, params.anchorTime, params.anchorId);
@@ -1818,10 +2086,7 @@ export class SqliteDb implements DbPort {
       where.push(`occurred_at IS NOT NULL`);
     }
     const sqlParams: SQLInputValue[] = [...params.realmIds, params.anchorId];
-    if (excludeSens.length > 0) {
-      where.push(`sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-      sqlParams.push(...excludeSens);
-    }
+    appendSensitivityExclusion(where, sqlParams, "sensitivity", excludeSens);
     if (params.direction === "before") {
       where.push(`(${timeCol} < ? OR (${timeCol} = ? AND id < ?))`);
       sqlParams.push(params.anchorTime, params.anchorTime, params.anchorId);
@@ -1849,6 +2114,13 @@ export class SqliteDb implements DbPort {
     return rows.map((r) => this.mapRecord(r));
   }
 
+  listRecordsBatch(afterId: string, limit: number): LedgerRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM records WHERE id > ? ORDER BY id ASC LIMIT ?`)
+      .all(afterId, limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapRecord(r));
+  }
+
   listPendingHumanQuestions(filter: {
     realmIds: string[];
     excludeSensitivities?: Sensitivity[];
@@ -1862,13 +2134,11 @@ export class SqliteDb implements DbPort {
       `p.realm_id IN (${placeholders(filter.realmIds.length)})`,
       `p.kind = 'proposal'`,
       `p.status = 'active'`,
+      `p.redacted_at IS NULL`,
       `json_extract(p.payload_json, '$.requiresHuman') = 1`,
     ];
     const params: SQLInputValue[] = [...filter.realmIds];
-    if (excludeSens.length > 0) {
-      where.push(`p.sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-      params.push(...excludeSens);
-    }
+    appendSensitivityExclusion(where, params, "p.sensitivity", excludeSens);
     where.push(`NOT EXISTS (
       SELECT 1 FROM records v
       WHERE v.realm_id = p.realm_id
@@ -1910,11 +2180,9 @@ export class SqliteDb implements DbPort {
     const params: SQLInputValue[] = [...filter.realmIds];
     if (!filter.includeSuperseded) {
       where.push(`status = 'active'`);
+      where.push(`redacted_at IS NULL`);
     }
-    if (excludeSens.length > 0) {
-      where.push(`sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-      params.push(...excludeSens);
-    }
+    appendSensitivityExclusion(where, params, "sensitivity", excludeSens);
     const rows = this.db
       .prepare(
         `SELECT kind, COUNT(*) AS c FROM records WHERE ${where.join(" AND ")} GROUP BY kind`,
@@ -1940,10 +2208,7 @@ export class SqliteDb implements DbPort {
       `redacted_at IS NULL`,
     ];
     const params: SQLInputValue[] = [...filter.realmIds];
-    if (excludeSens.length > 0) {
-      where.push(`sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-      params.push(...excludeSens);
-    }
+    appendSensitivityExclusion(where, params, "sensitivity", excludeSens);
     const rows = this.db
       .prepare(
         `SELECT realm_id, kind, COUNT(*) AS c FROM records WHERE ${where.join(" AND ")} GROUP BY realm_id, kind`,
@@ -1982,10 +2247,7 @@ export class SqliteDb implements DbPort {
       `redacted_at IS NULL`,
     ];
     const params: SQLInputValue[] = [...filter.realmIds];
-    if (excludeSens.length > 0) {
-      where.push(`sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-      params.push(...excludeSens);
-    }
+    appendSensitivityExclusion(where, params, "sensitivity", excludeSens);
     const rows = this.db
       .prepare(
         `SELECT realm_id, COUNT(*) AS c FROM seabed_entries WHERE ${where.join(" AND ")} GROUP BY realm_id`,
@@ -2012,10 +2274,7 @@ export class SqliteDb implements DbPort {
       `json_extract(p.payload_json, '$.requiresHuman') = 1`,
     ];
     const params: SQLInputValue[] = [...filter.realmIds];
-    if (excludeSens.length > 0) {
-      where.push(`p.sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-      params.push(...excludeSens);
-    }
+    appendSensitivityExclusion(where, params, "p.sensitivity", excludeSens);
     where.push(`NOT EXISTS (
       SELECT 1 FROM records v
       WHERE v.realm_id = p.realm_id
@@ -2068,14 +2327,26 @@ export class SqliteDb implements DbPort {
     const out = new Map<string, number>();
     if (filter.realmIds.length === 0) return out;
     const excludeSens = filter.excludeSensitivities ?? ["secret"];
+    const recSensWhere: string[] = [];
+    const recSensParams: SQLInputValue[] = [];
+    appendSensitivityExclusion(
+      recSensWhere,
+      recSensParams,
+      "r.sensitivity",
+      excludeSens,
+    );
+    const seaSensWhere: string[] = [];
+    const seaSensParams: SQLInputValue[] = [];
+    appendSensitivityExclusion(
+      seaSensWhere,
+      seaSensParams,
+      "s.sensitivity",
+      excludeSens,
+    );
     const sensClauseRec =
-      excludeSens.length > 0
-        ? `AND r.sensitivity NOT IN (${placeholders(excludeSens.length)})`
-        : "";
+      recSensWhere.length > 0 ? `AND ${recSensWhere.join(" AND ")}` : "";
     const sensClauseSea =
-      excludeSens.length > 0
-        ? `AND s.sensitivity NOT IN (${placeholders(excludeSens.length)})`
-        : "";
+      seaSensWhere.length > 0 ? `AND ${seaSensWhere.join(" AND ")}` : "";
     const sql = `
       SELECT realm_id, COUNT(DISTINCT entry_id) AS c FROM (
         SELECT o.realm_id AS realm_id, eo.entry_id AS entry_id
@@ -2104,10 +2375,10 @@ export class SqliteDb implements DbPort {
     const params: SQLInputValue[] = [
       filter.orgId,
       ...filter.realmIds,
-      ...excludeSens,
+      ...recSensParams,
       filter.orgId,
       ...filter.realmIds,
-      ...excludeSens,
+      ...seaSensParams,
     ];
     const rows = this.db.prepare(sql).all(...params) as Array<{
       realm_id: string;
@@ -2146,24 +2417,26 @@ export class SqliteDb implements DbPort {
           ? [params.kind]
           : [];
     const excludeSens = params.excludeSensitivities ?? ["secret"];
-    const branches: string[] = [];
-    const sqlParams: SQLInputValue[] = [];
+    const branchLimit = Math.max(0, params.offset + params.limit);
+    const pageBranches: string[] = [];
+    const pageParams: SQLInputValue[] = [];
+    const countSubqueries: string[] = [];
+    const countParams: SQLInputValue[] = [];
 
-    const addRecordBranch = (realmCondition: string, condParams: SQLInputValue[]) => {
+    const addRecordBranch = (
+      realmConditions: string[],
+      condParams: SQLInputValue[],
+      fromClause = `records r`,
+      fromParams: SQLInputValue[] = [],
+    ) => {
       const where: string[] = [
         `r.org_id = ?`,
-        realmCondition,
+        ...realmConditions,
         `r.redacted_at IS NULL`,
-        `r.status != 'retracted'`,
+        params.includeSuperseded ? `r.status != 'retracted'` : `r.status = 'active'`,
       ];
-      const bParams: SQLInputValue[] = [params.orgId, ...condParams];
-      if (!params.includeSuperseded) {
-        where.push(`r.status = 'active'`);
-      }
-      if (excludeSens.length > 0) {
-        where.push(`r.sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-        bParams.push(...excludeSens);
-      }
+      const bParams: SQLInputValue[] = [...fromParams, params.orgId, ...condParams];
+      appendSensitivityExclusion(where, bParams, "r.sensitivity", excludeSens);
       if (kindList.length === 1) {
         where.push(`r.kind = ?`);
         bParams.push(kindList[0]!);
@@ -2189,23 +2462,30 @@ export class SqliteDb implements DbPort {
         where.push(`r.id IN (${placeholders(params.entryIdsFilter.length)})`);
         bParams.push(...params.entryIdsFilter);
       }
-      branches.push(
-        `SELECT r.id AS id, 'record' AS source_type, r.occurred_at AS occurred_at, r.created_at AS created_at FROM records r WHERE ${where.join(" AND ")}`,
+      const whereSql = where.join(" AND ");
+      countSubqueries.push(
+        `(SELECT COUNT(*) FROM ${fromClause} WHERE ${whereSql})`,
       );
-      sqlParams.push(...bParams);
+      countParams.push(...bParams);
+      pageBranches.push(
+        `SELECT id, source_type, occurred_at, created_at FROM (SELECT r.id AS id, 'record' AS source_type, r.occurred_at AS occurred_at, r.created_at AS created_at FROM ${fromClause} WHERE ${whereSql} ORDER BY (r.occurred_at IS NULL) ASC, r.occurred_at DESC, r.created_at DESC, r.id DESC LIMIT ?)`,
+      );
+      pageParams.push(...bParams, branchLimit);
     };
 
-    const addSeabedBranch = (realmCondition: string, condParams: SQLInputValue[]) => {
+    const addSeabedBranch = (
+      realmConditions: string[],
+      condParams: SQLInputValue[],
+      fromClause = `seabed_entries s`,
+      fromParams: SQLInputValue[] = [],
+    ) => {
       const where: string[] = [
         `s.org_id = ?`,
-        realmCondition,
+        ...realmConditions,
         `s.redacted_at IS NULL`,
       ];
-      const bParams: SQLInputValue[] = [params.orgId, ...condParams];
-      if (excludeSens.length > 0) {
-        where.push(`s.sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-        bParams.push(...excludeSens);
-      }
+      const bParams: SQLInputValue[] = [...fromParams, params.orgId, ...condParams];
+      appendSensitivityExclusion(where, bParams, "s.sensitivity", excludeSens);
       if (kindList.length === 1) {
         where.push(`s.kind = ?`);
         bParams.push(kindList[0]!);
@@ -2231,37 +2511,66 @@ export class SqliteDb implements DbPort {
         where.push(`s.id IN (${placeholders(params.entryIdsFilter.length)})`);
         bParams.push(...params.entryIdsFilter);
       }
-      branches.push(
-        `SELECT s.id AS id, 'seabed' AS source_type, s.occurred_at AS occurred_at, s.created_at AS created_at FROM seabed_entries s WHERE ${where.join(" AND ")}`,
+      const whereSql = where.join(" AND ");
+      countSubqueries.push(
+        `(SELECT COUNT(*) FROM ${fromClause} WHERE ${whereSql})`,
       );
-      sqlParams.push(...bParams);
+      countParams.push(...bParams);
+      pageBranches.push(
+        `SELECT id, source_type, occurred_at, created_at FROM (SELECT s.id AS id, 'seabed' AS source_type, s.occurred_at AS occurred_at, s.created_at AS created_at FROM ${fromClause} WHERE ${whereSql} ORDER BY (s.occurred_at IS NULL) ASC, s.occurred_at DESC, s.created_at DESC, s.id DESC LIMIT ?)`,
+      );
+      pageParams.push(...bParams, branchLimit);
     };
 
+    // 4 strictly disjoint branches (UNION ALL, zero cross-branch duplicates)
     if (params.includePhysicalLedger) {
-      addRecordBranch(`r.realm_id = ?`, [params.targetRealmId]);
+      addRecordBranch([`r.realm_id = ?`], [params.targetRealmId]);
     }
     if (params.includePhysicalSeabed) {
-      addSeabedBranch(`s.realm_id = ?`, [params.targetRealmId]);
+      addSeabedBranch([`s.realm_id = ?`], [params.targetRealmId]);
     }
     if (params.includeObjectLinkedOpenMode) {
-      addRecordBranch(
-        `EXISTS (SELECT 1 FROM entry_objects eo JOIN objects o ON o.id = eo.object_id AND o.org_id = eo.org_id WHERE eo.org_id = r.org_id AND eo.entry_id = r.id AND o.realm_id = ?)`,
-        [params.targetRealmId],
-      );
-      addSeabedBranch(
-        `EXISTS (SELECT 1 FROM entry_objects eo JOIN objects o ON o.id = eo.object_id AND o.org_id = eo.org_id WHERE eo.org_id = s.org_id AND eo.entry_id = s.id AND o.realm_id = ?)`,
-        [params.targetRealmId],
-      );
+      // Drive strictly from small objects -> entry_objects -> records/seabed PK
+      // via CROSS JOIN so SQLite never scans org-wide records on open-mode ls!
+      const linkedFromRec = `(SELECT DISTINCT eo.entry_id FROM objects o CROSS JOIN entry_objects eo ON eo.org_id = o.org_id AND eo.object_id = o.id WHERE o.org_id = ? AND o.realm_id = ?) linked CROSS JOIN records r ON r.id = linked.entry_id`;
+      const linkedFromSea = `(SELECT DISTINCT eo.entry_id FROM objects o CROSS JOIN entry_objects eo ON eo.org_id = o.org_id AND eo.object_id = o.id WHERE o.org_id = ? AND o.realm_id = ?) linked CROSS JOIN seabed_entries s ON s.id = linked.entry_id`;
+      if (params.includePhysicalLedger) {
+        addRecordBranch(
+          [`r.realm_id != ?`],
+          [params.targetRealmId],
+          linkedFromRec,
+          [params.orgId, params.targetRealmId],
+        );
+      } else {
+        addRecordBranch([], [], linkedFromRec, [
+          params.orgId,
+          params.targetRealmId,
+        ]);
+      }
+      if (params.includePhysicalSeabed) {
+        addSeabedBranch(
+          [`s.realm_id != ?`],
+          [params.targetRealmId],
+          linkedFromSea,
+          [params.orgId, params.targetRealmId],
+        );
+      } else {
+        addSeabedBranch([], [], linkedFromSea, [
+          params.orgId,
+          params.targetRealmId,
+        ]);
+      }
     }
 
-    if (branches.length === 0) {
+    if (pageBranches.length === 0) {
       return { rows: [], total: 0 };
     }
 
-    const unionSql = branches.join(" UNION ");
     const totalRow = this.db
-      .prepare(`SELECT COUNT(*) AS c FROM (${unionSql}) u`)
-      .get(...sqlParams) as { c: number };
+      .prepare(`SELECT ${countSubqueries.join(" + ")} AS c`)
+      .get(...countParams) as { c: number };
+
+    const unionSql = pageBranches.join(" UNION ALL ");
     const rows = this.db
       .prepare(
         `SELECT id, source_type, occurred_at, created_at
@@ -2269,7 +2578,7 @@ export class SqliteDb implements DbPort {
          ORDER BY (occurred_at IS NULL) ASC, occurred_at DESC, created_at DESC, id DESC
          LIMIT ? OFFSET ?`,
       )
-      .all(...sqlParams, params.limit, params.offset) as Array<
+      .all(...pageParams, params.limit, params.offset) as Array<
       Record<string, unknown>
     >;
 
@@ -2319,20 +2628,14 @@ export class SqliteDb implements DbPort {
         `r.id IN (${placeholders(uniqueIds.length)})`,
         `r.realm_id IN (${placeholders(params.ledgerRealmIds.length)})`,
         `r.redacted_at IS NULL`,
-        `r.status != 'retracted'`,
+        params.includeSuperseded ? `r.status != 'retracted'` : `r.status = 'active'`,
       ];
       const bParams: SQLInputValue[] = [
         params.orgId,
         ...uniqueIds,
         ...params.ledgerRealmIds,
       ];
-      if (!params.includeSuperseded) {
-        where.push(`r.status = 'active'`);
-      }
-      if (excludeSens.length > 0) {
-        where.push(`r.sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-        bParams.push(...excludeSens);
-      }
+      appendSensitivityExclusion(where, bParams, "r.sensitivity", excludeSens);
       if (kindList.length === 1) {
         where.push(`r.kind = ?`);
         bParams.push(kindList[0]!);
@@ -2372,10 +2675,7 @@ export class SqliteDb implements DbPort {
         ...uniqueIds,
         ...params.seabedRealmIds,
       ];
-      if (excludeSens.length > 0) {
-        where.push(`s.sensitivity NOT IN (${placeholders(excludeSens.length)})`);
-        bParams.push(...excludeSens);
-      }
+      appendSensitivityExclusion(where, bParams, "s.sensitivity", excludeSens);
       if (kindList.length === 1) {
         where.push(`s.kind = ?`);
         bParams.push(kindList[0]!);
@@ -2621,7 +2921,7 @@ export class SqliteDb implements DbPort {
         checkpointed: Number(row?.checkpointed ?? 0),
       };
     } finally {
-      this.db.exec(`PRAGMA busy_timeout = 10000;`);
+      this.db.exec(`PRAGMA busy_timeout = ${DEFAULT_BUSY_TIMEOUT_MS};`);
     }
   }
 
@@ -3228,6 +3528,39 @@ export class SqliteDb implements DbPort {
     return rows.map((r) => this.mapDistillation(r));
   }
 
+  listDistillationsBatch(afterId: string, limit: number): Distillation[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM distillations WHERE id > ? ORDER BY id ASC LIMIT ?`,
+      )
+      .all(afterId, limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapDistillation(r));
+  }
+
+  listAllCanonicalIds(): Set<string> {
+    const out = new Set<string>();
+    const BATCH = 500;
+    const collectTable = (table: "records" | "seabed_entries" | "distillations") => {
+      const stmt = this.db.prepare(
+        `SELECT id FROM ${table} WHERE id > ? ORDER BY id ASC LIMIT ?`,
+      );
+      let lastId = "";
+      while (true) {
+        const rows = stmt.all(lastId, BATCH) as Array<{ id: string }>;
+        if (rows.length === 0) break;
+        for (const r of rows) {
+          out.add(String(r.id));
+        }
+        lastId = String(rows[rows.length - 1]!.id);
+        if (rows.length < BATCH) break;
+      }
+    };
+    collectTable("records");
+    collectTable("seabed_entries");
+    collectTable("distillations");
+    return out;
+  }
+
   private mapDistillation(row: Record<string, unknown>): Distillation {
     return {
       id: String(row.id),
@@ -3566,52 +3899,77 @@ export class SqliteDb implements DbPort {
     });
   }
 
-  // ---- Rebuildable FTS5 Index ----
+  // ---- Rebuildable FTS5 Index (fts_docs side-table + contentless_delete FTS5) ----
 
   upsertFtsItem(item: {
     itemId: string;
+    orgId: string;
     sourceType: "record" | "seabed" | "distillation";
     realmId: string;
     status: string;
+    kind: string;
+    occurredAt: string | null;
     title: string;
     body: string;
   }): void {
-    this.db.prepare(`DELETE FROM fts_index WHERE item_id = ?`).run(item.itemId);
-    this.db
-      .prepare(
-        `INSERT INTO fts_index (item_id, source_type, realm_id, status, title, body)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        item.itemId,
-        item.sourceType,
-        item.realmId,
-        item.status,
-        normalizeForFts(item.title),
-        normalizeForFts(item.body),
-      );
+    this.transaction(() => {
+      const existing = this.db
+        .prepare(`SELECT docid FROM fts_docs WHERE item_id = ?`)
+        .get(item.itemId) as { docid: number } | undefined;
+      if (existing) {
+        this.db
+          .prepare(`DELETE FROM fts_index WHERE rowid = ?`)
+          .run(existing.docid);
+        this.db
+          .prepare(`DELETE FROM fts_docs WHERE docid = ?`)
+          .run(existing.docid);
+      }
+      const info = this.db
+        .prepare(
+          `INSERT INTO fts_docs (item_id, org_id, source_type, realm_id, status, kind, occurred_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          item.itemId,
+          item.orgId,
+          item.sourceType,
+          item.realmId,
+          item.status,
+          item.kind,
+          item.occurredAt,
+        );
+      const newDocid = Number(info.lastInsertRowid);
+      this.db
+        .prepare(
+          `INSERT INTO fts_index (rowid, title, body) VALUES (?, ?, ?)`,
+        )
+        .run(
+          newDocid,
+          normalizeForFts(item.title),
+          normalizeForFts(item.body),
+        );
+    });
   }
 
   updateFtsStatus(itemId: string, status: string): void {
-    const row = this.db
-      .prepare(
-        `SELECT source_type, realm_id, title, body FROM fts_index WHERE item_id = ?`,
-      )
-      .get(itemId) as
-      | { source_type: string; realm_id: string; title: string; body: string }
-      | undefined;
-    if (!row) return;
-    this.db.prepare(`DELETE FROM fts_index WHERE item_id = ?`).run(itemId);
     this.db
-      .prepare(
-        `INSERT INTO fts_index (item_id, source_type, realm_id, status, title, body)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(itemId, row.source_type, row.realm_id, status, row.title, row.body);
+      .prepare(`UPDATE fts_docs SET status = ? WHERE item_id = ?`)
+      .run(status, itemId);
   }
 
   deleteFtsItem(itemId: string): void {
-    this.db.prepare(`DELETE FROM fts_index WHERE item_id = ?`).run(itemId);
+    this.transaction(() => {
+      const existing = this.db
+        .prepare(`SELECT docid FROM fts_docs WHERE item_id = ?`)
+        .get(itemId) as { docid: number } | undefined;
+      if (!existing) return;
+      this.db
+        .prepare(`DELETE FROM fts_index WHERE rowid = ?`)
+        .run(existing.docid);
+      this.db
+        .prepare(`DELETE FROM fts_docs WHERE docid = ?`)
+        .run(existing.docid);
+    });
   }
 
   searchFts(params: {
@@ -3630,23 +3988,24 @@ export class SqliteDb implements DbPort {
 
     const where: string[] = [
       `fts_index MATCH ?`,
-      `realm_id IN (${placeholders(params.realmIds.length)})`,
+      `d.realm_id IN (${placeholders(params.realmIds.length)})`,
     ];
     const sqlParams: SQLInputValue[] = [expr, ...params.realmIds];
     if (params.sourceTypes && params.sourceTypes.length > 0) {
-      where.push(`source_type IN (${placeholders(params.sourceTypes.length)})`);
+      where.push(`d.source_type IN (${placeholders(params.sourceTypes.length)})`);
       sqlParams.push(...params.sourceTypes);
     }
     if (!params.includeSuperseded) {
-      where.push(`status IN ('active', 'evidence')`);
+      where.push(`d.status IN ('active', 'evidence')`);
     }
 
     const rows = this.db
       .prepare(
-        `SELECT item_id, source_type, realm_id, status, bm25(fts_index) AS rank
+        `SELECT d.item_id, d.source_type, d.realm_id, d.status, bm25(fts_index) AS rank
          FROM fts_index
+         CROSS JOIN fts_docs d ON d.docid = fts_index.rowid
          WHERE ${where.join(" AND ")}
-         ORDER BY rank ASC
+         ORDER BY rank ASC, d.item_id ASC
          LIMIT ?`,
       )
       .all(...sqlParams, params.limit) as Array<Record<string, unknown>>;
@@ -3675,27 +4034,178 @@ export class SqliteDb implements DbPort {
 
     const where: string[] = [
       `fts_index MATCH ?`,
-      `realm_id IN (${placeholders(params.realmIds.length)})`,
+      `d.realm_id IN (${placeholders(params.realmIds.length)})`,
     ];
     const sqlParams: SQLInputValue[] = [expr, ...params.realmIds];
     if (params.sourceTypes && params.sourceTypes.length > 0) {
-      where.push(`source_type IN (${placeholders(params.sourceTypes.length)})`);
+      where.push(`d.source_type IN (${placeholders(params.sourceTypes.length)})`);
       sqlParams.push(...params.sourceTypes);
     }
     if (!params.includeSuperseded) {
-      where.push(`status IN ('active', 'evidence')`);
+      where.push(`d.status IN ('active', 'evidence')`);
     }
 
     const row = this.db
       .prepare(
-        `SELECT COUNT(*) AS c FROM fts_index WHERE ${where.join(" AND ")}`,
+        `SELECT COUNT(*) AS c
+         FROM fts_index
+         CROSS JOIN fts_docs d ON d.docid = fts_index.rowid
+         WHERE ${where.join(" AND ")}`,
       )
       .get(...sqlParams) as { c: number };
     return Number(row.c);
   }
 
+  searchFtsUnified(params: UnifiedFtsSearchParams): UnifiedFtsSearchResult {
+    const empty: UnifiedFtsSearchResult = {
+      rows: [],
+      total: 0,
+      ledgerCount: 0,
+      seabedCount: 0,
+    };
+    if (!params.ftsExpression || params.perBucketLimit <= 0) {
+      return empty;
+    }
+    if (
+      params.ledgerRealmIds.length === 0 &&
+      params.seabedRealmIds.length === 0
+    ) {
+      return empty;
+    }
+    if (
+      params.allowedEntryIds !== undefined &&
+      params.allowedEntryIds.length === 0
+    ) {
+      return empty;
+    }
+
+    const hasRecKinds = Boolean(
+      params.recordKinds && params.recordKinds.length > 0,
+    );
+    const hasSeaKinds = Boolean(
+      params.seabedKinds && params.seabedKinds.length > 0,
+    );
+    if (hasRecKinds && !hasSeaKinds && params.ledgerRealmIds.length === 0) {
+      return empty;
+    }
+    if (hasSeaKinds && !hasRecKinds && params.seabedRealmIds.length === 0) {
+      return empty;
+    }
+
+    const where: string[] = [`fts_index MATCH ?`];
+    const sqlParams: SQLInputValue[] = [params.ftsExpression];
+
+    // Strict ledger vs seabed realm scope isolation (never union realm arrays)
+    if (
+      params.ledgerRealmIds.length > 0 &&
+      params.seabedRealmIds.length > 0
+    ) {
+      where.push(
+        `((d.source_type IN ('record', 'distillation') AND d.realm_id IN (${placeholders(params.ledgerRealmIds.length)})) OR (d.source_type = 'seabed' AND d.realm_id IN (${placeholders(params.seabedRealmIds.length)})))`,
+      );
+      sqlParams.push(...params.ledgerRealmIds, ...params.seabedRealmIds);
+    } else if (params.ledgerRealmIds.length > 0) {
+      where.push(
+        `d.source_type IN ('record', 'distillation') AND d.realm_id IN (${placeholders(params.ledgerRealmIds.length)})`,
+      );
+      sqlParams.push(...params.ledgerRealmIds);
+    } else {
+      where.push(
+        `d.source_type = 'seabed' AND d.realm_id IN (${placeholders(params.seabedRealmIds.length)})`,
+      );
+      sqlParams.push(...params.seabedRealmIds);
+    }
+
+    if (!params.includeSuperseded) {
+      where.push(`d.status IN ('active', 'evidence')`);
+    }
+
+    // Explicit --kind SQL pushdown matching Stage 2 & JS semantics
+    if (hasRecKinds && hasSeaKinds) {
+      where.push(
+        `((d.source_type = 'record' AND d.kind IN (${placeholders(params.recordKinds!.length)})) OR (d.source_type = 'seabed' AND d.kind IN (${placeholders(params.seabedKinds!.length)})))`,
+      );
+      sqlParams.push(...params.recordKinds!, ...params.seabedKinds!);
+    } else if (hasRecKinds) {
+      where.push(
+        `d.source_type = 'record' AND d.kind IN (${placeholders(params.recordKinds!.length)})`,
+      );
+      sqlParams.push(...params.recordKinds!);
+    } else if (hasSeaKinds) {
+      where.push(
+        `d.source_type = 'seabed' AND d.kind IN (${placeholders(params.seabedKinds!.length)})`,
+      );
+      sqlParams.push(...params.seabedKinds!);
+    }
+
+    if (params.since) {
+      where.push(`d.occurred_at IS NOT NULL AND d.occurred_at >= ?`);
+      sqlParams.push(params.since);
+    }
+    if (params.until) {
+      where.push(`d.occurred_at IS NOT NULL AND d.occurred_at <= ?`);
+      sqlParams.push(params.until);
+    }
+    if (params.allowedEntryIds && params.allowedEntryIds.length > 0) {
+      where.push(`d.item_id IN (SELECT value FROM json_each(?))`);
+      sqlParams.push(JSON.stringify(params.allowedEntryIds));
+    }
+
+    const sql = `
+      WITH m AS MATERIALIZED (
+        SELECT d.item_id, d.source_type, d.realm_id, d.status, bm25(fts_index) AS rank
+        FROM fts_index
+        CROSS JOIN fts_docs d ON d.docid = fts_index.rowid
+        WHERE ${where.join(" AND ")}
+      )
+      SELECT item_id, source_type, realm_id, status, rank,
+             (SELECT COUNT(*) FROM m) AS total
+      FROM (
+        SELECT m.*,
+               ROW_NUMBER() OVER (
+                 PARTITION BY CASE WHEN source_type = 'seabed' THEN 1 ELSE 0 END
+                 ORDER BY rank ASC, item_id ASC
+               ) AS rn
+        FROM m
+      )
+      WHERE rn <= ?
+      ORDER BY rank ASC, item_id ASC
+    `;
+
+    const rawRows = this.db
+      .prepare(sql)
+      .all(...sqlParams, params.perBucketLimit) as Array<
+      Record<string, unknown>
+    >;
+
+    if (rawRows.length === 0) {
+      return empty;
+    }
+
+    const total = Number(rawRows[0]!.total ?? 0);
+    let ledgerCount = 0;
+    let seabedCount = 0;
+    const rows: FtsMatch[] = rawRows.map((r) => {
+      const sourceType = String(r.source_type) as FtsMatch["sourceType"];
+      if (sourceType === "seabed") seabedCount += 1;
+      else ledgerCount += 1;
+      return {
+        itemId: String(r.item_id),
+        sourceType,
+        realmId: String(r.realm_id),
+        status: String(r.status),
+        rank: Number(r.rank),
+      };
+    });
+
+    return { rows, total, ledgerCount, seabedCount };
+  }
+
   clearFtsIndex(): void {
-    this.db.exec(`DELETE FROM fts_index;`);
+    this.transaction(() => {
+      this.db.exec(`INSERT INTO fts_index(fts_index) VALUES('delete-all');`);
+      this.db.exec(`DELETE FROM fts_docs;`);
+    });
   }
 
   // ---- Rebuildable sqlite-vec Index ----

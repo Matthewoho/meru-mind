@@ -2,26 +2,30 @@
 
 ## Purpose
 
-Define durable SQLite schema migrations (v1–v5), nullable `occurred_at` vs `created_at` semantics, atomic single- and multi-predecessor CAS supersede DAGs, orphan superseded ingestion, organization-scoped and auto-generated idempotency keys, operational change logging, and off-write-path vector indexing.
+Define durable SQLite schema migrations (v1–v6), SQLite version and `busy_timeout` guards, `fts_docs` side-table and partial covering indexes, nullable `occurred_at` vs `created_at` semantics, atomic single- and multi-predecessor CAS supersede DAGs, orphan superseded ingestion, organization-scoped and auto-generated idempotency keys, operational change logging, and off-write-path vector indexing.
 
 ## Requirements
 
-### Requirement: Connection-Level Secure Delete and Concurrent Migrations v1–v5
-`SqliteDb` SHALL enable `PRAGMA secure_delete = ON`, `PRAGMA foreign_keys = ON`, and `PRAGMA journal_mode = WAL` on every connection, and execute versioned migrations (`[1, 2, 3, 4, 5]`) inside a single `BEGIN IMMEDIATE` transaction recorded in `schema_migrations`. Migration v5 SHALL add `CREATE INDEX IF NOT EXISTS idx_redacted_blocklist_org_sha ON redacted_blocklist(org_id, content_sha256)` for O(1) write-path lookups.
+### Requirement: Connection-Level Secure Delete and Concurrent Migrations v1–v6
+`SqliteDb` SHALL require SQLite `>= 3.43.0`, set shared `DEFAULT_BUSY_TIMEOUT_MS = 30000` (restored after `optimizeFtsAndCheckpoint`), enable `secure_delete = ON`, `foreign_keys = ON`, and `WAL`, and run migrations `[1..6]` in one `BEGIN IMMEDIATE` transaction. Migration v6 SHALL create zero-plaintext `fts_docs` (`AUTOINCREMENT`), contentless_delete `fts_index`, partial covering indexes (`idx_records_live_ls`, `idx_records_live_counts`, `idx_seabed_live_ls`), and keyset-batched backfill.
 
-#### Scenario: Upgrading a V0.1 database preserves tree isolation and records migrations 1 through 5
-- **WHEN** `SqliteDb` opens an existing V0.1 database containing organizations, records, seabed entries, and distillations
+#### Scenario: Upgrading a V0.1 or v5 database preserves isolation and records migrations 1 through 6
+- **WHEN** `SqliteDb` opens an existing V0.1 or v5 database containing records, seabed entries, distillations, secrets, and redacted rows
 - **THEN** migration v2 backfills `orgs.policy = 'tree'`, `org_id`, `occurred_at`, `confirmed_by_human`, and rebuilds `vec_pending`
-- **AND** migrations v3, v4, and v5 complete cleanly with `schema_migrations` versions `[1, 2, 3, 4, 5]`
+- **AND** migrations `[1, 2, 3, 4, 5, 6]` complete cleanly with `fts_docs` populated via keyset batches (excluding secrets/redacted/retracted) and `PRAGMA busy_timeout = 30000` before and after `redact()`
 
 #### Scenario: Multiple OS processes open an unmigrated database simultaneously
-- **WHEN** multiple OS processes invoke `new SqliteDb(...)` against the same V0.1 or v2 file concurrently
-- **THEN** all processes complete initialization with zero `duplicate column` or lock-race failures and record `[1, 2, 3, 4, 5]`
+- **WHEN** multiple OS processes invoke `new SqliteDb(...)` against the same V0.1, v2, or v5 file concurrently
+- **THEN** all processes complete initialization with zero `duplicate column` or lock-race failures and record `[1, 2, 3, 4, 5, 6]`
 
-#### Scenario: Migration v5 preserves pre-v5 redacted_blocklist rows
-- **WHEN** a v4 database containing a pre-v5 `redacted_blocklist` row is reopened on v5
-- **THEN** migration v5 creates `idx_redacted_blocklist_org_sha` without altering existing rows
+#### Scenario: Migration v5 and v6 preserve pre-v5 redacted_blocklist rows
+- **WHEN** a v4 database containing a pre-v5 `redacted_blocklist` row is reopened on v6
+- **THEN** migrations v5 and v6 preserve existing blocklist rows and `idx_redacted_blocklist_org_sha`
 - **AND** subsequent writes matching the pre-v5 `content_sha256` are blocked immediately
+
+#### Scenario: Rebuild streams canonical tables via keyset batches inside one transaction
+- **WHEN** `SeaEngine.rebuild()` runs on a store with records, seabed entries, and distillations
+- **THEN** it clears `fts_index` (`'delete-all'`) and `fts_docs`, streams keyset batches (`LIMIT 500`), verifies `sourceIds` via ID-only queries, and commits atomically
 
 ### Requirement: Nullable `occurred_at` Semantics Versus `created_at` Audit Semantics
 `records.occurred_at` and `seabed_entries.occurred_at` SHALL be nullable (`string | null`) representing declared event time, while `created_at` governs audit ordering and `change_log`. `appendRecord()` and `captureSeabed()` SHALL preserve explicit `null` without coalescing to `now()`, and `SqliteDb` row mappers SHALL never coalesce `NULL` to `created_at`.

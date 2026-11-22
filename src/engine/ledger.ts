@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { assertSafeIdentifier } from "../adapters/local-drive.js";
+import { buildRecordFtsBody } from "../format/snippet.js";
 import {
   assertAccess,
   intersectAccessScopes,
@@ -173,6 +174,8 @@ export class LedgerEngine {
     orgId: string;
     realmId: string;
     status: string;
+    kind: string;
+    occurredAt: string | null;
     title: string;
     body: string;
     sensitivity: Sensitivity;
@@ -183,9 +186,12 @@ export class LedgerEngine {
     }
     this.db.upsertFtsItem({
       itemId: params.itemId,
+      orgId: params.orgId,
       sourceType: params.sourceType,
       realmId: params.realmId,
       status: params.status,
+      kind: params.kind,
+      occurredAt: params.occurredAt,
       title: params.title,
       body: params.body,
     });
@@ -828,6 +834,8 @@ export class LedgerEngine {
         orgId: entry.orgId,
         realmId: entry.realmId,
         status: "evidence",
+        kind: entry.kind,
+        occurredAt: entry.occurredAt,
         title: `${entry.kind}:${entry.topicId ?? entry.realmId}`,
         body: entry.text,
         sensitivity: entry.sensitivity,
@@ -1240,11 +1248,7 @@ export class LedgerEngine {
         });
       }
 
-      const payloadText = Object.entries(record.payload)
-        .map(
-          ([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
-        )
-        .join("\n");
+      const payloadText = buildRecordFtsBody(record.payload);
 
       // 5. Synchronous FTS5 + vec_pending + change_log in the same transaction (zero sync embed())
       this.upsertFtsSync({
@@ -1253,6 +1257,8 @@ export class LedgerEngine {
         orgId: record.orgId,
         realmId: record.realmId,
         status: record.status,
+        kind: record.kind,
+        occurredAt: record.occurredAt,
         title: record.title,
         body: payloadText,
         sensitivity: record.sensitivity,

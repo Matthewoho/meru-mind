@@ -6,26 +6,37 @@ Define intact CJK bigram query parsing with exact JS identifier boundaries, comp
 
 ## Requirements
 
-### Requirement: Intact CJK Bigram Query Parsing and Exact Identifier Boundaries
-`SqliteDb` SHALL keep single-character CJK spacing (`normalizeForFts`) under FTS5 `unicode61`. `parseSearchQuery()` SHALL keep contiguous CJK segments intact: standalone 1-char particles drop only when another concrete concept remains; 2-char segments stay atomic; `>= 3`-char segments emit overlapping 2-char bigrams filtering only complete filler bigrams. Non-CJK identifiers enforce `-`, `/`, `:` boundaries (`1.0`/`0.0`); CJK segments count covered at `>= 0.75`.
+### Requirement: CJK Bigram Single-Token Indexing, Prefix Queries, and Exact Identifier Boundaries
+`normalizeForFts()` SHALL space CJK/Latin boundaries and emit overlapping 2-char bigrams plus trailing 1-char for contiguous Han/Hiragana/Katakana/Hangul runs (`L >= 2`), or 1-char for `L === 1`. `parseSearchQuery()` SHALL NOT call `normalizeForFts()`, mapping 1-char CJK to FTS5 prefix `"c"*`, 2-char to `"bg"`, and `>= 3` to filtered bigrams. Non-CJK identifiers enforce `-`, `/`, `:` boundaries (`1.0`/`0.0`); CJK segments count covered at `>= 0.75`.
 
-#### Scenario: Intra-word CJK compounds, 1-char queries, and exact identifiers match reliably
-- **WHEN** a caller searches `"现在上线东京生产了吗"`, `"锁"`, `"agent-worker"`, `"api/v2/auth"`, or `"redis:6379"`
-- **THEN** intact CJK compounds and 1-char queries match while longer identifiers (`"agent-worker-bridge"`, `"redis:63790"`) are excluded
+#### Scenario: Intra-word CJK compounds, 1-char prefix queries, Hangul, and cross-punctuation precision
+- **WHEN** a caller searches `"现在上线东京生产了吗"`, `"锁"`, Hangul `"배포"`, `"发布"`, `"agent-worker"`, `"api/v2/auth"`, or `"redis:6379"`
+- **THEN** intact CJK/Hangul compounds and 1-char queries match at start, middle, and end of words, while `"开发，布局"` does not match `"发布"` and longer identifiers (`"agent-worker-bridge"`, `"redis:63790"`) are excluded
 
 ### Requirement: Comparable Staged Retrieval and Strict Total-Order Lexicographic Ranking
-`SeaEngine.recall()` and `search()` SHALL run Pass-1 (`AND`), Pass-2 (`OR`) FTS5, and optional vector queries with SQL realm pushdown and `O(1)` batched hydration, normalizing `-bm25` within each `(coverageTier, matchSource)` group. Ranking SHALL sort lexicographically by `coverageTier`, `coverageRatioBand`, `lexicalMatchFlag`, `statusPriority` (3 active > 2 raw > 1 superseded), `relevanceBand`, `isOlderSameObjectSibling` ASC, SDK-only `focusFlag` (OFF on `search`), and recency DESC.
+`SeaEngine.recall()` and `search()` SHALL run Pass-1 (`AND`), Pass-2 (`OR`) FTS5, and optional vector queries with `O(1)` batched hydration, normalizing `-bm25` within each `(coverageTier, matchSource)` group. Ranking SHALL sort lexicographically by `coverageTier`, `coverageRatioBand`, `lexicalMatchFlag`, `statusPriority` (3 active > 2 raw > 1 superseded), `relevanceBand`, `isOlderSameObjectSibling` ASC, SDK-only `focusFlag` (OFF on `search`), and recency DESC.
 
 #### Scenario: Active record and stronger non-focus match rank strictly ahead while preserving sort transitivity
 - **WHEN** an active record competes with a superseded record or a strong non-focus match competes with a weak focus match
 - **THEN** the active record and stronger non-focus match rank strictly higher, and same-object sibling demotion produces identical order across all input permutations
 
-### Requirement: 1-Hop Current Head Resolution and Match-Centered Snippets
-Superseded records returned via `--history` or exact lookup SHALL include `currentHeadId` (visible active head or `null` if retracted/invisible/orphan) and `orphanSuperseded: boolean`. A single shared module (`src/format/snippet.ts`) SHALL extract readable text from payloads (omitting raw metadata such as `contentSha256`) and center ~240-character windows around matched query concepts with `...`.
+### Requirement: Single-Statement Unified FTS Retrieval and Strict Scope/Filter Pushdown
+`SeaEngine.recall()` and `search()` SHALL execute at most 2 unified FTS5 evaluations (`WITH m AS MATERIALIZED` joining `fts_index` and `fts_docs`, `ROW_NUMBER()` per bucket) plus optional vector search. Realm scope SHALL isolate `ledgerRealmIds` and `seabedRealmIds` strictly without unioning; `kind`, `since`, `until`, and `about` (`json_each`, with `[]` short-circuiting to 0 before FTS and vector) SHALL enforce SQL and JS parity.
+
+#### Scenario: Strict scope isolation, empty about short-circuit, and --kind parity across SQL and vector
+- **WHEN** tree-mode search runs with descendant seabed, `--about` matching 0 entries, or `--kind message`/`--kind decision` (including with vector enabled)
+- **THEN** descendant seabed never leaks into items or `totalMatched`, empty `--about` short-circuits to 0 results, and `--kind` excludes non-matching source types across both SQL and vector paths
+
+### Requirement: 1-Hop Current Head Resolution, Match-Centered Snippets, and Truncation Metadata
+Superseded records via `--history` or exact lookup SHALL include `currentHeadId` (visible active head or `null` if retracted/invisible/orphan) and `orphanSuperseded`. `src/format/snippet.ts` SHALL extract readable prose (omitting internal metadata), center ~240-char excerpts, and populate `RecallItem` with `contentChars`, `shownChars`, and `truncated` (true iff snippet elided readable text). `formatSearchMarkdown()` SHALL render `[shown/total chars]` and a 1-line legend iff truncated.
 
 #### Scenario: Redacted chain head clears currentHeadId and snippets omit metadata blobs
 - **WHEN** the active head `v3` of `v1 -> v2 -> v3` is redacted or a record with `contentSha256` metadata is returned
 - **THEN** lookup of `v1` reports `currentHeadId: null, orphanSuperseded: false`, and snippets contain clean centered text with zero raw `contentSha256` JSON
+
+#### Scenario: Truncation badge and legend appear only on genuinely excerpted hits
+- **WHEN** `search` returns both a short record whose full prose fits in the snippet and a long record whose prose is excerpted
+- **THEN** only the long record sets `truncated: true` and displays `[shownChars/contentChars chars]`, while the short record sets `truncated: false` and displays no badge
 
 ### Requirement: Exact SQL Counting Without Silent Truncation
 `SeaEngine.recall()`, `SeaEngine.search()`, and `SeaEngine.brief()` SHALL compute `totalMatched`/`totalCount` and `omittedCount` from exact SQL `COUNT(*)` queries constrained to readable realms and excluding `secret` rows, with zero silent 200/500/1000 caps.
@@ -35,11 +46,11 @@ Superseded records returned via `--history` or exact lookup SHALL include `curre
 - **THEN** unfiltered `recall({ limit: 10 })` reports `totalMatched = 525` and `omittedCount = 515`
 
 ### Requirement: Full-Chain Human-Only Redaction and Byte-Level Purge
-`LedgerEngine.redact()` SHALL require `actor.kind === 'human'` and atomically wipe target rows, delete `fts_index`/`vec_items`/`vec_pending`/`entry_objects`/`resource_tags`, sanitize `change_log` suffixes, retract citing `distillations`, record canonical hashes in `redacted_blocklist`, and log `op = 'redact'`. Post-commit, it SHALL unlink unreferenced blobs, run FTS5 `'optimize'` and `wal_checkpoint(TRUNCATE)`, and report `walCheckpoint` and live `drive://` `residualLocations`.
+`LedgerEngine.redact()` SHALL require `actor.kind === 'human'` and atomically wipe target rows, delete `fts_index` by `rowid` then `fts_docs` by `docid` plus `vec_items`/`vec_pending`/`entry_objects`/`resource_tags`, sanitize `change_log`, retract citing `distillations`, record canonical hashes in `redacted_blocklist`, and log `op = 'redact'`. Post-commit, it SHALL unlink unreferenced blobs, run FTS5 `'optimize'` and `wal_checkpoint(TRUNCATE)`, and report `walCheckpoint` and `residualLocations`.
 
-#### Scenario: Byte-level sweep finds zero residual plaintext after redaction and shared drive blobs stay intact
-- **WHEN** a human redacts a record, a blob-backed seabed entry, and their citing distillation and closes all DB handles
-- **THEN** raw byte inspection of `.sqlite`, `-wal`, `-shm`, and `blobs/` finds zero redacted secret tokens or tag plaintext
+#### Scenario: Byte-level sweep finds zero residual plaintext or CJK bigrams after redaction
+- **WHEN** a human redacts a record containing English and CJK canary tokens, a blob-backed seabed entry, and their citing distillation and closes all DB handles
+- **THEN** raw byte inspection of `.sqlite`, `-wal`, `-shm`, and `blobs/` finds zero redacted English tokens, CJK phrases, CJK bigrams, or tag plaintext
 - **AND** if a drive file still references a blob, `deletedBlobSha256` is `null` and `residualLocations` lists the live drive path
 
 ### Requirement: Global Exact-Match Content-Hash Blocklist Across All Write Paths

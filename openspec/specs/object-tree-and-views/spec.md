@@ -69,17 +69,35 @@ Across all read views (`whoami`, `listRealms`, `tree`, `ls`, `show`, `brief`, `s
 - **WHEN** a realm contains more than 6 objects while sibling realms follow at the same depth
 - **THEN** `formatTreeMarkdown()` renders at most 5 inline objects per realm plus a `(+N more objects; run \`meru-mind ls <realm> --only objects\`)` summary line, includes `objects=` in subtree rollups, keeps subsequent sibling realms visible within the default 60-line cap, and omits any redundant trailing `## Objects` block
 
+### Requirement: Literal Sensitivity Exclusion, Covering Counts, and Disjoint `UNION ALL` `ls`
+`SqliteDb` SHALL emit literal `sensitivity != '...'` SQL predicates so active count and direct `ls` queries use partial covering indexes (`idx_records_live_counts`, `idx_records_live_ls`, `idx_seabed_live_ls`) with zero temp B-trees. `lsRealmEntriesUnified()` SHALL combine disjoint branches via `UNION ALL` with per-branch ordered `LIMIT (offset + limit)`, `CROSS JOIN` derived tables (`objects -> entry_objects -> PK`) for open-mode object links, and a sum of disjoint `COUNT(*)` subqueries.
+
+#### Scenario: Covering index counts and disjoint UNION ALL ls avoid table lookups and temp B-trees
+- **WHEN** `EXPLAIN QUERY PLAN` inspects `countActiveRecordsByRealm`, `countRecordsByKind`, `countSeabedByRealm`, and `lsRealmEntriesUnified` direct/open-mode branches (excluding `['secret']` or `['secret', 'confidential']`)
+- **THEN** SQLite selects `USING COVERING INDEX` with zero `USE TEMP B-TREE FOR ORDER BY` on direct branches and drives open-mode links via `objects -> entry_objects -> PK` without scanning org-wide records
+
 ### Requirement: Polymorphic `show`, Single-Query `ls`, and `NOT_LISTABLE`
-`SeaEngine.show()` SHALL inspect realms (O(1) `brief` with `kindHistogram`, `recentConclusions`, `childSummaries`), unified objects (card + top 5 recent entries + `try: meru-mind ls <ref>`), entries (`cat` + optional `--history`/`--context`), and `file:` refs. `SeaEngine.ls()` SHALL list realms via single-query SQL `UNION` supporting `--only`, `--kind`, `--about`, `--since`, `--until`, `--history`, `--limit` (default `20`), and `--cursor`, throwing `NOT_LISTABLE` on entries/files.
+`SeaEngine.show()` SHALL inspect realms (`brief` with `kindHistogram`, `recentConclusions`, `childSummaries`, raw seabed lines capped at 500 chars in MD), unified objects (card + top 5 recent entries + `try`), entries (`cat` + optional `--history`/`--context`), and `file:` refs. `SeaEngine.ls()` SHALL support `--only`, `--kind`, `--about`, `--since`, `--until`, `--history`, `--limit` (default `20`), and `--cursor`, throwing `NOT_LISTABLE` on entries/files.
 
 #### Scenario: ls on entry or file returns not_listable and show inspects all 4 ref shapes
 - **WHEN** a caller invokes `ls rec_...` or `ls file:/readme.md`
 - **THEN** `ls` throws `NOT_LISTABLE` (wire `not_listable`) with `try: meru-mind show <ref>`
-- **AND** `show` returns the realm brief, unified object card, entry content (with optional `--history`/`--context`), or file content respectively
+- **AND** `show` returns the realm brief (with raw seabed lines capped at 500 chars in Markdown), unified object card, bounded entry content, or bounded file content respectively
 
 #### Scenario: show realm childSummaries report real active conclusions, rules, and objects excluding secrets
 - **WHEN** a child realm holds active `finding` conclusions, active `rule` records, objects, and a `secret` record
 - **THEN** `show <parentRealm>` reports `activeConclusions`, `activeRules`, and `activeObjects` accurately excluding `secret` and hidden-realm items in both JSON and Markdown (`conclusions=..., rules=..., objects=...`)
+
+### Requirement: Engine-Bounded `show` Window and Compact MCP JSON
+`SeaEngine.show()` SHALL enforce engine-level bounded windowing (default `3500` chars, `--around`, `--cursor`, `--limit`, `--full`; 1:1 CLI and compact-JSON MCP) across records (keeping non-metadata payload keys, stripping `payload` whenever `!full` and truncated/cursor/oversized), seabed, distillations, and files (version-pinned `v<ver>:<offset>` cursor with `CONFLICT` on drift), stripping `payload` in `history`/`context`, and rejecting window flags on realms/objects (`INVALID_INPUT`).
+
+#### Scenario: Engine-level show window bounds Markdown, JSON, and MCP with lossless cursor pagination
+- **WHEN** a caller inspects a multi-kilobyte entry or file via CLI Markdown, CLI `--json`, or MCP `mind_show` with default cap, `--around`, `--cursor`, `--history`, or `--context`
+- **THEN** output stays strictly bounded (including stripped payloads in `history`/`context`), continuation pages emit a 1-line header omitting repeated history/context, and stitching all cursor pages matches the canonical text losslessly across CJK, surrogate emojis, and newline-free mega-lines
+
+#### Scenario: Window flag validation, file cursor conflict, and out-of-bounds recovery
+- **WHEN** a caller passes window flags on a `/realm` or `kind:name` ref, passes `--around` with `--cursor`, reads a file whose version changed mid-pagination, or passes an out-of-bounds entry cursor
+- **THEN** realm/object window flags and combined `--around`+`--cursor` fail with `INVALID_INPUT`, stale file cursors fail with `CONFLICT` + `try` hint, and out-of-bounds cursors return a clean empty slice
 
 ### Requirement: Identity Anchors (`thing`), Scoped `changes --in` SQL Pushdown, and EPIPE
 Identity anchors SHALL reuse `records WHERE kind = 'thing'` and `external_ref` (no separate `things` table). `SeaEngine.changes()` with `--in <realm>` SHALL push narrowed visible realm IDs directly into `db.listChangeLog()` SQL (never JS post-filtered), preserving `B2` `scannedSeq` pagination across invisible rows. CLI read views SHALL default to compact Markdown, preserve `--json`, cap output with `--cursor` hints, and exit `0` on `EPIPE`.

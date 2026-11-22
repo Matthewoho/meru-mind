@@ -1,6 +1,19 @@
 import crypto from "node:crypto";
-import { parseSearchQuery, type SearchConcept } from "../adapters/sqlite-db.js";
-import { buildSnippet, extractReadableText } from "../format/snippet.js";
+import {
+  CJK_COVERAGE_THRESHOLD,
+  parseSearchQuery,
+  type SearchConcept,
+} from "../adapters/sqlite-db.js";
+import {
+  buildCanonicalEntryContent,
+  buildRecordFtsBody,
+  buildSnippet,
+  buildSnippetWithMeta,
+  DEFAULT_SHOW_LIMIT,
+  extractReadableText,
+  MAX_SHOW_LIMIT,
+  windowText,
+} from "../format/snippet.js";
 import {
   assertAccess,
   getDescendantIds,
@@ -29,6 +42,7 @@ import {
   type Distillation,
   type DistillationLayer,
   type LedgerRecord,
+  type LedgerRecordSummary,
   type LsDriveFileItem,
   type LsEntry,
   type LsObjectSummary,
@@ -53,7 +67,10 @@ import {
   type SeabedKind,
   type SearchResult,
   type Sensitivity,
+  type ShowContextResult,
   type ShowResult,
+  type ShowSupersedeChainResult,
+  type ShowWindow,
   type SyncEmbeddingsResult,
   type TreeResult,
   type WhoamiResult,
@@ -663,6 +680,17 @@ export class SeaEngine {
       const orphanSuperseded = isSuperseded
         ? vis.isOrphanSuperseded(rec)
         : undefined;
+      const snippetMeta = buildSnippetWithMeta({
+        title: clean.title,
+        payload: clean.payload,
+        concepts,
+      });
+      const canonical = buildCanonicalEntryContent({
+        kind: "record",
+        payload: clean.payload,
+      });
+      const contentChars =
+        canonical.length > 0 ? canonical.length : clean.title.length;
       return {
         id: clean.id,
         behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
@@ -672,11 +700,10 @@ export class SeaEngine {
         realmPath: vis.getSanitizedRealmPath(clean.realmId),
         status: clean.status,
         title: clean.title,
-        snippet: buildSnippet({
-          title: clean.title,
-          payload: clean.payload,
-          concepts,
-        }),
+        snippet: snippetMeta.snippet,
+        contentChars,
+        shownChars: snippetMeta.snippet.length,
+        truncated: snippetMeta.truncated,
         authorId: clean.authorId,
         createdAt: clean.createdAt,
         occurredAt: clean.occurredAt,
@@ -697,6 +724,7 @@ export class SeaEngine {
       concepts?: SearchConcept[],
     ): RecallItem => {
       const clean = vis.sanitizeSeabed(sea);
+      const snippetMeta = buildSnippetWithMeta({ text: clean.text, concepts });
       return {
         id: clean.id,
         behaviorClass: "raw",
@@ -706,7 +734,10 @@ export class SeaEngine {
         realmPath: vis.getSanitizedRealmPath(clean.realmId),
         status: clean.redactedAt ? "retracted" : "evidence",
         title: `${clean.kind}${clean.topicId ? ` (${clean.topicId})` : ""}`,
-        snippet: buildSnippet({ text: clean.text, concepts }),
+        snippet: snippetMeta.snippet,
+        contentChars: clean.text.length,
+        shownChars: snippetMeta.snippet.length,
+        truncated: snippetMeta.truncated,
         authorId: clean.authorId,
         createdAt: clean.createdAt,
         occurredAt: clean.occurredAt,
@@ -730,6 +761,11 @@ export class SeaEngine {
       concepts?: SearchConcept[],
     ): RecallItem => {
       const clean = vis.sanitizeDistillation(dist);
+      const canonical = clean.narrativeMd || JSON.stringify(clean.hardFacts);
+      const snippetMeta = buildSnippetWithMeta({
+        text: canonical,
+        concepts,
+      });
       return {
         id: clean.id,
         behaviorClass: "conclusion",
@@ -739,10 +775,10 @@ export class SeaEngine {
         realmPath: vis.getSanitizedRealmPath(clean.realmId),
         status: clean.status,
         title: `${clean.layer} (${clean.periodKey})`,
-        snippet: buildSnippet({
-          text: clean.narrativeMd || JSON.stringify(clean.hardFacts),
-          concepts,
-        }),
+        snippet: snippetMeta.snippet,
+        contentChars: canonical.length,
+        shownChars: snippetMeta.snippet.length,
+        truncated: snippetMeta.truncated,
         authorId: "system",
         createdAt: clean.createdAt,
         occurredAt: clean.createdAt,
@@ -925,7 +961,18 @@ export class SeaEngine {
       };
     }
 
-    // Stages 3 & 4: Comparable Staged FTS5 (Pass 1 AND + Pass 2 OR) + Vector + Strict Total-Order Lexicographic Rank
+    // Stages 3 & 4: Comparable Staged FTS5 (Pass 1 AND + Pass 2 OR via unified fts_docs) + Vector + Strict Total-Order Lexicographic Rank
+    if (allowedEntrySet && allowedEntrySet.size === 0) {
+      return {
+        viewerRealmId: query.viewerRealmId,
+        items: [],
+        totalMatched: 0,
+        omittedCount: 0,
+        vectorUsed: false,
+        message: "No matching entries found within your visible realm scope.",
+      };
+    }
+
     const parsedQuery = parseSearchQuery(query.query);
     const candidateLimit = Math.max((offset + limit) * 5, 100);
 
@@ -938,71 +985,55 @@ export class SeaEngine {
       { sourceType: "record" | "seabed" | "distillation"; rank: number }
     >();
 
-    const runFtsPass = (
-      ftsExpr: string | null,
-      targetMap: Map<
-        string,
-        { sourceType: "record" | "seabed" | "distillation"; rank: number }
-      >,
-    ) => {
-      if (!ftsExpr) return;
-      if (ledgerRealmIds.length > 0) {
-        const ledgerHits = this.db.searchFts({
-          ftsExpression: ftsExpr,
-          realmIds: ledgerRealmIds,
-          sourceTypes: ["record", "distillation"],
+    // Pass 1: All-concept AND (single unified SQL statement over fts_index + fts_docs)
+    const pass1Res = parsedQuery.ftsAndExpression
+      ? this.db.searchFtsUnified({
+          ftsExpression: parsedQuery.ftsAndExpression,
+          ledgerRealmIds,
+          seabedRealmIds,
           includeSuperseded,
-          limit: candidateLimit,
-        });
-        for (const m of ledgerHits) {
-          targetMap.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
-        }
-      }
-      if (seabedRealmIds.length > 0) {
-        const seabedHits = this.db.searchFts({
-          ftsExpression: ftsExpr,
-          realmIds: seabedRealmIds,
-          sourceTypes: ["seabed"],
-          includeSuperseded,
-          limit: candidateLimit,
-        });
-        for (const m of seabedHits) {
-          targetMap.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
-        }
-      }
-    };
-
-    // Pass 1: All-concept AND (multi-bigram CJK segments use OR inside parenthesized group)
-    runFtsPass(parsedQuery.ftsAndExpression, pass1Map);
+          recordKinds: query.recordKinds,
+          seabedKinds: query.seabedKinds,
+          since: query.since,
+          until: query.until,
+          allowedEntryIds: query.allowedEntryIds,
+          perBucketLimit: candidateLimit,
+        })
+      : { rows: [], total: 0, ledgerCount: 0, seabedCount: 0 };
+    for (const m of pass1Res.rows) {
+      pass1Map.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
+    }
 
     // Pass 2: Broad partial OR (only run separately when distinct from Pass 1)
     const hasDistinctPass2 =
       parsedQuery.ftsOrExpression !== null &&
       parsedQuery.ftsOrExpression !== parsedQuery.ftsAndExpression;
+    const pass2Res =
+      hasDistinctPass2 && parsedQuery.ftsOrExpression
+        ? this.db.searchFtsUnified({
+            ftsExpression: parsedQuery.ftsOrExpression,
+            ledgerRealmIds,
+            seabedRealmIds,
+            includeSuperseded,
+            recordKinds: query.recordKinds,
+            seabedKinds: query.seabedKinds,
+            since: query.since,
+            until: query.until,
+            allowedEntryIds: query.allowedEntryIds,
+            perBucketLimit: candidateLimit,
+          })
+        : pass1Res;
     if (hasDistinctPass2) {
-      runFtsPass(parsedQuery.ftsOrExpression, pass2Map);
+      for (const m of pass2Res.rows) {
+        pass2Map.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
+      }
     }
 
-    // Exact SQL COUNT(*) of the broad recall union (Pass 2 OR)
-    const broadFtsExpr = parsedQuery.ftsOrExpression ?? parsedQuery.ftsAndExpression;
-    const exactFtsTotal = broadFtsExpr
-      ? (ledgerRealmIds.length > 0
-          ? this.db.countFts({
-              ftsExpression: broadFtsExpr,
-              realmIds: ledgerRealmIds,
-              sourceTypes: ["record", "distillation"],
-              includeSuperseded,
-            })
-          : 0) +
-        (seabedRealmIds.length > 0
-          ? this.db.countFts({
-              ftsExpression: broadFtsExpr,
-              realmIds: seabedRealmIds,
-              sourceTypes: ["seabed"],
-              includeSuperseded,
-            })
-          : 0)
-      : 0;
+    // Exact SQL total from Pass 2 (OR) when Pass 2 executes, else from Pass 1
+    const sqlTotal = pass2Res.total;
+    const ftsCapped =
+      pass2Res.total > pass2Res.rows.length ||
+      pass1Res.total > pass1Res.rows.length;
 
     let vectorUsed = false;
     const vecMap = new Map<
@@ -1108,7 +1139,7 @@ export class SeaEngine {
     }
 
     const concepts = parsedQuery.concepts;
-    let droppedByIdentifierBoundary = false;
+    let ftsRejectedByJsCount = 0;
     let vectorOnlyHydratedCount = 0;
 
     const evaluateCandidate = (params: {
@@ -1133,29 +1164,33 @@ export class SeaEngine {
       if (hasFts) matchedBy.push("fts");
       if (hasVector) matchedBy.push("vector");
 
+      // Pre-compute lowercased title & body ONCE per candidate
+      const titleLower = params.titleText.toLowerCase();
+      const bodyLower = params.bodyText.toLowerCase();
       const fullText = `${params.titleText}\n${params.bodyText}`;
+      const fullLower = `${titleLower}\n${bodyLower}`;
 
       // Explicitly compute JS title vs title+body coverage (never rely solely on Pass 1 membership)
       let titleAllCovered = concepts.length > 0;
       let fullAllCovered = concepts.length > 0;
       let scoreSum = 0;
       for (const c of concepts) {
-        if (!c.matchText(params.titleText)) {
+        const threshold = c.isCjk ? CJK_COVERAGE_THRESHOLD : 1.0;
+        if (c.scoreText(params.titleText, titleLower) < threshold) {
           titleAllCovered = false;
         }
-        if (!c.matchText(fullText)) {
+        const fullScore = c.scoreText(fullText, fullLower);
+        if (fullScore < threshold) {
           fullAllCovered = false;
         }
-        scoreSum += c.scoreText(fullText);
+        scoreSum += fullScore;
       }
       const coverageRatio =
         concepts.length > 0 ? scoreSum / concepts.length : 0;
 
       // Reject FTS-only false positives where identifier or lexical terms scored 0 in JS
       if (hasFts && !hasVector && concepts.length > 0 && coverageRatio === 0) {
-        if (parsedQuery.hasIdentifiers) {
-          droppedByIdentifierBoundary = true;
-        }
+        ftsRejectedByJsCount += 1;
         return null;
       }
 
@@ -1272,32 +1307,54 @@ export class SeaEngine {
     const candidates: RankedCandidate[] = [];
 
     for (const [itemId, sourceType] of candidateSourceMap.entries()) {
+      const isFtsCandidate = pass1Map.has(itemId) || pass2Map.has(itemId);
+      const rejectIfFts = () => {
+        if (isFtsCandidate) ftsRejectedByJsCount += 1;
+      };
       if (allowedEntrySet && !allowedEntrySet.has(itemId)) {
+        rejectIfFts();
         continue;
       }
       if (sourceType === "record") {
         const rec = hydratedRecords.get(itemId);
         if (!rec || rec.sensitivity === "secret" || !vis.canSeeRecord(rec)) {
+          rejectIfFts();
           continue;
         }
-        if (rec.status === "retracted" || rec.redactedAt !== null) continue;
-        if (!includeSuperseded && rec.status !== "active") continue;
-        if (query.thingId && rec.thingId !== query.thingId) continue;
-        if (query.recordKinds && !query.recordKinds.includes(rec.kind)) continue;
-        if (query.authorId && rec.authorId !== query.authorId) continue;
+        if (rec.status === "retracted" || rec.redactedAt !== null) {
+          rejectIfFts();
+          continue;
+        }
+        if (!includeSuperseded && rec.status !== "active") {
+          rejectIfFts();
+          continue;
+        }
+        if (query.thingId && rec.thingId !== query.thingId) {
+          rejectIfFts();
+          continue;
+        }
+        if (query.seabedKinds && !query.recordKinds) {
+          rejectIfFts();
+          continue;
+        }
+        if (query.recordKinds && !query.recordKinds.includes(rec.kind)) {
+          rejectIfFts();
+          continue;
+        }
+        if (query.authorId && rec.authorId !== query.authorId) {
+          rejectIfFts();
+          continue;
+        }
         if (query.since && (rec.occurredAt === null || rec.occurredAt < query.since)) {
+          rejectIfFts();
           continue;
         }
         if (query.until && (rec.occurredAt === null || rec.occurredAt > query.until)) {
+          rejectIfFts();
           continue;
         }
 
-        const bodyText = Object.entries(rec.payload)
-          .map(
-            ([k, v]) =>
-              `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
-          )
-          .join("\n");
+        const bodyText = buildRecordFtsBody(rec.payload);
         const cand = evaluateCandidate({
           id: rec.id,
           sourceType: "record",
@@ -1311,19 +1368,37 @@ export class SeaEngine {
         });
         if (cand) candidates.push(cand);
       } else if (sourceType === "seabed") {
-        if (query.thingId) continue;
-        const sea = hydratedSeabed.get(itemId);
-        if (!sea || sea.sensitivity === "secret" || !vis.canSeeSeabed(sea)) {
+        if (query.thingId) {
+          rejectIfFts();
           continue;
         }
-        if (sea.redactedAt !== null) continue;
-        if (query.recordKinds && !query.seabedKinds) continue;
-        if (query.seabedKinds && !query.seabedKinds.includes(sea.kind)) continue;
-        if (query.authorId && sea.authorId !== query.authorId) continue;
+        const sea = hydratedSeabed.get(itemId);
+        if (!sea || sea.sensitivity === "secret" || !vis.canSeeSeabed(sea)) {
+          rejectIfFts();
+          continue;
+        }
+        if (sea.redactedAt !== null) {
+          rejectIfFts();
+          continue;
+        }
+        if (query.recordKinds && !query.seabedKinds) {
+          rejectIfFts();
+          continue;
+        }
+        if (query.seabedKinds && !query.seabedKinds.includes(sea.kind)) {
+          rejectIfFts();
+          continue;
+        }
+        if (query.authorId && sea.authorId !== query.authorId) {
+          rejectIfFts();
+          continue;
+        }
         if (query.since && (sea.occurredAt === null || sea.occurredAt < query.since)) {
+          rejectIfFts();
           continue;
         }
         if (query.until && (sea.occurredAt === null || sea.occurredAt > query.until)) {
+          rejectIfFts();
           continue;
         }
 
@@ -1341,15 +1416,39 @@ export class SeaEngine {
         });
         if (cand) candidates.push(cand);
       } else {
-        if (query.thingId) continue;
-        if (query.authorId && query.authorId !== "system") continue;
+        if (query.thingId) {
+          rejectIfFts();
+          continue;
+        }
+        if (query.authorId && query.authorId !== "system") {
+          rejectIfFts();
+          continue;
+        }
         const dist = hydratedDists.get(itemId);
-        if (!dist || !vis.canSeeDistillation(dist)) continue;
-        if (dist.status === "retracted") continue;
-        if (!includeSuperseded && dist.status !== "active") continue;
-        if (query.recordKinds || query.seabedKinds) continue;
-        if (query.since && dist.createdAt < query.since) continue;
-        if (query.until && dist.createdAt > query.until) continue;
+        if (!dist || !vis.canSeeDistillation(dist)) {
+          rejectIfFts();
+          continue;
+        }
+        if (dist.status === "retracted") {
+          rejectIfFts();
+          continue;
+        }
+        if (!includeSuperseded && dist.status !== "active") {
+          rejectIfFts();
+          continue;
+        }
+        if (query.recordKinds || query.seabedKinds) {
+          rejectIfFts();
+          continue;
+        }
+        if (query.since && dist.createdAt < query.since) {
+          rejectIfFts();
+          continue;
+        }
+        if (query.until && dist.createdAt > query.until) {
+          rejectIfFts();
+          continue;
+        }
 
         const titleText = `${dist.layer}:${dist.periodKey}`;
         const cand = evaluateCandidate({
@@ -1525,19 +1624,17 @@ export class SeaEngine {
       return compareRecencyDesc(a, b);
     });
 
-    const hasPostFilter = Boolean(
-      query.thingId ||
-        query.recordKinds ||
-        query.seabedKinds ||
-        query.authorId ||
-        query.since ||
-        query.until ||
-        allowedEntrySet ||
-        droppedByIdentifierBoundary,
+    const hasJsPostFilter = Boolean(
+      query.thingId || query.authorId || ftsRejectedByJsCount > 0,
     );
-    const totalMatched = hasPostFilter
-      ? candidates.length
-      : Math.max(candidates.length, exactFtsTotal + vectorOnlyHydratedCount);
+    const totalMatched = !hasJsPostFilter
+      ? Math.max(candidates.length, sqlTotal + vectorOnlyHydratedCount)
+      : !ftsCapped
+        ? candidates.length
+        : Math.max(
+            candidates.length,
+            sqlTotal + vectorOnlyHydratedCount - ftsRejectedByJsCount,
+          );
 
     const pageCandidates = candidates.slice(offset, offset + limit);
 
@@ -3108,6 +3205,10 @@ export class SeaEngine {
     ref: string;
     history?: boolean;
     context?: number;
+    around?: string;
+    cursor?: string;
+    limit?: number;
+    full?: boolean;
     includeDescendantSeabed?: boolean;
     scopeCeiling?: AccessScope;
   }): Promise<ShowResult> {
@@ -3120,8 +3221,40 @@ export class SeaEngine {
         `--context must be a non-negative integer, got ${String(params.context)}`,
       );
     }
+    if (
+      params.limit !== undefined &&
+      (!Number.isInteger(params.limit) ||
+        params.limit < 1 ||
+        params.limit > MAX_SHOW_LIMIT)
+    ) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `--limit must be an integer between 1 and ${MAX_SHOW_LIMIT}, got ${String(params.limit)}`,
+      );
+    }
+
+    const aroundTrimmed = params.around?.trim() || undefined;
+    const hasWindowFlags = Boolean(
+      params.around !== undefined ||
+        params.cursor !== undefined ||
+        params.limit !== undefined ||
+        params.full === true,
+    );
 
     const parsed = parseRefSyntax(params.ref);
+    if ((parsed.kind === "realm" || parsed.kind === "object") && hasWindowFlags) {
+      throw new MindError(
+        "INVALID_INPUT",
+        "--around/--cursor/--limit/--full are only supported when showing an entry (rec_/sea_) or file (file:...)",
+      );
+    }
+    if (aroundTrimmed && params.cursor !== undefined) {
+      throw new MindError(
+        "INVALID_INPUT",
+        "Use either --around or --cursor, not both",
+      );
+    }
+
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
     const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
@@ -3217,8 +3350,28 @@ export class SeaEngine {
       };
     }
 
-    // 3. File -> canonical file: read with longest visible realm prefix
+    const aroundConcepts = aroundTrimmed
+      ? parseSearchQuery(aroundTrimmed).concepts
+      : undefined;
+    const effectiveLimit = params.limit ?? DEFAULT_SHOW_LIMIT;
+    const isFull = Boolean(params.full);
+
+    // 3. File -> canonical file: read with longest visible realm prefix + version-pinned windowing
     if (parsed.kind === "file") {
+      let fileCursorVer: number | undefined;
+      let cursorOffset: number | undefined;
+      if (params.cursor !== undefined) {
+        const match = /^v(\d+):(\d+)$/.exec(params.cursor.trim());
+        if (!match) {
+          throw new MindError(
+            "INVALID_INPUT",
+            `Invalid file cursor "${params.cursor}": expected v<version>:<offset>`,
+          );
+        }
+        fileCursorVer = Number.parseInt(match[1]!, 10);
+        cursorOffset = Number.parseInt(match[2]!, 10);
+      }
+
       const resolvedFile = resolveFileRef({
         realms,
         orgId: viewerRealm.orgId,
@@ -3235,15 +3388,62 @@ export class SeaEngine {
       if (!file) {
         throw new MindError("NOT_FOUND", OPAQUE_FILE_NOT_FOUND);
       }
+      if (fileCursorVer !== undefined && fileCursorVer !== file.version) {
+        throw new MindError(
+          "CONFLICT",
+          `File changed since cursor was issued (cursor v${fileCursorVer}, current v${file.version})`,
+          { try: `meru-mind show ${resolvedFile.canonicalRef}` },
+        );
+      }
+
+      const win = windowText({
+        text: buildCanonicalEntryContent({ kind: "file", content: file.content }),
+        around: aroundTrimmed,
+        aroundConcepts,
+        cursorOffset,
+        limit: effectiveLimit,
+        full: isFull,
+      });
+      const showWindow: ShowWindow = {
+        start: win.start,
+        end: win.end,
+        total: win.total,
+        shownChars: win.shownChars,
+        truncated: win.truncated,
+        nextCursor:
+          win.nextOffset !== null ? `v${file.version}:${win.nextOffset}` : null,
+        ...(aroundTrimmed
+          ? { around: aroundTrimmed, aroundMatched: win.aroundMatched }
+          : {}),
+      };
       return {
         refType: "file",
         ref: resolvedFile.canonicalRef,
         realmPath: resolvedFile.realm.path,
-        file,
+        file: { ...file, content: win.slice },
+        window: showWindow,
       };
     }
 
-    // 4. Entry -> full entry + optional history DAG + optional context replay window
+    // 4. Entry -> bounded canonical window + optional bounded history DAG + optional bounded context replay window
+    let entryCursorOffset: number | undefined;
+    if (params.cursor !== undefined) {
+      const trimmedCursor = params.cursor.trim();
+      if (!/^\d+$/.test(trimmedCursor)) {
+        throw new MindError(
+          "INVALID_INPUT",
+          `Invalid cursor "${params.cursor}": expected a non-negative integer offset`,
+        );
+      }
+      entryCursorOffset = Number.parseInt(trimmedCursor, 10);
+      if (!Number.isSafeInteger(entryCursorOffset) || entryCursorOffset < 0) {
+        throw new MindError(
+          "INVALID_INPUT",
+          `Invalid cursor "${params.cursor}": offset out of range`,
+        );
+      }
+    }
+
     const catRes = await this.cat({
       actor: params.actor,
       viewerRealmId: viewerRealm.id,
@@ -3263,21 +3463,123 @@ export class SeaEngine {
       };
     }
 
-    let historyResult = undefined;
-    if (params.history && catRes.kind === "record") {
+    const canonicalContent =
+      catRes.kind === "record"
+        ? buildCanonicalEntryContent({
+            kind: "record",
+            payload: catRes.record.payload,
+          })
+        : catRes.kind === "seabed"
+          ? buildCanonicalEntryContent({
+              kind: "seabed",
+              text: catRes.seabed.text,
+            })
+          : catRes.kind === "distillation"
+            ? buildCanonicalEntryContent({
+                kind: "distillation",
+                narrativeMd: catRes.distillation.narrativeMd,
+              })
+            : buildCanonicalEntryContent({
+                kind: "file",
+                content: catRes.file.content,
+              });
+
+    const win = windowText({
+      text: canonicalContent,
+      around: aroundTrimmed,
+      aroundConcepts,
+      cursorOffset: entryCursorOffset,
+      limit: effectiveLimit,
+      full: isFull,
+    });
+    const showWindow: ShowWindow = {
+      start: win.start,
+      end: win.end,
+      total: win.total,
+      shownChars: win.shownChars,
+      truncated: win.truncated,
+      nextCursor: win.nextOffset !== null ? String(win.nextOffset) : null,
+      ...(aroundTrimmed
+        ? { around: aroundTrimmed, aroundMatched: win.aroundMatched }
+        : {}),
+    };
+
+    // Enforce strict JSON/MCP boundedness across ALL 4 content types
+    let boundedEntry: CatResult = catRes;
+    if (catRes.kind === "record") {
+      if (
+        !isFull &&
+        (showWindow.truncated ||
+          params.cursor !== undefined ||
+          JSON.stringify(catRes.record.payload).length > effectiveLimit)
+      ) {
+        boundedEntry = {
+          ...catRes,
+          record: { ...catRes.record, payload: {} },
+        };
+      }
+    } else if (catRes.kind === "seabed") {
+      boundedEntry = {
+        ...catRes,
+        seabed: { ...catRes.seabed, text: win.slice },
+      };
+    } else if (catRes.kind === "distillation") {
+      boundedEntry = {
+        ...catRes,
+        distillation: { ...catRes.distillation, narrativeMd: win.slice },
+      };
+    } else if (catRes.kind === "drive") {
+      boundedEntry = {
+        ...catRes,
+        file: { ...catRes.file, content: win.slice },
+      };
+    }
+
+    const isContinuation = params.cursor !== undefined && showWindow.start > 0;
+    const toRecordSummary = (r: LedgerRecord): LedgerRecordSummary => ({
+      id: r.id,
+      realmId: r.realmId,
+      kind: r.kind,
+      status: r.status,
+      title: r.title,
+      occurredAt: r.occurredAt,
+      createdAt: r.createdAt,
+      authorId: r.authorId,
+      authorKind: r.authorKind,
+      sensitivity: r.sensitivity,
+      supersedesId: r.supersedesId,
+      supersedesIds: r.supersedesIds,
+      supersededById: r.supersededById,
+    });
+    const capContextEntry = (e: LsEntry): LsEntry =>
+      !isFull && e.snippet.length > 500
+        ? {
+            ...e,
+            snippet: `${e.snippet.slice(0, 500)}... [+${e.snippet.length - 500} chars]`,
+          }
+        : e;
+
+    let historyResult: ShowSupersedeChainResult | undefined;
+    if (!isContinuation && params.history && catRes.kind === "record") {
       const rawRec = this.db.getRecord(parsed.entryId);
       if (rawRec && vis.canSeeRecord(rawRec)) {
-        historyResult = vis.traverseSupersedeDag(rawRec);
+        const dag = vis.traverseSupersedeDag(rawRec);
+        historyResult = {
+          nodes: dag.nodes.map(toRecordSummary),
+          currentHeadId: dag.currentHeadId,
+          orphanSuperseded: dag.orphanSuperseded,
+        };
       }
     }
 
-    let contextResult = undefined;
+    let contextResult: ShowContextResult | undefined;
     if (
+      !isContinuation &&
       params.context !== undefined &&
       params.context > 0 &&
       (catRes.kind === "record" || catRes.kind === "seabed")
     ) {
-      contextResult = this.replay({
+      const rawReplay = this.replay({
         actor: params.actor,
         viewerRealmId: viewerRealm.id,
         entryId: parsed.entryId,
@@ -3285,12 +3587,21 @@ export class SeaEngine {
         includeDescendantSeabed,
         scopeCeiling: scope,
       });
+      contextResult = {
+        ...rawReplay,
+        supersedeChain: rawReplay.supersedeChain.map(toRecordSummary),
+        before: rawReplay.before.map(capContextEntry),
+        anchor: capContextEntry(rawReplay.anchor),
+        after: rawReplay.after.map(capContextEntry),
+      };
     }
 
     return {
       refType: "entry",
       ref: parsed.entryId,
-      entry: catRes,
+      entry: boundedEntry,
+      content: win.slice,
+      window: showWindow,
       ...(historyResult ? { history: historyResult } : {}),
       ...(contextResult ? { context: contextResult } : {}),
     };
@@ -3634,9 +3945,12 @@ export class SeaEngine {
       const title = `${distillation.layer}:${distillation.periodKey}`;
       this.db.upsertFtsItem({
         itemId: distillation.id,
+        orgId: targetRealm.orgId,
         sourceType: "distillation",
         realmId: distillation.realmId,
         status: distillation.status,
+        kind: distillation.layer,
+        occurredAt: distillation.createdAt,
         title,
         body: distillation.narrativeMd,
       });
@@ -3830,12 +4144,10 @@ export class SeaEngine {
       this.db.clearVectorIndex();
 
       const now = new Date().toISOString();
+      const BATCH = 500;
       const realmsById = new Map(
         this.db.listRealms().map((r) => [r.id, r]),
       );
-      const seabed = this.db.listAllSeabedEntries();
-      const records = this.db.listAllRecords();
-      const distillations = this.db.listAllDistillations();
 
       const indexOneSync = (item: {
         itemId: string;
@@ -3843,14 +4155,19 @@ export class SeaEngine {
         orgId: string;
         realmId: string;
         status: string;
+        kind: string;
+        occurredAt: string | null;
         title: string;
         body: string;
       }) => {
         this.db.upsertFtsItem({
           itemId: item.itemId,
+          orgId: item.orgId,
           sourceType: item.sourceType,
           realmId: item.realmId,
           status: item.status,
+          kind: item.kind,
+          occurredAt: item.occurredAt,
           title: item.title,
           body: item.body,
         });
@@ -3868,72 +4185,91 @@ export class SeaEngine {
         });
       };
 
-      for (const s of seabed) {
-        if (s.redactedAt !== null || s.sensitivity === "secret") continue;
-        const orgId = s.orgId || realmsById.get(s.realmId)?.orgId || "";
-        indexOneSync({
-          itemId: s.id,
-          sourceType: "seabed",
-          orgId,
-          realmId: s.realmId,
-          status: "evidence",
-          title: `${s.kind}:${s.topicId ?? s.realmId}`,
-          body: s.text,
-        });
+      // 1) Stream seabed entries in keyset batches (zero full-table RAM spike)
+      let lastSeaId = "";
+      while (true) {
+        const batch = this.db.listSeabedEntriesBatch(lastSeaId, BATCH);
+        if (batch.length === 0) break;
+        for (const s of batch) {
+          if (s.redactedAt !== null || s.sensitivity === "secret") continue;
+          const orgId = s.orgId || realmsById.get(s.realmId)?.orgId || "";
+          indexOneSync({
+            itemId: s.id,
+            sourceType: "seabed",
+            orgId,
+            realmId: s.realmId,
+            status: "evidence",
+            kind: s.kind,
+            occurredAt: s.occurredAt,
+            title: `${s.kind}:${s.topicId ?? s.realmId}`,
+            body: s.text,
+          });
+        }
+        lastSeaId = batch[batch.length - 1]!.id;
+        if (batch.length < BATCH) break;
       }
 
-      for (const r of records) {
-        if (
-          r.redactedAt !== null ||
-          r.sensitivity === "secret" ||
-          r.status === "retracted"
-        ) {
-          continue;
+      // 2) Stream records in keyset batches using shared buildRecordFtsBody
+      let lastRecId = "";
+      while (true) {
+        const batch = this.db.listRecordsBatch(lastRecId, BATCH);
+        if (batch.length === 0) break;
+        for (const r of batch) {
+          if (
+            r.redactedAt !== null ||
+            r.sensitivity === "secret" ||
+            r.status === "retracted"
+          ) {
+            continue;
+          }
+          const orgId = r.orgId || realmsById.get(r.realmId)?.orgId || "";
+          const payloadText = buildRecordFtsBody(r.payload);
+          indexOneSync({
+            itemId: r.id,
+            sourceType: "record",
+            orgId,
+            realmId: r.realmId,
+            status: r.status,
+            kind: r.kind,
+            occurredAt: r.occurredAt,
+            title: r.title,
+            body: payloadText,
+          });
         }
-        const orgId = r.orgId || realmsById.get(r.realmId)?.orgId || "";
-        const payloadText = Object.entries(r.payload)
-          .map(
-            ([k, v]) =>
-              `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`,
-          )
-          .join("\n");
-        indexOneSync({
-          itemId: r.id,
-          sourceType: "record",
-          orgId,
-          realmId: r.realmId,
-          status: r.status,
-          title: r.title,
-          body: payloadText,
-        });
+        lastRecId = batch[batch.length - 1]!.id;
+        if (batch.length < BATCH) break;
       }
 
-      // Verify distillations against canonical truth
-      const existingIds = new Set<string>([
-        ...seabed.map((s) => s.id),
-        ...records.map((r) => r.id),
-        ...distillations.map((d) => d.id),
-      ]);
-      distillationsVerified = distillations.length;
-
-      for (const d of distillations) {
-        const missing = d.sourceIds.filter((id) => !existingIds.has(id));
-        if (missing.length > 0) {
-          distillationMismatches.push(
-            `${d.id}: missing sourceIds [${missing.join(", ")}]`,
-          );
+      // 3) Verify distillations against lightweight ID-only canonical set (zero payload materialization)
+      const existingIds = this.db.listAllCanonicalIds();
+      let lastDistId = "";
+      while (true) {
+        const batch = this.db.listDistillationsBatch(lastDistId, BATCH);
+        if (batch.length === 0) break;
+        distillationsVerified += batch.length;
+        for (const d of batch) {
+          const missing = d.sourceIds.filter((id) => !existingIds.has(id));
+          if (missing.length > 0) {
+            distillationMismatches.push(
+              `${d.id}: missing sourceIds [${missing.join(", ")}]`,
+            );
+          }
+          if ((d.status as string) === "retracted") continue;
+          const orgId = realmsById.get(d.realmId)?.orgId ?? "";
+          indexOneSync({
+            itemId: d.id,
+            sourceType: "distillation",
+            orgId,
+            realmId: d.realmId,
+            status: d.status,
+            kind: d.layer,
+            occurredAt: d.createdAt,
+            title: `${d.layer}:${d.periodKey}`,
+            body: d.narrativeMd,
+          });
         }
-        if ((d.status as string) === "retracted") continue;
-        const orgId = realmsById.get(d.realmId)?.orgId ?? "";
-        indexOneSync({
-          itemId: d.id,
-          sourceType: "distillation",
-          orgId,
-          realmId: d.realmId,
-          status: d.status,
-          title: `${d.layer}:${d.periodKey}`,
-          body: d.narrativeMd,
-        });
+        lastDistId = batch[batch.length - 1]!.id;
+        if (batch.length < BATCH) break;
       }
     });
 

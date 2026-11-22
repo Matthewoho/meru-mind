@@ -1457,8 +1457,8 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
     expect(parsedStop.concepts[0]!.terms).toContain("网关");
     expect(parsedStop.concepts[0]!.terms).not.toContain("查找");
     expect(parsedStop.concepts[0]!.terms).not.toContain("相关");
-    expect(parsedStop.ftsExpression).toContain('"支 付"');
-    expect(parsedStop.ftsExpression).toContain('"网 关"');
+    expect(parsedStop.ftsExpression).toContain('"支付"');
+    expect(parsedStop.ftsExpression).toContain('"网关"');
 
     const parsedAllStop = parseSearchQuery("查找一下相关");
     expect(parsedAllStop.concepts.length).toBeGreaterThan(0);

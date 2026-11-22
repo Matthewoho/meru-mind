@@ -250,10 +250,43 @@ export interface DriveFileContent extends DriveFileMeta {
   content: string;
 }
 
+export interface LedgerRecordSummary {
+  id: string;
+  realmId: string;
+  kind: RecordKind;
+  status: RecordStatus;
+  title: string;
+  occurredAt: string | null;
+  createdAt: string;
+  authorId: string;
+  authorKind: ActorKind;
+  sensitivity: Sensitivity;
+  supersedesId: string | null;
+  supersedesIds: string[];
+  supersededById: string | null;
+}
+
 export interface SupersedeChainResult {
   nodes: LedgerRecord[];
   currentHeadId: string | null;
   orphanSuperseded: boolean;
+}
+
+export interface ShowSupersedeChainResult {
+  nodes: LedgerRecordSummary[];
+  currentHeadId: string | null;
+  orphanSuperseded: boolean;
+}
+
+export interface ShowWindow {
+  start: number;
+  end: number;
+  total: number;
+  shownChars: number;
+  truncated: boolean;
+  nextCursor: string | null;
+  around?: string;
+  aroundMatched?: boolean;
 }
 
 export interface BriefBudget {
@@ -373,6 +406,9 @@ export interface RecallItem {
   status: RecallItemStatus;
   title: string;
   snippet: string;
+  contentChars: number;
+  shownChars: number;
+  truncated: boolean;
   authorId: string;
   createdAt: string;
   occurredAt: string | null;
@@ -659,14 +695,17 @@ export type ShowResult =
       refType: "entry";
       ref: string;
       entry: CatResult;
-      history?: SupersedeChainResult;
-      context?: ReplayResult;
+      content: string;
+      window: ShowWindow;
+      history?: ShowSupersedeChainResult;
+      context?: ShowContextResult;
     }
   | {
       refType: "file";
       ref: string;
       realmPath: string;
       file: DriveFileContent;
+      window: ShowWindow;
     };
 
 export interface SearchResult extends RecallResult {
@@ -716,6 +755,19 @@ export interface ReplayResult {
   timeBasis: "occurred_at" | "created_at";
   window: number;
   supersedeChain: LedgerRecord[];
+  before: LsEntry[];
+  anchor: LsEntry;
+  after: LsEntry[];
+}
+
+export interface ShowContextResult {
+  anchorId: string;
+  anchorBehaviorClass: BehaviorClass;
+  anchorRealmId: string;
+  anchorOccurredAt: string | null;
+  timeBasis: "occurred_at" | "created_at";
+  window: number;
+  supersedeChain: LedgerRecordSummary[];
   before: LsEntry[];
   anchor: LsEntry;
   after: LsEntry[];

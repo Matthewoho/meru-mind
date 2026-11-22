@@ -320,7 +320,7 @@ describe("V0.2a-Surface Contract: 7-Tool MCP Budget, Typed Refs, Unified Objects
       next: string;
     };
     expect(whoamiBefore.bound.realmPath).toBe("/team-b2/app-c2");
-    expect(whoamiBefore.schemaVersion).toBe(5);
+    expect(whoamiBefore.schemaVersion).toBe(6);
     expect(whoamiBefore.next).toBe("meru-mind tree /team-b2/app-c2");
     // Visible realms for C2: root `/`, `/team-b2`, `/team-b2/app-c2`, `@mounted/shared-c1` = 4 (excludes hidden B1!)
     expect(whoamiBefore.corpus.realms).toBe(4);
@@ -1202,7 +1202,7 @@ describe("V0.2a-Surface Contract: 7-Tool MCP Budget, Typed Refs, Unified Objects
     });
     engines.push(upgraded);
     expect(upgraded.db.listSchemaMigrations().map((m) => m.version)).toEqual([
-      1, 2, 3, 4, 5,
+      1, 2, 3, 4, 5, 6,
     ]);
 
     // Attempt to re-write identical record via CLI `write` -> MUST be blocked with wire `forbidden`!

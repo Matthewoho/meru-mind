@@ -108,9 +108,17 @@ export {
   type VisibilityHelpers,
 } from "./engine/visibility.js";
 export {
+  buildCanonicalEntryContent,
+  buildRecordFtsBody,
   buildSnippet,
+  buildSnippetWithMeta,
+  DEFAULT_SHOW_LIMIT,
   extractReadableText,
+  MAX_SHOW_LIMIT,
+  windowText,
   type SnippetConceptLike,
+  type SnippetWithMeta,
+  type WindowTextResult,
 } from "./format/snippet.js";
 export { SeaEngine } from "./engine/sea.js";
 export {

@@ -21,7 +21,9 @@ import type {
   ReplayResult,
   ResourceTagSummary,
   SearchResult,
+  ShowContextResult,
   ShowResult,
+  ShowWindow,
   TreeResult,
   WhoamiResult,
 } from "../types.js";
@@ -462,8 +464,12 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
     lines.push("- _(none)_");
   } else {
     for (const m of brief.surface.recentMessages.items) {
+      const text =
+        m.text.length > 500
+          ? `${m.text.slice(0, 500)}... [+${m.text.length - 500} chars]`
+          : m.text;
       lines.push(
-        `- [raw/${m.kind}] \`${m.id}\` (${m.authorId} @ ${formatDateLabel(m.occurredAt)}): ${m.text}`,
+        `- [raw/${m.kind}] \`${m.id}\` (${m.authorId} @ ${formatDateLabel(m.occurredAt)}): ${text}`,
       );
     }
   }
@@ -490,7 +496,9 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
   return lines.join("\n");
 }
 
-export function formatReplayMarkdown(res: ReplayResult): string {
+export function formatReplayMarkdown(
+  res: ReplayResult | ShowContextResult,
+): string {
   const lines: string[] = [
     `# Replay: \`${res.anchorId}\` (${formatDateLabel(res.anchorOccurredAt)}, basis: \`${res.timeBasis}\`, window: ±${res.window})`,
     "",
@@ -749,6 +757,101 @@ export function formatWhoamiMarkdown(res: WhoamiResult): string {
   ].join("\n");
 }
 
+function formatShowWindowFooter(ref: string, w: ShowWindow): string | null {
+  if (!w.truncated) return null;
+  if (w.nextCursor !== null) {
+    return `--- chars ${w.start}–${w.end} of ${w.total} · next: meru-mind show ${ref} --cursor ${w.nextCursor} · all: --full (${w.total} chars)`;
+  }
+  return `--- chars ${w.start}–${w.end} of ${w.total} · end of content · all: --full (${w.total} chars)`;
+}
+
+function formatEntryHeaderLines(res: CatResult): string[] {
+  if (res.kind === "record") {
+    const r = res.record;
+    const badge = formatBehaviorBadge(res.behaviorClass, r.kind, r.extKind);
+    const lines: string[] = [
+      `# ${badge} ${r.title}`,
+      "",
+      `- **ID**: \`${r.id}\``,
+      `- **Realm**: \`${res.realmPath}\` (\`${r.realmId}\`)`,
+      `- **Status**: \`${r.status}\`${res.orphanSuperseded ? " _(orphan superseded)_" : ""}`,
+      `- **Author**: \`${r.authorId}\` (${r.authorKind}, confirmedByHuman: ${r.confirmedByHuman})`,
+      `- **Occurred**: ${formatDateLabel(r.occurredAt)}`,
+      `- **Sensitivity**: \`${r.sensitivity}\``,
+    ];
+    if (r.externalRef) lines.push(`- **External Ref**: \`${r.externalRef}\``);
+    if (r.sourceRef) lines.push(`- **Source Ref**: \`${r.sourceRef}\``);
+    if (r.supersedesIds && r.supersedesIds.length > 1) {
+      lines.push(
+        `- **Supersedes**: ${r.supersedesIds.map((id) => `\`${id}\``).join(", ")}`,
+      );
+    } else if (r.supersedesId) {
+      lines.push(`- **Supersedes**: \`${r.supersedesId}\``);
+    }
+    if (r.supersededById)
+      lines.push(`- **Superseded By**: \`${r.supersededById}\``);
+    if (res.currentHeadId)
+      lines.push(`- **Current Head**: \`${res.currentHeadId}\``);
+    if (res.objectIds.length > 0)
+      lines.push(
+        `- **Objects**: ${res.objectIds.map((o) => `\`${o}\``).join(", ")}`,
+      );
+    if (res.resourceTags.length > 0)
+      lines.push(
+        `- **Tags**: ${res.resourceTags.map((t) => `\`${t}\``).join(", ")}`,
+      );
+    if (r.refs.length > 0)
+      lines.push(`- **Refs**: ${r.refs.map((ref) => `\`${ref}\``).join(", ")}`);
+    return lines;
+  }
+
+  if (res.kind === "seabed") {
+    const s = res.seabed;
+    const badge = formatBehaviorBadge("raw", s.kind);
+    const lines: string[] = [
+      `# ${badge} ${s.kind}${s.topicId ? ` (${s.topicId})` : ""}`,
+      "",
+      `- **ID**: \`${s.id}\``,
+      `- **Realm**: \`${res.realmPath}\` (\`${s.realmId}\`)`,
+      `- **Author**: \`${s.authorId}\` (${s.authorKind})`,
+      `- **Occurred**: ${formatDateLabel(s.occurredAt)}`,
+      `- **Sensitivity**: \`${s.sensitivity}\``,
+    ];
+    if (s.sourceRef) lines.push(`- **Source Ref**: \`${s.sourceRef}\``);
+    if (res.objectIds.length > 0)
+      lines.push(
+        `- **Objects**: ${res.objectIds.map((o) => `\`${o}\``).join(", ")}`,
+      );
+    if (res.resourceTags.length > 0)
+      lines.push(
+        `- **Tags**: ${res.resourceTags.map((t) => `\`${t}\``).join(", ")}`,
+      );
+    return lines;
+  }
+
+  if (res.kind === "distillation") {
+    const d = res.distillation;
+    return [
+      `# [conclusion/${d.layer}] ${d.periodKey}`,
+      "",
+      `- **ID**: \`${d.id}\``,
+      `- **Realm**: \`${res.realmPath}\` (\`${d.realmId}\`)`,
+      `- **Status**: \`${d.status}\``,
+      `- **Created**: ${d.createdAt}`,
+      `- **Sources**: ${d.sourceIds.length}`,
+    ];
+  }
+
+  const f = res.file;
+  return [
+    `# [raw/drive] ${f.relPath} (v${f.version})`,
+    "",
+    `- **Realm**: \`${res.realmPath}\` (\`${f.realmId}\`)`,
+    `- **Updated**: ${f.updatedAt} by \`${f.updatedBy}\``,
+    `- **SHA-256**: \`${f.sha256}\``,
+  ];
+}
+
 export function formatShowMarkdown(res: ShowResult): string {
   if (res.refType === "realm") {
     return formatBriefMarkdown(res.brief);
@@ -783,17 +886,71 @@ export function formatShowMarkdown(res: ShowResult): string {
   }
   if (res.refType === "file") {
     const f = res.file;
-    return [
+    const w = res.window;
+    const isContinuation = w.start > 0 && w.around === undefined;
+    const footer = formatShowWindowFooter(res.ref, w);
+    if (isContinuation) {
+      const lines: string[] = [
+        `# ${res.ref} (continuation · chars ${w.start}–${w.end} of ${w.total})`,
+        "",
+        f.content,
+      ];
+      if (footer) lines.push("", footer);
+      return lines.join("\n");
+    }
+    const lines: string[] = [
       `# [raw/file] \`${res.ref}\` (v${f.version})`,
       "",
       `- **Realm**: \`${res.realmPath}\` (\`${f.realmId}\`)`,
       `- **Updated**: ${f.updatedAt} by \`${f.updatedBy}\``,
       `- **SHA-256**: \`${f.sha256}\``,
-      "",
-      f.content,
-    ].join("\n");
+    ];
+    if (w.around && w.aroundMatched === false) {
+      lines.push(
+        "",
+        `Note: no match for "${w.around}" in content; showing from start.`,
+      );
+    }
+    lines.push("", f.content);
+    if (footer) lines.push("", footer);
+    return lines.join("\n");
   }
-  const sections: string[] = [formatCatMarkdown(res.entry)];
+
+  const w = res.window;
+  const isContinuation = w.start > 0 && w.around === undefined;
+  const footer = formatShowWindowFooter(res.ref, w);
+  if (isContinuation) {
+    const lines: string[] = [
+      `# ${res.ref} (continuation · chars ${w.start}–${w.end} of ${w.total})`,
+    ];
+    if (res.content) {
+      lines.push("", res.content);
+    }
+    if (footer) lines.push("", footer);
+    return lines.join("\n");
+  }
+
+  const sections: string[] = [...formatEntryHeaderLines(res.entry)];
+  if (w.around && w.aroundMatched === false) {
+    sections.push(
+      "",
+      `Note: no match for "${w.around}" in content; showing from start.`,
+    );
+  }
+  if (res.entry.kind === "record") {
+    if (res.content) {
+      if (res.content.startsWith("## Payload")) {
+        sections.push("", res.content);
+      } else {
+        sections.push("", "## Body", "", res.content);
+      }
+    }
+  } else if (res.entry.kind === "seabed") {
+    sections.push("", "## Content", "", res.content);
+  } else if (res.content) {
+    sections.push("", res.content);
+  }
+
   if (res.history && res.history.nodes.length > 0) {
     sections.push(
       "",
@@ -807,6 +964,9 @@ export function formatShowMarkdown(res: ShowResult): string {
   if (res.context) {
     sections.push("", formatReplayMarkdown(res.context));
   }
+  if (footer) {
+    sections.push("", footer);
+  }
   return sections.join("\n");
 }
 
@@ -819,6 +979,7 @@ export function formatSearchMarkdown(res: SearchResult): string {
     `# Search "${res.query}"${scopeSuffix} (${res.items.length}/${res.totalMatched}, omitted: ${res.omittedCount})`,
     "",
   ];
+  let anyTruncated = false;
   if (res.items.length === 0) {
     lines.push("_(no matches)_");
   } else {
@@ -837,13 +998,24 @@ export function formatSearchMarkdown(res: SearchResult): string {
           ? ` -> head:\`${item.currentHeadId ?? "none"}\``
           : "";
       const realmLabel = item.realmPath ? ` in \`${item.realmPath}\`` : "";
+      const truncBadge = item.truncated
+        ? ` [${item.shownChars}/${item.contentChars} chars]`
+        : "";
+      if (item.truncated) {
+        anyTruncated = true;
+      }
       lines.push(
-        `- ${badge} \`${item.id}\` **${item.title}**${realmLabel} (${item.status}${headHint}, @ ${formatDateLabel(item.occurredAt)}) — ${item.snippet}`,
+        `- ${badge} \`${item.id}\` **${item.title}**${realmLabel} (${item.status}${headHint}, @ ${formatDateLabel(item.occurredAt)}) — ${item.snippet}${truncBadge}`,
       );
     }
     if (res.omittedCount > 0 && res.nextCursor) {
       lines.push(
         `... and ${res.omittedCount} more (next page: meru-mind search "${res.query}" --cursor ${res.nextCursor}; inspect: meru-mind show <id>)`,
+      );
+    }
+    if (anyTruncated) {
+      lines.push(
+        `Hits marked [shown/total chars] are excerpts. Inspect full entry: meru-mind show <id> --around "<query>"`,
       );
     }
   }

@@ -75,6 +75,7 @@ const BOOLEAN_FLAGS = new Set([
   "personal",
   "as-human",
   "history",
+  "full",
   "include-descendant-seabed",
   "no-restore-drive",
   "sync-embeddings",
@@ -416,7 +417,7 @@ Examples:
 `,
   show: `Risk: read
 When to use: Inspect any ref verbatim: /realm (brief), kind:name (object card), rec_/sea_ (entry), or file:/realm/path.
-Usage: meru-mind show <ref> [--history] [--context <N>] [--include-descendant-seabed]
+Usage: meru-mind show <ref> [--around "<words>"] [--cursor <cursor>] [--limit <N>] [--full] [--history] [--context <N>] [--include-descendant-seabed]
 Flags:
   --history              Include supersede DAG history (on record entries)
   --context <N>          Include ±N timeline replay window (integer >= 0)
@@ -935,7 +936,15 @@ async function main(): Promise<void> {
     if (cmd === "show") {
       assertAllowedFlags(
         flags,
-        ["history", "context", "include-descendant-seabed"],
+        [
+          "around",
+          "cursor",
+          "limit",
+          "full",
+          "history",
+          "context",
+          "include-descendant-seabed",
+        ],
         "show",
       );
       const includeDescendantSeabed = flagBool(
@@ -958,6 +967,10 @@ async function main(): Promise<void> {
         actor,
         viewerRealmId: ctx.boundViewerRealmId,
         ref: sub,
+        around: flagStr(flags, "around"),
+        cursor: flagStr(flags, "cursor"),
+        limit: parseIntFlag(flags, "limit", { min: 1 }),
+        full: flagBool(flags, "full") ? true : undefined,
         history: flagBool(flags, "history"),
         context: parseIntFlag(flags, "context", { min: 0 }),
         includeDescendantSeabed,
