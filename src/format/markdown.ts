@@ -50,8 +50,10 @@ function formatCountsTag(counts: RealmTreeCounts, collapsedChildren: number): st
   ];
   if (counts.subtreeConclusions !== null) {
     const subRaw = counts.subtreeRaw === null ? "—" : String(counts.subtreeRaw);
+    const subObj =
+      counts.subtreeObjects === null ? "" : `, objects=${counts.subtreeObjects}`;
     parts.push(
-      `subtree(conclusions=${counts.subtreeConclusions}, raw=${subRaw})`,
+      `subtree(conclusions=${counts.subtreeConclusions}, raw=${subRaw}${subObj})`,
     );
   }
   if (counts.linkedViaObjects !== null && counts.linkedViaObjects > 0) {
@@ -63,25 +65,39 @@ function formatCountsTag(counts: RealmTreeCounts, collapsedChildren: number): st
   return `[${parts.join(", ")}]`;
 }
 
+const MAX_INLINE_OBJECTS_PER_REALM = 5;
+
+function countObjectTreeNodes(nodes: ObjectTreeNode[]): number {
+  let total = 0;
+  for (const node of nodes) {
+    total += 1 + countObjectTreeNodes(node.children);
+  }
+  return total;
+}
+
 function renderObjectTreeLines(
   nodes: ObjectTreeNode[],
   realmPathById: Map<string, string>,
   duplicateKeys: Set<string>,
   indent = "",
+  remainingBudget?: { left: number },
 ): string[] {
   const lines: string[] = [];
   for (const node of nodes) {
+    if (remainingBudget && remainingBudget.left <= 0) break;
     const o = node.object;
     const rPath = realmPathById.get(o.realmId) ?? "/";
     const canonicalRef = formatCanonicalObjectRef(o, rPath, duplicateKeys);
     lines.push(`${indent}- \`${canonicalRef}\` (\`${o.id}\`)`);
-    if (node.children.length > 0) {
+    if (remainingBudget) remainingBudget.left -= 1;
+    if (node.children.length > 0 && (!remainingBudget || remainingBudget.left > 0)) {
       lines.push(
         ...renderObjectTreeLines(
           node.children,
           realmPathById,
           duplicateKeys,
           `${indent}  `,
+          remainingBudget,
         ),
       );
     }
@@ -107,14 +123,32 @@ function renderRealmTreeLines(
       `${indent}- **${r.path}** — ${r.name} (\`${r.id}\`) ${countsStr}`,
     );
     if (node.objects.length > 0) {
-      lines.push(
-        ...renderObjectTreeLines(
-          node.objects,
-          realmPathById,
-          duplicateKeys,
-          `${indent}  `,
-        ),
-      );
+      const totalObjects = countObjectTreeNodes(node.objects);
+      if (totalObjects > MAX_INLINE_OBJECTS_PER_REALM + 1) {
+        const budget = { left: MAX_INLINE_OBJECTS_PER_REALM };
+        lines.push(
+          ...renderObjectTreeLines(
+            node.objects,
+            realmPathById,
+            duplicateKeys,
+            `${indent}  `,
+            budget,
+          ),
+        );
+        const omittedObjects = totalObjects - MAX_INLINE_OBJECTS_PER_REALM;
+        lines.push(
+          `${indent}  - ... (+${omittedObjects} more objects; run \`meru-mind ls ${r.path} --only objects\`)`,
+        );
+      } else {
+        lines.push(
+          ...renderObjectTreeLines(
+            node.objects,
+            realmPathById,
+            duplicateKeys,
+            `${indent}  `,
+          ),
+        );
+      }
     }
     if (node.children.length > 0) {
       lines.push(
@@ -142,16 +176,6 @@ export function formatTreeMarkdown(res: TreeResult): string {
     lines.push("- _(none)_");
   } else {
     lines.push(...renderRealmTreeLines(res.realmTree, realmPathById, duplicateKeys));
-  }
-  if (res.includeObjects) {
-    lines.push("", `## Objects (${res.objects.length})`);
-    if (res.objectTree.length === 0) {
-      lines.push("- _(none)_");
-    } else {
-      lines.push(
-        ...renderObjectTreeLines(res.objectTree, realmPathById, duplicateKeys),
-      );
-    }
   }
 
   const cap = Math.max(1, res.lineLimit || 60);
@@ -450,8 +474,10 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
       `## Child Realms (${brief.middleMind.childSummaries.items.length}/${brief.middleMind.childSummaries.totalCount}, omitted: ${brief.omittedChildRealmsCount})`,
     );
     for (const c of brief.middleMind.childSummaries.items) {
+      const pendingSuffix =
+        c.pendingQuestions > 0 ? `, pendingQ=${c.pendingQuestions}` : "";
       lines.push(
-        `- **${c.realmPath}** (${c.realmName}): things=${c.activeThings}, decisions=${c.activeDecisions}, pendingQ=${c.pendingQuestions}`,
+        `- **${c.realmPath}** (${c.realmName}): conclusions=${c.activeConclusions}, rules=${c.activeRules}, objects=${c.activeObjects}${pendingSuffix}`,
       );
     }
     if (brief.omittedChildRealmsCount > 0) {

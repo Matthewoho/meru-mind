@@ -1475,4 +1475,181 @@ describe("V0.2a-Surface Contract: 7-Tool MCP Budget, Typed Refs, Unified Objects
     expect(nbParsed.try).toContain("/team/project");
     expect(nbParsed.try).not.toContain("MERU_MIND_VIEWER_REALM_ID=/ ");
   });
+
+  it("7. Display polish: tree per-realm inline object cap (no duplicate Objects block, off-by-one 6-object rule) & show realm childSummaries real totals excluding secrets/hidden", async () => {
+    const homeDir = makeTempDir("meru-mind-display-polish-");
+    const engine = await createMindEngine({
+      homeDir,
+      enableVector: false,
+    });
+    engines.push(engine);
+
+    const { org, rootRealm } = engine.ledger.createOrg({
+      name: "DisplayOrg",
+      policy: "open",
+    });
+    const alpha = engine.ledger.createRealm({
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "alpha",
+      name: "Alpha Realm",
+      actor: humanAlice,
+    });
+    const mid = engine.ledger.createRealm({
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "mid",
+      name: "Mid Realm (6 objects)",
+      actor: humanAlice,
+    });
+    const ops = engine.ledger.createRealm({
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "ops",
+      name: "Ops Realm",
+      actor: humanAlice,
+    });
+    const opsInfra = engine.ledger.createRealm({
+      orgId: org.id,
+      parentId: ops.id,
+      slug: "infra",
+      name: "Cloud Infra",
+      actor: humanAlice,
+    });
+    const zeta = engine.ledger.createRealm({
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "zeta",
+      name: "Zeta Realm",
+      actor: humanAlice,
+    });
+
+    // 20 objects under /alpha (must truncate to 5 + summary line)
+    for (let i = 1; i <= 20; i += 1) {
+      engine.objects.createObject({
+        actor: agentBot,
+        viewerRealmId: alpha.id,
+        targetRealmRef: alpha.id,
+        kind: "service",
+        name: `svc-${String(i).padStart(2, "0")}`,
+      });
+    }
+    // Exactly 6 objects under /mid (off-by-one rule: 6 <= 5 + 1, show all 6 without (+1 more))
+    for (let i = 1; i <= 6; i += 1) {
+      engine.objects.createObject({
+        actor: agentBot,
+        viewerRealmId: mid.id,
+        targetRealmRef: mid.id,
+        kind: "service",
+        name: `mid-${i}`,
+      });
+    }
+    // 2 objects, 3 active finding conclusions, 1 active rule, and 1 secret conclusion under /ops/infra
+    engine.objects.createObject({
+      actor: agentBot,
+      viewerRealmId: opsInfra.id,
+      targetRealmRef: opsInfra.id,
+      kind: "project",
+      name: "cdn",
+    });
+    engine.objects.createObject({
+      actor: agentBot,
+      viewerRealmId: opsInfra.id,
+      targetRealmRef: opsInfra.id,
+      kind: "project",
+      name: "redis",
+    });
+    for (let i = 1; i <= 3; i += 1) {
+      await engine.ledger.appendRecord({
+        actor: agentBot,
+        viewerRealmId: opsInfra.id,
+        targetRealmId: opsInfra.id,
+        kind: "finding",
+        title: `Infra Finding ${i}`,
+        payload: { body: `Finding body ${i}` },
+      });
+    }
+    await engine.ledger.appendRecord({
+      actor: humanAlice,
+      viewerRealmId: opsInfra.id,
+      targetRealmId: opsInfra.id,
+      kind: "rule",
+      title: "Infra Guard Rule",
+      payload: { body: "Rule body" },
+    });
+    await engine.ledger.appendRecord({
+      actor: agentBot,
+      viewerRealmId: opsInfra.id,
+      targetRealmId: opsInfra.id,
+      kind: "finding",
+      title: "Secret Finding Must Exclude",
+      payload: { body: "SECRET_INFRA_TOKEN" },
+      sensitivity: "secret",
+    });
+    expect(zeta.path).toBe("/zeta");
+
+    await engine.close();
+    engines.pop();
+
+    // 1) T-TreeCap: default `tree` caps /alpha at 5 + summary, shows all 6 under /mid, keeps /zeta visible, no duplicate ## Objects block, includes subtree objects=
+    const treeMd = runCliText(homeDir, ["tree"]);
+    expect(treeMd).toContain("**/alpha**");
+    expect(treeMd).toContain("(+15 more objects; run `meru-mind ls /alpha --only objects`)");
+    expect((treeMd.match(/service:svc-\d+/g) ?? []).length).toBe(5);
+    expect((treeMd.match(/service:mid-\d+/g) ?? []).length).toBe(6);
+    expect(treeMd).not.toContain("more objects; run `meru-mind ls /mid");
+    expect(treeMd).toContain("**/zeta**");
+    expect(treeMd).not.toContain("## Objects (");
+    expect(treeMd).toContain("subtree(conclusions=3, raw=0, objects=2)");
+
+    // 2) T-BriefChild: show /ops reports real activeConclusions=3 (excluding secret), activeRules=1, activeObjects=2 in JSON & Markdown
+    const showOpsJson = runCliJson<{
+      refType: string;
+      brief: {
+        middleMind: {
+          childSummaries: {
+            items: Array<{
+              realmPath: string;
+              activeConclusions: number;
+              activeRules: number;
+              activeObjects: number;
+            }>;
+          };
+        };
+      };
+    }>(homeDir, ["show", "/ops"]);
+    expect(showOpsJson.refType).toBe("realm");
+    const infraSummary = showOpsJson.brief.middleMind.childSummaries.items.find(
+      (c) => c.realmPath === "/ops/infra",
+    );
+    expect(infraSummary).toBeDefined();
+    expect(infraSummary?.activeConclusions).toBe(3);
+    expect(infraSummary?.activeRules).toBe(1);
+    expect(infraSummary?.activeObjects).toBe(2);
+
+    const showOpsMd = runCliText(homeDir, ["show", "/ops"]);
+    expect(showOpsMd).toContain(
+      "- **/ops/infra** (Cloud Infra): conclusions=3, rules=1, objects=2",
+    );
+    expect(showOpsMd).not.toContain("SECRET_INFRA_TOKEN");
+
+    // 3) Hard-wall tree-mode check: sibling /alpha never appears in /ops show childSummaries
+    runCliJson(homeDir, [
+      "--as-human",
+      "org",
+      "set-policy",
+      "--org",
+      org.id,
+      "--policy",
+      "tree",
+    ]);
+    const showOpsTreeMd = runCliText(homeDir, ["show", "/ops"], {
+      MERU_MIND_VIEWER_REALM_ID: "/ops",
+    });
+    expect(showOpsTreeMd).toContain(
+      "- **/ops/infra** (Cloud Infra): conclusions=3, rules=1, objects=2",
+    );
+    expect(showOpsTreeMd).not.toContain("/alpha");
+    expect(showOpsTreeMd).not.toContain("/zeta");
+  });
 });

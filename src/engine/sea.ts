@@ -450,6 +450,13 @@ export class SeaEngine {
             excludeSensitivities,
           })
         : new Map();
+    const childObjectCounts =
+      cappedDescendantIds.length > 0
+        ? this.db.countObjectsByRealm({
+            orgId: targetRealm.orgId,
+            realmIds: cappedDescendantIds,
+          })
+        : new Map<string, number>();
 
     const childSlice: ChildRealmSummary[] = cappedDescendantIds.map((cid) => {
       const cRealm = vis.sanitizeRealm(realmsById.get(cid)!);
@@ -459,6 +466,9 @@ export class SeaEngine {
         realmId: cid,
         realmPath: cRealm.path,
         realmName: cRealm.name,
+        activeRules: counts?.rules ?? 0,
+        activeConclusions: counts?.conclusions ?? 0,
+        activeObjects: childObjectCounts.get(cid) ?? 0,
         activeThings: counts?.things ?? 0,
         pendingQuestions: childPendingCounts.get(cid) ?? 0,
         activeDecisions: counts?.decisions ?? 0,

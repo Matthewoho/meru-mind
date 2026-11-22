@@ -65,6 +65,10 @@ Across all read views (`whoami`, `listRealms`, `tree`, `ls`, `show`, `brief`, `s
 - **THEN** `whoami` reports strictly visible counts and `latestSeq` excluding the hidden sibling
 - **AND** `tree` computes counts in O(1) queries and renders unreadable descendant raw counts as `—` (`null`)
 
+#### Scenario: tree caps inline objects per realm without duplicating an objects block
+- **WHEN** a realm contains more than 6 objects while sibling realms follow at the same depth
+- **THEN** `formatTreeMarkdown()` renders at most 5 inline objects per realm plus a `(+N more objects; run \`meru-mind ls <realm> --only objects\`)` summary line, includes `objects=` in subtree rollups, keeps subsequent sibling realms visible within the default 60-line cap, and omits any redundant trailing `## Objects` block
+
 ### Requirement: Polymorphic `show`, Single-Query `ls`, and `NOT_LISTABLE`
 `SeaEngine.show()` SHALL inspect realms (O(1) `brief` with `kindHistogram`, `recentConclusions`, `childSummaries`), unified objects (card + top 5 recent entries + `try: meru-mind ls <ref>`), entries (`cat` + optional `--history`/`--context`), and `file:` refs. `SeaEngine.ls()` SHALL list realms via single-query SQL `UNION` supporting `--only`, `--kind`, `--about`, `--since`, `--until`, `--history`, `--limit` (default `20`), and `--cursor`, throwing `NOT_LISTABLE` on entries/files.
 
@@ -72,6 +76,10 @@ Across all read views (`whoami`, `listRealms`, `tree`, `ls`, `show`, `brief`, `s
 - **WHEN** a caller invokes `ls rec_...` or `ls file:/readme.md`
 - **THEN** `ls` throws `NOT_LISTABLE` (wire `not_listable`) with `try: meru-mind show <ref>`
 - **AND** `show` returns the realm brief, unified object card, entry content (with optional `--history`/`--context`), or file content respectively
+
+#### Scenario: show realm childSummaries report real active conclusions, rules, and objects excluding secrets
+- **WHEN** a child realm holds active `finding` conclusions, active `rule` records, objects, and a `secret` record
+- **THEN** `show <parentRealm>` reports `activeConclusions`, `activeRules`, and `activeObjects` accurately excluding `secret` and hidden-realm items in both JSON and Markdown (`conclusions=..., rules=..., objects=...`)
 
 ### Requirement: Identity Anchors (`thing`), Scoped `changes --in` SQL Pushdown, and EPIPE
 Identity anchors SHALL reuse `records WHERE kind = 'thing'` and `external_ref` (no separate `things` table). `SeaEngine.changes()` with `--in <realm>` SHALL push narrowed visible realm IDs directly into `db.listChangeLog()` SQL (never JS post-filtered), preserving `B2` `scannedSeq` pagination across invisible rows. CLI read views SHALL default to compact Markdown, preserve `--json`, cap output with `--cursor` hints, and exit `0` on `EPIPE`.

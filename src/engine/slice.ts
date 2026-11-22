@@ -170,8 +170,10 @@ function renderBriefMarkdown(brief: BriefOutput): string {
       `## Child Realms (${brief.middleMind.childSummaries.items.length}/${brief.middleMind.childSummaries.totalCount}, omitted: ${brief.middleMind.childSummaries.omittedCount})`,
     );
     for (const c of brief.middleMind.childSummaries.items) {
+      const pendingSuffix =
+        c.pendingQuestions > 0 ? `, pendingQuestions=${c.pendingQuestions}` : "";
       lines.push(
-        `- ${c.realmPath} (${c.realmId}): things=${c.activeThings}, pendingQuestions=${c.pendingQuestions}, decisions=${c.activeDecisions}`,
+        `- ${c.realmPath} (${c.realmId}): conclusions=${c.activeConclusions}, rules=${c.activeRules}, objects=${c.activeObjects}${pendingSuffix}`,
       );
     }
   }

@@ -276,6 +276,9 @@ export interface ChildRealmSummary {
   realmId: string;
   realmPath: string;
   realmName: string;
+  activeRules: number;
+  activeConclusions: number;
+  activeObjects: number;
   activeThings: number;
   pendingQuestions: number;
   activeDecisions: number;
