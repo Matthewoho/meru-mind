@@ -1012,7 +1012,9 @@ describe("V0.2a-Perf & Show-Window: Migration v6, Covering Indexes, CJK Bigrams,
       ref: "/",
     });
     const briefMd = formatShowMarkdown(showRealm);
-    expect(briefMd).toContain("... [+");
+    // L1 brief folds raw seabed messages out of main view with explicit drill-down count (keeps brief bounded)
+    expect(briefMd).toContain("1 raw message(s)");
+    expect(briefMd).not.toContain("RAW_SEABED_LOG RAW_SEABED_LOG");
 
     const bigDist = await engine.sea.settle({
       actor: agentWorker,

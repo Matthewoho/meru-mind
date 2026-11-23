@@ -8,6 +8,7 @@ import {
   assertAccess,
   createMindEngine,
   discoverWorkspaceRealmMarker,
+  findRelatedActiveForEcho,
   MindError,
   resolveAccessScope,
   resolveRealmByPath,
@@ -574,10 +575,18 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
           sensitivity: args.sensitivity,
           allowRedactedReingest: false,
         });
+        const relatedActive = await findRelatedActiveForEcho({
+          sea: engine.sea,
+          actor: boundActor,
+          viewerRealmId: boundViewerRealmId,
+          newRecord: rec,
+          scopeCeiling: writeScope,
+        });
         return okResult({
           ...rec,
           realmPath: targetRealmPath,
           routedBy,
+          ...(relatedActive.length > 0 ? { relatedActive } : {}),
         });
       } catch (err) {
         return errResult(err, cachedErrorCtx);

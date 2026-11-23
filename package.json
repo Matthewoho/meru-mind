@@ -1,6 +1,6 @@
 {
   "name": "@meru-mind/core",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Scoped visibility (MindRealm) and layered memory & ledger engine (MindSea) for multi-agent teams.",
   "license": "MIT",
   "repository": {

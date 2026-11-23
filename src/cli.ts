@@ -4,6 +4,7 @@ import {
   buildWriteRecordPayload,
   createMindEngine,
   discoverWorkspaceRealmMarker,
+  findRelatedActiveForEcho,
   formatChangesMarkdown,
   formatGenericMarkdown,
   formatImportJsonlMarkdown,
@@ -1194,18 +1195,34 @@ async function main(): Promise<void> {
         explicitIdempotencyKey: flagStr(flags, "idempotency-key"),
         allowRedactedReingest: flagBool(flags, "as-human"),
       });
+      const relatedActive = await findRelatedActiveForEcho({
+        sea: engine.sea,
+        actor,
+        viewerRealmId: ctx.boundViewerRealmId,
+        newRecord: rec,
+        scopeCeiling: effectiveScope,
+      });
       const payloadOut = {
         ...rec,
         realmPath: routed.realm.path,
         routedBy: routed.routedBy,
+        ...(relatedActive.length > 0 ? { relatedActive } : {}),
       };
-      output(
+      const baseMd = formatGenericMarkdown(
+        `Written [${rec.kind}] -> \`${routed.realm.path}\` (routed: ${routed.routedBy})`,
         payloadOut,
-        formatGenericMarkdown(
-          `Written [${rec.kind}] -> \`${routed.realm.path}\` (routed: ${routed.routedBy})`,
-          payloadOut,
-        ),
       );
+      const echoFooter =
+        relatedActive.length > 0
+          ? "\n\nRelated active entries (context only; if this supersedes one, re-run with `--supersedes <id>`):\n" +
+            relatedActive
+              .map(
+                (r) =>
+                  `- [${r.kind}] \`${r.id}\` ${r.title} (${r.realmPath}${r.occurredAt ? ` @ ${r.occurredAt.slice(0, 10)}` : ""})`,
+              )
+              .join("\n")
+          : "";
+      output(payloadOut, `${baseMd}${echoFooter}`);
       return;
     }
 

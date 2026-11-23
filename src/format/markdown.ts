@@ -401,7 +401,7 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
     );
   }
 
-  // Bucket 1: Rules
+  // L1 Section 1: Rules (self + ancestors, NEVER silently truncated)
   lines.push(
     "",
     `## Rules (${brief.middleMind.rules.items.length}/${brief.middleMind.rules.totalCount}, omitted: ${brief.middleMind.rules.omittedCount})`,
@@ -415,25 +415,41 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
       );
     }
   }
+  if (brief.middleMind.rules.omittedCount > 0 || brief.middleMind.rules.totalCount > 50) {
+    lines.push(
+      `> Governance notice: ${brief.middleMind.rules.totalCount} active rules (${brief.middleMind.rules.omittedCount} omitted); review rule sprawl via \`meru-mind ls ${brief.realm.path} --kind rule\`.`,
+    );
+  }
 
-  // Bucket 2: Conclusions
+  // L1 Section 2: Active Decisions (self listed in full; ancestor decisions folded with count + drill-down)
   lines.push(
     "",
-    `## Conclusions`,
-    `### Recent Conclusions (${brief.recentConclusions.items.length}/${brief.recentConclusions.totalCount}, omitted: ${brief.recentConclusions.omittedCount})`,
+    `## Active Decisions (${brief.upperLedger.activeDecisions.items.length}/${brief.upperLedger.activeDecisions.totalCount}, omitted: ${brief.upperLedger.activeDecisions.omittedCount})`,
   );
-  if (brief.recentConclusions.items.length === 0) {
+  if (brief.upperLedger.activeDecisions.items.length === 0) {
     lines.push("- _(none)_");
   } else {
-    for (const c of brief.recentConclusions.items) {
+    for (const d of brief.upperLedger.activeDecisions.items) {
       lines.push(
-        `- [conclusion/${c.kind}] \`${c.id}\` ${c.title} @ ${formatDateLabel(c.occurredAt)}`,
+        `- [conclusion/decision] \`${d.id}\` ${d.title} @ ${formatDateLabel(d.occurredAt)}`,
+      );
+    }
+    if (brief.upperLedger.activeDecisions.omittedCount > 0) {
+      lines.push(
+        `... (+${brief.upperLedger.activeDecisions.omittedCount} more; inspect: \`meru-mind ls ${brief.realm.path} --kind decision\`)`,
       );
     }
   }
+  if ((brief.upperLedger.inheritedDecisionsCount ?? 0) > 0) {
+    lines.push(
+      `_(+${brief.upperLedger.inheritedDecisionsCount} inherited ancestor decision(s) folded; inspect: \`meru-mind ls / --kind decision\`)_`,
+    );
+  }
 
+  // L1 Section 3: Pending Human Proposals / Questions
   lines.push(
-    `### Pending Human Questions (${brief.upperLedger.pendingQuestions.items.length}/${brief.upperLedger.pendingQuestions.totalCount}, omitted: ${brief.upperLedger.pendingQuestions.omittedCount})`,
+    "",
+    `## Pending Proposals (${brief.upperLedger.pendingQuestions.items.length}/${brief.upperLedger.pendingQuestions.totalCount}, omitted: ${brief.upperLedger.pendingQuestions.omittedCount})`,
   );
   if (brief.upperLedger.pendingQuestions.items.length === 0) {
     lines.push("- _(none)_");
@@ -443,27 +459,51 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
     }
   }
 
-  lines.push(
-    `### Active Things (${brief.upperLedger.activeThings.items.length}/${brief.upperLedger.activeThings.totalCount}, omitted: ${brief.upperLedger.activeThings.omittedCount})`,
-  );
-  if (brief.upperLedger.activeThings.items.length === 0) {
-    lines.push("- _(none)_");
-  } else {
-    for (const t of brief.upperLedger.activeThings.items) {
-      const ext = t.externalRef ? ` <${t.externalRef}>` : "";
-      lines.push(`- [conclusion/thing] \`${t.id}\` ${t.title}${ext}`);
+  // L1 Section 4: Recent Findings (clean signal; bulk claims & raw messages folded with explicit drill-down counts)
+  const findingsSec = brief.upperLedger.recentFindings;
+  if (findingsSec) {
+    lines.push(
+      "",
+      `## Recent Findings (${findingsSec.items.length}/${findingsSec.totalCount}, omitted: ${findingsSec.omittedCount})`,
+    );
+    if (findingsSec.items.length === 0) {
+      lines.push("- _(none)_");
+    } else {
+      for (const f of findingsSec.items) {
+        lines.push(
+          `- [conclusion/finding] \`${f.id}\` ${f.title} @ ${formatDateLabel(f.occurredAt)}`,
+        );
+      }
+      if (findingsSec.omittedCount > 0) {
+        lines.push(
+          `... (+${findingsSec.omittedCount} more; inspect: \`meru-mind ls ${brief.realm.path} --kind finding\`)`,
+        );
+      }
     }
   }
 
-  lines.push(
-    `### Active Decisions (${brief.upperLedger.activeDecisions.items.length}/${brief.upperLedger.activeDecisions.totalCount}, omitted: ${brief.upperLedger.activeDecisions.omittedCount})`,
-  );
-  if (brief.upperLedger.activeDecisions.items.length === 0) {
-    lines.push("- _(none)_");
-  } else {
-    for (const d of brief.upperLedger.activeDecisions.items) {
-      lines.push(`- [conclusion/decision] \`${d.id}\` ${d.title}`);
-    }
+  // Explicit folded counts & drill-down commands for claims, things, and raw messages
+  const claimCount = brief.kindHistogram?.claim ?? 0;
+  const thingCount = brief.upperLedger.activeThings.totalCount;
+  const rawMsgCount = brief.surface.recentMessages.totalCount;
+  const foldedHints: string[] = [];
+  if (claimCount > 0) {
+    foldedHints.push(
+      `${claimCount} claim(s) (\`meru-mind ls ${brief.realm.path} --kind claim\`)`,
+    );
+  }
+  if (thingCount > 0) {
+    foldedHints.push(
+      `${thingCount} thing(s) (\`meru-mind ls ${brief.realm.path} --kind thing\`)`,
+    );
+  }
+  if (rawMsgCount > 0) {
+    foldedHints.push(
+      `${rawMsgCount} raw message(s) (\`meru-mind ls ${brief.realm.path} --kind message\`)`,
+    );
+  }
+  if (foldedHints.length > 0) {
+    lines.push("", `Folded L2 inventory: ${foldedHints.join(" · ")}`);
   }
 
   if (brief.middleMind.realmCard) {
@@ -476,25 +516,6 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
       `## Narrative Card${seqSuffix}`,
       brief.middleMind.realmCard.narrativeMd,
     );
-  }
-
-  // Bucket 3: Raw (Recent Messages)
-  lines.push(
-    "",
-    `## Raw (${brief.surface.recentMessages.items.length}/${brief.surface.recentMessages.totalCount}, omitted: ${brief.surface.recentMessages.omittedCount})`,
-  );
-  if (brief.surface.recentMessages.items.length === 0) {
-    lines.push("- _(none)_");
-  } else {
-    for (const m of brief.surface.recentMessages.items) {
-      const text =
-        m.text.length > 500
-          ? `${m.text.slice(0, 500)}... [+${m.text.length - 500} chars]`
-          : m.text;
-      lines.push(
-        `- [raw/${m.kind}] \`${m.id}\` (${m.authorId} @ ${formatDateLabel(m.occurredAt)}): ${text}`,
-      );
-    }
   }
 
   if (brief.middleMind.childSummaries.totalCount > 0) {

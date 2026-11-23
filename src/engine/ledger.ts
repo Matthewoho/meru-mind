@@ -182,6 +182,24 @@ export interface IndexHooks {
   indexRecord(record: LedgerRecord): Promise<void>;
 }
 
+export function isAllowedSupersedeKind(
+  nextKind: RecordKind,
+  prevKind: RecordKind,
+): boolean {
+  if (nextKind === prevKind) return true;
+  if (nextKind === "rule" || prevKind === "rule") return false;
+  if (
+    nextKind === "decision" &&
+    (prevKind === "proposal" || prevKind === "claim" || prevKind === "finding")
+  ) {
+    return true;
+  }
+  if (nextKind === "finding" && prevKind === "claim") {
+    return true;
+  }
+  return false;
+}
+
 export class LedgerEngine {
   constructor(
     private readonly db: DbPort,
@@ -1673,10 +1691,10 @@ export class LedgerEngine {
             `Entry not found in visible scope: ${supId}`,
           );
         }
-        if (oldRec.kind !== params.kind) {
+        if (!isAllowedSupersedeKind(params.kind, oldRec.kind)) {
           throw new MindError(
             "INVALID_INPUT",
-            `Superseding record kind "${params.kind}" must match superseded record kind "${oldRec.kind}"`,
+            `Superseding record kind "${params.kind}" cannot supersede record kind "${oldRec.kind}" (allowed: same kind; decision -> proposal/claim/finding; finding -> claim; rule <-> rule only)`,
           );
         }
         if (oldRec.status !== "active" || oldRec.supersededById !== null) {

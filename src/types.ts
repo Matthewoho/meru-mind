@@ -405,6 +405,10 @@ export interface BriefOutput {
     pendingQuestions: BriefSection<LedgerRecord>;
     activeThings: BriefSection<LedgerRecord>;
     activeDecisions: BriefSection<LedgerRecord>;
+    /** Count of active decisions in visible ancestor realms (folded out of default L1; only rules bind downward) */
+    inheritedDecisionsCount?: number;
+    /** Recent findings in the target realm (L1 clean signal, excluding bulk claims) */
+    recentFindings?: BriefSection<LedgerRecord>;
   };
   middleMind: {
     realmCard: Distillation | null;

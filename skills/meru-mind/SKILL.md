@@ -15,8 +15,8 @@ Shared long-term memory, partitioned into realms (`/`, `/ops`, `/ops/cicd`). The
 ## When you learn something durable
 Write once a conclusion is settled or verified: one fact per entry, readable without this conversation (absolute dates, real names).
 - **Where**: pass `--in <realm>` when a scope clearly owns it. If none does, omit it; the entry goes to the workspace's default realm or to `/inbox` for a human to file. Use `--in /` only for an org-wide decision. The result reports where it landed; check it.
-- **Kind**: use `--kind decision` for a settled choice, which keeps it in the brief of that realm and its sub-realms. Leave the default `finding` for everything else.
-- **Updates**: if it replaces an existing entry, `search` for that entry and pass `--supersedes <rec_id>` with the same kind. Without it both stay current. If the error says it is already superseded, use the id the error names.
+- **Kind**: use `--kind decision` for a settled choice (listed in that realm's brief; only `rule` binds child realms). Leave the default `finding` for everything else.
+- **Updates**: if it replaces an existing entry, `search` for that entry and pass `--supersedes <rec_id>` (same kind, or `decision` superseding `proposal`/`claim`/`finding`, or `finding` superseding `claim`). Without it both stay current. If the error says it is already superseded, use the id the error names.
 - **Entity**: add `--about <kind>:<name>` (e.g. `service:billing-api`) so `ls service:billing-api` finds it.
 
 ## Limits

@@ -773,6 +773,7 @@ function isSqliteBusyError(err: unknown): boolean {
 
 export class SqliteDb implements DbPort {
   private readonly rawDb: DatabaseSync;
+  readonly dbPath: string;
   private readonly db: {
     prepare: DatabaseSync["prepare"];
     exec: DatabaseSync["exec"];
@@ -784,6 +785,7 @@ export class SqliteDb implements DbPort {
   private queryCount = 0;
 
   constructor(options: SqliteDbOptions) {
+    this.dbPath = options.dbPath;
     this.vectorDimensions = options.vectorDimensions ?? DEFAULT_VECTOR_DIM;
     if (
       !Number.isInteger(this.vectorDimensions) ||
@@ -926,8 +928,49 @@ export class SqliteDb implements DbPort {
     }
   }
 
+  /**
+   * Creates an atomic, self-contained SQLite backup snapshot using VACUUM INTO.
+   * Safe to run while WAL readers are active; never copies transient -wal/-shm files.
+   */
+  vacuumInto(destPath: string): void {
+    const resolved = path.resolve(destPath);
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    if (fs.existsSync(resolved)) {
+      fs.unlinkSync(resolved);
+    }
+    const escaped = resolved.replace(/'/g, "''");
+    this.db.exec(`VACUUM INTO '${escaped}';`);
+  }
+
+  private maybeBackupBeforeMigration(latestVersion: number): void {
+    if (this.dbPath === ":memory:") return;
+    try {
+      const tbl = this.db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'`,
+        )
+        .get() as { name: string } | undefined;
+      if (!tbl) return;
+      const row = this.db
+        .prepare(`SELECT MAX(version) AS max_v FROM schema_migrations`)
+        .get() as { max_v: number | null } | undefined;
+      const maxV = Number(row?.max_v ?? 0);
+      if (maxV > 0 && maxV < latestVersion) {
+        const backupDir = path.join(path.dirname(this.dbPath), "backups");
+        const backupPath = path.join(
+          backupDir,
+          `pre-v${latestVersion}-from-v${maxV}-${Date.now()}.sqlite`,
+        );
+        this.vacuumInto(backupPath);
+      }
+    } catch {
+      // Never block opening an older DB if backup dir is read-only; migration transaction still protects integrity
+    }
+  }
+
   private initSchema(): void {
     this.assertMinSqliteVersion(3, 43);
+    this.maybeBackupBeforeMigration(8);
     this.transaction(() => {
       const now = new Date().toISOString();
 

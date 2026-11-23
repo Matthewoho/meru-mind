@@ -303,12 +303,16 @@ export class SeaEngine {
     const recentMessagesLimit = clampBudget(params.budget?.recentMessages, 10);
     const maxQuestions = clampBudget(params.budget?.maxQuestions, 5);
     const maxActiveThings = clampBudget(params.budget?.maxActiveThings, 5);
-    const maxDecisions = clampBudget(params.budget?.maxDecisions, 5);
+    const maxDecisions = clampBudget(params.budget?.maxDecisions, 20);
     const maxRecentConclusions = clampBudget(
       params.budget?.maxRecentConclusions,
       10,
     );
-    const maxRules = clampBudget(params.budget?.maxRules, 20);
+    // Rules are NEVER silently truncated in default L1 brief (1000 ceiling; explicit warning if >50 or truncated)
+    const maxRules =
+      params.budget?.maxRules !== undefined
+        ? clampBudget(params.budget.maxRules, 1000)
+        : 1000;
     const maxChildSummaries = clampBudget(params.budget?.maxChildSummaries, 20);
 
     const canSeeSelfLedger = scope.readableLedgerIds.includes(targetRealm.id);
@@ -324,9 +328,12 @@ export class SeaEngine {
         })
       : { items: [], total: 0 };
 
-    // 2. Upper Ledger: pending questions, active things, active decisions, recent conclusions (occurred_at DESC)
-    const selfAndAncestors = [targetRealm.id, ...centerScope.ancestorIds].filter(
-      (id) => scope.readableLedgerIds.includes(id),
+    // 2. Upper Ledger: pending questions, active things, self active decisions (ancestors folded per L1 spec), recent findings & conclusions
+    const visibleAncestors = centerScope.ancestorIds.filter((id) =>
+      scope.readableLedgerIds.includes(id),
+    );
+    const selfAndAncestors = [targetRealm.id, ...visibleAncestors].filter((id) =>
+      scope.readableLedgerIds.includes(id),
     );
     const pendingQuestionsRes = canSeeSelfLedger
       ? this.db.listPendingHumanQuestions({
@@ -346,13 +353,37 @@ export class SeaEngine {
         })
       : { items: [], total: 0 };
 
-    const decisionsRes = this.db.listRecords({
-      realmIds: selfAndAncestors,
-      kinds: ["decision"],
-      includeSuperseded: false,
-      excludeSensitivities,
-      limit: maxDecisions,
-    });
+    // Target realm's own active decisions are never crowded out by ancestor decisions
+    const decisionsRes = canSeeSelfLedger
+      ? this.db.listRecords({
+          realmIds: [targetRealm.id],
+          kinds: ["decision"],
+          includeSuperseded: false,
+          excludeSensitivities,
+          limit: maxDecisions,
+        })
+      : { items: [], total: 0 };
+
+    const inheritedDecisionsCount =
+      visibleAncestors.length > 0
+        ? this.db.listRecords({
+            realmIds: visibleAncestors,
+            kinds: ["decision"],
+            includeSuperseded: false,
+            excludeSensitivities,
+            limit: 1,
+          }).total
+        : 0;
+
+    const recentFindingsRes = canSeeSelfLedger
+      ? this.db.listRecords({
+          realmIds: [targetRealm.id],
+          kinds: ["finding"],
+          includeSuperseded: false,
+          excludeSensitivities,
+          limit: maxRecentConclusions,
+        })
+      : { items: [], total: 0 };
 
     const recentConclusionsRes = canSeeSelfLedger
       ? this.db.listRecords({
@@ -586,6 +617,15 @@ export class SeaEngine {
           omittedCount: Math.max(
             0,
             decisionsRes.total - decisionsRes.items.length,
+          ),
+        },
+        inheritedDecisionsCount,
+        recentFindings: {
+          items: recentFindingsRes.items.map(vis.sanitizeRecord),
+          totalCount: recentFindingsRes.total,
+          omittedCount: Math.max(
+            0,
+            recentFindingsRes.total - recentFindingsRes.items.length,
           ),
         },
       },

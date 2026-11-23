@@ -1,6 +1,6 @@
 # Cloud Deployment & Composable AI-Built Frontend Architecture
 
-> Design reference for Meru Mind `v0.3` (Team Server) and `v0.4` (Composable Web Governance Surface).
+> Design reference for Meru Mind `v0.3` (Team Server), `v0.4` (Composable Web Governance Surface), and future Cloudflare Durable Objects SaaS Track.
 
 ---
 
@@ -11,7 +11,7 @@ Meru Mind `v0.3+` runs as a **single Node.js 22+ process owning one SQLite WAL d
 - **Best fit**: Single-instance compute with a **persistent local block volume** (VPS / ECS / GCE / Fly.io Machines / Railway / Render Disk).
 - **Avoid**: Multi-replica stateless containers sharing SQLite over NFS/SMB (breaks WAL locking) or ephemeral disks without persistent volumes.
 
-### Deployment Option A: Standard Cloud VPS / Docker Compose + Caddy (Recommended for Teams)
+### Track 1 (Open-Source Self-Hosted Primary): Docker Compose + Caddy / Fly.io
 
 A 1 vCPU / 1 GB RAM instance handles a small-to-medium human-AI team comfortably with zero heavy middleware (no Kafka, no Elasticsearch, no Neo4j, no CockroachDB).
 
@@ -26,7 +26,9 @@ Internet (HTTPS / WSS)
    ├── /v1/*           REST API (MindSurface + Long-Poll)
    ├── /mcp            Streamable HTTP MCP (7 tools)
    ├── /v1/ws          v0.4 Pump WebSocket (same-origin HttpOnly Cookie + Origin check)
-   └── /               Static Web Governance UI (--web-dir overrideable!)
+   ├── /_meru/client.js  Zero-dependency framework-agnostic client (version-locked to server)
+   ├── /_meru/shell    Built-in official Default Shell (always available as fallback)
+   └── /               Active UI (--web-dir on loopback, or built-in default shell)
    │
    ▼
 [Persistent Disk Volume: /var/lib/meru-mind]
@@ -38,44 +40,48 @@ Internet (HTTPS / WSS)
 Key operational guardrails:
 1. **Secrets stay in environment variables** (`MERU_MIND_ORIGIN`, `LINEAR_API_KEY`, etc.) — never stored in SQLite tables or `work_bindings.config_json`.
 2. **Disaster recovery**: Built-in scheduled `VACUUM INTO` atomic snapshots (restore drill verified in CI), optionally paired with [Litestream](https://litestream.io/) for continuous WAL replication to S3 / R2 / GCS.
-3. **Managed multi-tenant hosting**: **One SQLite database file (or isolated container) per tenant** — eliminates cross-tenant data leaks structurally and pushes Postgres migration far out.
 
-### Deployment Option B: One-Command PaaS (Fly.io / Railway / Render)
-Mount a 1 GB persistent volume at `/var/lib/meru-mind`, pin **`max_machines = 1, min_machines = 1`** (strict single-writer), set `MERU_MIND_HOME=/var/lib/meru-mind`, and expose `/healthz`.
+### Track 2 (Future Managed Cloud / SaaS Edition): Cloudflare Workers + Durable Objects
+
+**One tenant = One Durable Object = One isolated single-writer SQLite database**:
+- **Official DO SQLite limits**: up to **10 GB per DO** (Workers Paid), native synchronous `ctx.storage.sql.exec()`, native **FTS5** (including `fts5vocab` and JSON), and **WebSocket Hibernation** (free idle connections after 10s inactivity, 0 GB-s idle billing).
+- **Required adaptations when launching the hosted track**:
+  - Store `blobs/` in Cloudflare R2 (async) and optional vectors in Cloudflare Vectorize (`sqlite-vec` native C extension is unavailable in V8 isolates).
+  - Adapt visible-realm `IN (...)` predicates past DO's 100-bound-parameter limit (`json_each` / batching).
+  - Keep `MindPulse` in an **in-process `Map` + `ws.serializeAttachment()`** (never write high-frequency heartbeats to DO SQLite — preserves hibernation and avoids row-write billing).
+  - **Open compliance question to resolve before hosted launch**: verify DO SQLite PRAGMA support (`secure_delete`, `wal_checkpoint`) and how Cloudflare's 30-day Point-in-Time Recovery interacts with `redact` byte-purge guarantees.
 
 ---
 
-## Part 2: Composable Frontend Architecture (`v0.4`) — "UI Atoms + Agent-Crafted Bespoke Shell"
+## Part 2: Composable Frontend Architecture (`v0.4`) — "1.5-Layer Zero-Package Model"
 
-Instead of shipping a rigid monolithic SaaS clone or building a bloated drag-and-drop website builder, Meru Mind `v0.4` takes an **AI-Native composable architecture** inspired by headless state primitives + shadcn-style UI atoms:
+Reviewed & hardened via red-team security critique: instead of shipping separate React npm packages (`@meru-mind/client`, `@meru-mind/ui-atoms`) that cause version drift and lock users into React, Meru Mind stays a **single `@meru-mind/core` package** with a **1.5-layer architecture**:
 
-```mermaid
-flowchart TB
-    subgraph SERVER["meru-mind serve (Security & Truth Boundary — Never Delegated to UI)"]
-        AUTH["Same-Origin HttpOnly Cookie + Origin Allowlist"]
-        PUMP_S["Pump Model: WS /v1/ws (thin frames) + Long-Poll Fallback"]
-        REST_S["REST /v1/* (policy.ts open|tree enforcement + redact verification)"]
-    end
-
-    subgraph LAYER1["Layer 1: @meru-mind/client (Headless SDK — Zero UI)"]
-        HOOKS["useMindPump() · useRealmTree() · useRealmBrief()<br/>useInboxTriage() · useSupersedeChain() · usePulse() · useSearch()"]
-    end
-
-    subgraph LAYER2["Layer 2: @meru-mind/ui-atoms (8 Themeable Atomic Primitives)"]
-        ATOMS["&lt;ConnectionLamp /&gt; · &lt;RealmTree /&gt; · &lt;RuleBanner /&gt; · &lt;DecisionChain /&gt;<br/>&lt;InboxTriageItem /&gt; · &lt;EntryReader /&gt; · &lt;RedactGuardDialog /&gt; · &lt;CommandSearch /&gt;"]
-    end
-
-    subgraph LAYER3["Layer 3: Shell (Zero-Config Default OR Agent-Crafted in 60s)"]
-        DEF["Built-in Minimal Default Shell<br/>(works out-of-the-box on localhost:3800)"]
-        CUSTOM["User's Bespoke Shell (--web-dir ./my-ui/dist)<br/>Generated at init by user's Agent reading UI_BUILDER_SKILL.md<br/>Custom layout, typography, CSS tokens, domain-specific views"]
-    end
-
-    SERVER --> LAYER1 --> LAYER2 --> LAYER3
+```
+Browser (v0.4: --web-dir custom shell strictly loopback-only; team servers serve official shell)
+ ├─ /                  Active UI (--web-dir custom shell OR built-in default shell)
+ ├─ /_meru/client.js   Server-hosted zero-dependency ES module client (framework-agnostic, always version-matched)
+ ├─ /_meru/shell       Built-in official Default Shell (always reachable as safe fallback)
+ └─ /v1/*              REST + Pump WS (wire protocol stays private to server + /_meru/client.js)
+        │ Cookie Session = READ + REVERSIBLE VERBS ONLY (inbox triage, pulse focus)
+        ▼
+   MindSurface Choke Point: redact / mount / org policy / token management require CLI Bearer (Cookie -> 403 + copyable CLI command)
 ```
 
-### Why This Works (First Principles)
-1. **Hard protocol & security plumbing is locked once**: Agents crafting a custom UI never touch raw WebSocket reconnection, `(generation, cursor)` catch-up, long-poll proxy fallback, `HttpOnly` cookie sessions, or `redact` safety confirmations — all of that lives inside `@meru-mind/client` and `@meru-mind/ui-atoms`.
-2. **Server remains the sole security boundary**: Even if a user's Agent writes a buggy custom layout, `meru-mind serve` enforces `open | tree` visibility, human/agent principal identity, `Origin` allowlists, and `redact` checks on every request.
-3. **Zero cold-start friction + infinite personalization**:
-   - First-time users immediately get a clean, minimal **Default Shell** served directly from `meru-mind serve` (zero CORS, single port, Vite + React 19 + TypeScript + Tailwind CSS v4).
-   - Teams or individuals who want a tailored workspace (e.g., an ops incident dashboard, a warm editorial notebook, or a minimal keyboard-first terminal console) simply ask their coding agent — guided by `UI_BUILDER_SKILL.md` — to compose a bespoke shell from the 8 atomic primitives and CSS design tokens, build static assets, and mount them via `meru-mind serve --web-dir ./my-ui/dist`.
+### Only 4 True Primitives (Zero Styled Component Lock-In)
+1. **Pump** (`pump.status` + `subscribe/getSnapshot` — React, Svelte, Vue, or zero-build `index.html` + ES module all work natively).
+2. **Write Actions** (`inbox.triage()` state machine with CAS, idempotency keys, and optimistic rollback).
+3. **Safe Renderer** (`<meru-entry>` framework-agnostic Web Component with built-in XSS sanitization, `[REDACTED]` placeholders, and CSS custom properties for full skinning).
+4. **Visible Scope Snapshots** (`realms`, untruncated `brief.rules`, server-computed `chain(id)`, and `search()` returning highlight index ranges instead of raw HTML).
+
+### 6 Mandatory Security Guardrails (Preventing Agent-Written UI Privilege Escalation)
+1. **Weakened Cookie Sessions**: Browser Cookie sessions only allow reads and reversible actions; irreversible or scope-widening mutations (`redact`, `mount`, `org policy`, `token`) strictly return `403` with a copyable CLI command.
+2. **No Browser Login Page**: `meru-mind ui login` issues a 60-second single-use CLI code exchanged for an `HttpOnly; SameSite=Strict` Cookie — long-lived tokens never enter DOM inputs.
+3. **Strict Server-Enforced CSP**: `default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`.
+4. **Reserved Prefixes**: `/_meru/*` and `/v1/*` can never be shadowed by files inside `--web-dir`.
+5. **No Service Workers**: Requests carrying `Service-Worker: script` return `404` so custom bundles can never hijack the origin after `--web-dir` is removed.
+6. **Loopback-Only `--web-dir` in `v0.4`**: Binding `--web-dir` on a non-loopback address fails fast at startup.
+
+### Agent Custom UI Workflow
+- `meru-mind serve --demo` boots a seeded sandbox containing rule-tail sentinels, stored-XSS test records, and unknown record kinds so any coding agent builds against real edge cases.
+- `meru-mind ui eject ./my-ui` copies the built-in official shell source (which imports only `/_meru/client.js`), paired with `UI_BUILDER_SKILL.md` so the user's Agent can craft a bespoke zero-build or framework shell without breaking upgrades.

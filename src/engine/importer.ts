@@ -82,6 +82,65 @@ function normalizeDeclaredTimestamp(raw: unknown): string | null {
   return parsed.toISOString();
 }
 
+function isDateOnlyLiteral(raw: unknown): boolean {
+  if (typeof raw !== "string") return false;
+  return /^\d{4}-\d{2}-\d{2}$/.test(raw.trim().replace(/^["']|["']$/g, ""));
+}
+
+/**
+ * Resolves the highest-precedence declared timestamp while preserving sub-day precision:
+ * if the highest-priority candidate is date-only (`YYYY-MM-DD`) and a lower-priority
+ * candidate on the same calendar day supplies an exact time-of-day, upgrade to the
+ * exact timestamp so same-day records never invert on ingestion-order tie-breaks.
+ */
+export function resolveMostPreciseDeclaredTimestamp(
+  candidates: unknown[],
+): string | null {
+  let primaryIso: string | null = null;
+  let primaryDateOnlyDay: string | null = null;
+
+  for (const raw of candidates) {
+    const iso = normalizeDeclaredTimestamp(raw);
+    if (!iso) continue;
+    if (!primaryIso) {
+      primaryIso = iso;
+      if (isDateOnlyLiteral(raw)) {
+        primaryDateOnlyDay = String(raw)
+          .trim()
+          .replace(/^["']|["']$/g, "")
+          .slice(0, 10);
+      } else {
+        return primaryIso;
+      }
+      continue;
+    }
+    if (primaryDateOnlyDay && !isDateOnlyLiteral(raw)) {
+      const rawDay = String(raw)
+        .trim()
+        .replace(/^["']|["']$/g, "")
+        .slice(0, 10);
+      if (rawDay === primaryDateOnlyDay || iso.slice(0, 10) === primaryDateOnlyDay) {
+        return iso;
+      }
+    }
+  }
+  return primaryIso;
+}
+
+function getAllFields(
+  obj: Record<string, unknown>,
+  spec?: string | string[],
+): unknown[] {
+  if (!spec) return [];
+  const paths = Array.isArray(spec) ? spec : [spec];
+  const out: unknown[] = [];
+  for (const p of paths) {
+    const v = getFieldByPath(obj, p);
+    if (v !== undefined && v !== null && v !== "") out.push(v);
+  }
+  return out;
+}
+
 function validateMappingConfig(mapping?: ImportMappingConfig): RegExp | null {
   if (!mapping) return null;
   if (mapping.statusMap) {
@@ -260,32 +319,27 @@ export function parseMarkdownDocument(
     "date",
     "timestamp",
   ];
-  let occurredAt: string | null = null;
+  const fmCandidates: unknown[] = [];
   for (const key of timeKeys) {
     if (key in frontmatter) {
-      const normalized = normalizeDeclaredTimestamp(frontmatter[key]);
-      if (normalized) {
-        occurredAt = normalized;
-        break;
-      }
+      fmCandidates.push(frontmatter[key]);
     }
   }
+  let occurredAt = resolveMostPreciseDeclaredTimestamp(fmCandidates);
 
   if (!occurredAt) {
     const headerLines = body.split("\n").slice(0, 30);
+    const headerCandidates: unknown[] = [];
     for (const line of headerLines) {
       const m =
         /^\s*(?:[-*]\s*)?(?:\*\*)?(occurred_at|updated_at|valid_from|created_at|date|timestamp)(?:\*\*)?\s*[:：]\s*(.+)$/i.exec(
           line,
         );
       if (m) {
-        const normalized = normalizeDeclaredTimestamp(m[2]);
-        if (normalized) {
-          occurredAt = normalized;
-          break;
-        }
+        headerCandidates.push(m[2]);
       }
     }
+    occurredAt = resolveMostPreciseDeclaredTimestamp(headerCandidates);
   }
 
   // 3. Title: frontmatter title -> first # H1 heading -> fallbackTitle
@@ -1115,8 +1169,8 @@ export class ImporterEngine {
       const supersedesSourceIds = Array.from(
         new Set(toStringArray(getFieldByPath(row, mapping.supersedes))),
       );
-      const occurredAt = normalizeDeclaredTimestamp(
-        getFirstField(row, mapping.occurredAt),
+      const occurredAt = resolveMostPreciseDeclaredTimestamp(
+        getAllFields(row, mapping.occurredAt),
       );
 
       parsedRows.push({

@@ -40,6 +40,7 @@ export {
 export {
   LedgerEngine,
   computePayloadHash,
+  isAllowedSupersedeKind,
 } from "./engine/ledger.js";
 export {
   canonicalizeJson,
@@ -67,8 +68,10 @@ export {
 } from "./engine/refs.js";
 export {
   writeEverydayConclusion,
+  findRelatedActiveForEcho,
   resolveWriteTargetRealm,
   EVERYDAY_WRITE_KINDS,
+  type RelatedActiveEcho,
   type SurfaceWriteParams,
   type ResolveWriteTargetParams,
   type ResolvedWriteTarget,
@@ -117,6 +120,7 @@ export {
 export {
   ImporterEngine,
   parseMarkdownDocument,
+  resolveMostPreciseDeclaredTimestamp,
   type ParsedMarkdownDoc,
 } from "./engine/importer.js";
 export {

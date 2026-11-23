@@ -24,7 +24,16 @@ import {
 import type { LedgerEngine } from "./ledger.js";
 import { resolveRealmByPath, resolveVisibleRealm } from "./objects.js";
 import { resolveAboutRefsForWrite } from "./refs.js";
+import type { SeaEngine } from "./sea.js";
 import { createVisibilityHelpers } from "./visibility.js";
+
+export interface RelatedActiveEcho {
+  id: string;
+  kind: RecordKind;
+  realmPath: string;
+  title: string;
+  occurredAt: string | null;
+}
 
 export interface ResolveWriteTargetParams {
   db: DbPort;
@@ -390,4 +399,56 @@ export async function writeEverydayConclusion(
     idempotencyKey,
     allowRedactedReingest: allowHumanOverride,
   });
+}
+
+/**
+ * Neutral write-time echo: after an interactive write without explicit `--supersedes`,
+ * runs a fast lexical recall on the new record's title and returns up to 3 potentially
+ * related active entries for context (zero LLM, non-blocking, never fires on secrets).
+ */
+export async function findRelatedActiveForEcho(params: {
+  sea: SeaEngine;
+  actor: Actor;
+  viewerRealmId: string;
+  newRecord: LedgerRecord;
+  scopeCeiling?: AccessScope;
+  limit?: number;
+}): Promise<RelatedActiveEcho[]> {
+  if (
+    params.newRecord.supersedesIds.length > 0 ||
+    params.newRecord.sensitivity === "secret" ||
+    !params.newRecord.title.trim()
+  ) {
+    return [];
+  }
+  const maxItems = Math.max(1, Math.min(params.limit ?? 3, 5));
+  try {
+    const res = await params.sea.recall({
+      actor: params.actor,
+      viewerRealmId: params.viewerRealmId,
+      query: params.newRecord.title,
+      scopeCeiling: params.scopeCeiling,
+      includeSuperseded: false,
+      limit: maxItems + 3,
+    });
+    const out: RelatedActiveEcho[] = [];
+    for (const item of res.items) {
+      if (item.sourceType !== "record") continue;
+      if (item.id === params.newRecord.id) continue;
+      if (item.status !== "active") continue;
+      if (item.kind === "rule" && params.newRecord.kind !== "rule") continue;
+      out.push({
+        id: item.id,
+        kind: item.kind as RecordKind,
+        realmPath: item.realmPath ?? "/",
+        title: item.title,
+        occurredAt: item.occurredAt,
+      });
+      if (out.length >= maxItems) break;
+    }
+    return out;
+  } catch {
+    // Non-blocking best-effort echo: never fail a committed write
+    return [];
+  }
 }
