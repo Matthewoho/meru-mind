@@ -100,6 +100,24 @@ export interface RealmUnarchiveResult {
   archivedAncestorPath?: string | null;
 }
 
+export interface MovedEntryItem {
+  id: string;
+  entityType: "record" | "seabed";
+  fromRealmId: string;
+  fromRealmPath: string;
+  toRealmId: string;
+  toRealmPath: string;
+  chainExpanded?: boolean;
+}
+
+export interface MoveEntriesResult {
+  targetRealmId: string;
+  targetRealmPath: string;
+  dryRun: boolean;
+  moved: MovedEntryItem[];
+  skippedAlreadyInTargetIds: string[];
+}
+
 export type MountScope = "all" | "ledger" | "drive";
 
 export interface RealmMount {

@@ -371,7 +371,7 @@ RECORD [write]:
         [--occurred-at <iso|none>] [--sensitivity public|internal|confidential|secret]
 
 MANAGE [write / human]:
-  realm | object | file | rule | raw | redact | settle | import | org | admin
+  realm | entry | object | file | rule | raw | redact | settle | import | org | admin
 
 OUTPUT:
   Markdown capped with next-page --cursor; pass --json for JSON; errors include try:.
@@ -495,6 +495,14 @@ Examples:
   meru-mind realm create --parent / --slug ops --name "Operations" --scope "Include: releases, alerts. Exclude: product specs." --as-human
   meru-mind realm set /ops --scope "Include: prod deploys, rollbacks. Exclude: CI flakes." --as-human
   meru-mind realm archive /old-project --as-human
+`,
+  entry: `Risk: high-risk-write (requires --as-human)
+When to use: Move misplaced ledger/raw entries (e.g. triaging /inbox or evacuating an archived realm) in-place without breaking history.
+Usage:
+  meru-mind entry move <entryId>... --to <realmRef> [--dry-run] [--org <orgId>] --as-human
+Examples:
+  meru-mind entry move rec_0123456789abcdef --to /ops --as-human
+  meru-mind entry move rec_aaa rec_bbb --to /eng --dry-run --as-human
 `,
   object: `Risk: write
 When to use: Create, reparent, delete, link, unlink, set lifecycle state, or manage aliases on structured objects (kind "file" is reserved).
@@ -835,6 +843,7 @@ async function main(): Promise<void> {
     "changes",
     "write",
     "realm",
+    "entry",
     "object",
     "file",
     "rule",
@@ -1426,6 +1435,46 @@ async function main(): Promise<void> {
         "UNKNOWN_COMMAND",
         `Unknown realm subcommand "${sub ?? ""}"`,
         { try: "meru-mind realm --help" },
+      );
+    }
+
+    if (cmd === "entry") {
+      if (sub === "move") {
+        assertAllowedFlags(flags, ["to", "dry-run"], "entry move");
+        const entryIds = positionals.slice(2).map((s) => s.trim()).filter(Boolean);
+        if (entryIds.length === 0) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "Missing <entryId>... for 'entry move'",
+            { try: "meru-mind entry move <entryId> --to /ops --as-human" },
+          );
+        }
+        const orgId = resolveAdminOrgId(engine, orgFlag);
+        const toRef = requireFlag(flags, "to", "entry move");
+        const targetRealmId = resolveAdminRealmId(engine, toRef, orgId);
+        const res = engine.ledger.moveEntries({
+          actor,
+          orgId,
+          entryIds,
+          targetRealmId,
+          dryRun: flagBool(flags, "dry-run"),
+        });
+        const mdLines = [
+          `# Entry Move${res.dryRun ? " (Dry Run)" : ""}: -> \`${res.targetRealmPath}\``,
+          `- Moved: ${res.moved.length}`,
+          `- Skipped (already in target): ${res.skippedAlreadyInTargetIds.length}`,
+          ...res.moved.map(
+            (m) =>
+              `- \`${m.id}\` (${m.entityType}): \`${m.fromRealmPath}\` -> \`${m.toRealmPath}\`${m.chainExpanded ? " _(chain-expanded)_" : ""}`,
+          ),
+        ];
+        output(res, mdLines.join("\n"));
+        return;
+      }
+      throw new MindError(
+        "UNKNOWN_COMMAND",
+        `Unknown entry subcommand "${sub ?? ""}"`,
+        { try: "meru-mind entry --help" },
       );
     }
 

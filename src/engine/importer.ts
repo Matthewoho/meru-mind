@@ -1,7 +1,11 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { resolveAccess, resolveAccessScope } from "../policy.js";
+import {
+  isRealmEffectivelyArchived,
+  resolveAccess,
+  resolveAccessScope,
+} from "../policy.js";
 import type { DbPort } from "../ports.js";
 import {
   MindError,
@@ -734,7 +738,7 @@ export class ImporterEngine {
       });
 
       // Active chain head lookup:
-      // - open mode: (org_id, source_ref) so realm reassignment supersedes old head cleanly
+      // - open mode: (org_id, source_ref) so explicit mapping reassignment supersedes old head cleanly
       // - tree mode: (org_id, realm_id, source_ref) to preserve strict realm partition
       const head =
         orgPolicy === "open"
@@ -745,6 +749,50 @@ export class ImporterEngine {
               targetRealm.id,
             );
 
+      // P0-2 protection against undoing human `entry move`:
+      // Only treat targetRealm as a non-overriding fallback when mapping didn't assign a realm AND
+      // caller did not explicitly target a specific non-root/non-inbox realm (e.g. --in /beta).
+      const isFallbackRealm =
+        usedDefaultRealm &&
+        (!params.targetRealmRef?.trim() ||
+          defaultRealm.path === "/" ||
+          defaultRealm.path === "/inbox");
+
+      if (orgPolicy === "tree" && !head && isFallbackRealm) {
+        const initKey = `import-md:${sourceRef}:init:${newSha256}:${initialStatus}`;
+        const existingInit = this.db.getIdempotencyKey(
+          viewerRealm.orgId,
+          initKey,
+        );
+        if (
+          existingInit &&
+          existingInit.targetTable === "records" &&
+          existingInit.realmId !== targetRealm.id
+        ) {
+          skippedUnchanged += 1;
+          items.push({
+            filePath,
+            sourceRef,
+            contentSha256: newSha256,
+            action: "skipped_unchanged",
+            recordId: null,
+            supersedesId: null,
+            realmId: targetRealm.id,
+            occurredAt,
+          });
+          continue;
+        }
+      }
+
+      const effectiveRealmId =
+        orgPolicy === "open" &&
+        isFallbackRealm &&
+        head &&
+        head.realmId !== targetRealm.id &&
+        !isRealmEffectivelyArchived(realms, head.realmId)
+          ? head.realmId
+          : targetRealm.id;
+
       const headSha =
         head && typeof head.payload.contentSha256 === "string"
           ? head.payload.contentSha256
@@ -753,7 +801,7 @@ export class ImporterEngine {
       if (
         head &&
         headSha === newSha256 &&
-        head.realmId === targetRealm.id &&
+        head.realmId === effectiveRealmId &&
         head.status === initialStatus
       ) {
         skippedUnchanged += 1;
@@ -764,7 +812,7 @@ export class ImporterEngine {
           action: "skipped_unchanged",
           recordId: head.id,
           supersedesId: null,
-          realmId: targetRealm.id,
+          realmId: effectiveRealmId,
           occurredAt,
         });
         continue;
@@ -899,7 +947,7 @@ export class ImporterEngine {
         const rec = await this.ledger.appendRecord({
           actor,
           viewerRealmId: viewerRealm.id,
-          targetRealmId: targetRealm.id,
+          targetRealmId: effectiveRealmId,
           kind: desiredKind,
           extKind: params.extKind,
           title: parsed.title,

@@ -22,6 +22,8 @@ import {
   type DriveFileMeta,
   type LedgerRecord,
   type MountScope,
+  type MovedEntryItem,
+  type MoveEntriesResult,
   type Organization,
   type OrgPolicy,
   type Realm,
@@ -608,6 +610,226 @@ export class LedgerEngine {
         alreadyActive,
         effectivelyArchived: stillArchivedBy !== null,
         ...(stillArchivedBy ? { archivedAncestorPath: stillArchivedBy.path } : {}),
+      };
+    });
+  }
+
+  /**
+   * Org-admin human-only in-place entry move across realms within one BEGIN IMMEDIATE transaction.
+   * - Updates all 4 realm_id copies: records/seabed_entries, fts_docs, vec_items+vec_pending, idempotency_keys.
+   * - Rejects effectively archived target realms (CONFLICT reason="realm_archived"), while allowing
+   *   evacuation OUT of archived source realms into active realms.
+   * - Rejects drive://-backed seabed artifacts (drive files remain bound to their realm).
+   * - In `tree` mode, atomically expands to the full connected supersede component (enforcing same-realm invariant).
+   * - In `open` mode, moves strictly the requested entry IDs (preserving legal cross-realm supersedes).
+   * - Caps total moved entries per transaction at 500; appends dual `move_out` / `move_in` change_log rows.
+   */
+  moveEntries(params: {
+    actor: Actor;
+    orgId: string;
+    entryIds: string[];
+    targetRealmId: string;
+    dryRun?: boolean;
+  }): MoveEntriesResult {
+    const MAX_MOVE_BATCH = 500;
+    const actor = validateActor(params.actor);
+    if (actor.kind !== "human") {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Only human actors can move entries between realms (actor "${actor.id}" is "${actor.kind}")`,
+        {
+          try: "meru-mind entry move <entryId> --to <realm> --as-human",
+        },
+      );
+    }
+    const requestedIds = Array.from(
+      new Set(params.entryIds.map((id) => id.trim()).filter(Boolean)),
+    );
+    if (requestedIds.length === 0) {
+      throw new MindError(
+        "INVALID_INPUT",
+        "At least one entry ID (rec_... or sea_...) is required for entry move",
+        { try: "meru-mind entry move <entryId> --to <realm> --as-human" },
+      );
+    }
+    if (requestedIds.length > MAX_MOVE_BATCH) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `entry move batch size (${requestedIds.length}) exceeds maximum of ${MAX_MOVE_BATCH}`,
+      );
+    }
+
+    return this.db.transaction(() => {
+      const org = this.db.getOrg(params.orgId);
+      if (!org) {
+        throw new MindError("NOT_FOUND", `Organization not found: ${params.orgId}`);
+      }
+      const orgRealms = this.db.listRealms(org.id);
+      const realmsById = new Map(orgRealms.map((r) => [r.id, r]));
+      const targetRealm = realmsById.get(params.targetRealmId);
+      if (!targetRealm) {
+        throw new MindError(
+          "NOT_FOUND",
+          `Target realm not found in org "${org.id}": ${params.targetRealmId}`,
+        );
+      }
+      const archivedTarget = findEffectiveArchivedRealm(
+        orgRealms,
+        targetRealm.id,
+      );
+      if (archivedTarget) {
+        throw new MindError(
+          "CONFLICT",
+          `Target realm "${archivedTarget.path}" is archived and frozen for writes.`,
+          {
+            reason: "realm_archived",
+            targetRealmId: targetRealm.id,
+            archivedRealmId: archivedTarget.id,
+            try: `meru-mind realm unarchive ${archivedTarget.path} --as-human`,
+          },
+        );
+      }
+
+      // Resolve requested entries & expand connected supersede component in tree mode
+      interface PlannedMove {
+        id: string;
+        entityType: "record" | "seabed";
+        fromRealmId: string;
+        chainExpanded: boolean;
+      }
+      const plannedById = new Map<string, PlannedMove>();
+      const queue: Array<{ id: string; chainExpanded: boolean }> =
+        requestedIds.map((id) => ({ id, chainExpanded: false }));
+
+      while (queue.length > 0) {
+        const cur = queue.shift()!;
+        if (plannedById.has(cur.id)) continue;
+
+        const rec = this.db.getRecord(cur.id);
+        if (rec) {
+          if (rec.orgId !== org.id) {
+            throw new MindError(
+              "NOT_FOUND",
+              `Entry not found in organization "${org.id}": ${cur.id}`,
+            );
+          }
+          plannedById.set(rec.id, {
+            id: rec.id,
+            entityType: "record",
+            fromRealmId: rec.realmId,
+            chainExpanded: cur.chainExpanded,
+          });
+          if (plannedById.size > MAX_MOVE_BATCH) {
+            throw new MindError(
+              "INVALID_INPUT",
+              `Expanded supersede chain exceeds maximum batch size of ${MAX_MOVE_BATCH} entries`,
+            );
+          }
+          if (org.policy === "tree") {
+            const neighbors = this.db.listRecordSupersedeNeighborIds(
+              org.id,
+              rec.id,
+            );
+            for (const nid of neighbors) {
+              if (!plannedById.has(nid)) {
+                queue.push({ id: nid, chainExpanded: true });
+              }
+            }
+          }
+          continue;
+        }
+
+        const sea = this.db.getSeabedEntry(cur.id);
+        if (sea) {
+          if (sea.orgId !== org.id) {
+            throw new MindError(
+              "NOT_FOUND",
+              `Entry not found in organization "${org.id}": ${cur.id}`,
+            );
+          }
+          if (sea.sourceRef && parseDriveSourceRef(sea.sourceRef)) {
+            throw new MindError(
+              "INVALID_INPUT",
+              `Cannot move drive-backed seabed entry "${sea.id}" (${sea.sourceRef}): drive files remain bound to their realm.`,
+            );
+          }
+          plannedById.set(sea.id, {
+            id: sea.id,
+            entityType: "seabed",
+            fromRealmId: sea.realmId,
+            chainExpanded: false,
+          });
+          if (plannedById.size > MAX_MOVE_BATCH) {
+            throw new MindError(
+              "INVALID_INPUT",
+              `entry move batch exceeds maximum of ${MAX_MOVE_BATCH} entries`,
+            );
+          }
+          continue;
+        }
+
+        throw new MindError(
+          "NOT_FOUND",
+          `Entry not found in organization "${org.id}": ${cur.id}`,
+        );
+      }
+
+      const moved: MovedEntryItem[] = [];
+      const skippedAlreadyInTargetIds: string[] = [];
+      const now = new Date().toISOString();
+      const dryRun = Boolean(params.dryRun);
+
+      for (const item of plannedById.values()) {
+        if (item.fromRealmId === targetRealm.id) {
+          skippedAlreadyInTargetIds.push(item.id);
+          continue;
+        }
+        const fromRealmPath =
+          realmsById.get(item.fromRealmId)?.path ?? item.fromRealmId;
+        if (!dryRun) {
+          this.db.moveEntryRealm({
+            orgId: org.id,
+            targetTable:
+              item.entityType === "record" ? "records" : "seabed_entries",
+            entryId: item.id,
+            newRealmId: targetRealm.id,
+          });
+          this.db.appendChangeLog({
+            orgId: org.id,
+            realmId: item.fromRealmId,
+            entityType: item.entityType,
+            entityId: item.id,
+            op: "move_out",
+            actorId: actor.id,
+            createdAt: now,
+          });
+          this.db.appendChangeLog({
+            orgId: org.id,
+            realmId: targetRealm.id,
+            entityType: item.entityType,
+            entityId: item.id,
+            op: "move_in",
+            actorId: actor.id,
+            createdAt: now,
+          });
+        }
+        moved.push({
+          id: item.id,
+          entityType: item.entityType,
+          fromRealmId: item.fromRealmId,
+          fromRealmPath,
+          toRealmId: targetRealm.id,
+          toRealmPath: targetRealm.path,
+          ...(item.chainExpanded ? { chainExpanded: true } : {}),
+        });
+      }
+
+      return {
+        targetRealmId: targetRealm.id,
+        targetRealmPath: targetRealm.path,
+        dryRun,
+        moved,
+        skippedAlreadyInTargetIds,
       };
     });
   }

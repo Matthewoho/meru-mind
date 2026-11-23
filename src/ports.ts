@@ -445,6 +445,13 @@ export interface DbPort {
   // Idempotency keys (org-scoped, shared across records & seabed_entries)
   getIdempotencyKey(orgId: string, key: string): IdempotencyRecord | null;
   insertIdempotencyKey(record: IdempotencyRecord): void;
+  moveEntryRealm(params: {
+    orgId: string;
+    targetTable: "records" | "seabed_entries";
+    entryId: string;
+    newRealmId: string;
+  }): void;
+  listRecordSupersedeNeighborIds(orgId: string, recordId: string): string[];
 
   // Change log (append-only operational event log; never cleared by rebuild())
   getChangeLogGeneration(): number;

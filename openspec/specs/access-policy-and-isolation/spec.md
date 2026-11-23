@@ -22,7 +22,7 @@ In `open` orgs, a single org auto-resolves and missing `MERU_MIND_VIEWER_REALM_I
 - **AND** `meru-mind org set-policy --org <id> --policy open --as-human` succeeds without `MERU_MIND_VIEWER_REALM_ID`
 
 ### Requirement: Complete Removal of Legacy Commands and Flags with Self-Correcting Hints
-CLI SHALL expose 7 everyday verbs (`whoami`, `tree`, `ls`, `show`, `search`, `changes`, `write`) and 10 management groups (`realm`, `object`, `file`, `rule`, `raw`, `redact`, `settle`, `import`, `org`, `admin`) with zero aliases. Legacy commands (`recall`, `cat`, `brief`, `replay`, `record`, `capture`, `drive`, `mount`, `thing`, `tag`, `import-*`, `init`, `rebuild`, `status`, `inspect`, `log`, `add`) return `unknown_command` + `try:`; legacy flags return `unknown_flag`.
+CLI SHALL expose 7 everyday verbs (`whoami`, `tree`, `ls`, `show`, `search`, `changes`, `write`) and 11 management groups (`realm`, `entry`, `object`, `file`, `rule`, `raw`, `redact`, `settle`, `import`, `org`, `admin`) with zero aliases. Legacy commands (`recall`, `cat`, `brief`, `replay`, `record`, `capture`, `drive`, `mount`, `thing`, `tag`, `import-*`, `init`, `rebuild`, `status`, `inspect`, `log`, `add`) return `unknown_command` + `try:`; legacy flags return `unknown_flag`.
 
 #### Scenario: Legacy commands and removed flags return self-correcting 4-field errors
 - **WHEN** a caller invokes `meru-mind recall "x"`, `meru-mind status`, or `meru-mind ls / --realm /ops`

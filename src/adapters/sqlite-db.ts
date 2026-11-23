@@ -4322,6 +4322,106 @@ export class SqliteDb implements DbPort {
       );
   }
 
+  /**
+   * Atomically updates every realm_id copy for a moved entry inside caller's transaction:
+   * records/seabed_entries, fts_docs, vec_pending, vec_items (delete + re-insert), and idempotency_keys.
+   */
+  moveEntryRealm(params: {
+    orgId: string;
+    targetTable: "records" | "seabed_entries";
+    entryId: string;
+    newRealmId: string;
+  }): void {
+    if (params.targetTable === "records") {
+      this.db
+        .prepare(`UPDATE records SET realm_id = ? WHERE id = ?`)
+        .run(params.newRealmId, params.entryId);
+    } else {
+      this.db
+        .prepare(`UPDATE seabed_entries SET realm_id = ? WHERE id = ?`)
+        .run(params.newRealmId, params.entryId);
+    }
+    this.db
+      .prepare(`UPDATE fts_docs SET realm_id = ? WHERE item_id = ?`)
+      .run(params.newRealmId, params.entryId);
+    this.db
+      .prepare(`UPDATE vec_pending SET realm_id = ? WHERE item_id = ?`)
+      .run(params.newRealmId, params.entryId);
+    if (this.vecEnabled) {
+      const row = this.db
+        .prepare(
+          `SELECT status, source_type, embedding FROM vec_items WHERE item_id = ?`,
+        )
+        .get(params.entryId) as
+        | { status: string; source_type: string; embedding: Uint8Array }
+        | undefined;
+      if (row) {
+        this.db
+          .prepare(`DELETE FROM vec_items WHERE item_id = ?`)
+          .run(params.entryId);
+        this.db
+          .prepare(
+            `INSERT INTO vec_items (item_id, realm_id, status, source_type, embedding)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(
+            params.entryId,
+            params.newRealmId,
+            row.status,
+            row.source_type,
+            row.embedding,
+          );
+      }
+    }
+    this.db
+      .prepare(
+        `UPDATE idempotency_keys
+         SET realm_id = ?
+         WHERE org_id = ? AND target_table = ? AND target_id = ?`,
+      )
+      .run(params.newRealmId, params.orgId, params.targetTable, params.entryId);
+  }
+
+  listRecordSupersedeNeighborIds(orgId: string, recordId: string): string[] {
+    const out = new Set<string>();
+    const self = this.getRecord(recordId);
+    if (self && self.orgId === orgId) {
+      if (self.supersedesId) out.add(self.supersedesId);
+      if (self.supersededById) out.add(self.supersededById);
+      if (self.supersedesIds) {
+        for (const sid of self.supersedesIds) out.add(sid);
+      }
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT id, supersedes_ids_json FROM records
+         WHERE org_id = ?
+           AND (supersedes_id = ? OR superseded_by_id = ? OR supersedes_ids_json LIKE ?)`,
+      )
+      .all(orgId, recordId, recordId, `%"${recordId}"%`) as Array<{
+      id: string;
+      supersedes_ids_json: string | null;
+    }>;
+    for (const r of rows) {
+      if (r.id === recordId) continue;
+      // Double-check exact JSON membership if matched via LIKE
+      if (r.supersedes_ids_json) {
+        try {
+          const arr = JSON.parse(String(r.supersedes_ids_json)) as unknown[];
+          if (Array.isArray(arr) && arr.includes(recordId)) {
+            out.add(String(r.id));
+            continue;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      out.add(String(r.id));
+    }
+    out.delete(recordId);
+    return Array.from(out);
+  }
+
   // ---- Change Log ----
 
   getChangeLogGeneration(): number {

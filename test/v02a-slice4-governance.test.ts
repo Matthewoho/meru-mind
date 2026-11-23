@@ -599,3 +599,292 @@ describe("V0.2a Slice 4 — Pillar 3: Migration v8 realms.scope, realm set & arc
     eng.close();
   });
 });
+
+describe("V0.2a Slice 4 — Pillar 4: Atomic entry move & Importer P0-2 preservation", () => {
+  it("moves records and seabed atomically across realms, updates FTS/idempotency/change_log, expands supersede chains in tree mode, allows archive evacuation, and rejects drive artifacts", async () => {
+    const homeDir = makeTempHome();
+    const eng = await createMindEngine({ homeDir });
+    const { org, rootRealm } = eng.ledger.createOrg({
+      name: "MoveOrg",
+      policy: "open",
+      actor: humanAdmin,
+    });
+    const src = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "src",
+      name: "Source",
+      scope: "Temporary holding",
+    });
+    const dst = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "dst",
+      name: "Destination",
+      scope: "Permanent home",
+    });
+
+    const rec = await eng.ledger.appendRecord({
+      actor: agentWorker,
+      viewerRealmId: src.id,
+      realmId: src.id,
+      kind: "finding",
+      title: "MoveableToken882 finding",
+      payload: { body: "Payload stays intact across realm move." },
+      occurredAt: "2026-10-15T10:00:00Z",
+      idempotencyKey: "move-key-882",
+    });
+    const rawMsg = await eng.ledger.captureSeabed({
+      actor: agentWorker,
+      viewerRealmId: src.id,
+      realmId: src.id,
+      kind: "message",
+      text: "MoveableRawToken882 message",
+    });
+    const driveRes = await eng.ledger.writeDriveFile({
+      actor: agentWorker,
+      viewerRealmId: src.id,
+      realmId: src.id,
+      relPath: "pinned.md",
+      content: "# Pinned file",
+    });
+
+    // Agents are forbidden from moving entries
+    expect(() =>
+      eng.ledger.moveEntries({
+        actor: agentWorker,
+        orgId: org.id,
+        entryIds: [rec.id],
+        targetRealmId: dst.id,
+      }),
+    ).toThrow(/Only human actors/);
+
+    // Drive-backed seabed artifact CANNOT be moved
+    expect(() =>
+      eng.ledger.moveEntries({
+        actor: humanAdmin,
+        orgId: org.id,
+        entryIds: [driveRes.artifactId],
+        targetRealmId: dst.id,
+      }),
+    ).toThrow(/drive-backed seabed/);
+
+    // Dry run returns plan without mutating DB
+    const dry = eng.ledger.moveEntries({
+      actor: humanAdmin,
+      orgId: org.id,
+      entryIds: [rec.id, rawMsg.id],
+      targetRealmId: dst.id,
+      dryRun: true,
+    });
+    expect(dry.dryRun).toBe(true);
+    expect(dry.moved.length).toBe(2);
+    expect(eng.db.getRecord(rec.id)?.realmId).toBe(src.id);
+
+    // Archive src FIRST -> evacuation OUT of archived src to active dst MUST SUCCEED!
+    eng.ledger.archiveRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      realmId: src.id,
+    });
+    const moved = eng.ledger.moveEntries({
+      actor: humanAdmin,
+      orgId: org.id,
+      entryIds: [rec.id, rawMsg.id],
+      targetRealmId: dst.id,
+    });
+    expect(moved.moved.map((m) => m.id).sort()).toEqual(
+      [rec.id, rawMsg.id].sort(),
+    );
+    expect(eng.db.getRecord(rec.id)?.realmId).toBe(dst.id);
+    expect(eng.db.getRecord(rec.id)?.authorId).toBe(agentWorker.id);
+    expect(eng.db.getRecord(rec.id)?.occurredAt).toBe("2026-10-15T10:00:00Z");
+    expect(eng.db.getSeabedEntry(rawMsg.id)?.realmId).toBe(dst.id);
+    expect(eng.db.getIdempotencyKey(org.id, "move-key-882")?.realmId).toBe(
+      dst.id,
+    );
+
+    // FTS updated atomically: found in /dst, absent in /src!
+    const inDst = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      in: "/dst",
+      query: "MoveableToken882",
+    });
+    expect(inDst.items.map((i) => i.id)).toEqual([rec.id]);
+    const inSrc = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      in: "/src",
+      query: "MoveableToken882",
+    });
+    expect(inSrc.items.length).toBe(0);
+
+    // Dual move_out / move_in change_log entries written
+    const logs = eng.sea.listChangeLog({ orgId: org.id }).entries;
+    expect(
+      logs.some(
+        (e) =>
+          e.op === "move_out" && e.entityId === rec.id && e.realmId === src.id,
+      ),
+    ).toBe(true);
+    expect(
+      logs.some(
+        (e) =>
+          e.op === "move_in" && e.entityId === rec.id && e.realmId === dst.id,
+      ),
+    ).toBe(true);
+
+    // Moving INTO archived realm fails with CONFLICT (realm_archived)
+    let conflictErr: unknown;
+    try {
+      eng.ledger.moveEntries({
+        actor: humanAdmin,
+        orgId: org.id,
+        entryIds: [rec.id],
+        targetRealmId: src.id,
+      });
+    } catch (e) {
+      conflictErr = e;
+    }
+    expect(conflictErr).toBeInstanceOf(MindError);
+    expect((conflictErr as MindError).code).toBe("CONFLICT");
+    expect((conflictErr as MindError).details?.reason).toBe("realm_archived");
+
+    // Re-moving already-in-target entry is idempotent no-op
+    const noop = eng.ledger.moveEntries({
+      actor: humanAdmin,
+      orgId: org.id,
+      entryIds: [rec.id],
+      targetRealmId: dst.id,
+    });
+    expect(noop.moved.length).toBe(0);
+    expect(noop.skippedAlreadyInTargetIds).toEqual([rec.id]);
+    eng.close();
+
+    // Tree-mode supersede chain closure: moving B automatically expands to A -> B
+    const treeHome = makeTempHome();
+    const tEng = await createMindEngine({ homeDir: treeHome });
+    const { org: tOrg, rootRealm: tRoot } = tEng.ledger.createOrg({
+      name: "TreeMoveOrg",
+      policy: "tree",
+      actor: humanAdmin,
+    });
+    const tA = tEng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: tOrg.id,
+      parentId: tRoot.id,
+      slug: "a",
+      name: "A",
+    });
+    const tB = tEng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: tOrg.id,
+      parentId: tRoot.id,
+      slug: "b",
+      name: "B",
+    });
+    const recV1 = await tEng.ledger.appendRecord({
+      actor: agentWorker,
+      viewerRealmId: tA.id,
+      realmId: tA.id,
+      kind: "decision",
+      title: "Policy v1",
+      payload: { body: "Old policy" },
+    });
+    const recV2 = await tEng.ledger.appendRecord({
+      actor: agentWorker,
+      viewerRealmId: tA.id,
+      realmId: tA.id,
+      kind: "decision",
+      title: "Policy v2",
+      payload: { body: "New policy" },
+      supersedesId: recV1.id,
+    });
+
+    const treeMove = tEng.ledger.moveEntries({
+      actor: humanAdmin,
+      orgId: tOrg.id,
+      entryIds: [recV2.id],
+      targetRealmId: tB.id,
+    });
+    expect(treeMove.moved.map((m) => m.id).sort()).toEqual(
+      [recV1.id, recV2.id].sort(),
+    );
+    expect(treeMove.moved.find((m) => m.id === recV1.id)?.chainExpanded).toBe(
+      true,
+    );
+    expect(tEng.db.getRecord(recV1.id)?.realmId).toBe(tB.id);
+    expect(tEng.db.getRecord(recV2.id)?.realmId).toBe(tB.id);
+    tEng.close();
+  });
+
+  it("importer P0-2: re-importing default-realm markdown after human entry move preserves moved realm instead of reverting or crashing", async () => {
+    const homeDir = makeTempHome();
+    const eng = await createMindEngine({ homeDir });
+    const { org, rootRealm } = eng.ledger.createOrg({
+      name: "ImpMoveOrg",
+      policy: "open",
+      actor: humanAdmin,
+    });
+    const ops = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "ops",
+      name: "Ops",
+    });
+
+    const docsDir = makeTempHome();
+    const mdFile = path.join(docsDir, "deploy-guide.md");
+    fs.writeFileSync(mdFile, "# Deploy Guide\n\nVersion 1 steps.\n", "utf8");
+
+    // 1. Initial import lands in default target "/"
+    const imp1 = await eng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      targetRealmRef: "/",
+      inputPath: docsDir,
+      syncEmbeddings: false,
+    });
+    expect(imp1.created).toBe(1);
+    const recId = imp1.items[0]!.recordId!;
+    expect(eng.db.getRecord(recId)?.realmId).toBe(rootRealm.id);
+
+    // 2. Human triages it to /ops via entry move
+    eng.ledger.moveEntries({
+      actor: humanAdmin,
+      orgId: org.id,
+      entryIds: [recId],
+      targetRealmId: ops.id,
+    });
+    expect(eng.db.getRecord(recId)?.realmId).toBe(ops.id);
+
+    // 3. Re-running importMd with default target "/" MUST keep it unchanged in /ops!
+    const imp2 = await eng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      targetRealmRef: "/",
+      inputPath: docsDir,
+      syncEmbeddings: false,
+    });
+    expect(imp2.skippedUnchanged).toBe(1);
+    expect(imp2.superseded).toBe(0);
+    expect(eng.db.getRecord(recId)?.realmId).toBe(ops.id);
+
+    // 4. Editing the markdown file and re-importing keeps the new revision in /ops!
+    fs.writeFileSync(mdFile, "# Deploy Guide\n\nVersion 2 steps.\n", "utf8");
+    const imp3 = await eng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      targetRealmRef: "/",
+      inputPath: docsDir,
+      syncEmbeddings: false,
+    });
+    expect(imp3.superseded).toBe(1);
+    expect(imp3.items[0]!.realmId).toBe(ops.id);
+    eng.close();
+  });
+});
