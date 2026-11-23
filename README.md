@@ -37,32 +37,40 @@ export MERU_MIND_HOME="$HOME/.meru-mind"
 # 1. Initialize personal root org & root realm
 node dist/cli.js admin init --org "Acme"
 
-# 2. Create child realms (realm topology is human-only in both open and tree modes)
+# 2. Create child realms (realm topology & lifecycle are human-only in both open and tree modes)
 node dist/cli.js realm create --parent / --slug backend --name "Backend" --scope "Include: API design, storage, backend deploys. Exclude: marketing." --as-human
 node dist/cli.js realm create --parent / --slug marketing --name "Marketing" --scope "Include: launches, campaigns. Exclude: backend infra." --as-human
 
-# 3. Record a human rule & everyday conclusion
+# 3. Record a human rule, an explicit-realm conclusion, and a zero-flag note (auto-routes to /inbox)
 node dist/cli.js rule add --in / --title "Never deploy without passing integration tests" --body "All merges require passing CI." --as-human
 node dist/cli.js write --in /backend --kind decision --title "Use PostgreSQL 17 for primary storage" --body "Standardize on PG 17."
+node dist/cli.js write --title "Investigate p95 latency spike" --body "Omitted --in lands in /inbox for triage."
 
 # 4. Capture seabed messages & write shared drive files
 node dist/cli.js raw add --in /backend --kind message --text "Benchmarked PostgreSQL connection pool sizing"
 node dist/cli.js file write file:/backend/STATE.md --content "# Backend State"
 
-# 5. Inspect workspace tree & realm brief
+# 5. Inspect identity/inbox count, workspace tree, and realm brief
+node dist/cli.js whoami
 node dist/cli.js tree
 node dist/cli.js show /backend
 
-# 6. Scoped search (ID -> filter -> FTS5 -> sqlite-vec)
+# 6. Scoped search (ID -> filter -> FTS5 + local-passage window -> optional sqlite-vec)
 node dist/cli.js search "PostgreSQL" --in /backend
 
-# 7. Export a read-only slice for sandboxed agents
+# 7. Govern realms & move entries atomically (human-only)
+node dist/cli.js realm set /backend --scope "Include: API, storage, database migrations. Exclude: frontend." --as-human
+node dist/cli.js entry move <rec_id> --to /backend --dry-run --as-human
+node dist/cli.js realm archive /marketing --as-human
+node dist/cli.js tree --all
+
+# 8. Export a read-only slice for sandboxed agents
 node dist/cli.js admin export-slice --in /backend --out /tmp/agent-slice/.meru/.mindrealm
 ```
 
 ### MCP Server Usage
 
-Connect any MCP-compatible client (Claude Code, Codex, Antigravity, Cursor, etc.):
+`meru-mind-mcp` exposes a compact **7-tool** contract (`mind_whoami`, `mind_tree`, `mind_ls`, `mind_show`, `mind_search`, `mind_changes`, `mind_write`). Connect any MCP-compatible client (Claude Code, Codex, Antigravity, Cursor, etc.):
 
 ```json
 {

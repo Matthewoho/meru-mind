@@ -1,8 +1,26 @@
 {
   "name": "@meru-mind/core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Scoped visibility (MindRealm) and layered memory & ledger engine (MindSea) for multi-agent teams.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Matthewoho/meru-mind.git"
+  },
+  "homepage": "https://github.com/Matthewoho/meru-mind#readme",
+  "bugs": {
+    "url": "https://github.com/Matthewoho/meru-mind/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "agent-memory",
+    "mcp",
+    "sqlite",
+    "fts5",
+    "sqlite-vec",
+    "multi-agent",
+    "ledger"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
