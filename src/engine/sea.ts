@@ -1539,14 +1539,21 @@ export class SeaEngine {
             const end = Math.min(bodyLen, start + PASSAGE_WINDOW_CHARS);
             const slice = params.bodyText.slice(start, end);
             const sliceLower = bodyLower.slice(start, end);
-            // P2-1: pad 1 word-character on left/right for non-CJK boundary regexes so a
-            // window cut mid-word (e.g. "config|uration") never fabricates a false word boundary.
+            // P2-1 + R2-4: pad 1 word-character on left/right ONLY when both sides of the
+            // cut are word characters (e.g. "config|uration") so we never fabricate either a
+            // false word boundary OR a standalone 1-char token (e.g. "magix| ").
             const leftWordPad =
-              start > 0 && /[A-Za-z0-9_:/-]/.test(params.bodyText[start - 1]!)
+              start > 0 &&
+              slice.length > 0 &&
+              /[A-Za-z0-9_:/-]/.test(slice[0]!) &&
+              /[A-Za-z0-9_:/-]/.test(params.bodyText[start - 1]!)
                 ? params.bodyText[start - 1]!
                 : "";
             const rightWordPad =
-              end < bodyLen && /[A-Za-z0-9_:/-]/.test(params.bodyText[end]!)
+              end < bodyLen &&
+              slice.length > 0 &&
+              /[A-Za-z0-9_:/-]/.test(slice[slice.length - 1]!) &&
+              /[A-Za-z0-9_:/-]/.test(params.bodyText[end]!)
                 ? params.bodyText[end]!
                 : "";
             const boundarySlice =
@@ -1580,18 +1587,26 @@ export class SeaEngine {
             let winDateCount = baseDateCount;
             let winDateAll = baseDateAll;
             if (activeBodyDates.length > 0) {
-              // P2-2: prepend ONLY an immediately preceding "YYYY年" prefix before `start`
-              // so a split year-prefix ("2025年|10月10日") is preserved without dragging a
-              // separate date from the pad region into this window.
+              // P2-2 + R2-2: preserve ANY year-prefix token ("YYYY年", "YYYY-", "YYYY/", "YYYY.")
+              // that ends at or straddles `start` (all 5 CJK cut points: 2025年|, 2025|年, 202|5年,
+              // 20|25年, 2|025年, plus ISO cuts), without dragging a separate earlier date into `slice`.
               let dateSlice = slice;
-              if (start > 0) {
+              if (start > 0 && PASSAGE_DATE_LEFT_PAD > 0) {
                 const lookBack = params.bodyText.slice(
                   Math.max(0, start - PASSAGE_DATE_LEFT_PAD),
                   start,
                 );
-                const yearPrefixMatch = /(\d{4}\s*年\s*)$/.exec(lookBack);
-                if (yearPrefixMatch) {
-                  dateSlice = yearPrefixMatch[1]! + slice;
+                const lookAhead = slice.slice(0, PASSAGE_DATE_LEFT_PAD);
+                const seam = lookBack + lookAhead;
+                const seamRe = /(?<!\d)(\d{4}\s*(?:年\s*|[-/.]))/g;
+                let match: RegExpExecArray | null;
+                while ((match = seamRe.exec(seam)) !== null) {
+                  const mStart = match.index;
+                  const mEnd = mStart + match[0].length;
+                  if (mStart < lookBack.length && mEnd >= lookBack.length) {
+                    dateSlice = lookBack.slice(mStart) + slice;
+                    break;
+                  }
                 }
               }
               for (let j = 0; j < activeBodyDates.length; j += 1) {

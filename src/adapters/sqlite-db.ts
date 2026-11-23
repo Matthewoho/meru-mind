@@ -4506,19 +4506,48 @@ export class SqliteDb implements DbPort {
     return row ? Number(row.seq) : null;
   }
 
-  hasEntityChangeLogOp(
+  hasRecordLineageChangeLogOp(
     orgId: string,
-    entityType: string,
-    entityId: string,
+    recordId: string,
     op: string,
+    realmId?: string,
   ): boolean {
-    const row = this.db
-      .prepare(
-        `SELECT 1 AS hit FROM change_log
-         WHERE org_id = ? AND entity_type = ? AND entity_id = ? AND op = ?
-         LIMIT 1`,
-      )
-      .get(orgId, entityType, entityId, op) as { hit: number } | undefined;
+    const visited = new Set<string>([recordId]);
+    const queue: string[] = [recordId];
+    const MAX_LINEAGE = 512;
+    while (queue.length > 0 && visited.size < MAX_LINEAGE) {
+      const curId = queue.shift()!;
+      const rec = this.getRecord(curId);
+      if (!rec || rec.orgId !== orgId) continue;
+      const parents: string[] = [];
+      if (rec.supersedesId) parents.push(rec.supersedesId);
+      if (rec.supersedesIds) {
+        for (const pid of rec.supersedesIds) parents.push(pid);
+      }
+      for (const pid of parents) {
+        if (!visited.has(pid) && visited.size < MAX_LINEAGE) {
+          visited.add(pid);
+          queue.push(pid);
+        }
+      }
+    }
+    const ids = Array.from(visited);
+    if (ids.length === 0) return false;
+    const ph = placeholders(ids.length);
+    const sql = realmId
+      ? `SELECT 1 AS hit FROM change_log
+         WHERE org_id = ? AND entity_type = 'record' AND op = ? AND realm_id = ? AND entity_id IN (${ph})
+         LIMIT 1`
+      : `SELECT 1 AS hit FROM change_log
+         WHERE org_id = ? AND entity_type = 'record' AND op = ? AND entity_id IN (${ph})
+         LIMIT 1`;
+    const row = realmId
+      ? (this.db.prepare(sql).get(orgId, op, realmId, ...ids) as
+          | { hit: number }
+          | undefined)
+      : (this.db.prepare(sql).get(orgId, op, ...ids) as
+          | { hit: number }
+          | undefined);
     return Boolean(row);
   }
 

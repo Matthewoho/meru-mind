@@ -788,11 +788,11 @@ export class ImporterEngine {
         usedDefaultRealm &&
         head !== null &&
         head.realmId !== targetRealm.id &&
-        this.db.hasEntityChangeLogOp(
+        this.db.hasRecordLineageChangeLogOp(
           viewerRealm.orgId,
-          "record",
           head.id,
           "move_in",
+          head.realmId,
         );
 
       const effectiveRealmId =

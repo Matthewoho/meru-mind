@@ -1204,7 +1204,8 @@ describe("V0.2a Slice 4 — Post-Build Regression & T1 Mutation-Killer Suite (N1
     expect(Math.floor(bucketRes.items[0]!.score / 1000)).toBe(3);
     expect(bucketRes.items[0]!.snippet).toContain("MarkerWin5");
 
-    // 3. N3 (partial-title CJK > 5000 chars): branch-and-bound MUST match exhaustive tier 3
+    // 3. N3 + M37 (partial-title CJK > 5000 chars): window 0 has "库迁" (which under broken B&B
+    //    would saturate bucket h=1 via title union and prune window 5 containing "rollback").
     const partialTitleDoc = await eng.ledger.appendRecord({
       actor: humanAdmin,
       viewerRealmId: rootRealm.id,
@@ -1212,7 +1213,7 @@ describe("V0.2a Slice 4 — Post-Build Regression & T1 Mutation-Killer Suite (N1
       kind: "claim",
       title: "数据库 迁移手册",
       payload: {
-        body: `${"普通日志记录。".repeat(900)} 应急章节：执行 rollback 回退步骤。${"尾部填充。".repeat(300)}`,
+        body: `前期讨论库迁方案细节。${"普通日志记录。".repeat(900)} 应急章节：执行 rollback 回退步骤。${"尾部填充。".repeat(300)}`,
       },
     });
     const partialRes = await eng.sea.search({
@@ -1223,26 +1224,32 @@ describe("V0.2a Slice 4 — Post-Build Regression & T1 Mutation-Killer Suite (N1
     expect(partialRes.items[0]?.id).toBe(partialTitleDoc.id);
     expect(Math.floor(partialRes.items[0]!.score / 1000)).toBe(3);
 
-    // 4. M04 & P2-2: "2025年" at 995..999 + "10月10日" at 1000..1004 MUST NOT false-match "2026年10月10日"
-    const dateSeamDoc = await eng.ledger.appendRecord({
-      actor: humanAdmin,
-      viewerRealmId: rootRealm.id,
-      realmId: rootRealm.id,
-      kind: "claim",
-      title: "Archive log",
-      payload: {
-        body: `${"p".repeat(995)}2025年10月10日 seamTopicXYZ 处理完毕。${"q".repeat(1800)}`,
-      },
-      occurredAt: "2024-01-01T00:00:00Z",
-    });
-    const seamRes = await eng.sea.search({
-      actor: agentWorker,
-      viewerRealmId: rootRealm.id,
-      query: "2026年10月10日 seamTopicXYZ",
-    });
-    const seamHit = seamRes.items.find((i) => i.id === dateSeamDoc.id);
-    expect(seamHit).toBeDefined();
-    expect(Math.floor(seamHit!.score / 1000)).toBe(2);
+    // 4. M04 & P2-2 & R2-2: ALL 5 CJK year-prefix cut points across index 1000
+    //    ("body: " is 6 chars, so pad=989..993 places index 1000 at:
+    //     2025年|10月10日, 2025|年10月10日, 202|5年10月10日, 20|25年10月10日, 2|025年10月10日).
+    //    Each doc includes a far-away real "2026年10月10日" so activeBodyDates is non-empty!
+    for (const pad of [989, 990, 991, 992, 993]) {
+      const tag = `seamCut${pad}XYZ`;
+      const dateSeamDoc = await eng.ledger.appendRecord({
+        actor: humanAdmin,
+        viewerRealmId: rootRealm.id,
+        realmId: rootRealm.id,
+        kind: "claim",
+        title: `Archive seam ${pad}`,
+        payload: {
+          body: `${"p".repeat(pad)}2025年10月10日 ${tag} 处理完毕。${"q".repeat(3200)} 另附2026年10月10日无关远端记录。`,
+        },
+        occurredAt: "2024-01-01T00:00:00Z",
+      });
+      const seamRes = await eng.sea.search({
+        actor: agentWorker,
+        viewerRealmId: rootRealm.id,
+        query: `2026年10月10日 ${tag}`,
+      });
+      const seamHit = seamRes.items.find((i) => i.id === dateSeamDoc.id);
+      expect(seamHit).toBeDefined();
+      expect(Math.floor(seamHit!.score / 1000)).toBe(2);
+    }
 
     // P2-2: real 2026 date 3000 chars away from topic+2025 date must stay tier 2
     const farDateDoc = await eng.ledger.appendRecord({
@@ -1265,7 +1272,8 @@ describe("V0.2a Slice 4 — Post-Build Regression & T1 Mutation-Killer Suite (N1
     expect(farHit).toBeDefined();
     expect(Math.floor(farHit!.score / 1000)).toBe(2);
 
-    // 5. P2-1: window cut mid-word ("config|uration") MUST NOT fabricate a false word boundary
+    // 5. P2-1 + R2-4: window cut mid-word ("config|uration") MUST NOT fabricate a false word boundary,
+    //    AND window cut at word end ("magix| probeTarget") MUST NOT fabricate standalone "x"!
     const cutWordDoc = await eng.ledger.appendRecord({
       actor: humanAdmin,
       viewerRealmId: rootRealm.id,
@@ -1273,7 +1281,7 @@ describe("V0.2a Slice 4 — Post-Build Regression & T1 Mutation-Killer Suite (N1
       kind: "claim",
       title: "Word boundary cut",
       payload: {
-        body: `cutZebraOnly ${"w".repeat(1981)}configuration ${"v".repeat(2500)}`,
+        body: `cutZebraOnly ${"w".repeat(1975)}configuration ${"v".repeat(2500)}`,
       },
     });
     const cutRes = await eng.sea.search({
@@ -1284,6 +1292,25 @@ describe("V0.2a Slice 4 — Post-Build Regression & T1 Mutation-Killer Suite (N1
     const cutHit = cutRes.items.find((i) => i.id === cutWordDoc.id);
     expect(cutHit).toBeDefined();
     expect(Math.floor(cutHit!.score / 1000)).toBe(2);
+
+    const endWordDoc = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "claim",
+      title: "Word end cut",
+      payload: {
+        body: `${"p".repeat(989)}magix probeTargetOnly ${"v".repeat(2500)}`,
+      },
+    });
+    const endWordRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "x probeTargetOnly",
+    });
+    const endWordHit = endWordRes.items.find((i) => i.id === endWordDoc.id);
+    expect(endWordHit).toBeDefined();
+    expect(Math.floor(endWordHit!.score / 1000)).toBe(2);
     eng.close();
   });
 
@@ -1499,6 +1526,31 @@ describe("V0.2a Slice 4 — Post-Build Regression & T1 Mutation-Killer Suite (N1
     expect(oi2.skippedUnchanged).toBe(1);
     expect(oi2.superseded).toBe(0);
     expect(oEng.db.getRecord(movedId)?.realmId).toBe(oOps.id);
+
+    // R2-1: edit file to v2, re-import with --in /beta (stays in /ops as rec2),
+    // then re-import UNCHANGED with --in /beta -> MUST still stay in /ops (never revert to /beta)!
+    fs.writeFileSync(path.join(oDocs, "guide.md"), "# Guide\n\nBody v2\n", "utf8");
+    const oi3 = await oEng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: oRoot.id,
+      targetRealmRef: "/beta",
+      inputPath: oDocs,
+      syncEmbeddings: false,
+    });
+    expect(oi3.superseded).toBe(1);
+    const v2Id = oi3.items[0]!.recordId!;
+    expect(oEng.db.getRecord(v2Id)?.realmId).toBe(oOps.id);
+
+    const oi4 = await oEng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: oRoot.id,
+      targetRealmRef: "/beta",
+      inputPath: oDocs,
+      syncEmbeddings: false,
+    });
+    expect(oi4.skippedUnchanged).toBe(1);
+    expect(oi4.superseded).toBe(0);
+    expect(oEng.db.getRecord(v2Id)?.realmId).toBe(oOps.id);
     oEng.close();
 
     // 4. M16: vec_items partition key updated on entry move!
