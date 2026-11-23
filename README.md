@@ -18,7 +18,7 @@ flowchart LR
         ROOT --> INBOX
     end
 
-    subgraph SEA["MindSea (2 Canonical Truth Sources)"]
+    subgraph SEA["MindSea (Single Truth Store: Evidence Seabed ⊥ Conclusions Ledger)"]
         SEABED["Seabed (Immutable Raw)<br/>messages · evidence · artifacts · 0o444 blobs"]
         LEDGER["Ledger (Append-Only Truth)<br/>rules · decisions · findings · proposals · supersedes CAS"]
         SEABED -. "distill / cite" .-> LEDGER
@@ -37,7 +37,7 @@ flowchart LR
 ## Why Meru Mind?
 
 - **Tree-scoped visibility (`open | tree`)**: Every read, search, vector KNN query, and slice export passes through one pure policy engine (`src/policy.ts`). In `tree` mode, sibling branches are excluded **before Top-K**; ancestor rules inherit downward; cross-branch reads require explicit `@mount`.
-- **Two canonical truth sources (`Seabed ⊥ Ledger`)**: Immutable raw logs (`seabed_entries` + `0o444` content-addressed `blobs/`) stay separated from structured conclusions (`records` with atomic `supersedes` chains and compliance-grade `redact`). All derived indexes (FTS5, optional `sqlite-vec`) can be destroyed and reconstructed via `admin rebuild`.
+- **Single truth store, layered into Evidence (`Seabed`) and Conclusions (`Ledger`)**: Inside one canonical SQLite store, immutable raw evidence (`seabed_entries` + `0o444` content-addressed `blobs/`) stays layered beneath structured conclusions (`records` with atomic `supersedes` chains and compliance-grade `redact`). All derived indexes (FTS5, optional `sqlite-vec`) can be destroyed and reconstructed via `admin rebuild`.
 - **Zero-Docker, deterministic speed**: Built directly on Node.js 22+ built-in `node:sqlite` (WAL + FTS5 + local-passage windowed coverage) with optional `sqlite-vec` embeddings.
 - **Minimal 7-tool MCP + 23-line Skill**: Agents follow a deterministic `whoami -> tree -> show <realm> -> search` rhythm without burning context budget.
 

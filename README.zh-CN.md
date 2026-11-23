@@ -1,6 +1,6 @@
 # Meru Mind
 
-**面向下一代人机团队的「空间隔离 × 双真源演化」共享上下文内核。**
+**面向下一代人机团队的「空间隔离 × 单真相库分层演化」共享上下文内核。**
 
 [English README](./README.md) · [架构设计 (ARCHITECTURE.md)](./ARCHITECTURE.md) · [云端部署与可组合前端指南](./docs/deployment-and-frontend.md)
 
@@ -18,7 +18,7 @@ flowchart LR
         ROOT --> INBOX
     end
 
-    subgraph SEA["MindSea（双唯一真相源）"]
+    subgraph SEA["MindSea（单真相库：证据 Seabed ⊥ 定论 Ledger）"]
         SEABED["Seabed 海床（不可变原文）<br/>消息 · 证据 · 制品 · 0o444 不可变 blobs"]
         LEDGER["Ledger 账本（追加式现行真相）<br/>规则 · 决策 · 发现 · 提案 · supersedes 原子取代链"]
         SEABED -. "提炼 / 引证" .-> LEDGER
@@ -37,7 +37,7 @@ flowchart LR
 ## 核心设计优势
 
 - **树状空间隔离与继承（`open | tree`）**：所有读写、检索、向量查询与只读切片导出均经过同一套纯函数策略引擎（`src/policy.ts`）。`tree` 模式下兄弟分支在 Top-K 之前即被 SQL/分区键物理排除；祖先规矩向下继承；跨分支访问必须经人类显式 `@mount`。
-- **双真相源架构（`Seabed ⊥ Ledger`）**：原始记录（`seabed_entries` + `0o444` 内容寻址 `blobs/`）与水上定论（带原子 `supersedes` 取代链和合规级 `redact` 字节抹除的 `records`）严格分层；FTS5 与可选 `sqlite-vec` 等派生索引随时可用 `admin rebuild` 无损重建。
+- **单真相库，证据（`Seabed`）与定论（`Ledger`）分层**：在同一座 SQLite 真相库内，不可变原始证据（`seabed_entries` + `0o444` 内容寻址 `blobs/`）与水上定论（带原子 `supersedes` 取代链和合规级 `redact` 字节抹除的 `records`）严格分层；FTS5 与可选 `sqlite-vec` 等派生索引随时可用 `admin rebuild` 无损重建。
 - **零 Docker、确定性毫秒级召回**：直接构建于 Node.js 22+ 内置 `node:sqlite`（WAL + CJK 双字 FTS5 + 局部滑动窗口覆盖度），无外部数据库、无重中间件。
 - **极简 7 工具 MCP + 23 行 Skill**：引导 Agent 稳定执行 `whoami -> tree -> show <realm> -> search` 冷启动节奏，不浪费上下文预算。
 
