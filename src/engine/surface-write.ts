@@ -25,6 +25,7 @@ import type { LedgerEngine } from "./ledger.js";
 import { resolveRealmByPath, resolveVisibleRealm } from "./objects.js";
 import { resolveAboutRefsForWrite } from "./refs.js";
 import type { SeaEngine } from "./sea.js";
+import { assertNoAccidentalSecret } from "./secret-guard.js";
 import { createVisibilityHelpers } from "./visibility.js";
 
 export interface RelatedActiveEcho {
@@ -268,6 +269,13 @@ export async function writeEverydayConclusion(
   if (!body) {
     throw new MindError("INVALID_INPUT", "Record body cannot be empty");
   }
+
+  assertNoAccidentalSecret({
+    texts: [title, body],
+    sensitivity,
+    surfaceHint:
+      'Remove the credential value or re-run with --sensitivity secret',
+  });
 
   const targetRealm = params.realms.find((r) => r.id === params.targetRealmId);
   if (!targetRealm) {

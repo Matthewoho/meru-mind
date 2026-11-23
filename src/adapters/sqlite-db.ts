@@ -2,11 +2,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
-import {
-  isValidCalendarDate,
-  normalizeAlias,
-} from "../format/inactive-badges.js";
+import { normalizeAlias } from "../format/inactive-badges.js";
 import { buildRecordFtsBody } from "../format/snippet.js";
+import {
+  buildDateLiteralFtsExpr,
+  buildFtsMatchExpression,
+  CJK_COVERAGE_THRESHOLD,
+  normalizeForFts,
+  parseSearchQuery,
+  placeholders,
+  type DateConcept,
+  type ParsedSearchQuery,
+  type SearchConcept,
+} from "../query/fts-query.js";
 import type {
   DateWindowMatch,
   DateWindowQueryParams,
@@ -23,7 +31,13 @@ import type {
 } from "../ports.js";
 import {
   MindError,
+  type AuthTokenRecord,
+  type ChangeAssetClass,
+  type ChangeCommittedEvent,
   type ChangeLogEntry,
+  type ConsumerCursor,
+  type DeliveryRecord,
+  type DeliveryState,
   type Distillation,
   type DistillationLayer,
   type DriveFileMeta,
@@ -35,6 +49,7 @@ import {
   type ObjectState,
   type Organization,
   type OrgPolicy,
+  type PumpChangeFrame,
   type Realm,
   type RealmMount,
   type RecordKind,
@@ -48,6 +63,18 @@ import {
   type WalCheckpointResult,
 } from "../types.js";
 
+export {
+  buildDateLiteralFtsExpr,
+  buildFtsMatchExpression,
+  CJK_COVERAGE_THRESHOLD,
+  normalizeForFts,
+  parseSearchQuery,
+  placeholders,
+  type DateConcept,
+  type ParsedSearchQuery,
+  type SearchConcept,
+};
+
 export interface SqliteDbOptions {
   dbPath: string;
   vectorDimensions?: number;
@@ -56,666 +83,6 @@ export interface SqliteDbOptions {
 
 const DEFAULT_VECTOR_DIM = 1536;
 const DEFAULT_BUSY_TIMEOUT_MS = 30000;
-
-const CJK_CHAR_RE =
-  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
-const CJK_RUN_RE =
-  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
-
-/**
- * Normalizes mixed CJK + Latin text for SQLite FTS5 unicode61:
- * - Preserves Latin/numeric words and exact word boundaries.
- * - Inserts spaces at CJK <-> Latin/digit boundaries so tokens never fuse.
- * - For contiguous CJK runs (Han/Hiragana/Katakana/Hangul):
- *   - L === 1: emits the single character (e.g. "锁").
- *   - L >= 2: emits overlapping 2-char bigram tokens plus the trailing character
- *     (e.g. "发布平台" -> "发布 布平 平台 台") for single-token posting lookups
- *     with zero cross-punctuation false positives.
- */
-export function normalizeForFts(text: string): string {
-  return text
-    .replace(CJK_RUN_RE, (run) => {
-      const chars = Array.from(run);
-      if (chars.length === 1) {
-        return ` ${chars[0]!} `;
-      }
-      const tokens: string[] = [];
-      for (let i = 0; i < chars.length - 1; i += 1) {
-        tokens.push(`${chars[i]!}${chars[i + 1]!}`);
-      }
-      tokens.push(chars[chars.length - 1]!);
-      return ` ${tokens.join(" ")} `;
-    })
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-const EN_STOPWORDS = new Set([
-  "find",
-  "search",
-  "about",
-  "related",
-  "show",
-  "list",
-  "get",
-  "what",
-  "is",
-  "are",
-  "the",
-  "for",
-  "of",
-  "in",
-  "on",
-  "to",
-  "with",
-  "check",
-  "look",
-  "lookup",
-  "query",
-  "please",
-  "tell",
-  "me",
-  "a",
-  "an",
-]);
-
-/** Standalone length-1 CJK particles dropped ONLY when separated and >=1 concrete concept remains */
-const CJK_STANDALONE_PARTICLES = new Set([
-  "把",
-  "从",
-  "的",
-  "了",
-  "吗",
-  "呢",
-  "啊",
-  "在",
-  "里",
-  "给",
-  "被",
-  "将",
-]);
-
-/** Complete 2-char CJK filler bigrams filtered ONLY after generating overlapping bigrams from intact segments */
-const CJK_BIGRAM_STOPWORDS = new Set([
-  "什么",
-  "为什",
-  "上次",
-  "现在",
-  "已经",
-  "关于",
-  "相关",
-  "一下",
-  "查一",
-  "查找",
-  "搜索",
-  "查询",
-  "帮我",
-  "请问",
-  "看看",
-  "有没",
-  "没有",
-  "怎么",
-  "如何",
-  "哪些",
-  "可以",
-  "应该",
-  "需要",
-  "还是",
-  "或者",
-  "以及",
-  "的是",
-  "了吗",
-  "了没",
-]);
-
-const SEGMENT_RE =
-  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+|[A-Za-z0-9_]+(?:[-/:.][A-Za-z0-9_]+)*/gu;
-
-export const CJK_COVERAGE_THRESHOLD = 0.75;
-
-export interface SearchConcept {
-  raw: string;
-  ftsPhrase: string;
-  /** Retained terms for matching (2-char bigrams for CJK len>=3, [raw] for len 1-2 or non-CJK) */
-  terms: string[];
-  /** FTS5 expression for this concept: `"t"`, `"c"*`, or `("b1" OR "b2" ...)` */
-  ftsGroupExpr: string;
-  isCjk: boolean;
-  isIdentifier: boolean;
-  /** Continuous coverage score in [0, 1]; optional pre-lowercased text avoids repeated .toLowerCase() */
-  scoreText(text: string, lowerText?: string): number;
-  /** Covered per pre-registered threshold (>= 0.75 for CJK, 1.0 for non-CJK) */
-  matchText(text: string, lowerText?: string): boolean;
-}
-
-export interface DateConcept {
-  raw: string;
-  year: number | null;
-  month: number;
-  day: number;
-  /** Canonical display label, e.g. "2026-10-10" or "10-10" */
-  label: string;
-  /** ±1 calendar day UTC window spec */
-  window: DateWindowSpec;
-  /** Canonical FTS5 OR expression covering padded/unpadded ISO, ISO-T prefix, and Chinese 日/号 prefix phrases */
-  ftsLiteralExpr: string;
-  /** True iff occurredAt UTC date prefix falls within ±1 calendar day */
-  matchOccurredAt(occurredAt: string | null): boolean;
-  /** True iff body/title text matches any literal variant accepted by ftsLiteralExpr */
-  matchLiteralText(text: string): boolean;
-}
-
-export interface ParsedSearchQuery {
-  concepts: SearchConcept[];
-  /** Pass 1 (AND across all concepts; multi-bigram CJK uses OR inside parenthesized group) */
-  ftsAndExpression: string | null;
-  /** Pass 2 (OR across all concepts/bigrams) */
-  ftsOrExpression: string | null;
-  /** Backward-compatible alias for ftsOrExpression */
-  ftsExpression: string | null;
-  hasIdentifiers: boolean;
-  /** Present ONLY when parseSearchQuery is called with { extractDates: true } */
-  dateConcepts?: DateConcept[];
-}
-
-function pad2(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
-function formatUtcYmd(ms: number): string {
-  const dt = new Date(ms);
-  return `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
-}
-
-function formatUtcMd(ms: number): string {
-  const dt = new Date(ms);
-  return `${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
-}
-
-/**
- * Canonical FTS5 literal expression for a parsed date concept:
- * - Full Cartesian product of padded/unpadded month & day
- * - ISO numeric + ISO timestamp T-prefix (`"2026 10 10t"*`) when year is specified
- * - Chinese `YYYY 年 M 月 D 日/号*` (when year specified) + `M 月 D 日/号*` (always),
- *   using FTS5 prefix-phrase idiom to match contiguous `"10月10日上线"` and `日`↔`号`.
- */
-export function buildDateLiteralFtsExpr(dc: {
-  year: number | null;
-  month: number;
-  day: number;
-}): string {
-  const mVariants = Array.from(new Set([String(dc.month), pad2(dc.month)]));
-  const dVariants = Array.from(new Set([String(dc.day), pad2(dc.day)]));
-  const clauses: string[] = [];
-  const seen = new Set<string>();
-  const add = (expr: string) => {
-    if (!seen.has(expr)) {
-      seen.add(expr);
-      clauses.push(expr);
-    }
-  };
-
-  if (dc.year !== null) {
-    const y = String(dc.year);
-    for (const m of mVariants) {
-      for (const d of dVariants) {
-        add(`"${y} ${m} ${d}"`);
-        add(`"${y} ${m} ${d}t"*`);
-        add(`"${y} 年 ${m} 月 ${d} 日"*`);
-        add(`"${y} 年 ${m} 月 ${d} 号"*`);
-      }
-    }
-  }
-  for (const m of mVariants) {
-    for (const d of dVariants) {
-      add(`"${m} 月 ${d} 日"*`);
-      add(`"${m} 月 ${d} 号"*`);
-    }
-  }
-
-  return clauses.join(" OR ");
-}
-
-function makeDateConcept(
-  raw: string,
-  year: number | null,
-  month: number,
-  day: number,
-): DateConcept {
-  const DAY_MS = 86_400_000;
-  let window: DateWindowSpec;
-  let matchOccurredAt: (occurredAt: string | null) => boolean;
-
-  if (year !== null) {
-    const centerMs = Date.UTC(year, month - 1, day);
-    const startDate = formatUtcYmd(centerMs - DAY_MS);
-    const endDate = formatUtcYmd(centerMs + DAY_MS);
-    window = { startDate, endDate };
-    matchOccurredAt = (occurredAt: string | null): boolean => {
-      if (!occurredAt || occurredAt.length < 10) return false;
-      const prefix = occurredAt.slice(0, 10);
-      return prefix >= startDate && prefix <= endDate;
-    };
-  } else {
-    const mdSet = new Set<string>();
-    // Compute ±1 day across BOTH leap year (2024) and non-leap year (2025)
-    // so e.g. year-less 3月1日 includes BOTH 02-28 and 02-29, and Dec 31 <-> Jan 1 rolls over cleanly.
-    for (const refYear of [2024, 2025]) {
-      if (!isValidCalendarDate(refYear, month, day)) continue;
-      const centerMs = Date.UTC(refYear, month - 1, day);
-      mdSet.add(formatUtcMd(centerMs - DAY_MS));
-      mdSet.add(formatUtcMd(centerMs));
-      mdSet.add(formatUtcMd(centerMs + DAY_MS));
-    }
-    const monthDays = Array.from(mdSet).sort();
-    window = { monthDays };
-    matchOccurredAt = (occurredAt: string | null): boolean => {
-      if (!occurredAt || occurredAt.length < 10) return false;
-      return mdSet.has(occurredAt.slice(5, 10));
-    };
-  }
-
-  const label =
-    year !== null
-      ? `${year}-${pad2(month)}-${pad2(day)}`
-      : `${pad2(month)}-${pad2(day)}`;
-  const ftsLiteralExpr = buildDateLiteralFtsExpr({ year, month, day });
-
-  // Body-side JS matcher: digit-only boundaries matching everything ftsLiteralExpr accepts,
-  // while rejecting mismatched YYYY年 on year-qualified queries and rejecting 2010-10-05 for 10-10.
-  const mPat = month < 10 ? `0?${month}` : String(month);
-  const dPat = day < 10 ? `0?${day}` : String(day);
-
-  const isoBodyRe =
-    year !== null
-      ? new RegExp(
-          `(?<!\\d)${year}[-/.\\s]${mPat}[-/.\\s]${dPat}(?!\\d)`,
-          "i",
-        )
-      : null;
-  const cnFullBodyRe =
-    year !== null
-      ? new RegExp(`(?<!\\d)${year}\\s*年\\s*${mPat}\\s*月\\s*${dPat}\\s*[日号]`)
-      : null;
-  const cnMdBodyRe = new RegExp(
-    `(?<!\\d)${mPat}\\s*月\\s*${dPat}\\s*[日号]`,
-    "g",
-  );
-  const numericMdBodyRe =
-    year === null
-      ? new RegExp(`(?<!\\d)${mPat}[-/]${dPat}(?!\\d|[-/]\\d)`)
-      : null;
-
-  const matchLiteralText = (text: string): boolean => {
-    if (!text) return false;
-    if (year !== null) {
-      if (isoBodyRe!.test(text)) return true;
-      if (cnFullBodyRe!.test(text)) return true;
-      cnMdBodyRe.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = cnMdBodyRe.exec(text)) !== null) {
-        const before = text.slice(Math.max(0, m.index - 12), m.index);
-        const yearPrefix = /(\d{4})\s*年\s*$/.exec(before);
-        if (yearPrefix && Number.parseInt(yearPrefix[1]!, 10) !== year) {
-          continue;
-        }
-        return true;
-      }
-      return false;
-    }
-    cnMdBodyRe.lastIndex = 0;
-    if (cnMdBodyRe.test(text)) return true;
-    if (numericMdBodyRe!.test(text)) return true;
-    return false;
-  };
-
-  return {
-    raw,
-    year,
-    month,
-    day,
-    label,
-    window,
-    ftsLiteralExpr,
-    matchOccurredAt,
-    matchLiteralText,
-  };
-}
-
-// Strict extraction order:
-// 1. ISO full date (relaxes sentence-end `2026-10-10.` / `2026-10-10:` while NOT slicing `backup_2026-10-10`, `2026-10-10T08:00`, `file:/ops/2026-10-10.md`)
-const QUERY_ISO_DATE_RE =
-  /(?<![A-Za-z0-9_./:-])(\d{4})-(\d{1,2})-(\d{1,2})(?![A-Za-z0-9_/-]|[.:][A-Za-z0-9_/-])/g;
-// 2. Chinese full date (MUST run before Chinese month-day)
-const QUERY_CN_FULL_DATE_RE =
-  /(?<![0-9])(\d{4})年(\d{1,2})月(\d{1,2})[日号]/g;
-// 3. Chinese month-day
-const QUERY_CN_MD_DATE_RE = /(?<![0-9])(\d{1,2})月(\d{1,2})[日号]/g;
-
-function extractDateConceptsFromQuery(rawQuery: string): {
-  strippedQuery: string;
-  dateConcepts: DateConcept[];
-} {
-  const found: Array<{ index: number; concept: DateConcept }> = [];
-  const seenLabels = new Set<string>();
-  let working = rawQuery;
-
-  // Replace each valid date match with a SINGLE SPACE (" ") so adjacent CJK chars never fuse.
-  working = working.replace(
-    QUERY_ISO_DATE_RE,
-    (match, yStr: string, mStr: string, dStr: string, offset: number) => {
-      const year = Number.parseInt(yStr, 10);
-      const month = Number.parseInt(mStr, 10);
-      const day = Number.parseInt(dStr, 10);
-      if (!isValidCalendarDate(year, month, day)) return match;
-      const dc = makeDateConcept(match, year, month, day);
-      if (!seenLabels.has(dc.label)) {
-        seenLabels.add(dc.label);
-        found.push({ index: offset, concept: dc });
-      }
-      return " ";
-    },
-  );
-
-  working = working.replace(
-    QUERY_CN_FULL_DATE_RE,
-    (match, yStr: string, mStr: string, dStr: string, offset: number) => {
-      const year = Number.parseInt(yStr, 10);
-      const month = Number.parseInt(mStr, 10);
-      const day = Number.parseInt(dStr, 10);
-      if (!isValidCalendarDate(year, month, day)) return match;
-      const dc = makeDateConcept(match, year, month, day);
-      if (!seenLabels.has(dc.label)) {
-        seenLabels.add(dc.label);
-        found.push({ index: offset, concept: dc });
-      }
-      return " ";
-    },
-  );
-
-  working = working.replace(
-    QUERY_CN_MD_DATE_RE,
-    (match, mStr: string, dStr: string, offset: number) => {
-      const month = Number.parseInt(mStr, 10);
-      const day = Number.parseInt(dStr, 10);
-      // Use leap year 2024 so year-less 2月29日 is accepted while 2月30日 / 4月31日 are rejected
-      if (!isValidCalendarDate(2024, month, day)) return match;
-      const dc = makeDateConcept(match, null, month, day);
-      if (!seenLabels.has(dc.label)) {
-        seenLabels.add(dc.label);
-        found.push({ index: offset, concept: dc });
-      }
-      return " ";
-    },
-  );
-
-  found.sort((a, b) => a.index - b.index);
-  return {
-    strippedQuery: working,
-    dateConcepts: found.map((f) => f.concept),
-  };
-}
-
-function escapeRegExp(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function quoteFtsPhrase(phrase: string): string {
-  return `"${phrase.replace(/"/g, '""')}"`;
-}
-
-function formatCjkFtsTerm(term: string): string {
-  const chars = Array.from(term);
-  if (chars.length === 1) {
-    // Prefix match catches every bigram starting with this character PLUS the trailing single character
-    return `${quoteFtsPhrase(term)}*`;
-  }
-  return quoteFtsPhrase(term);
-}
-
-function generateOverlappingBigrams(segment: string): string[] {
-  const chars = Array.from(segment);
-  if (chars.length <= 2) return [segment];
-  const bigrams: string[] = [];
-  for (let i = 0; i <= chars.length - 2; i += 1) {
-    bigrams.push(`${chars[i]!}${chars[i + 1]!}`);
-  }
-  return bigrams;
-}
-
-function makeCjkConcept(raw: string): SearchConcept | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  const chars = Array.from(trimmed);
-
-  let terms: string[];
-  if (chars.length <= 2) {
-    terms = [trimmed];
-  } else {
-    const allBigrams = Array.from(new Set(generateOverlappingBigrams(trimmed)));
-    const filtered = allBigrams.filter((bg) => !CJK_BIGRAM_STOPWORDS.has(bg));
-    terms = filtered.length > 0 ? filtered : allBigrams;
-  }
-
-  const ftsPhrase = terms.join(" ");
-  const lowerRaw = trimmed.toLowerCase();
-  const lowerTerms = terms.map((t) => t.toLowerCase());
-  const ftsTokens = terms.map((t) => formatCjkFtsTerm(t));
-  const ftsGroupExpr =
-    ftsTokens.length === 1 ? ftsTokens[0]! : `(${ftsTokens.join(" OR ")})`;
-
-  const scoreText = (text: string, preLower?: string): number => {
-    const lowerText = preLower ?? text.toLowerCase();
-    if (lowerText.includes(lowerRaw)) {
-      return 1.0;
-    }
-    if (lowerTerms.length === 1) {
-      return lowerText.includes(lowerTerms[0]!) ? 1.0 : 0.0;
-    }
-    let matched = 0;
-    for (const bg of lowerTerms) {
-      if (lowerText.includes(bg)) {
-        matched += 1;
-      }
-    }
-    return matched / lowerTerms.length;
-  };
-
-  return {
-    raw: trimmed,
-    ftsPhrase,
-    terms,
-    ftsGroupExpr,
-    isCjk: true,
-    isIdentifier: false,
-    scoreText,
-    matchText: (text: string, preLower?: string) =>
-      scoreText(text, preLower) >= CJK_COVERAGE_THRESHOLD,
-  };
-}
-
-function makeNonCjkConcept(raw: string): SearchConcept | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-
-  const isIdentifier = /[-/:]/.test(trimmed);
-  const ftsTokens = trimmed
-    .split(/[^A-Za-z0-9_]+/)
-    .map((t) => t.trim())
-    .filter(Boolean);
-  if (ftsTokens.length === 0) return null;
-  const ftsPhrase = ftsTokens.join(" ");
-  const boundaryRe = isIdentifier
-    ? new RegExp(
-        `(?<![A-Za-z0-9_:/-])${escapeRegExp(trimmed)}(?![A-Za-z0-9_:/-])`,
-        "i",
-      )
-    : new RegExp(
-        `(?<![A-Za-z0-9_])${escapeRegExp(trimmed)}(?![A-Za-z0-9_])`,
-        "i",
-      );
-
-  const scoreText = (text: string): number => (boundaryRe.test(text) ? 1.0 : 0.0);
-
-  return {
-    raw: trimmed,
-    ftsPhrase,
-    terms: [trimmed],
-    ftsGroupExpr: quoteFtsPhrase(ftsPhrase),
-    isCjk: false,
-    isIdentifier,
-    scoreText,
-    matchText: (text: string) => boundaryRe.test(text),
-  };
-}
-
-/**
- * Parses a mixed CJK + English + identifier query into concrete search concepts and staged FTS5 expressions:
- * - NEVER deletes characters from inside a contiguous Han/CJK segment (preserving compounds like "上线"/"下线"/"在线").
- * - Length-1 standalone CJK particles are dropped ONLY when separated and >=1 concrete concept remains (so "锁" works).
- * - Length-2 CJK segments stay atomic (dropping standalone 2-char filler segments only when >=1 concrete concept remains).
- * - Length >= 3 CJK segments emit all overlapping 2-char bigrams from the intact segment, filtering ONLY complete
- *   2-char filler bigrams when >=1 non-stopword bigram remains.
- * - Hyphen/slash/colon identifiers (e.g. agent-worker, api/v2, redis:6379) keep exact JS boundary matchers.
- * - Produces both Pass-1 AND expression (`ftsAndExpression`) and Pass-2 OR expression (`ftsOrExpression`).
- */
-export function parseSearchQuery(
-  rawQuery: string,
-  options?: { extractDates?: boolean },
-): ParsedSearchQuery {
-  const wantDates = options?.extractDates === true;
-  let queryForSegments = rawQuery;
-  let dateConcepts: DateConcept[] = [];
-  if (wantDates) {
-    const extracted = extractDateConceptsFromQuery(rawQuery);
-    queryForSegments = extracted.strippedQuery;
-    dateConcepts = extracted.dateConcepts;
-  }
-
-  const rawSegments = queryForSegments.match(SEGMENT_RE) ?? [];
-  if (rawSegments.length === 0) {
-    return {
-      concepts: [],
-      ftsAndExpression: null,
-      ftsOrExpression: null,
-      ftsExpression: null,
-      hasIdentifiers: false,
-      ...(wantDates ? { dateConcepts } : {}),
-    };
-  }
-
-  const concreteRaw: string[] = [];
-  const fallbackRaw: string[] = [];
-
-  for (const seg of rawSegments) {
-    fallbackRaw.push(seg);
-    if (CJK_CHAR_RE.test(seg)) {
-      const chars = Array.from(seg);
-      if (chars.length === 1) {
-        if (CJK_STANDALONE_PARTICLES.has(seg)) {
-          continue;
-        }
-        concreteRaw.push(seg);
-      } else if (chars.length === 2) {
-        if (CJK_BIGRAM_STOPWORDS.has(seg)) {
-          continue;
-        }
-        concreteRaw.push(seg);
-      } else {
-        // Length >= 3: NEVER delete characters from inside the segment;
-        // drop the whole segment ONLY if EVERY overlapping bigram is a filler bigram.
-        const allBigrams = generateOverlappingBigrams(seg);
-        const nonFiller = allBigrams.filter(
-          (bg) => !CJK_BIGRAM_STOPWORDS.has(bg),
-        );
-        if (nonFiller.length > 0) {
-          concreteRaw.push(seg);
-        }
-      }
-    } else {
-      if (!EN_STOPWORDS.has(seg.toLowerCase())) {
-        concreteRaw.push(seg);
-      }
-    }
-  }
-
-  // Only strip stopwords/particles when at least one concrete concept remains;
-  // when dateConcepts were extracted and only stopwords remain (e.g. "查一下10月10日"),
-  // skip raw-segment fallback so the query routes cleanly to pure-date mode.
-  const chosen =
-    concreteRaw.length > 0
-      ? concreteRaw
-      : dateConcepts.length > 0
-        ? []
-        : fallbackRaw;
-  const seen = new Set<string>();
-  const concepts: SearchConcept[] = [];
-  for (const raw of chosen) {
-    const key = raw.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const concept = CJK_CHAR_RE.test(raw)
-      ? makeCjkConcept(raw)
-      : makeNonCjkConcept(raw);
-    if (concept) {
-      concepts.push(concept);
-    }
-  }
-
-  if (concepts.length === 0) {
-    return {
-      concepts: [],
-      ftsAndExpression: null,
-      ftsOrExpression: null,
-      ftsExpression: null,
-      hasIdentifiers: false,
-      ...(wantDates ? { dateConcepts } : {}),
-    };
-  }
-
-  const ftsAndExpression =
-    concepts.length === 1
-      ? concepts[0]!.ftsGroupExpr
-      : concepts.map((c) => c.ftsGroupExpr).join(" AND ");
-
-  const orClauses: string[] = [];
-  const seenOr = new Set<string>();
-  for (const c of concepts) {
-    if (c.isCjk) {
-      for (const t of c.terms) {
-        const tokenExpr = formatCjkFtsTerm(t);
-        if (!seenOr.has(tokenExpr)) {
-          seenOr.add(tokenExpr);
-          orClauses.push(tokenExpr);
-        }
-      }
-    } else {
-      const phrase = quoteFtsPhrase(c.ftsPhrase);
-      if (!seenOr.has(phrase)) {
-        seenOr.add(phrase);
-        orClauses.push(phrase);
-      }
-    }
-  }
-  const ftsOrExpression = orClauses.join(" OR ");
-
-  return {
-    concepts,
-    ftsAndExpression,
-    ftsOrExpression,
-    ftsExpression: ftsOrExpression,
-    hasIdentifiers: concepts.some((c) => c.isIdentifier),
-    ...(wantDates ? { dateConcepts } : {}),
-  };
-}
-
-export function buildFtsMatchExpression(rawQuery: string): string | null {
-  return parseSearchQuery(rawQuery).ftsOrExpression;
-}
-
-function placeholders(count: number): string {
-  return Array.from({ length: count }, () => "?").join(", ");
-}
 
 function appendSensitivityExclusion(
   where: string[],
@@ -783,6 +150,10 @@ export class SqliteDb implements DbPort {
   readonly vectorDimensions: number;
   private inTransaction = false;
   private queryCount = 0;
+  private pendingCommitEvents: ChangeCommittedEvent[] = [];
+  private readonly changeCommittedListeners = new Set<
+    (events: ChangeCommittedEvent[]) => void
+  >();
 
   constructor(options: SqliteDbOptions) {
     this.dbPath = options.dbPath;
@@ -957,10 +328,15 @@ export class SqliteDb implements DbPort {
       const maxV = Number(row?.max_v ?? 0);
       if (maxV > 0 && maxV < latestVersion) {
         const backupDir = path.join(path.dirname(this.dbPath), "backups");
-        const backupPath = path.join(
-          backupDir,
-          `pre-v${latestVersion}-from-v${maxV}-${Date.now()}.sqlite`,
-        );
+        const prefix = `pre-v${latestVersion}-from-v${maxV}-`;
+        if (fs.existsSync(backupDir)) {
+          const existing = fs
+            .readdirSync(backupDir)
+            .find((name) => name.startsWith(prefix) && name.endsWith(".sqlite"));
+          if (existing) return;
+        }
+        const suffix = `${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+        const backupPath = path.join(backupDir, `${prefix}${suffix}.sqlite`);
         this.vacuumInto(backupPath);
       }
     } catch {
@@ -970,7 +346,7 @@ export class SqliteDb implements DbPort {
 
   private initSchema(): void {
     this.assertMinSqliteVersion(3, 43);
-    this.maybeBackupBeforeMigration(8);
+    this.maybeBackupBeforeMigration(9);
     this.transaction(() => {
       const now = new Date().toISOString();
 
@@ -1804,6 +1180,71 @@ export class SqliteDb implements DbPort {
           .run(now);
       }
 
+      // Migration v9: v0.3 Server Auth Tokens, Pump asset_class + topology_version, Outbox cursors & deliveries
+      if (!applied.has(9)) {
+        const nowV9 = new Date().toISOString();
+        this.ensureColumn("change_log", "asset_class", "TEXT");
+        this.db.exec(`
+          UPDATE change_log
+          SET asset_class = CASE
+            WHEN entity_type = 'org' THEN 'org'
+            WHEN entity_type = 'seabed' THEN 'seabed'
+            WHEN entity_type = 'drive' THEN 'drive'
+            WHEN entity_type = 'record' AND EXISTS (
+              SELECT 1 FROM records r WHERE r.id = change_log.entity_id AND r.kind = 'rule'
+            ) THEN 'rule'
+            ELSE 'ledger'
+          END
+          WHERE asset_class IS NULL;
+
+          CREATE INDEX IF NOT EXISTS idx_change_log_org_seq
+            ON change_log(org_id, seq);
+
+          INSERT OR IGNORE INTO meta (key, value) VALUES ('topology_version', '1');
+
+          CREATE TABLE IF NOT EXISTS tokens (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES orgs(id),
+            token_hash TEXT NOT NULL UNIQUE,
+            actor_id TEXT NOT NULL,
+            actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human', 'agent')),
+            actor_family TEXT,
+            bound_realm_id TEXT REFERENCES realms(id),
+            label TEXT,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT,
+            last_used_at TEXT
+          );
+          CREATE INDEX IF NOT EXISTS idx_tokens_org ON tokens(org_id, revoked_at);
+
+          CREATE TABLE IF NOT EXISTS consumer_cursors (
+            consumer TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL,
+            seq INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+
+          CREATE TABLE IF NOT EXISTS deliveries (
+            consumer TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'succeeded', 'failed', 'dead')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            due_at TEXT NOT NULL,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (consumer, seq)
+          );
+          CREATE INDEX IF NOT EXISTS idx_deliveries_due ON deliveries(state, due_at);
+        `);
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (9, 'v9_v03_server_tokens_pump_outbox', ?)`,
+          )
+          .run(nowV9);
+      }
+
       if (this.vecEnabled && !this.tableExists("vec_items")) {
         this.createVecItemsTable();
       }
@@ -1814,17 +1255,52 @@ export class SqliteDb implements DbPort {
     this.db.close();
   }
 
+  onChangeCommitted(
+    listener: (events: ChangeCommittedEvent[]) => void,
+  ): () => void {
+    this.changeCommittedListeners.add(listener);
+    return () => {
+      this.changeCommittedListeners.delete(listener);
+    };
+  }
+
+  private emitCommittedEvents(events: ChangeCommittedEvent[]): void {
+    if (events.length === 0 || this.changeCommittedListeners.size === 0) return;
+    for (const listener of this.changeCommittedListeners) {
+      try {
+        listener(events);
+      } catch {
+        // Wakeup listeners are best-effort signals and must never fail committed writes
+      }
+    }
+  }
+
+  private recordCommittedEvent(ev: ChangeCommittedEvent): void {
+    if (this.inTransaction) {
+      this.pendingCommitEvents.push(ev);
+    } else {
+      this.emitCommittedEvents([ev]);
+    }
+  }
+
   transaction<T>(fn: () => T): T {
     if (this.inTransaction) {
       return fn();
     }
     this.inTransaction = true;
+    this.pendingCommitEvents = [];
     this.db.exec("BEGIN IMMEDIATE;");
+    let committed = false;
+    let flushedEvents: ChangeCommittedEvent[] = [];
     try {
       const result = fn();
       this.db.exec("COMMIT;");
+      committed = true;
+      flushedEvents = this.pendingCommitEvents;
+      this.pendingCommitEvents = [];
       return result;
     } catch (err) {
+      this.pendingCommitEvents = [];
       try {
         this.db.exec("ROLLBACK;");
       } catch {
@@ -1833,6 +1309,9 @@ export class SqliteDb implements DbPort {
       throw err;
     } finally {
       this.inTransaction = false;
+      if (committed && flushedEvents.length > 0) {
+        this.emitCommittedEvents(flushedEvents);
+      }
     }
   }
 
@@ -1865,6 +1344,21 @@ export class SqliteDb implements DbPort {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       )
       .run(key, value);
+  }
+
+  getTopologyVersion(): number {
+    const raw = this.getMeta("topology_version");
+    const parsed = raw ? Number.parseInt(raw, 10) : 1;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+  }
+
+  bumpTopologyVersion(orgId?: string): number {
+    const next = this.getTopologyVersion() + 1;
+    this.setMeta("topology_version", String(next));
+    if (orgId) {
+      this.recordCommittedEvent({ orgId, realmId: "__org__" });
+    }
+    return next;
   }
 
   // ---- Organizations ----
@@ -1902,7 +1396,11 @@ export class SqliteDb implements DbPort {
     const res = this.db
       .prepare(`UPDATE orgs SET policy = ? WHERE id = ?`)
       .run(policy, orgId);
-    return Number(res.changes) > 0;
+    const changed = Number(res.changes) > 0;
+    if (changed) {
+      this.bumpTopologyVersion(orgId);
+    }
+    return changed;
   }
 
   private mapOrg(row: Record<string, unknown>): Organization {
@@ -1936,6 +1434,7 @@ export class SqliteDb implements DbPort {
         realm.archivedAt,
         realm.createdAt,
       );
+    this.bumpTopologyVersion(realm.orgId);
   }
 
   updateRealmMetadata(
@@ -1960,9 +1459,13 @@ export class SqliteDb implements DbPort {
   }
 
   setRealmArchivedAt(id: string, archivedAt: string | null): void {
+    const existing = this.getRealm(id);
     this.db
       .prepare(`UPDATE realms SET archived_at = ? WHERE id = ?`)
       .run(archivedAt, id);
+    if (existing) {
+      this.bumpTopologyVersion(existing.orgId);
+    }
   }
 
   getRealm(id: string): Realm | null {
@@ -2028,15 +1531,22 @@ export class SqliteDb implements DbPort {
         mount.mountedBy,
         mount.createdAt,
       );
+    const viewer = this.getRealm(mount.viewerRealmId);
+    this.bumpTopologyVersion(viewer?.orgId);
   }
 
   deleteMount(viewerRealmId: string, targetRealmId: string): boolean {
+    const viewer = this.getRealm(viewerRealmId);
     const res = this.db
       .prepare(
         `DELETE FROM realm_mounts WHERE viewer_realm_id = ? AND target_realm_id = ?`,
       )
       .run(viewerRealmId, targetRealmId);
-    return Number(res.changes) > 0;
+    const changed = Number(res.changes) > 0;
+    if (changed) {
+      this.bumpTopologyVersion(viewer?.orgId);
+    }
+    return changed;
   }
 
   listMounts(viewerRealmId?: string): RealmMount[] {
@@ -4636,15 +4146,36 @@ export class SqliteDb implements DbPort {
     return Number(row.c ?? 0);
   }
 
+  private deriveAssetClass(
+    entry: Omit<ChangeLogEntry, "seq" | "generation"> & {
+      assetClass?: ChangeAssetClass;
+    },
+  ): ChangeAssetClass {
+    if (entry.assetClass) return entry.assetClass;
+    if (entry.entityType === "org" || entry.realmId === "__org__") return "org";
+    if (entry.entityType === "seabed") return "seabed";
+    if (entry.entityType === "drive") return "drive";
+    if (entry.entityType === "record") {
+      const row = this.db
+        .prepare(`SELECT kind FROM records WHERE id = ?`)
+        .get(entry.entityId) as { kind: string } | undefined;
+      if (row?.kind === "rule") return "rule";
+    }
+    return "ledger";
+  }
+
   appendChangeLog(
-    entry: Omit<ChangeLogEntry, "seq" | "generation">,
+    entry: Omit<ChangeLogEntry, "seq" | "generation"> & {
+      assetClass?: ChangeAssetClass;
+    },
   ): ChangeLogEntry {
     const generation = this.getChangeLogGeneration();
+    const assetClass = this.deriveAssetClass(entry);
     const res = this.db
       .prepare(
         `INSERT INTO change_log
-         (generation, org_id, realm_id, entity_type, entity_id, op, actor_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (generation, org_id, realm_id, entity_type, entity_id, op, asset_class, actor_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         generation,
@@ -4653,13 +4184,21 @@ export class SqliteDb implements DbPort {
         entry.entityType,
         entry.entityId,
         entry.op,
+        assetClass,
         entry.actorId,
         entry.createdAt,
       );
+    const seq = Number(res.lastInsertRowid);
+    this.recordCommittedEvent({
+      orgId: entry.orgId,
+      realmId: entry.realmId,
+      seq,
+    });
     return {
-      seq: Number(res.lastInsertRowid),
+      seq,
       generation,
       ...entry,
+      assetClass,
     };
   }
 
@@ -4722,9 +4261,138 @@ export class SqliteDb implements DbPort {
         entityType: String(r.entity_type),
         entityId: String(r.entity_id),
         op: String(r.op),
+        ...(r.asset_class
+          ? { assetClass: String(r.asset_class) as ChangeAssetClass }
+          : {}),
         actorId: String(r.actor_id),
         createdAt: String(r.created_at),
       })),
+    };
+  }
+
+  /**
+   * Single-cursor Pump query: reads thin, contentless frames directly from SQLite WAL
+   * with strict (ledgerSet, seabedSet, driveSet) separation and the __org__ invariant
+   * (realm_id = '__org__' is ONLY visible when entity_type = 'org', never leaking sibling realms).
+   */
+  listChangeLogForPump(params: {
+    orgId: string;
+    ledgerRealmIds: string[];
+    seabedRealmIds: string[];
+    driveRealmIds: string[];
+    sinceSeq: number;
+    limit: number;
+    includeSecret?: boolean;
+    filterRealmIds?: string[];
+  }): { generation: number; topologyVersion: number; frames: PumpChangeFrame[] } {
+    const generation = this.getChangeLogGeneration();
+    const topologyVersion = this.getTopologyVersion();
+
+    const filterSet = params.filterRealmIds
+      ? new Set(params.filterRealmIds)
+      : null;
+    const ledgerIds = filterSet
+      ? params.ledgerRealmIds.filter((id) => filterSet.has(id))
+      : params.ledgerRealmIds;
+    const seabedIds = filterSet
+      ? params.seabedRealmIds.filter((id) => filterSet.has(id))
+      : params.seabedRealmIds;
+    const driveIds = filterSet
+      ? params.driveRealmIds.filter((id) => filterSet.has(id))
+      : params.driveRealmIds;
+
+    const branches: string[] = [];
+    const sqlParams: SQLInputValue[] = [params.orgId, generation, params.sinceSeq];
+
+    // Org-level events are only ever visible when entity_type = 'org' (unless caller narrowed to specific realms)
+    if (!filterSet) {
+      branches.push(`(cl.realm_id = '__org__' AND cl.entity_type = 'org')`);
+    }
+    if (ledgerIds.length > 0) {
+      branches.push(
+        `(COALESCE(cl.asset_class, CASE WHEN cl.entity_type = 'seabed' THEN 'seabed' WHEN cl.entity_type = 'drive' THEN 'drive' WHEN cl.entity_type = 'org' THEN 'org' ELSE 'ledger' END) IN ('rule', 'ledger') AND cl.realm_id IN (${placeholders(ledgerIds.length)}))`,
+      );
+      sqlParams.push(...ledgerIds);
+    }
+    if (seabedIds.length > 0) {
+      branches.push(
+        `(COALESCE(cl.asset_class, CASE WHEN cl.entity_type = 'seabed' THEN 'seabed' ELSE 'ledger' END) = 'seabed' AND cl.realm_id IN (${placeholders(seabedIds.length)}))`,
+      );
+      sqlParams.push(...seabedIds);
+    }
+    if (driveIds.length > 0) {
+      branches.push(
+        `(COALESCE(cl.asset_class, CASE WHEN cl.entity_type = 'drive' THEN 'drive' ELSE 'ledger' END) = 'drive' AND cl.realm_id IN (${placeholders(driveIds.length)}))`,
+      );
+      sqlParams.push(...driveIds);
+    }
+
+    if (branches.length === 0) {
+      return { generation, topologyVersion, frames: [] };
+    }
+
+    const where: string[] = [
+      `cl.org_id = ?`,
+      `cl.generation = ?`,
+      `cl.seq > ?`,
+      `(${branches.join(" OR ")})`,
+    ];
+
+    if (!params.includeSecret) {
+      where.push(`NOT (
+        cl.entity_type = 'record'
+        AND EXISTS (
+          SELECT 1 FROM records r
+          WHERE r.id = cl.entity_id AND r.sensitivity = 'secret'
+        )
+      )`);
+      where.push(`NOT (
+        cl.entity_type = 'seabed'
+        AND EXISTS (
+          SELECT 1 FROM seabed_entries s
+          WHERE s.id = cl.entity_id AND s.sensitivity = 'secret'
+        )
+      )`);
+    }
+
+    const limit = Math.max(1, Math.min(params.limit, 500));
+    const rows = this.db
+      .prepare(
+        `SELECT cl.seq, cl.generation, cl.realm_id, cl.entity_type, cl.entity_id, cl.op, cl.asset_class, cl.actor_id, cl.created_at
+         FROM change_log cl
+         WHERE ${where.join(" AND ")}
+         ORDER BY cl.seq ASC
+         LIMIT ?`,
+      )
+      .all(...sqlParams, limit) as Array<Record<string, unknown>>;
+
+    return {
+      generation,
+      topologyVersion,
+      frames: rows.map((r) => {
+        const entityType = String(r.entity_type);
+        const fallbackClass: ChangeAssetClass =
+          entityType === "org"
+            ? "org"
+            : entityType === "seabed"
+              ? "seabed"
+              : entityType === "drive"
+                ? "drive"
+                : "ledger";
+        return {
+          seq: Number(r.seq),
+          generation: Number(r.generation),
+          realmId: String(r.realm_id),
+          entityType,
+          entityId: String(r.entity_id),
+          op: String(r.op),
+          assetClass: (r.asset_class
+            ? String(r.asset_class)
+            : fallbackClass) as ChangeAssetClass,
+          actorId: String(r.actor_id),
+          createdAt: String(r.created_at),
+        };
+      }),
     };
   }
 
@@ -4741,6 +4409,194 @@ export class SqliteDb implements DbPort {
         clearedCount: Number(countRow.c),
       };
     });
+  }
+
+  // ---- Auth Tokens (Migration v9) ----
+
+  insertToken(token: AuthTokenRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO tokens
+         (id, org_id, token_hash, actor_id, actor_kind, actor_family, bound_realm_id, label, created_by, created_at, revoked_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        token.id,
+        token.orgId,
+        token.tokenHash,
+        token.actorId,
+        token.actorKind,
+        token.actorFamily,
+        token.boundRealmId,
+        token.label,
+        token.createdBy,
+        token.createdAt,
+        token.revokedAt,
+        token.lastUsedAt,
+      );
+  }
+
+  private mapToken(row: Record<string, unknown>): AuthTokenRecord {
+    return {
+      id: String(row.id),
+      orgId: String(row.org_id),
+      tokenHash: String(row.token_hash),
+      actorId: String(row.actor_id),
+      actorKind: String(row.actor_kind) as "human" | "agent",
+      actorFamily: row.actor_family ? String(row.actor_family) : null,
+      boundRealmId: row.bound_realm_id ? String(row.bound_realm_id) : null,
+      label: row.label ? String(row.label) : null,
+      createdBy: String(row.created_by),
+      createdAt: String(row.created_at),
+      revokedAt: row.revoked_at ? String(row.revoked_at) : null,
+      lastUsedAt: row.last_used_at ? String(row.last_used_at) : null,
+    };
+  }
+
+  getToken(id: string): AuthTokenRecord | null {
+    const row = this.db
+      .prepare(`SELECT * FROM tokens WHERE id = ?`)
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? this.mapToken(row) : null;
+  }
+
+  getTokenByHash(tokenHash: string): AuthTokenRecord | null {
+    const row = this.db
+      .prepare(`SELECT * FROM tokens WHERE token_hash = ?`)
+      .get(tokenHash) as Record<string, unknown> | undefined;
+    return row ? this.mapToken(row) : null;
+  }
+
+  listTokens(orgId: string, includeRevoked = false): AuthTokenRecord[] {
+    const sql = includeRevoked
+      ? `SELECT * FROM tokens WHERE org_id = ? ORDER BY created_at DESC`
+      : `SELECT * FROM tokens WHERE org_id = ? AND revoked_at IS NULL ORDER BY created_at DESC`;
+    const rows = this.db.prepare(sql).all(orgId) as Array<
+      Record<string, unknown>
+    >;
+    return rows.map((r) => this.mapToken(r));
+  }
+
+  revokeToken(orgId: string, id: string, revokedAt: string): boolean {
+    const res = this.db
+      .prepare(
+        `UPDATE tokens SET revoked_at = ? WHERE org_id = ? AND id = ? AND revoked_at IS NULL`,
+      )
+      .run(revokedAt, orgId, id);
+    return Number(res.changes) > 0;
+  }
+
+  touchTokenLastUsed(id: string, usedAt: string): void {
+    this.db
+      .prepare(`UPDATE tokens SET last_used_at = ? WHERE id = ?`)
+      .run(usedAt, id);
+  }
+
+  // ---- Outbox Consumer Cursors & Deliveries (Migration v9) ----
+
+  upsertConsumerCursor(cursor: ConsumerCursor): void {
+    this.db
+      .prepare(
+        `INSERT INTO consumer_cursors (consumer, generation, seq, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(consumer) DO UPDATE SET
+           generation = excluded.generation,
+           seq = excluded.seq,
+           updated_at = excluded.updated_at`,
+      )
+      .run(cursor.consumer, cursor.generation, cursor.seq, cursor.updatedAt);
+  }
+
+  getConsumerCursor(consumer: string): ConsumerCursor | null {
+    const row = this.db
+      .prepare(`SELECT * FROM consumer_cursors WHERE consumer = ?`)
+      .get(consumer) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      consumer: String(row.consumer),
+      generation: Number(row.generation),
+      seq: Number(row.seq),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  enqueueDelivery(delivery: {
+    consumer: string;
+    seq: number;
+    dueAt: string;
+    createdAt: string;
+  }): boolean {
+    const res = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO deliveries
+         (consumer, seq, state, attempts, due_at, last_error, created_at, updated_at)
+         VALUES (?, ?, 'pending', 0, ?, NULL, ?, ?)`,
+      )
+      .run(
+        delivery.consumer,
+        delivery.seq,
+        delivery.dueAt,
+        delivery.createdAt,
+        delivery.createdAt,
+      );
+    return Number(res.changes) > 0;
+  }
+
+  listDueDeliveries(params: {
+    consumer?: string;
+    nowIso: string;
+    limit: number;
+  }): DeliveryRecord[] {
+    const where = [`state IN ('pending', 'failed')`, `due_at <= ?`];
+    const sqlParams: SQLInputValue[] = [params.nowIso];
+    if (params.consumer) {
+      where.push(`consumer = ?`);
+      sqlParams.push(params.consumer);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM deliveries WHERE ${where.join(" AND ")} ORDER BY due_at ASC, seq ASC LIMIT ?`,
+      )
+      .all(...sqlParams, Math.max(1, Math.min(params.limit, 200))) as Array<
+      Record<string, unknown>
+    >;
+    return rows.map((r) => ({
+      consumer: String(r.consumer),
+      seq: Number(r.seq),
+      state: String(r.state) as DeliveryState,
+      attempts: Number(r.attempts),
+      dueAt: String(r.due_at),
+      lastError: r.last_error ? String(r.last_error) : null,
+      createdAt: String(r.created_at),
+      updatedAt: String(r.updated_at),
+    }));
+  }
+
+  updateDeliveryState(params: {
+    consumer: string;
+    seq: number;
+    state: DeliveryState;
+    attempts: number;
+    dueAt: string;
+    lastError: string | null;
+    updatedAt: string;
+  }): boolean {
+    const res = this.db
+      .prepare(
+        `UPDATE deliveries
+         SET state = ?, attempts = ?, due_at = ?, last_error = ?, updated_at = ?
+         WHERE consumer = ? AND seq = ?`,
+      )
+      .run(
+        params.state,
+        params.attempts,
+        params.dueAt,
+        params.lastError,
+        params.updatedAt,
+        params.consumer,
+        params.seq,
+      );
+    return Number(res.changes) > 0;
   }
 
   // ---- Rebuildable FTS5 Index (fts_docs side-table + contentless_delete FTS5) ----

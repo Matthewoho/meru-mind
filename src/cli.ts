@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import {
   buildWriteRecordPayload,
+  createAuthToken,
   createMindEngine,
   discoverWorkspaceRealmMarker,
   findRelatedActiveForEcho,
@@ -28,6 +29,8 @@ import {
   resolveUnifiedObjectRead,
   resolveVisibleRealm,
   resolveWriteTargetRealm,
+  startMindServer,
+  toPublicToken,
   toSurfaceError,
   writeEverydayConclusion,
   type AccessScope,
@@ -46,6 +49,7 @@ import {
   type SeabedKind,
   type Sensitivity,
 } from "./index.js";
+import { runRemoteCliCommand } from "./cli-remote.js";
 import { createVisibilityHelpers } from "./engine/visibility.js";
 
 // Handle broken stdout pipes cleanly (e.g. `meru-mind tree | head -n 5`)
@@ -64,6 +68,8 @@ interface ParsedArgs {
 
 const GLOBAL_FLAGS = new Set([
   "home",
+  "url",
+  "token",
   "drive",
   "actor",
   "actor-kind",
@@ -79,6 +85,7 @@ const BOOLEAN_FLAGS = new Set([
   "help",
   "personal",
   "as-human",
+  "init-token",
   "history",
   "full",
   "include-descendant-seabed",
@@ -381,7 +388,7 @@ RECORD [write]:
         [--occurred-at <iso|none>] [--sensitivity public|internal|confidential|secret]
 
 MANAGE [write / human] (experimental: file, raw, settle):
-  realm | entry | object | file | rule | raw | redact | settle | import | org | admin
+  realm | entry | object | file | rule | raw | redact | settle | import | serve | token | org | admin
 
 OUTPUT:
   Markdown capped with next-page --cursor; pass --json for JSON; errors include try:.
@@ -590,15 +597,37 @@ Examples:
   meru-mind org set-policy --org org_123 --policy tree --as-human
 `,
   admin: `Risk: high-risk-write
-When to use: Initialize a store, sync pending embeddings, rebuild derived indexes/drive, or export a read-only slice.
+When to use: Initialize a store, take atomic VACUUM INTO backups, sync pending embeddings, rebuild derived indexes/drive, or export a read-only slice.
 Usage:
   meru-mind admin init [--org <name>] [--personal] [--policy open|tree]
+  meru-mind admin backup --out <file.sqlite>
   meru-mind admin sync-embeddings [--batch-size <n>] [--max-items <n>]
   meru-mind admin rebuild [--no-restore-drive]
   meru-mind admin export-slice [--in <realm>] --out <dir>
 Examples:
   meru-mind admin init --org "Acme" --policy open
-  meru-mind admin rebuild
+  meru-mind admin backup --out ./backups/mind-snapshot.sqlite
+`,
+  serve: `Risk: write (starts single-writer HTTP + Streamable HTTP MCP server with exclusive store lock)
+When to use: Serve one organization over HTTP (/v1/*) and Streamable HTTP MCP (/mcp) for human + multi-agent teams.
+Usage:
+  meru-mind serve [--host 127.0.0.1] [--port 3800] [--org <orgId>] [--init-token]
+Flags:
+  --host <addr>      Bind address (default: 127.0.0.1)
+  --port <port>      Listen port (default: 3800)
+  --init-token       If no active tokens exist, mint and print one bootstrap human admin token once
+Examples:
+  meru-mind serve --host 127.0.0.1 --port 3800 --init-token
+`,
+  token: `Risk: high-risk-write (human-only)
+When to use: Issue, list, or revoke hashed authentication tokens for meru-mind serve.
+Usage:
+  meru-mind token create --actor-id <id> --kind human|agent [--in <realm>] [--family <model>] [--label <text>] [--as-human]
+  meru-mind token list [--all] [--as-human]
+  meru-mind token revoke <tokenId> [--as-human]
+Examples:
+  meru-mind token create --actor-id claude-ci --kind agent --in /ops --as-human
+  meru-mind token list --as-human
 `,
 };
 
@@ -862,6 +891,8 @@ async function main(): Promise<void> {
     "redact",
     "settle",
     "import",
+    "serve",
+    "token",
     "org",
     "admin",
   ]);
@@ -871,22 +902,6 @@ async function main(): Promise<void> {
     });
   }
 
-  const engine = await createMindEngine({
-    homeDir: flagStr(flags, "home"),
-  });
-
-  // Discover hardened `.meru-mind-realm` marker strictly at CLI process entrypoint.
-  // Invalid markers fail only on routed writes (never breaking read commands).
-  let workspaceMarkerRef: string | null = null;
-  let workspaceMarkerError: unknown = null;
-  try {
-    workspaceMarkerRef =
-      discoverWorkspaceRealmMarker(process.cwd())?.ref ?? null;
-  } catch (err) {
-    workspaceMarkerError = err;
-  }
-
-  const actor = buildActor(flags);
   const asJson = flagBool(flags, "json");
   const orgFlag = flagStr(flags, "org");
 
@@ -899,6 +914,110 @@ async function main(): Promise<void> {
       process.stdout.write(`${formatGenericMarkdown(cmd, data)}\n`);
     }
   };
+
+  // Discover hardened `.meru-mind-realm` marker strictly at CLI process entrypoint.
+  // Invalid markers fail only on routed writes (never breaking read commands).
+  let workspaceMarkerRef: string | null = null;
+  let workspaceMarkerError: unknown = null;
+  try {
+    workspaceMarkerRef =
+      discoverWorkspaceRealmMarker(process.cwd())?.ref ?? null;
+  } catch (err) {
+    workspaceMarkerError = err;
+  }
+
+  // `meru-mind serve` owns the exclusive writer lock itself before opening SQLite.
+  if (cmd === "serve") {
+    assertAllowedFlags(flags, ["host", "port", "init-token"], "serve");
+    const host = flagStr(flags, "host") ?? "127.0.0.1";
+    const port = parseIntFlag(flags, "port", { min: 0 }) ?? 3800;
+    const srv = await startMindServer({
+      homeDir: flagStr(flags, "home"),
+      host,
+      port,
+      orgId: orgFlag,
+    });
+    let bootstrapToken: string | null = null;
+    if (flagBool(flags, "init-token")) {
+      const existing = srv.engine.db.listTokens(srv.orgId, false);
+      if (existing.length === 0) {
+        const minted = srv.createToken({
+          actorId: flagStr(flags, "actor") ?? "admin",
+          actorKind: "human",
+          label: "bootstrap-admin",
+          createdBy: "serve-init",
+        });
+        bootstrapToken = minted.token;
+      }
+    }
+    const startPayload = {
+      url: srv.url,
+      orgId: srv.orgId,
+      homeDir: srv.homeDir,
+      mcpEndpoint: `${srv.url}/mcp`,
+      ...(bootstrapToken
+        ? {
+            bootstrapToken,
+            note: "Save this human admin token now; plaintext is shown ONCE.",
+          }
+        : {}),
+    };
+    output(
+      startPayload,
+      [
+        `Meru Mind server listening at ${srv.url} (org: ${srv.orgId})`,
+        `  REST: ${srv.url}/v1/whoami`,
+        `  MCP:  ${srv.url}/mcp`,
+        ...(bootstrapToken
+          ? [`  Admin Token (shown ONCE): ${bootstrapToken}`]
+          : []),
+      ].join("\n"),
+    );
+    await new Promise<void>((resolve) => {
+      const shutdown = () => {
+        srv
+          .close()
+          .catch(() => {})
+          .finally(() => resolve());
+      };
+      process.once("SIGINT", shutdown);
+      process.once("SIGTERM", shutdown);
+    });
+    return;
+  }
+
+  // Remote HTTP mode (--url / MERU_MIND_URL): route through RemoteMindSurface and never touch local SQLite.
+  const remoteUrl = (
+    flagStr(flags, "url") ?? process.env.MERU_MIND_URL?.trim()
+  )?.trim();
+  if (remoteUrl) {
+    const remoteToken = (
+      flagStr(flags, "token") ?? process.env.MERU_MIND_TOKEN?.trim()
+    )?.trim();
+    if (!remoteToken) {
+      throw new MindError(
+        "ACCESS_DENIED",
+        "Remote mode (--url / MERU_MIND_URL) requires --token or MERU_MIND_TOKEN",
+        { try: `MERU_MIND_URL=${remoteUrl} MERU_MIND_TOKEN=<token> meru-mind whoami` },
+      );
+    }
+    await runRemoteCliCommand({
+      baseUrl: remoteUrl,
+      token: remoteToken,
+      positionals,
+      flags,
+      multiFlags,
+      workspaceHint: workspaceMarkerRef,
+      output,
+    });
+    return;
+  }
+
+  const engine = await createMindEngine({
+    homeDir: flagStr(flags, "home"),
+  });
+
+  const actor = buildActor(flags);
 
   try {
     // ======== EVERYDAY 7 VERBS ========
@@ -1254,6 +1373,14 @@ async function main(): Promise<void> {
         output(res, formatGenericMarkdown("Initialized", res));
         return;
       }
+      if (sub === "backup") {
+        assertAllowedFlags(flags, ["out"], "admin backup");
+        const outPath = requireFlag(flags, "out", "admin backup");
+        engine.db.vacuumInto(outPath);
+        const res = { backedUp: true, outPath };
+        output(res, formatGenericMarkdown("Atomic Backup Created (VACUUM INTO)", res));
+        return;
+      }
       if (sub === "sync-embeddings") {
         assertAllowedFlags(
           flags,
@@ -1299,6 +1426,73 @@ async function main(): Promise<void> {
         "UNKNOWN_COMMAND",
         `Unknown admin subcommand "${sub ?? ""}"`,
         { try: "meru-mind admin --help" },
+      );
+    }
+
+    if (cmd === "token") {
+      if (actor.kind !== "human") {
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Local token management requires --as-human (actor "${actor.id}" is "${actor.kind}")`,
+          { try: "meru-mind token list --as-human" },
+        );
+      }
+      const orgId = resolveAdminOrgId(engine, orgFlag);
+      if (sub === "create") {
+        assertAllowedFlags(
+          flags,
+          ["actor-id", "kind", "in", "family", "label"],
+          "token create",
+        );
+        const minted = createAuthToken({
+          db: engine.db,
+          orgId,
+          actorId: requireFlag(flags, "actor-id", "token create"),
+          actorKind: requireFlag(flags, "kind", "token create") as
+            | "human"
+            | "agent",
+          actorFamily: flagStr(flags, "family"),
+          boundRealmId: flagStr(flags, "in"),
+          label: flagStr(flags, "label"),
+          createdBy: actor.id,
+        });
+        output(
+          minted,
+          formatGenericMarkdown(
+            "Token Created (plaintext shown ONCE — store securely)",
+            minted,
+          ),
+        );
+        return;
+      }
+      if (sub === "list") {
+        assertAllowedFlags(flags, ["all"], "token list");
+        const tokens = engine.db
+          .listTokens(orgId, flagBool(flags, "all"))
+          .map(toPublicToken);
+        output(tokens, formatGenericMarkdown("Auth Tokens", tokens));
+        return;
+      }
+      if (sub === "revoke") {
+        assertAllowedFlags(flags, [], "token revoke");
+        if (!third?.trim()) {
+          throw new MindError("INVALID_INPUT", "token revoke requires <tokenId>", {
+            try: "meru-mind token revoke tok_... --as-human",
+          });
+        }
+        const revoked = engine.db.revokeToken(
+          orgId,
+          third.trim(),
+          new Date().toISOString(),
+        );
+        const res = { tokenId: third.trim(), revoked };
+        output(res, formatGenericMarkdown("Token Revoked", res));
+        return;
+      }
+      throw new MindError(
+        "UNKNOWN_COMMAND",
+        `Unknown token subcommand "${sub ?? ""}"`,
+        { try: "meru-mind token --help" },
       );
     }
 

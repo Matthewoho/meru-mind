@@ -1,0 +1,736 @@
+import http, {
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import type { AddressInfo } from "node:net";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { toSurfaceError } from "../format/errors.js";
+import {
+  createMindEngine,
+  resolveDefaultHomeDir,
+  type MindEngine,
+} from "../index.js";
+import type { EmbedderPort } from "../ports.js";
+import { LocalMindSurface } from "../surface-local.js";
+import type {
+  SurfaceAddRuleInput,
+  SurfaceCreateRealmInput,
+  SurfaceCreateTokenInput,
+  SurfaceMountRealmInput,
+  SurfaceMoveInput,
+  SurfaceRawAddInput,
+  SurfaceRedactInput,
+  SurfaceWriteInput,
+} from "../surface.js";
+import {
+  MindError,
+  type LsOnlyFilter,
+  type OrgPolicy,
+  type Principal,
+} from "../types.js";
+import { createSurfaceMcpServer } from "./mcp-http.js";
+import { ChangeWakeBus } from "./pump.js";
+import {
+  createAuthToken,
+  resolvePrincipalFromToken,
+  type CreateAuthTokenResult,
+} from "./tokens.js";
+import {
+  acquireServeWriterLock,
+  type ServeWriterLockHandle,
+} from "./writer-lock.js";
+
+export const SERVER_VERSION = "0.3.0";
+const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
+
+export interface AccessLogEntry {
+  timestamp: string;
+  method: string;
+  /** Strictly pathname ONLY — query strings are NEVER logged to prevent secret/query leakage */
+  pathname: string;
+  statusCode: number;
+  durationMs: number;
+  actorId: string | null;
+}
+
+export interface MindServerOptions {
+  homeDir?: string;
+  host?: string;
+  port?: number;
+  orgId?: string;
+  enableVector?: boolean;
+  embedder?: EmbedderPort;
+  /** Custom access logger (pass false to disable stderr logging in tests) */
+  accessLog?: ((entry: AccessLogEntry) => void) | false;
+  /** Optional custom request hook invoked for non-/v1, non-/mcp paths (used by v0.4 Web UI shell) */
+  extraRouteHandler?: (params: {
+    req: IncomingMessage;
+    res: ServerResponse;
+    url: URL;
+    engine: MindEngine;
+    orgId: string;
+    wakeBus: ChangeWakeBus;
+    authenticate: (
+      req: IncomingMessage,
+      options?: { allowCookie?: boolean },
+    ) => Principal;
+    createSurface: (principal: Principal, req: IncomingMessage) => LocalMindSurface;
+  }) => Promise<boolean>;
+  /** Optional custom Cookie/session principal resolver (used by v0.4 HttpOnly Cookie auth) */
+  cookieAuthenticator?: (req: IncomingMessage, orgId: string) => Principal | null;
+}
+
+export interface MindServerHandle {
+  readonly url: string;
+  readonly host: string;
+  readonly port: number;
+  readonly homeDir: string;
+  readonly orgId: string;
+  readonly engine: MindEngine;
+  readonly wakeBus: ChangeWakeBus;
+  readonly httpServer: http.Server;
+  createToken(params: {
+    actorId: string;
+    actorKind: "human" | "agent";
+    actorFamily?: string | null;
+    boundRealmId?: string | null;
+    label?: string | null;
+    createdBy?: string;
+  }): CreateAuthTokenResult;
+  close(): Promise<void>;
+}
+
+function httpStatusForError(err: unknown): number {
+  if (err instanceof MindError) {
+    switch (err.code) {
+      case "ACCESS_DENIED":
+      case "RULE_REQUIRES_HUMAN":
+      case "SLICE_VIOLATION":
+      case "FORBIDDEN_HOME_PATH":
+        return 403;
+      case "NOT_FOUND":
+        return 404;
+      case "CONFLICT":
+      case "VERDICT_INVARIANT":
+      case "IDEMPOTENCY_MISMATCH":
+        return 409;
+      default:
+        return 400;
+    }
+  }
+  return 500;
+}
+
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  extraHeaders?: Record<string, string>,
+): void {
+  if (res.writableEnded) return;
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    ...(extraHeaders ?? {}),
+  });
+  res.end(payload);
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > MAX_JSON_BODY_BYTES) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Request body exceeds ${MAX_JSON_BODY_BYTES} byte limit`,
+      );
+    }
+    chunks.push(buf);
+  }
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new MindError("INVALID_INPUT", "Request body must be valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new MindError("INVALID_INPUT", "Request JSON body must be an object");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function parseOptionalInt(raw: string | null): number | undefined {
+  if (raw === null || raw.trim() === "") return undefined;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) {
+    throw new MindError("INVALID_INPUT", `Invalid integer parameter: "${raw}"`);
+  }
+  return n;
+}
+
+function parseOptionalBool(raw: string | null): boolean | undefined {
+  if (raw === null || raw.trim() === "") return undefined;
+  const low = raw.trim().toLowerCase();
+  if (low === "true" || low === "1") return true;
+  if (low === "false" || low === "0") return false;
+  throw new MindError("INVALID_INPUT", `Invalid boolean parameter: "${raw}"`);
+}
+
+function parseOptionalDepth(raw: string | null): number | "all" | undefined {
+  if (raw === null || raw.trim() === "") return undefined;
+  if (raw.trim().toLowerCase() === "all") return "all";
+  const n = parseOptionalInt(raw);
+  if (n === undefined || n < 0) {
+    throw new MindError("INVALID_INPUT", `Invalid depth parameter: "${raw}"`);
+  }
+  return n;
+}
+
+function extractBearerToken(req: IncomingMessage): string | null {
+  const header = req.headers.authorization;
+  if (!header || typeof header !== "string") return null;
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match ? match[1]!.trim() : null;
+}
+
+function formatHostForUrl(host: string): string {
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+
+/**
+ * Starts the single-writer Meru Mind HTTP + Streamable HTTP MCP server (`meru-mind serve`).
+ * Enforces:
+ * - Exclusive writer lock (`<homeDir>/mind.serve.lock`) blocking local direct SQLite bypasses
+ * - Single organization per server instance
+ * - Hashed token auth with server-authoritative Principal (`actor.kind` fixed at issuance)
+ * - Pump Model + Long-Poll (`GET /v1/changes?since=...&wait=25`)
+ * - Streamable HTTP MCP (`POST /mcp`) exposing strictly the 7 everyday tools
+ * - Redacted access logs (pathname only; never logs query strings, tokens, cookies, or bodies)
+ */
+export async function startMindServer(
+  options: MindServerOptions = {},
+): Promise<MindServerHandle> {
+  const homeDir = options.homeDir ?? resolveDefaultHomeDir();
+  const host = options.host ?? "127.0.0.1";
+  const requestedPort = options.port ?? 3800;
+
+  // Acquire exclusive single-writer lock BEFORE opening SQLite
+  let lockHandle: ServeWriterLockHandle = acquireServeWriterLock({
+    homeDir,
+    url: `http://${formatHostForUrl(host)}:${requestedPort}`,
+  });
+
+  let engine: MindEngine | null = null;
+  let unsubChangeLog: (() => void) | null = null;
+
+  try {
+    engine = await createMindEngine({
+      homeDir,
+      enableVector: options.enableVector ?? true,
+      embedder: options.embedder,
+      isServerOwner: true,
+    });
+
+    // Enforce single-org per server instance
+    const orgs = engine.ledger.listOrgs();
+    let orgId: string;
+    if (options.orgId) {
+      const found = engine.db.getOrg(options.orgId);
+      if (!found) {
+        throw new MindError("NOT_FOUND", `Organization not found: ${options.orgId}`);
+      }
+      orgId = found.id;
+    } else if (orgs.length === 0) {
+      const created = engine.ledger.createOrg({
+        name: "Default",
+        isPersonalRoot: true,
+        policy: "open",
+      });
+      orgId = created.org.id;
+    } else if (orgs.length === 1) {
+      orgId = orgs[0]!.id;
+    } else {
+      throw new MindError(
+        "NOT_BOUND",
+        `Multiple organizations exist in "${homeDir}"; pass --org <orgId> (Meru Mind serve hosts one organization per instance).`,
+      );
+    }
+
+    const wakeBus = new ChangeWakeBus();
+    unsubChangeLog = engine.db.onChangeCommitted((events) =>
+      wakeBus.notifyEvents(events),
+    );
+
+    const authenticate = (
+      req: IncomingMessage,
+      authOpts?: { allowCookie?: boolean },
+    ): Principal => {
+      const bearer = extractBearerToken(req);
+      if (bearer) {
+        return resolvePrincipalFromToken({
+          db: engine!.db,
+          plaintextToken: bearer,
+          expectedOrgId: orgId,
+          authKind: "bearer",
+        });
+      }
+      if (authOpts?.allowCookie !== false && options.cookieAuthenticator) {
+        const cookiePrincipal = options.cookieAuthenticator(req, orgId);
+        if (cookiePrincipal) {
+          return cookiePrincipal;
+        }
+      }
+      throw new MindError(
+        "ACCESS_DENIED",
+        "Missing or invalid authentication credentials",
+        {
+          try: "Pass Authorization: Bearer <MERU_MIND_TOKEN>",
+        },
+      );
+    };
+
+    const serverUrlRef = { value: `http://${formatHostForUrl(host)}:${requestedPort}` };
+
+    const createSurface = (
+      principal: Principal,
+      req: IncomingMessage,
+    ): LocalMindSurface => {
+      const rawHint = req.headers["x-meru-workspace-hint"];
+      const workspaceHint =
+        typeof rawHint === "string" && rawHint.trim() ? rawHint.trim() : null;
+      return new LocalMindSurface({
+        engine: engine!,
+        principal,
+        wakeBus,
+        defaultWorkspaceHint: workspaceHint,
+        storeDescriptor: {
+          path: serverUrlRef.value,
+          localOnly: false,
+        },
+        ownsEngine: false,
+      });
+    };
+
+    const logAccess = (entry: AccessLogEntry): void => {
+      if (options.accessLog === false) return;
+      if (typeof options.accessLog === "function") {
+        options.accessLog(entry);
+        return;
+      }
+      // Strictly log pathname ONLY — NEVER query string, headers, or body
+      process.stderr.write(
+        `[meru-mind serve] ${entry.method} ${entry.pathname} ${entry.statusCode} ${entry.durationMs}ms actor=${entry.actorId ?? "-"}\n`,
+      );
+    };
+
+    const httpServer = http.createServer(async (req, res) => {
+      const t0 = performance.now();
+      const method = (req.method ?? "GET").toUpperCase();
+      const rawUrl = req.url ?? "/";
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(rawUrl, "http://localhost");
+      } catch {
+        sendJson(res, 400, {
+          error: "invalid_input",
+          message: "Malformed request URL",
+        });
+        return;
+      }
+
+      const pathname = parsedUrl.pathname;
+      let actorId: string | null = null;
+
+      res.on("finish", () => {
+        logAccess({
+          timestamp: new Date().toISOString(),
+          method,
+          pathname,
+          statusCode: res.statusCode,
+          durationMs: Math.round(performance.now() - t0),
+          actorId,
+        });
+      });
+
+      try {
+        // Unauthenticated liveness probe (zero org/corpus leakage)
+        if (method === "GET" && pathname === "/v1/health") {
+          sendJson(res, 200, { ok: true, version: SERVER_VERSION });
+          return;
+        }
+
+        // Streamable HTTP MCP endpoint (/mcp) — Bearer token auth only, strictly 7 tools
+        if (pathname === "/mcp") {
+          const principal = authenticate(req, { allowCookie: false });
+          actorId = principal.actor.id;
+          const surface = createSurface(principal, req);
+          const mcpServer = createSurfaceMcpServer(surface);
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined,
+          });
+          await mcpServer.connect(transport);
+          try {
+            const parsedBody =
+              method === "POST" ? await readJsonBody(req) : undefined;
+            await transport.handleRequest(req, res, parsedBody);
+          } finally {
+            await transport.close();
+            await mcpServer.close();
+            await surface.close();
+          }
+          return;
+        }
+
+        // REST API under /v1/*
+        if (pathname.startsWith("/v1/")) {
+          const principal = authenticate(req, { allowCookie: true });
+          actorId = principal.actor.id;
+          const surface = createSurface(principal, req);
+          try {
+            const sp = parsedUrl.searchParams;
+
+            if (method === "GET" && pathname === "/v1/whoami") {
+              const out = await surface.whoami();
+              sendJson(res, 200, out, {
+                "X-Meru-Latest-Seq": String(out.latestSeq),
+              });
+              return;
+            }
+
+            if (method === "GET" && pathname === "/v1/tree") {
+              const out = await surface.tree({
+                ref: sp.get("ref") ?? undefined,
+                depth: parseOptionalDepth(sp.get("depth")),
+                includeObjects: parseOptionalBool(sp.get("objects")),
+                limit: parseOptionalInt(sp.get("limit")),
+              });
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "GET" && pathname === "/v1/ls") {
+              const onlyRaw = sp.get("only");
+              const only =
+                onlyRaw &&
+                ["realms", "objects", "entries", "files"].includes(onlyRaw)
+                  ? (onlyRaw as LsOnlyFilter)
+                  : undefined;
+              const out = await surface.ls({
+                ref: sp.get("ref") ?? undefined,
+                only,
+                kind: sp.get("kind") ?? undefined,
+                about: sp.get("about") ?? undefined,
+                since: sp.get("since") ?? undefined,
+                until: sp.get("until") ?? undefined,
+                history: parseOptionalBool(sp.get("history")),
+                includeDescendantSeabed: parseOptionalBool(
+                  sp.get("include_descendant_seabed"),
+                ),
+                limit: parseOptionalInt(sp.get("limit")),
+                cursor: sp.get("cursor") ?? undefined,
+              });
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "GET" && pathname === "/v1/show") {
+              const ref = sp.get("ref");
+              if (!ref) {
+                throw new MindError("INVALID_INPUT", 'Query parameter "ref" is required');
+              }
+              const out = await surface.show({
+                ref,
+                around: sp.get("around") ?? undefined,
+                cursor: sp.get("cursor") ?? undefined,
+                chars: parseOptionalInt(sp.get("chars")),
+                full: parseOptionalBool(sp.get("full")),
+                history: parseOptionalBool(sp.get("history")),
+                context: parseOptionalInt(sp.get("context")),
+                includeDescendantSeabed: parseOptionalBool(
+                  sp.get("include_descendant_seabed"),
+                ),
+              });
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "GET" && pathname === "/v1/search") {
+              const query = sp.get("query");
+              if (!query) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Query parameter "query" is required',
+                );
+              }
+              const out = await surface.search({
+                query,
+                in: sp.get("in") ?? undefined,
+                about: sp.get("about") ?? undefined,
+                kind: sp.get("kind") ?? undefined,
+                since: sp.get("since") ?? undefined,
+                until: sp.get("until") ?? undefined,
+                history: parseOptionalBool(sp.get("history")),
+                includeDescendantSeabed: parseOptionalBool(
+                  sp.get("include_descendant_seabed"),
+                ),
+                limit: parseOptionalInt(sp.get("limit")),
+                cursor: sp.get("cursor") ?? undefined,
+              });
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "GET" && pathname === "/v1/changes") {
+              const ac = new AbortController();
+              req.on("close", () => ac.abort());
+              const out = await surface.changes({
+                sinceSeq: parseOptionalInt(sp.get("since")) ?? 0,
+                generation: parseOptionalInt(sp.get("generation")),
+                in: sp.get("in") ?? undefined,
+                limit: parseOptionalInt(sp.get("limit")) ?? 50,
+                includeDescendantSeabed: parseOptionalBool(
+                  sp.get("include_descendant_seabed"),
+                ),
+                waitSeconds: parseOptionalInt(sp.get("wait")) ?? 0,
+                signal: ac.signal,
+              });
+              sendJson(res, 200, out, {
+                "X-Meru-Latest-Seq": String(out.latestSeq),
+              });
+              return;
+            }
+
+            const chainMatch = /^\/v1\/entry\/([^/]+)\/chain$/.exec(pathname);
+            if (method === "GET" && chainMatch) {
+              const entryId = decodeURIComponent(chainMatch[1]!);
+              const out = await surface.getEntryChain(entryId);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/write") {
+              const body = (await readJsonBody(req)) as unknown as SurfaceWriteInput;
+              const lastSeqHeader = req.headers["x-meru-last-read-seq"];
+              const parsedHeaderSeq =
+                typeof lastSeqHeader === "string"
+                  ? Number.parseInt(lastSeqHeader, 10)
+                  : undefined;
+              const out = await surface.write({
+                ...body,
+                lastReadSeq:
+                  body.lastReadSeq ??
+                  (Number.isFinite(parsedHeaderSeq) ? parsedHeaderSeq : undefined),
+              });
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/raw") {
+              const body = (await readJsonBody(req)) as unknown as SurfaceRawAddInput;
+              const out = await surface.rawAdd(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/move") {
+              const body = (await readJsonBody(req)) as unknown as SurfaceMoveInput;
+              const out = await surface.move(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/rules") {
+              const body = (await readJsonBody(req)) as unknown as SurfaceAddRuleInput;
+              const out = await surface.addRule(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/redact") {
+              const body = (await readJsonBody(req)) as unknown as SurfaceRedactInput;
+              const out = await surface.redact(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/realms") {
+              const body = (await readJsonBody(req)) as unknown as SurfaceCreateRealmInput;
+              const out = await surface.createRealm(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/realms/mount") {
+              const body = (await readJsonBody(req)) as unknown as SurfaceMountRealmInput;
+              const out = await surface.mountRealm(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/realms/unmount") {
+              const body = (await readJsonBody(req)) as {
+                viewerRef: string;
+                targetRef: string;
+              };
+              const unmounted = await surface.unmountRealm(body);
+              sendJson(res, 200, { unmounted });
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/realms/archive") {
+              const body = (await readJsonBody(req)) as { ref: string };
+              const out = await surface.archiveRealm(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/realms/unarchive") {
+              const body = (await readJsonBody(req)) as { ref: string };
+              const out = await surface.unarchiveRealm(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/org/policy") {
+              const body = (await readJsonBody(req)) as { policy: OrgPolicy };
+              const out = await surface.setOrgPolicy(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "GET" && pathname === "/v1/tokens") {
+              const out = await surface.listTokens({
+                includeRevoked: parseOptionalBool(sp.get("include_revoked")),
+              });
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/tokens") {
+              const body = (await readJsonBody(req)) as unknown as SurfaceCreateTokenInput;
+              const out = await surface.createToken(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/tokens/revoke") {
+              const body = (await readJsonBody(req)) as { tokenId: string };
+              const revoked = await surface.revokeToken(body);
+              sendJson(res, 200, { revoked });
+              return;
+            }
+
+            sendJson(res, 404, {
+              error: "not_found",
+              message: `Unknown API route: ${method} ${pathname}`,
+            });
+            return;
+          } finally {
+            await surface.close();
+          }
+        }
+
+        // Optional extra routes (v0.4 Web UI shell, /_meru/client.js, /_meru/shell, auth code exchange)
+        if (options.extraRouteHandler) {
+          const handled = await options.extraRouteHandler({
+            req,
+            res,
+            url: parsedUrl,
+            engine: engine!,
+            orgId,
+            wakeBus,
+            authenticate,
+            createSurface,
+          });
+          if (handled) return;
+        }
+
+        sendJson(res, 404, {
+          error: "not_found",
+          message: `Route not found: ${method} ${pathname}`,
+        });
+      } catch (err) {
+        const status = httpStatusForError(err);
+        const payload = toSurfaceError(err, { surface: "cli" });
+        if (status === 403 && !actorId) {
+          sendJson(res, 401, payload);
+        } else {
+          sendJson(res, status, payload);
+        }
+      }
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once("error", reject);
+      httpServer.listen(requestedPort, host, () => {
+        httpServer.removeListener("error", reject);
+        resolve();
+      });
+    });
+
+    const addr = httpServer.address() as AddressInfo;
+    const boundPort = addr.port;
+    const url = `http://${formatHostForUrl(host)}:${boundPort}`;
+    serverUrlRef.value = url;
+
+    // Update lock file in-place with actual bound port and orgId (zero lock-release window)
+    lockHandle.updateInfo({ url, orgId });
+
+    let closed = false;
+    const close = async () => {
+      if (closed) return;
+      closed = true;
+      await new Promise<void>((resolve) => {
+        httpServer.close(() => resolve());
+        httpServer.closeAllConnections?.();
+      });
+      if (unsubChangeLog) {
+        unsubChangeLog();
+        unsubChangeLog = null;
+      }
+      if (engine) {
+        await engine.close();
+        engine = null;
+      }
+      lockHandle.release();
+    };
+
+    return {
+      url,
+      host,
+      port: boundPort,
+      homeDir,
+      orgId,
+      engine,
+      wakeBus,
+      httpServer,
+      createToken(params) {
+        return createAuthToken({
+          db: engine!.db,
+          orgId,
+          actorId: params.actorId,
+          actorKind: params.actorKind,
+          actorFamily: params.actorFamily,
+          boundRealmId: params.boundRealmId,
+          label: params.label,
+          createdBy: params.createdBy ?? "serve-bootstrap",
+        });
+      },
+      close,
+    };
+  } catch (err) {
+    if (unsubChangeLog) unsubChangeLog();
+    if (engine) {
+      await engine.close().catch(() => {});
+    }
+    lockHandle.release();
+    throw err;
+  }
+}

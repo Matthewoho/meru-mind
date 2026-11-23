@@ -1,0 +1,49 @@
+# Single-writer Meru Mind Team Server + Caddy Automatic HTTPS Reverse Proxy
+# IMPORTANT: Always keep replicas = 1. Do NOT mount /var/lib/meru-mind over NFS/SMB.
+services:
+  meru-mind:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      MERU_MIND_HOME: /var/lib/meru-mind
+      # Optional external provider env vars (referenced as env:LINEAR_API_KEY in work_bindings)
+      # LINEAR_API_KEY: ${LINEAR_API_KEY}
+      # GITHUB_TOKEN: ${GITHUB_TOKEN}
+    volumes:
+      - meru_mind_data:/var/lib/meru-mind
+    expose:
+      - "3800"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3800/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      meru-mind:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      MERU_DOMAIN: ${MERU_DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  meru_mind_data:
+  caddy_data:
+  caddy_config:

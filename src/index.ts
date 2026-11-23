@@ -10,6 +10,7 @@ import { ImporterEngine } from "./engine/importer.js";
 import { ObjectEngine } from "./engine/objects.js";
 import { SeaEngine } from "./engine/sea.js";
 import { SliceExporter } from "./engine/slice.js";
+import { assertNoLiveServeLock } from "./server/writer-lock.js";
 import type { BlobPort, DbPort, DrivePort, EmbedderPort } from "./ports.js";
 import { MindError } from "./types.js";
 
@@ -27,6 +28,71 @@ export {
   type SearchConcept,
   type ParsedSearchQuery,
 } from "./adapters/sqlite-db.js";
+export { computeHighlightRanges, placeholders } from "./query/fts-query.js";
+export {
+  detectPlaintextSecret,
+  assertNoAccidentalSecret,
+  type SecretPatternMatch,
+} from "./engine/secret-guard.js";
+export type {
+  MindSurface,
+  SurfaceTreeParams,
+  SurfaceLsParams,
+  SurfaceShowParams,
+  SurfaceSearchParams,
+  SurfaceChangesParams,
+  SurfaceWriteInput,
+  SurfaceWriteResult,
+  SurfaceRawAddInput,
+  SurfaceMoveInput,
+  SurfaceAddRuleInput,
+  SurfaceRedactInput,
+  SurfaceCreateRealmInput,
+  SurfaceMountRealmInput,
+  SurfaceCreateTokenInput,
+  SurfaceCreateTokenResult,
+} from "./surface.js";
+export {
+  LocalMindSurface,
+  type LocalMindSurfaceOptions,
+} from "./surface-local.js";
+export {
+  RemoteMindSurface,
+  type RemoteMindSurfaceOptions,
+} from "./surface-remote.js";
+export {
+  ChangeWakeBus,
+  MindPump,
+  type PumpPollParams,
+  type PumpPollResult,
+} from "./server/pump.js";
+export {
+  TOKEN_PREFIX,
+  hashAuthToken,
+  generateAuthTokenPlaintext,
+  toPublicToken,
+  createAuthToken,
+  resolvePrincipalFromToken,
+  isPrincipalTokenActive,
+  type CreateAuthTokenParams,
+  type CreateAuthTokenResult,
+} from "./server/tokens.js";
+export {
+  SERVE_LOCK_FILENAME,
+  readLiveServeLock,
+  assertNoLiveServeLock,
+  acquireServeWriterLock,
+  type ServeLockInfo,
+  type ServeWriterLockHandle,
+} from "./server/writer-lock.js";
+export {
+  startMindServer,
+  SERVER_VERSION,
+  type AccessLogEntry,
+  type MindServerOptions,
+  type MindServerHandle,
+} from "./server/http-server.js";
+export { createSurfaceMcpServer } from "./server/mcp-http.js";
 export { LocalBlobStore } from "./adapters/blob-store.js";
 export {
   NoopEmbedder,
@@ -180,6 +246,8 @@ export interface MindEngineOptions {
   vectorDimensions?: number;
   /** Enable sqlite-vec extension loading (default: true) */
   enableVector?: boolean;
+  /** Internal flag set by `meru-mind serve` after acquiring the exclusive writer lock */
+  isServerOwner?: boolean;
 }
 
 export interface MindEngine {
@@ -256,6 +324,11 @@ export async function createMindEngine(
       "FORBIDDEN_HOME_PATH",
       `Refusing to store runtime data inside the @meru-mind/core repository (${homeDir}). Set MERU_MIND_HOME or --home to an external path (e.g. ~/.meru-mind).`,
     );
+  }
+
+  // Block direct local SQLite access whenever a live `meru-mind serve` holds the exclusive writer lock.
+  if (!options.isServerOwner && !options.db) {
+    assertNoLiveServeLock(homeDir);
   }
 
   fs.mkdirSync(homeDir, { recursive: true });

@@ -1,5 +1,11 @@
 import type {
+  AuthTokenRecord,
+  ChangeAssetClass,
+  ChangeCommittedEvent,
   ChangeLogEntry,
+  ConsumerCursor,
+  DeliveryRecord,
+  DeliveryState,
   Distillation,
   DistillationLayer,
   DriveFileContent,
@@ -12,6 +18,7 @@ import type {
   ObjectState,
   Organization,
   OrgPolicy,
+  PumpChangeFrame,
   Realm,
   RealmMount,
   RecordKind,
@@ -145,6 +152,10 @@ export interface DbPort {
   listSchemaMigrations(): SchemaMigrationRecord[];
   getMeta(key: string): string | null;
   setMeta(key: string, value: string): void;
+  getTopologyVersion(): number;
+  bumpTopologyVersion(orgId?: string): number;
+  vacuumInto(destPath: string): void;
+  onChangeCommitted(listener: (events: ChangeCommittedEvent[]) => void): () => void;
 
   // Organizations & Realms
   insertOrg(org: Organization): void;
@@ -477,7 +488,9 @@ export interface DbPort {
     includeSecret?: boolean;
   }): number;
   appendChangeLog(
-    entry: Omit<ChangeLogEntry, "seq" | "generation">,
+    entry: Omit<ChangeLogEntry, "seq" | "generation"> & {
+      assetClass?: ChangeAssetClass;
+    },
   ): ChangeLogEntry;
   listChangeLog(params?: {
     orgId?: string;
@@ -486,7 +499,49 @@ export interface DbPort {
     limit?: number;
     includeSecret?: boolean;
   }): { generation: number; entries: ChangeLogEntry[] };
+  listChangeLogForPump(params: {
+    orgId: string;
+    ledgerRealmIds: string[];
+    seabedRealmIds: string[];
+    driveRealmIds: string[];
+    sinceSeq: number;
+    limit: number;
+    includeSecret?: boolean;
+    filterRealmIds?: string[];
+  }): { generation: number; topologyVersion: number; frames: PumpChangeFrame[] };
   resetChangeLog(): { generation: number; clearedCount: number };
+
+  // Auth Tokens (Migration v9)
+  insertToken(token: AuthTokenRecord): void;
+  getToken(id: string): AuthTokenRecord | null;
+  getTokenByHash(tokenHash: string): AuthTokenRecord | null;
+  listTokens(orgId: string, includeRevoked?: boolean): AuthTokenRecord[];
+  revokeToken(orgId: string, id: string, revokedAt: string): boolean;
+  touchTokenLastUsed(id: string, usedAt: string): void;
+
+  // Outbox Consumer Cursors & Deliveries (Migration v9)
+  upsertConsumerCursor(cursor: ConsumerCursor): void;
+  getConsumerCursor(consumer: string): ConsumerCursor | null;
+  enqueueDelivery(delivery: {
+    consumer: string;
+    seq: number;
+    dueAt: string;
+    createdAt: string;
+  }): boolean;
+  listDueDeliveries(params: {
+    consumer?: string;
+    nowIso: string;
+    limit: number;
+  }): DeliveryRecord[];
+  updateDeliveryState(params: {
+    consumer: string;
+    seq: number;
+    state: DeliveryState;
+    attempts: number;
+    dueAt: string;
+    lastError: string | null;
+    updatedAt: string;
+  }): boolean;
 
   // Rebuildable FTS5 index
   upsertFtsItem(item: {

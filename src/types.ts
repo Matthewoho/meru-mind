@@ -553,6 +553,8 @@ export interface IdempotencyRecord {
   createdAt: string;
 }
 
+export type ChangeAssetClass = "rule" | "ledger" | "seabed" | "drive" | "org";
+
 export interface ChangeLogEntry {
   seq: number;
   generation: number;
@@ -561,8 +563,92 @@ export interface ChangeLogEntry {
   entityType: string;
   entityId: string;
   op: string;
+  assetClass?: ChangeAssetClass;
   actorId: string;
   createdAt: string;
+}
+
+export type AuthKind = "local" | "bearer" | "cookie";
+
+export interface AuthTokenRecord {
+  id: string;
+  orgId: string;
+  tokenHash: string;
+  actorId: string;
+  actorKind: "human" | "agent";
+  actorFamily: string | null;
+  boundRealmId: string | null;
+  label: string | null;
+  createdBy: string;
+  createdAt: string;
+  revokedAt: string | null;
+  lastUsedAt: string | null;
+}
+
+export interface AuthTokenPublic {
+  id: string;
+  orgId: string;
+  actorId: string;
+  actorKind: "human" | "agent";
+  actorFamily: string | null;
+  boundRealmId: string | null;
+  label: string | null;
+  createdBy: string;
+  createdAt: string;
+  revokedAt: string | null;
+  lastUsedAt: string | null;
+}
+
+export interface Principal {
+  tokenId: string | null;
+  orgId: string;
+  actor: Actor;
+  boundRealmId: string;
+  boundSource: string;
+  authKind: AuthKind;
+}
+
+export interface ConsumerCursor {
+  consumer: string;
+  generation: number;
+  seq: number;
+  updatedAt: string;
+}
+
+export type DeliveryState =
+  | "pending"
+  | "processing"
+  | "succeeded"
+  | "failed"
+  | "dead";
+
+export interface DeliveryRecord {
+  consumer: string;
+  seq: number;
+  state: DeliveryState;
+  attempts: number;
+  dueAt: string;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PumpChangeFrame {
+  seq: number;
+  generation: number;
+  realmId: string;
+  entityType: string;
+  entityId: string;
+  op: string;
+  assetClass: ChangeAssetClass;
+  actorId: string;
+  createdAt: string;
+}
+
+export interface ChangeCommittedEvent {
+  orgId: string;
+  realmId: string;
+  seq?: number;
 }
 
 export interface SyncEmbeddingsResult {
@@ -741,7 +827,7 @@ export interface WhoamiResult {
   };
   store: {
     path: string;
-    localOnly: true;
+    localOnly: boolean;
   };
   corpus: {
     realms: number;
@@ -876,6 +962,8 @@ export interface ChangesResult {
   generation: number;
   sinceSeq: number;
   latestSeq: number;
+  topologyVersion?: number;
+  resetRequired?: boolean;
   entries: ChangeLogEntry[];
 }
 
