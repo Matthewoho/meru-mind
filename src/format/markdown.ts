@@ -565,8 +565,12 @@ export function formatChangesMarkdown(res: ChangesResult): string {
 }
 
 export function formatRecallMarkdown(res: RecallResult): string {
+  const dateSuffix =
+    res.interpretedDates && res.interpretedDates.length > 0
+      ? ` [dates=${res.interpretedDates.map((d) => `\`${d}\``).join(", ")}]`
+      : "";
   const lines: string[] = [
-    `# Recall (${res.items.length}/${res.totalMatched}, omitted: ${res.omittedCount})`,
+    `# Recall${dateSuffix} (${res.items.length}/${res.totalMatched}, omitted: ${res.omittedCount})`,
     res.message,
     "",
   ];
@@ -1002,6 +1006,11 @@ export function formatSearchMarkdown(res: SearchResult): string {
   const scopeParts: string[] = [];
   if (res.in) scopeParts.push(`in=\`${res.in}\``);
   if (res.about) scopeParts.push(`about=\`${res.about}\``);
+  if (res.interpretedDates && res.interpretedDates.length > 0) {
+    scopeParts.push(
+      `dates=${res.interpretedDates.map((d) => `\`${d}\``).join(",")}`,
+    );
+  }
   const scopeSuffix = scopeParts.length > 0 ? ` [${scopeParts.join(", ")}]` : "";
   const lines: string[] = [
     `# Search "${res.query}"${scopeSuffix} (${res.items.length}/${res.totalMatched}, omitted: ${res.omittedCount})`,

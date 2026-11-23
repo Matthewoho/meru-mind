@@ -1002,7 +1002,10 @@ export class SeaEngine {
       };
     }
 
-    const parsedQuery = parseSearchQuery(query.query);
+    const parsedQuery = parseSearchQuery(query.query, { extractDates: true });
+    const dateConcepts = parsedQuery.dateConcepts ?? [];
+    const hasDates = dateConcepts.length > 0;
+    const isPureDateQuery = hasDates && parsedQuery.concepts.length === 0;
     const candidateLimit = Math.max((offset + limit) * 5, 100);
 
     const pass1Map = new Map<
@@ -1013,34 +1016,42 @@ export class SeaEngine {
       string,
       { sourceType: "record" | "seabed" | "distillation"; rank: number }
     >();
+    const dateWindowMap = new Map<
+      string,
+      { sourceType: "record" | "seabed" | "distillation" }
+    >();
 
-    // Pass 1: All-concept AND (single unified SQL statement over fts_index + fts_docs)
-    const pass1Res = parsedQuery.ftsAndExpression
-      ? this.db.searchFtsUnified({
-          ftsExpression: parsedQuery.ftsAndExpression,
-          ledgerRealmIds,
-          seabedRealmIds,
-          includeSuperseded,
-          recordKinds: query.recordKinds,
-          seabedKinds: query.seabedKinds,
-          since: query.since,
-          until: query.until,
-          allowedEntryIds: query.allowedEntryIds,
-          perBucketLimit: candidateLimit,
-        })
-      : { rows: [], total: 0, ledgerCount: 0, seabedCount: 0 };
-    for (const m of pass1Res.rows) {
-      pass1Map.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
-    }
+    let sqlTotal = 0;
+    let ftsCapped = false;
 
-    // Pass 2: Broad partial OR (only run separately when distinct from Pass 1)
-    const hasDistinctPass2 =
-      parsedQuery.ftsOrExpression !== null &&
-      parsedQuery.ftsOrExpression !== parsedQuery.ftsAndExpression;
-    const pass2Res =
-      hasDistinctPass2 && parsedQuery.ftsOrExpression
+    const dateWindows = hasDates ? dateConcepts.map((d) => d.window) : [];
+    const combinedDateLiteralExpr = hasDates
+      ? dateConcepts.length === 1
+        ? dateConcepts[0]!.ftsLiteralExpr
+        : dateConcepts.map((d) => `(${d.ftsLiteralExpr})`).join(" OR ")
+      : null;
+
+    if (isPureDateQuery) {
+      // Pure date-only query: union structured occurred_at ±1 day window WITH literal date phrase FTS
+      const windowRes = this.db.listEntriesByDateWindow({
+        dateWindows,
+        ledgerRealmIds,
+        seabedRealmIds,
+        includeSuperseded,
+        recordKinds: query.recordKinds,
+        seabedKinds: query.seabedKinds,
+        since: query.since,
+        until: query.until,
+        allowedEntryIds: query.allowedEntryIds,
+        perBucketLimit: candidateLimit,
+      });
+      for (const m of windowRes.rows) {
+        dateWindowMap.set(m.itemId, { sourceType: m.sourceType });
+      }
+
+      const literalRes = combinedDateLiteralExpr
         ? this.db.searchFtsUnified({
-            ftsExpression: parsedQuery.ftsOrExpression,
+            ftsExpression: combinedDateLiteralExpr,
             ledgerRealmIds,
             seabedRealmIds,
             includeSuperseded,
@@ -1051,18 +1062,142 @@ export class SeaEngine {
             allowedEntryIds: query.allowedEntryIds,
             perBucketLimit: candidateLimit,
           })
-        : pass1Res;
-    if (hasDistinctPass2) {
-      for (const m of pass2Res.rows) {
-        pass2Map.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
+        : { rows: [], total: 0, ledgerCount: 0, seabedCount: 0 };
+      for (const m of literalRes.rows) {
+        pass1Map.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
       }
-    }
 
-    // Exact SQL total from Pass 2 (OR) when Pass 2 executes, else from Pass 1
-    const sqlTotal = pass2Res.total;
-    const ftsCapped =
-      pass2Res.total > pass2Res.rows.length ||
-      pass1Res.total > pass1Res.rows.length;
+      // Deduplicate overlap in totalMatched via inclusion-exclusion (exact even above perBucketLimit)
+      let overlapCount = 0;
+      if (windowRes.total > 0 && literalRes.total > 0 && combinedDateLiteralExpr) {
+        if (
+          windowRes.total === windowRes.rows.length &&
+          literalRes.total === literalRes.rows.length
+        ) {
+          for (const id of dateWindowMap.keys()) {
+            if (pass1Map.has(id)) overlapCount += 1;
+          }
+        } else {
+          overlapCount = this.db.searchFtsUnified({
+            ftsExpression: combinedDateLiteralExpr,
+            dateWindows,
+            ledgerRealmIds,
+            seabedRealmIds,
+            includeSuperseded,
+            recordKinds: query.recordKinds,
+            seabedKinds: query.seabedKinds,
+            since: query.since,
+            until: query.until,
+            allowedEntryIds: query.allowedEntryIds,
+            perBucketLimit: 1,
+          }).total;
+        }
+      }
+      sqlTotal = Math.max(0, windowRes.total + literalRes.total - overlapCount);
+      ftsCapped =
+        windowRes.total > windowRes.rows.length ||
+        literalRes.total > literalRes.rows.length;
+    } else {
+      // Pass 1: All-concept AND (single unified SQL statement over fts_index + fts_docs)
+      const pass1Res = parsedQuery.ftsAndExpression
+        ? this.db.searchFtsUnified({
+            ftsExpression: parsedQuery.ftsAndExpression,
+            ledgerRealmIds,
+            seabedRealmIds,
+            includeSuperseded,
+            recordKinds: query.recordKinds,
+            seabedKinds: query.seabedKinds,
+            since: query.since,
+            until: query.until,
+            allowedEntryIds: query.allowedEntryIds,
+            perBucketLimit: candidateLimit,
+          })
+        : { rows: [], total: 0, ledgerCount: 0, seabedCount: 0 };
+      for (const m of pass1Res.rows) {
+        pass1Map.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
+      }
+
+      // Pass 2: Broad partial OR (only run separately when distinct from Pass 1)
+      const hasDistinctPass2 =
+        parsedQuery.ftsOrExpression !== null &&
+        parsedQuery.ftsOrExpression !== parsedQuery.ftsAndExpression;
+      const pass2Res =
+        hasDistinctPass2 && parsedQuery.ftsOrExpression
+          ? this.db.searchFtsUnified({
+              ftsExpression: parsedQuery.ftsOrExpression,
+              ledgerRealmIds,
+              seabedRealmIds,
+              includeSuperseded,
+              recordKinds: query.recordKinds,
+              seabedKinds: query.seabedKinds,
+              since: query.since,
+              until: query.until,
+              allowedEntryIds: query.allowedEntryIds,
+              perBucketLimit: candidateLimit,
+            })
+          : pass1Res;
+      if (hasDistinctPass2) {
+        for (const m of pass2Res.rows) {
+          pass2Map.set(m.itemId, { sourceType: m.sourceType, rank: m.rank });
+        }
+      }
+
+      // Mixed query with date concepts: run supplemental Date-Window Pass AND Literal-Date Pass,
+      // merging insert-if-absent so Pass 2's BM25 rank is never overwritten.
+      if (hasDates && parsedQuery.ftsOrExpression) {
+        const dateTargetMap = hasDistinctPass2 ? pass2Map : pass1Map;
+        const dateWindowFtsRes = this.db.searchFtsUnified({
+          ftsExpression: parsedQuery.ftsOrExpression,
+          dateWindows,
+          ledgerRealmIds,
+          seabedRealmIds,
+          includeSuperseded,
+          recordKinds: query.recordKinds,
+          seabedKinds: query.seabedKinds,
+          since: query.since,
+          until: query.until,
+          allowedEntryIds: query.allowedEntryIds,
+          perBucketLimit: candidateLimit,
+        });
+        for (const m of dateWindowFtsRes.rows) {
+          if (!dateTargetMap.has(m.itemId)) {
+            dateTargetMap.set(m.itemId, {
+              sourceType: m.sourceType,
+              rank: m.rank,
+            });
+          }
+        }
+
+        if (combinedDateLiteralExpr) {
+          const dateLiteralFtsRes = this.db.searchFtsUnified({
+            ftsExpression: `(${parsedQuery.ftsOrExpression}) AND (${combinedDateLiteralExpr})`,
+            ledgerRealmIds,
+            seabedRealmIds,
+            includeSuperseded,
+            recordKinds: query.recordKinds,
+            seabedKinds: query.seabedKinds,
+            since: query.since,
+            until: query.until,
+            allowedEntryIds: query.allowedEntryIds,
+            perBucketLimit: candidateLimit,
+          });
+          for (const m of dateLiteralFtsRes.rows) {
+            if (!dateTargetMap.has(m.itemId)) {
+              dateTargetMap.set(m.itemId, {
+                sourceType: m.sourceType,
+                rank: m.rank,
+              });
+            }
+          }
+        }
+      }
+
+      // Exact SQL total from Pass 2 (OR) when Pass 2 executes, else from Pass 1
+      sqlTotal = pass2Res.total;
+      ftsCapped =
+        pass2Res.total > pass2Res.rows.length ||
+        pass1Res.total > pass1Res.rows.length;
+    }
 
     let vectorUsed = false;
     const vecMap = new Map<
@@ -1122,6 +1257,11 @@ export class SeaEngine {
         candidateSourceMap.set(id, info.sourceType);
       }
     }
+    for (const [id, info] of dateWindowMap.entries()) {
+      if (!candidateSourceMap.has(id)) {
+        candidateSourceMap.set(id, info.sourceType);
+      }
+    }
     for (const [id, info] of vecMap.entries()) {
       if (!candidateSourceMap.has(id)) {
         candidateSourceMap.set(id, info.sourceType);
@@ -1144,7 +1284,7 @@ export class SeaEngine {
       this.db.getDistillationsByIds(distCandIds).map((d) => [d.id, d]),
     );
 
-    type MatchSource = "pass1" | "pass2" | "vector";
+    type MatchSource = "pass1" | "pass2" | "vector" | "filter";
     interface RankedCandidate {
       id: string;
       sourceType: "record" | "seabed" | "distillation";
@@ -1154,7 +1294,7 @@ export class SeaEngine {
       realmId: string;
       occurredAt: string | null;
       createdAt: string;
-      matchedBy: Array<"fts" | "vector">;
+      matchedBy: Array<"filter" | "fts" | "vector">;
       coverageTier: number;
       coverageRatioBand: number;
       lexicalMatchFlag: number;
@@ -1168,6 +1308,7 @@ export class SeaEngine {
     }
 
     const concepts = parsedQuery.concepts;
+    const totalConceptCount = concepts.length + dateConcepts.length;
     let ftsRejectedByJsCount = 0;
     let vectorOnlyHydratedCount = 0;
 
@@ -1187,11 +1328,9 @@ export class SeaEngine {
       const p1 = pass1Map.get(params.id);
       const p2 = pass2Map.get(params.id);
       const vec = vecMap.get(params.id);
+      const inDateWindow = dateWindowMap.has(params.id);
       const hasFts = Boolean(p1 || p2);
       const hasVector = Boolean(vec);
-      const matchedBy: Array<"fts" | "vector"> = [];
-      if (hasFts) matchedBy.push("fts");
-      if (hasVector) matchedBy.push("vector");
 
       // Pre-compute lowercased title & body ONCE per candidate
       const titleLower = params.titleText.toLowerCase();
@@ -1200,25 +1339,78 @@ export class SeaEngine {
       const fullLower = `${titleLower}\n${bodyLower}`;
 
       // Explicitly compute JS title vs title+body coverage (never rely solely on Pass 1 membership)
-      let titleAllCovered = concepts.length > 0;
-      let fullAllCovered = concepts.length > 0;
+      let textTitleAllCovered = concepts.length > 0;
+      let textFullAllCovered = concepts.length > 0;
       let scoreSum = 0;
       for (const c of concepts) {
         const threshold = c.isCjk ? CJK_COVERAGE_THRESHOLD : 1.0;
         if (c.scoreText(params.titleText, titleLower) < threshold) {
-          titleAllCovered = false;
+          textTitleAllCovered = false;
         }
         const fullScore = c.scoreText(fullText, fullLower);
         if (fullScore < threshold) {
-          fullAllCovered = false;
+          textFullAllCovered = false;
         }
         scoreSum += fullScore;
       }
-      const coverageRatio =
-        concepts.length > 0 ? scoreSum / concepts.length : 0;
 
-      // Reject FTS-only false positives where identifier or lexical terms scored 0 in JS
-      if (hasFts && !hasVector && concepts.length > 0 && coverageRatio === 0) {
+      let dateSatisfiedCount = 0;
+      let dateAllSatisfied = hasDates;
+      let dateTitleAllSatisfied = hasDates;
+      if (hasDates) {
+        for (const dc of dateConcepts) {
+          const occHit = dc.matchOccurredAt(params.occurredAt);
+          const titleHit = occHit || dc.matchLiteralText(params.titleText);
+          const fullHit = titleHit || dc.matchLiteralText(params.bodyText);
+          if (fullHit) {
+            dateSatisfiedCount += 1;
+          } else {
+            dateAllSatisfied = false;
+          }
+          if (!titleHit) {
+            dateTitleAllSatisfied = false;
+          }
+        }
+      }
+
+      const dateSatisfied = dateSatisfiedCount > 0;
+      const hasFilterDate = inDateWindow && dateSatisfied;
+      const hasLexicalOrDate = hasFts || hasFilterDate;
+
+      const matchedBy: Array<"filter" | "fts" | "vector"> = [];
+      if (hasFilterDate) matchedBy.push("filter");
+      if (hasFts) matchedBy.push("fts");
+      if (hasVector) matchedBy.push("vector");
+
+      const titleAllCovered =
+        concepts.length > 0 && hasDates
+          ? textTitleAllCovered && dateTitleAllSatisfied
+          : concepts.length > 0
+            ? textTitleAllCovered
+            : hasDates
+              ? dateTitleAllSatisfied
+              : false;
+      const fullAllCovered =
+        concepts.length > 0 && hasDates
+          ? textFullAllCovered && dateAllSatisfied
+          : concepts.length > 0
+            ? textFullAllCovered
+            : hasDates
+              ? dateAllSatisfied
+              : false;
+      const coverageRatio =
+        totalConceptCount > 0
+          ? (scoreSum + dateSatisfiedCount) / totalConceptCount
+          : 0;
+
+      // Reject FTS-only false positives where identifier, lexical, or date terms scored 0 in JS
+      if (
+        hasFts &&
+        !hasVector &&
+        !hasFilterDate &&
+        totalConceptCount > 0 &&
+        coverageRatio === 0
+      ) {
         ftsRejectedByJsCount += 1;
         return null;
       }
@@ -1234,38 +1426,47 @@ export class SeaEngine {
       const p1Magnitude = p1 ? Math.max(0, -p1.rank) : null;
       const p2Magnitude = p2 ? Math.max(0, -p2.rank) : null;
 
-      if (hasFts && titleAllCovered) {
+      if (hasLexicalOrDate && titleAllCovered) {
         coverageTier = 4;
         coverageRatioBand = 10;
-        lexicalMatchFlag = 1;
+        lexicalMatchFlag = hasFts ? 1 : 0;
         if (p1Magnitude !== null) {
           matchSource = "pass1";
           rawRelevance = p1Magnitude;
-        } else {
-          matchSource = "pass2";
-          rawRelevance = p2Magnitude ?? 0;
-        }
-      } else if (hasFts && fullAllCovered) {
-        coverageTier = 3;
-        coverageRatioBand = 10;
-        lexicalMatchFlag = 1;
-        if (p1Magnitude !== null) {
-          matchSource = "pass1";
-          rawRelevance = p1Magnitude;
-        } else {
-          matchSource = "pass2";
-          rawRelevance = p2Magnitude ?? 0;
-        }
-      } else if (hasFts && coverageRatio >= 0.5) {
-        coverageTier = 2;
-        coverageRatioBand = Math.round(coverageRatio * 10);
-        lexicalMatchFlag = 1;
-        if (p2Magnitude !== null) {
+        } else if (p2Magnitude !== null) {
           matchSource = "pass2";
           rawRelevance = p2Magnitude;
         } else {
+          matchSource = "filter";
+          rawRelevance = 0;
+        }
+      } else if (hasLexicalOrDate && fullAllCovered) {
+        coverageTier = 3;
+        coverageRatioBand = 10;
+        lexicalMatchFlag = hasFts ? 1 : 0;
+        if (p1Magnitude !== null) {
           matchSource = "pass1";
-          rawRelevance = p1Magnitude ?? 0;
+          rawRelevance = p1Magnitude;
+        } else if (p2Magnitude !== null) {
+          matchSource = "pass2";
+          rawRelevance = p2Magnitude;
+        } else {
+          matchSource = "filter";
+          rawRelevance = 0;
+        }
+      } else if (hasLexicalOrDate && coverageRatio >= 0.5) {
+        coverageTier = 2;
+        coverageRatioBand = Math.round(coverageRatio * 10);
+        lexicalMatchFlag = hasFts ? 1 : 0;
+        if (p2Magnitude !== null) {
+          matchSource = "pass2";
+          rawRelevance = p2Magnitude;
+        } else if (p1Magnitude !== null) {
+          matchSource = "pass1";
+          rawRelevance = p1Magnitude;
+        } else {
+          matchSource = "filter";
+          rawRelevance = 0;
         }
       } else if (hasVector && vec!.cosine >= 0.75) {
         // High-confidence semantic hit (pure vector-only or weak-lexical hybrid) placed in Tier 2
@@ -1274,16 +1475,19 @@ export class SeaEngine {
         lexicalMatchFlag = hasFts && coverageRatio > 0 ? 1 : 0;
         matchSource = "vector";
         rawRelevance = vec!.cosine;
-      } else if (hasFts && coverageRatio > 0) {
+      } else if (hasLexicalOrDate && coverageRatio > 0) {
         coverageTier = 1;
         coverageRatioBand = Math.round(coverageRatio * 10);
-        lexicalMatchFlag = 1;
+        lexicalMatchFlag = hasFts ? 1 : 0;
         if (p2Magnitude !== null) {
           matchSource = "pass2";
           rawRelevance = p2Magnitude;
-        } else {
+        } else if (p1Magnitude !== null) {
           matchSource = "pass1";
-          rawRelevance = p1Magnitude ?? 0;
+          rawRelevance = p1Magnitude;
+        } else {
+          matchSource = "filter";
+          rawRelevance = 0;
         }
       } else if (hasVector) {
         coverageTier = 0;
@@ -1306,7 +1510,7 @@ export class SeaEngine {
         statusPriority = 3;
       }
 
-      if (!hasFts && hasVector) {
+      if (!hasFts && !hasFilterDate && hasVector) {
         vectorOnlyHydratedCount += 1;
       }
 
@@ -1336,9 +1540,10 @@ export class SeaEngine {
     const candidates: RankedCandidate[] = [];
 
     for (const [itemId, sourceType] of candidateSourceMap.entries()) {
-      const isFtsCandidate = pass1Map.has(itemId) || pass2Map.has(itemId);
+      const isSqlCountedCandidate =
+        pass1Map.has(itemId) || pass2Map.has(itemId) || dateWindowMap.has(itemId);
       const rejectIfFts = () => {
-        if (isFtsCandidate) ftsRejectedByJsCount += 1;
+        if (isSqlCountedCandidate) ftsRejectedByJsCount += 1;
       };
       if (allowedEntrySet && !allowedEntrySet.has(itemId)) {
         rejectIfFts();
@@ -1716,6 +1921,9 @@ export class SeaEngine {
       totalMatched,
       omittedCount: Math.max(0, totalMatched - offset - page.length),
       vectorUsed,
+      ...(hasDates
+        ? { interpretedDates: dateConcepts.map((d) => d.label) }
+        : {}),
       message:
         page.length > 0
           ? `Found ${totalMatched} matching item(s)${vectorUsed ? " (FTS5 + vector hybrid)" : " (FTS5)"}.`

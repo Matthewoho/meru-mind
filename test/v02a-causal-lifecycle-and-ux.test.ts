@@ -8,11 +8,13 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  buildDateLiteralFtsExpr,
   createMindEngine,
   formatLsMarkdown,
   formatSearchMarkdown,
   formatShowMarkdown,
   formatTreeMarkdown,
+  parseSearchQuery,
   type Actor,
   type MindEngine,
 } from "../src/index.js";
@@ -1315,5 +1317,325 @@ describe("V0.2a Causal Entity Lifecycle & Round-3 UX Polish", () => {
     } finally {
       await client.close();
     }
+  });
+
+  it("7. Query-side date concepts: opt-in parsing, >100 occurred_at & body-literal B1 recall, contiguous 10月10日上线 + 日↔号 B2, pure-date overlap dedupe, 查一下10月10日, leap 3月1日, rollover, show --around unchanged", async () => {
+    // A) Parser unit assertions: opt-in default, boundaries, calendar validation, space replacement, stopword bypass, mixed padding
+    const defaultParsed = parseSearchQuery("10月10日");
+    expect("dateConcepts" in defaultParsed).toBe(false);
+    expect(defaultParsed.concepts.length).toBeGreaterThan(0);
+
+    const stopwordPure = parseSearchQuery("查一下10月10日", {
+      extractDates: true,
+    });
+    expect(stopwordPure.concepts).toHaveLength(0);
+    expect(stopwordPure.dateConcepts?.map((d) => d.label)).toEqual(["10-10"]);
+
+    // Space replacement prevents adjacent CJK fusion ("部署10月10日上线" -> ["部署", "上线"])
+    const noFusion = parseSearchQuery("部署10月10日上线", { extractDates: true });
+    expect(noFusion.concepts.map((c) => c.raw)).toEqual(["部署", "上线"]);
+    expect(noFusion.dateConcepts?.map((d) => d.label)).toEqual(["10-10"]);
+
+    // Sentence-end punctuation relaxed (2026-10-10. / 2026-10-10:) while identifiers are NOT sliced!
+    expect(
+      parseSearchQuery("2026-10-10. summary", { extractDates: true })
+        .dateConcepts?.map((d) => d.label),
+    ).toEqual(["2026-10-10"]);
+    expect(
+      parseSearchQuery("2026-10-10: summary", { extractDates: true })
+        .dateConcepts?.map((d) => d.label),
+    ).toEqual(["2026-10-10"]);
+    for (const nonDateIdent of [
+      "backup_2026-10-10",
+      "2026-10-10T08:00",
+      "file:/ops/2026-10-10.md",
+      "2026-02-30",
+      "2月30日",
+      "4月31日",
+    ]) {
+      const p = parseSearchQuery(nonDateIdent, { extractDates: true });
+      expect(p.dateConcepts).toHaveLength(0);
+    }
+
+    // Year-less 2月29日 allowed; year-less 3月1日 includes BOTH 02-28 and 02-29
+    const feb29 = parseSearchQuery("2月29日", { extractDates: true });
+    expect(feb29.dateConcepts?.map((d) => d.label)).toEqual(["02-29"]);
+    const mar1 = parseSearchQuery("3月1日", { extractDates: true });
+    expect(mar1.dateConcepts?.[0]?.window.monthDays).toContain("02-28");
+    expect(mar1.dateConcepts?.[0]?.window.monthDays).toContain("02-29");
+
+    // Full Chinese date extracted BEFORE month-day
+    const cnFull = parseSearchQuery("2026年10月10日", { extractDates: true });
+    expect(cnFull.dateConcepts?.map((d) => d.label)).toEqual(["2026-10-10"]);
+
+    // Mixed padding & ISO-T prefix in buildDateLiteralFtsExpr
+    const mixedExpr = buildDateLiteralFtsExpr({ year: 2026, month: 3, day: 5 });
+    expect(mixedExpr).toContain('"2026 3 05"');
+    expect(mixedExpr).toContain('"2026 03 5"');
+    expect(mixedExpr).toContain('"2026 03 05t"*');
+    expect(mixedExpr).toContain('"3 月 05 日"*');
+    expect(mixedExpr).toContain('"3 月 05 号"*');
+
+    // Negative JS checks: 2025年10月10日 rejected for 2026-10-10; 2010-10-05 rejected for 10月10日
+    const dc2026 = parseSearchQuery("2026-10-10", { extractDates: true })
+      .dateConcepts![0]!;
+    expect(dc2026.matchLiteralText("2025年10月10日回溯")).toBe(false);
+    expect(dc2026.matchLiteralText("10月10日上线")).toBe(true);
+    expect(dc2026.matchLiteralText("2026-10-10T08:00:00Z")).toBe(true);
+    expect(dc2026.matchLiteralText("backup_2026-10-10")).toBe(true);
+    expect(dc2026.matchLiteralText("2026/10/10")).toBe(true);
+    expect(dc2026.matchLiteralText("2026.10.10")).toBe(true);
+
+    const dcMd = stopwordPure.dateConcepts![0]!;
+    expect(dcMd.matchLiteralText("2010-10-05 archive")).toBe(false);
+    expect(dcMd.matchLiteralText("月度日志总结")).toBe(false);
+    expect(dcMd.matchLiteralText("10月10号上线")).toBe(true);
+
+    // B) End-to-end DB recall tests (>100 same-keyword records for P1-1 & B1 + B2 + P1-2 overlap dedupe)
+    const homeDir = makeTempDir("meru-v7-dates-");
+    const eng = await createMindEngine({ homeDir, enableVector: false });
+    engines.push(eng);
+    const { rootRealm } = eng.ledger.createOrg({
+      name: "Acme",
+      policy: "open",
+    });
+
+    // Insert 115 decoy records with keyword "deploy" in August 2026 (pushes targets beyond top-100 FTS cap!)
+    for (let i = 0; i < 115; i += 1) {
+      await eng.ledger.appendRecord({
+        actor: humanAdmin,
+        viewerRealmId: rootRealm.id,
+        realmId: rootRealm.id,
+        kind: "finding",
+        title: `Deploy deploy deploy batch ${i}`,
+        payload: { body: `Routine deploy deploy log entry #${i}.` },
+        occurredAt: "2026-08-01T10:00:00Z",
+      });
+    }
+
+    // Target 1 (P1-1): occurred_at on 2026-10-10, NO date text in title/body!
+    const targetOccurred = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "decision",
+      title: "Deploy gateway hotfix",
+      payload: { body: "Shipped gateway hotfix cleanly." },
+      occurredAt: "2026-10-10T10:00:00Z",
+    });
+
+    // Target 2 (B1 ISO body-literal): occurred_at 10 days away, body mentions 2026-10-10
+    const targetBodyIso = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Deploy retro ISO",
+      payload: { body: "Postmortem referencing 2026-10-10 incident." },
+      occurredAt: "2026-10-20T10:00:00Z",
+    });
+
+    // Target 3 (B1 ISO-T body timestamp): occurred_at 10 days away, body mentions 2026-10-10T08:00:00Z
+    const targetBodyIsoT = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Deploy retro timestamp",
+      payload: { body: "Trigger fired at 2026-10-10T08:00:00Z." },
+      occurredAt: "2026-10-21T10:00:00Z",
+    });
+
+    // Target 4 (B1+B2 contiguous "10月10日上线" + 日↔号): occurred_at 10 days away
+    const targetBodyCnContig = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Deploy retro CJK",
+      payload: { body: "回溯10月10日上线变更的监控指标。" },
+      occurredAt: "2026-10-22T10:00:00Z",
+    });
+
+    // Negative mismatched year: 2025年10月10日 (must NOT match 2026-10-10 date concept!)
+    const targetWrongYear = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Deploy archive 2025",
+      payload: { body: "2025年10月10日上线历史记录。" },
+      occurredAt: "2025-10-10T10:00:00Z",
+    });
+
+    // Mixed query: "deploy 2026-10-10" MUST recall targetOccurred (tier 4!), targetBodyIso, targetBodyIsoT, targetBodyCnContig
+    const mixedIso = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "deploy 2026-10-10",
+      limit: 10,
+    });
+    expect(mixedIso.interpretedDates).toEqual(["2026-10-10"]);
+    const mixedIsoTopIds = mixedIso.items.slice(0, 5).map((i) => i.id);
+    // targetOccurred reaches Tier 4 (occurred_at satisfies titleAllCovered!) -> ranks #1!
+    expect(mixedIsoTopIds[0]).toBe(targetOccurred.id);
+    expect(mixedIsoTopIds).toContain(targetBodyIso.id);
+    expect(mixedIsoTopIds).toContain(targetBodyIsoT.id);
+    expect(mixedIsoTopIds).toContain(targetBodyCnContig.id);
+    // Wrong year 2025 must NOT rank in top 4 (only satisfies "deploy", not date 2026-10-10)
+    expect(mixedIsoTopIds.slice(0, 4)).not.toContain(targetWrongYear.id);
+
+    // Mixed Chinese query with 号 matching body with contiguous 日上线 (B1 + B2!)
+    const mixedCn = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "deploy 10月10号",
+      limit: 10,
+    });
+    expect(mixedCn.interpretedDates).toEqual(["10-10"]);
+    const mixedCnTopIds = mixedCn.items.slice(0, 5).map((i) => i.id);
+    expect(mixedCnTopIds).toContain(targetOccurred.id);
+    expect(mixedCnTopIds).toContain(targetBodyCnContig.id);
+
+    // Pure-date union + overlap deduplication + upper-bound timestamp + negative 2010-10-05/月度日志
+    const pureOverlapRec = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Rollout summary",
+      payload: { body: "Completed 10月10日 rollout." },
+      occurredAt: "2026-10-10T14:00:00Z", // sits in BOTH window AND literal FTS!
+    });
+    const pureUpperBoundRec = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Late evening follow-up",
+      payload: { body: "Post-window check." },
+      occurredAt: "2026-10-11T23:00:00Z", // UTC date prefix 2026-10-11 <= 2026-10-11!
+    });
+    const pureNegRec = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "月度日志 2010-10-05",
+      payload: { body: "Archived on 2010-10-05 for 月度日志." },
+      occurredAt: "2026-05-01T10:00:00Z",
+    });
+
+    // Pure-date query via stopword bypass: "查一下10月10日"
+    const pureRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "查一下10月10日",
+      limit: 20,
+    });
+    expect(pureRes.interpretedDates).toEqual(["10-10"]);
+    expect(formatSearchMarkdown(pureRes)).toContain("dates=`10-10`");
+    const pureIds = pureRes.items.map((i) => i.id);
+    expect(pureIds).toContain(targetOccurred.id);
+    expect(pureIds).toContain(targetBodyCnContig.id);
+    expect(pureIds).toContain(pureOverlapRec.id);
+    expect(pureIds).toContain(pureUpperBoundRec.id);
+    expect(pureIds).not.toContain(pureNegRec.id);
+    // Exact deduped totalMatched === returned items length (no double-counting of pureOverlapRec!)
+    expect(pureRes.totalMatched).toBe(pureRes.items.length);
+    // Window-only hit has matchedBy: ["filter"]
+    const windowOnlyHit = pureRes.items.find((i) => i.id === pureUpperBoundRec.id)!;
+    expect(windowOnlyHit.matchedBy).toContain("filter");
+
+    // Leap-year 3月1日 window (includes 2024-02-29 AND 2025-02-28) & Dec 31 <-> Jan 1 rollover
+    const leapFeb29Rec = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Leap day event",
+      payload: { body: "Leap day maintenance." },
+      occurredAt: "2024-02-29T10:00:00Z",
+    });
+    const nonLeapFeb28Rec = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Feb 28 event",
+      payload: { body: "End of February check." },
+      occurredAt: "2025-02-28T10:00:00Z",
+    });
+    const dec31Rec = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Year end freeze",
+      payload: { body: "New Year freeze active." },
+      occurredAt: "2025-12-31T22:00:00Z",
+    });
+
+    const mar1Res = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "3月1日",
+      limit: 10,
+    });
+    expect(mar1Res.items.map((i) => i.id)).toContain(leapFeb29Rec.id);
+    expect(mar1Res.items.map((i) => i.id)).toContain(nonLeapFeb28Rec.id);
+
+    const jan1Res = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "2026-01-01",
+      limit: 10,
+    });
+    expect(jan1Res.items.map((i) => i.id)).toContain(dec31Rec.id);
+
+    // Two dates in one query: OR'd in candidate passes, scored separately
+    const twoDatesRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "2026-01-01 2024-02-29",
+      limit: 10,
+    });
+    expect(twoDatesRes.interpretedDates).toEqual(["2026-01-01", "2024-02-29"]);
+    expect(twoDatesRes.items.map((i) => i.id)).toContain(dec31Rec.id);
+    expect(twoDatesRes.items.map((i) => i.id)).toContain(leapFeb29Rec.id);
+
+    // show --around "10月10日" remains 100% unchanged (opt-in extractDates=false!)
+    const longRec = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Long dated log",
+      payload: {
+        body: `${"Padding section text. ".repeat(220)}关键节点：10月10日完成切换。${"Trailing section text. ".repeat(220)}`,
+      },
+      occurredAt: "2026-11-01T10:00:00Z",
+    });
+    const showAroundDate = await eng.sea.show({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      ref: longRec.id,
+      around: "10月10日",
+      chars: 600,
+    });
+    expect(showAroundDate.refType).toBe("entry");
+    if (showAroundDate.refType === "entry") {
+      expect(showAroundDate.window.aroundMatched).toBe(true);
+      expect(showAroundDate.content).toContain("10月10日完成切换");
+    }
+
+    // Non-date query stays byte-identical (no interpretedDates key, no dates= header)
+    const nonDateRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "hotfix",
+    });
+    expect("interpretedDates" in nonDateRes).toBe(false);
+    expect(formatSearchMarkdown(nonDateRes)).not.toContain("dates=");
   });
 });

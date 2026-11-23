@@ -466,6 +466,7 @@ export interface RecallResult {
   totalMatched: number;
   omittedCount: number;
   vectorUsed: boolean;
+  interpretedDates?: string[];
   message: string;
 }
 

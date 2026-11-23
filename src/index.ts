@@ -25,7 +25,9 @@ export {
   normalizeForFts,
   parseSearchQuery,
   buildFtsMatchExpression,
+  buildDateLiteralFtsExpr,
   CJK_COVERAGE_THRESHOLD,
+  type DateConcept,
   type SearchConcept,
   type ParsedSearchQuery,
 } from "./adapters/sqlite-db.js";

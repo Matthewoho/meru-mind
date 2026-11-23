@@ -13,6 +13,13 @@ Define intact CJK bigram query parsing with exact JS identifier boundaries, comp
 - **WHEN** a caller searches `"现在上线东京生产了吗"`, `"锁"`, Hangul `"배포"`, `"发布"`, `"agent-worker"`, `"api/v2/auth"`, or `"redis:6379"`
 - **THEN** intact CJK/Hangul compounds and 1-char queries match at start, middle, and end of words, while `"开发，布局"` does not match `"发布"` and longer identifiers (`"agent-worker-bridge"`, `"redis:63790"`) are excluded
 
+### Requirement: Opt-In Query-Side Date Concepts in Search
+`parseSearchQuery(rawQuery, { extractDates })` SHALL default `extractDates` to `false` (leaving `show --around` untouched) and when `true` SHALL extract validated `YYYY-MM-DD`, `YYYY年M月D日/号`, and `M月D日/号` without slicing identifiers or changing FTS indexing. `recall()`/`search()` SHALL combine `±1 day` UTC `occurred_at` windows with literal-date FTS unions (deduping overlap in `totalMatched`), count `occurred_at` hits toward `titleAllCovered`, and echo `interpretedDates`.
+
+#### Scenario: Mixed and pure-date queries recall beyond-top-100 occurred_at and body-literal records accurately
+- **WHEN** a caller searches mixed (`"部署 2026-10-10"`, `"上线 10月10号"`) or pure-date (`"2026-10-10"`, `"查一下10月10日"`) queries over >100 same-keyword records, contiguous `"10月10日上线"`, `日`↔`号`, leap `3月1日`, Dec 31↔Jan 1 rollover, and `2026-10-11T23:00:00Z`
+- **THEN** both `occurred_at`-window and distant body-literal hits are recalled and ranked cleanly without double-counting overlapping records, while `2025年10月10日` (for `2026-10-10`), `2010-10-05`, `"月度日志"`, and `backup_2026-10-10` slicing are rejected
+
 ### Requirement: Comparable Staged Retrieval and Strict Total-Order Lexicographic Ranking
 `SeaEngine.recall()` and `search()` SHALL run Pass-1 (`AND`), Pass-2 (`OR`) FTS5, and optional vector queries with `O(1)` batched hydration, normalizing `-bm25` within each `(coverageTier, matchSource)` group. Ranking SHALL sort lexicographically by `coverageTier`, `coverageRatioBand`, `lexicalMatchFlag`, `statusPriority` (3 active > 2 raw > 1 superseded), `relevanceBand`, `isOlderSameObjectSibling` ASC, SDK-only `focusFlag` (OFF on `search`), and recency DESC.
 

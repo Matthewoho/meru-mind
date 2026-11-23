@@ -33,8 +33,37 @@ export interface FtsMatch {
   rank: number;
 }
 
+export interface DateWindowSpec {
+  /** Inclusive UTC YYYY-MM-DD bounds (d-1..d+1) when year is specified */
+  startDate?: string;
+  endDate?: string;
+  /** Inclusive MM-DD values (with leap-day & year rollover) when year is omitted */
+  monthDays?: string[];
+}
+
 export interface UnifiedFtsSearchParams {
   ftsExpression: string;
+  ledgerRealmIds: string[];
+  seabedRealmIds: string[];
+  includeSuperseded: boolean;
+  recordKinds?: RecordKind[];
+  seabedKinds?: SeabedKind[];
+  since?: string;
+  until?: string;
+  dateWindows?: DateWindowSpec[];
+  allowedEntryIds?: string[];
+  perBucketLimit: number;
+}
+
+export interface UnifiedFtsSearchResult {
+  rows: FtsMatch[];
+  total: number;
+  ledgerCount: number;
+  seabedCount: number;
+}
+
+export interface DateWindowQueryParams {
+  dateWindows: DateWindowSpec[];
   ledgerRealmIds: string[];
   seabedRealmIds: string[];
   includeSuperseded: boolean;
@@ -46,8 +75,16 @@ export interface UnifiedFtsSearchParams {
   perBucketLimit: number;
 }
 
-export interface UnifiedFtsSearchResult {
-  rows: FtsMatch[];
+export interface DateWindowMatch {
+  itemId: string;
+  sourceType: "record" | "seabed" | "distillation";
+  realmId: string;
+  status: string;
+  occurredAt: string | null;
+}
+
+export interface DateWindowQueryResult {
+  rows: DateWindowMatch[];
   total: number;
   ledgerCount: number;
   seabedCount: number;
@@ -463,6 +500,7 @@ export interface DbPort {
     includeSuperseded: boolean;
   }): number;
   searchFtsUnified(params: UnifiedFtsSearchParams): UnifiedFtsSearchResult;
+  listEntriesByDateWindow(params: DateWindowQueryParams): DateWindowQueryResult;
   clearFtsIndex(): void;
 
   // Rebuildable sqlite-vec index

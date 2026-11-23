@@ -2,9 +2,16 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
-import { normalizeAlias } from "../format/inactive-badges.js";
+import {
+  isValidCalendarDate,
+  normalizeAlias,
+} from "../format/inactive-badges.js";
 import { buildRecordFtsBody } from "../format/snippet.js";
 import type {
+  DateWindowMatch,
+  DateWindowQueryParams,
+  DateWindowQueryResult,
+  DateWindowSpec,
   DbPort,
   FtsMatch,
   PendingVectorItem,
@@ -181,6 +188,23 @@ export interface SearchConcept {
   matchText(text: string, lowerText?: string): boolean;
 }
 
+export interface DateConcept {
+  raw: string;
+  year: number | null;
+  month: number;
+  day: number;
+  /** Canonical display label, e.g. "2026-10-10" or "10-10" */
+  label: string;
+  /** ±1 calendar day UTC window spec */
+  window: DateWindowSpec;
+  /** Canonical FTS5 OR expression covering padded/unpadded ISO, ISO-T prefix, and Chinese 日/号 prefix phrases */
+  ftsLiteralExpr: string;
+  /** True iff occurredAt UTC date prefix falls within ±1 calendar day */
+  matchOccurredAt(occurredAt: string | null): boolean;
+  /** True iff body/title text matches any literal variant accepted by ftsLiteralExpr */
+  matchLiteralText(text: string): boolean;
+}
+
 export interface ParsedSearchQuery {
   concepts: SearchConcept[];
   /** Pass 1 (AND across all concepts; multi-bigram CJK uses OR inside parenthesized group) */
@@ -190,6 +214,246 @@ export interface ParsedSearchQuery {
   /** Backward-compatible alias for ftsOrExpression */
   ftsExpression: string | null;
   hasIdentifiers: boolean;
+  /** Present ONLY when parseSearchQuery is called with { extractDates: true } */
+  dateConcepts?: DateConcept[];
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+function formatUtcYmd(ms: number): string {
+  const dt = new Date(ms);
+  return `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+}
+
+function formatUtcMd(ms: number): string {
+  const dt = new Date(ms);
+  return `${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+}
+
+/**
+ * Canonical FTS5 literal expression for a parsed date concept:
+ * - Full Cartesian product of padded/unpadded month & day
+ * - ISO numeric + ISO timestamp T-prefix (`"2026 10 10t"*`) when year is specified
+ * - Chinese `YYYY 年 M 月 D 日/号*` (when year specified) + `M 月 D 日/号*` (always),
+ *   using FTS5 prefix-phrase idiom to match contiguous `"10月10日上线"` and `日`↔`号`.
+ */
+export function buildDateLiteralFtsExpr(dc: {
+  year: number | null;
+  month: number;
+  day: number;
+}): string {
+  const mVariants = Array.from(new Set([String(dc.month), pad2(dc.month)]));
+  const dVariants = Array.from(new Set([String(dc.day), pad2(dc.day)]));
+  const clauses: string[] = [];
+  const seen = new Set<string>();
+  const add = (expr: string) => {
+    if (!seen.has(expr)) {
+      seen.add(expr);
+      clauses.push(expr);
+    }
+  };
+
+  if (dc.year !== null) {
+    const y = String(dc.year);
+    for (const m of mVariants) {
+      for (const d of dVariants) {
+        add(`"${y} ${m} ${d}"`);
+        add(`"${y} ${m} ${d}t"*`);
+        add(`"${y} 年 ${m} 月 ${d} 日"*`);
+        add(`"${y} 年 ${m} 月 ${d} 号"*`);
+      }
+    }
+  }
+  for (const m of mVariants) {
+    for (const d of dVariants) {
+      add(`"${m} 月 ${d} 日"*`);
+      add(`"${m} 月 ${d} 号"*`);
+    }
+  }
+
+  return clauses.join(" OR ");
+}
+
+function makeDateConcept(
+  raw: string,
+  year: number | null,
+  month: number,
+  day: number,
+): DateConcept {
+  const DAY_MS = 86_400_000;
+  let window: DateWindowSpec;
+  let matchOccurredAt: (occurredAt: string | null) => boolean;
+
+  if (year !== null) {
+    const centerMs = Date.UTC(year, month - 1, day);
+    const startDate = formatUtcYmd(centerMs - DAY_MS);
+    const endDate = formatUtcYmd(centerMs + DAY_MS);
+    window = { startDate, endDate };
+    matchOccurredAt = (occurredAt: string | null): boolean => {
+      if (!occurredAt || occurredAt.length < 10) return false;
+      const prefix = occurredAt.slice(0, 10);
+      return prefix >= startDate && prefix <= endDate;
+    };
+  } else {
+    const mdSet = new Set<string>();
+    // Compute ±1 day across BOTH leap year (2024) and non-leap year (2025)
+    // so e.g. year-less 3月1日 includes BOTH 02-28 and 02-29, and Dec 31 <-> Jan 1 rolls over cleanly.
+    for (const refYear of [2024, 2025]) {
+      if (!isValidCalendarDate(refYear, month, day)) continue;
+      const centerMs = Date.UTC(refYear, month - 1, day);
+      mdSet.add(formatUtcMd(centerMs - DAY_MS));
+      mdSet.add(formatUtcMd(centerMs));
+      mdSet.add(formatUtcMd(centerMs + DAY_MS));
+    }
+    const monthDays = Array.from(mdSet).sort();
+    window = { monthDays };
+    matchOccurredAt = (occurredAt: string | null): boolean => {
+      if (!occurredAt || occurredAt.length < 10) return false;
+      return mdSet.has(occurredAt.slice(5, 10));
+    };
+  }
+
+  const label =
+    year !== null
+      ? `${year}-${pad2(month)}-${pad2(day)}`
+      : `${pad2(month)}-${pad2(day)}`;
+  const ftsLiteralExpr = buildDateLiteralFtsExpr({ year, month, day });
+
+  // Body-side JS matcher: digit-only boundaries matching everything ftsLiteralExpr accepts,
+  // while rejecting mismatched YYYY年 on year-qualified queries and rejecting 2010-10-05 for 10-10.
+  const mPat = month < 10 ? `0?${month}` : String(month);
+  const dPat = day < 10 ? `0?${day}` : String(day);
+
+  const isoBodyRe =
+    year !== null
+      ? new RegExp(
+          `(?<!\\d)${year}[-/.\\s]${mPat}[-/.\\s]${dPat}(?!\\d)`,
+          "i",
+        )
+      : null;
+  const cnFullBodyRe =
+    year !== null
+      ? new RegExp(`(?<!\\d)${year}\\s*年\\s*${mPat}\\s*月\\s*${dPat}\\s*[日号]`)
+      : null;
+  const cnMdBodyRe = new RegExp(
+    `(?<!\\d)${mPat}\\s*月\\s*${dPat}\\s*[日号]`,
+    "g",
+  );
+  const numericMdBodyRe =
+    year === null
+      ? new RegExp(`(?<!\\d)${mPat}[-/]${dPat}(?!\\d|[-/]\\d)`)
+      : null;
+
+  const matchLiteralText = (text: string): boolean => {
+    if (!text) return false;
+    if (year !== null) {
+      if (isoBodyRe!.test(text)) return true;
+      if (cnFullBodyRe!.test(text)) return true;
+      cnMdBodyRe.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = cnMdBodyRe.exec(text)) !== null) {
+        const before = text.slice(0, m.index);
+        const yearPrefix = /(\d{4})\s*年\s*$/.exec(before);
+        if (yearPrefix && Number.parseInt(yearPrefix[1]!, 10) !== year) {
+          continue;
+        }
+        return true;
+      }
+      return false;
+    }
+    cnMdBodyRe.lastIndex = 0;
+    if (cnMdBodyRe.test(text)) return true;
+    if (numericMdBodyRe!.test(text)) return true;
+    return false;
+  };
+
+  return {
+    raw,
+    year,
+    month,
+    day,
+    label,
+    window,
+    ftsLiteralExpr,
+    matchOccurredAt,
+    matchLiteralText,
+  };
+}
+
+// Strict extraction order:
+// 1. ISO full date (relaxes sentence-end `2026-10-10.` / `2026-10-10:` while NOT slicing `backup_2026-10-10`, `2026-10-10T08:00`, `file:/ops/2026-10-10.md`)
+const QUERY_ISO_DATE_RE =
+  /(?<![A-Za-z0-9_./:-])(\d{4})-(\d{1,2})-(\d{1,2})(?![A-Za-z0-9_/-]|[.:][A-Za-z0-9_/-])/g;
+// 2. Chinese full date (MUST run before Chinese month-day)
+const QUERY_CN_FULL_DATE_RE =
+  /(?<![0-9])(\d{4})年(\d{1,2})月(\d{1,2})[日号]/g;
+// 3. Chinese month-day
+const QUERY_CN_MD_DATE_RE = /(?<![0-9])(\d{1,2})月(\d{1,2})[日号]/g;
+
+function extractDateConceptsFromQuery(rawQuery: string): {
+  strippedQuery: string;
+  dateConcepts: DateConcept[];
+} {
+  const found: Array<{ index: number; concept: DateConcept }> = [];
+  const seenLabels = new Set<string>();
+  let working = rawQuery;
+
+  // Replace each valid date match with a SINGLE SPACE (" ") so adjacent CJK chars never fuse.
+  working = working.replace(
+    QUERY_ISO_DATE_RE,
+    (match, yStr: string, mStr: string, dStr: string, offset: number) => {
+      const year = Number.parseInt(yStr, 10);
+      const month = Number.parseInt(mStr, 10);
+      const day = Number.parseInt(dStr, 10);
+      if (!isValidCalendarDate(year, month, day)) return match;
+      const dc = makeDateConcept(match, year, month, day);
+      if (!seenLabels.has(dc.label)) {
+        seenLabels.add(dc.label);
+        found.push({ index: offset, concept: dc });
+      }
+      return " ";
+    },
+  );
+
+  working = working.replace(
+    QUERY_CN_FULL_DATE_RE,
+    (match, yStr: string, mStr: string, dStr: string, offset: number) => {
+      const year = Number.parseInt(yStr, 10);
+      const month = Number.parseInt(mStr, 10);
+      const day = Number.parseInt(dStr, 10);
+      if (!isValidCalendarDate(year, month, day)) return match;
+      const dc = makeDateConcept(match, year, month, day);
+      if (!seenLabels.has(dc.label)) {
+        seenLabels.add(dc.label);
+        found.push({ index: offset, concept: dc });
+      }
+      return " ";
+    },
+  );
+
+  working = working.replace(
+    QUERY_CN_MD_DATE_RE,
+    (match, mStr: string, dStr: string, offset: number) => {
+      const month = Number.parseInt(mStr, 10);
+      const day = Number.parseInt(dStr, 10);
+      // Use leap year 2024 so year-less 2月29日 is accepted while 2月30日 / 4月31日 are rejected
+      if (!isValidCalendarDate(2024, month, day)) return match;
+      const dc = makeDateConcept(match, null, month, day);
+      if (!seenLabels.has(dc.label)) {
+        seenLabels.add(dc.label);
+        found.push({ index: offset, concept: dc });
+      }
+      return " ";
+    },
+  );
+
+  found.sort((a, b) => a.index - b.index);
+  return {
+    strippedQuery: working,
+    dateConcepts: found.map((f) => f.concept),
+  };
 }
 
 function escapeRegExp(str: string): string {
@@ -315,8 +579,20 @@ function makeNonCjkConcept(raw: string): SearchConcept | null {
  * - Hyphen/slash/colon identifiers (e.g. agent-worker, api/v2, redis:6379) keep exact JS boundary matchers.
  * - Produces both Pass-1 AND expression (`ftsAndExpression`) and Pass-2 OR expression (`ftsOrExpression`).
  */
-export function parseSearchQuery(rawQuery: string): ParsedSearchQuery {
-  const rawSegments = rawQuery.match(SEGMENT_RE) ?? [];
+export function parseSearchQuery(
+  rawQuery: string,
+  options?: { extractDates?: boolean },
+): ParsedSearchQuery {
+  const wantDates = options?.extractDates === true;
+  let queryForSegments = rawQuery;
+  let dateConcepts: DateConcept[] = [];
+  if (wantDates) {
+    const extracted = extractDateConceptsFromQuery(rawQuery);
+    queryForSegments = extracted.strippedQuery;
+    dateConcepts = extracted.dateConcepts;
+  }
+
+  const rawSegments = queryForSegments.match(SEGMENT_RE) ?? [];
   if (rawSegments.length === 0) {
     return {
       concepts: [],
@@ -324,6 +600,7 @@ export function parseSearchQuery(rawQuery: string): ParsedSearchQuery {
       ftsOrExpression: null,
       ftsExpression: null,
       hasIdentifiers: false,
+      ...(wantDates ? { dateConcepts } : {}),
     };
   }
 
@@ -362,8 +639,15 @@ export function parseSearchQuery(rawQuery: string): ParsedSearchQuery {
     }
   }
 
-  // Only strip stopwords/particles when at least one concrete concept remains
-  const chosen = concreteRaw.length > 0 ? concreteRaw : fallbackRaw;
+  // Only strip stopwords/particles when at least one concrete concept remains;
+  // when dateConcepts were extracted and only stopwords remain (e.g. "查一下10月10日"),
+  // skip raw-segment fallback so the query routes cleanly to pure-date mode.
+  const chosen =
+    concreteRaw.length > 0
+      ? concreteRaw
+      : dateConcepts.length > 0
+        ? []
+        : fallbackRaw;
   const seen = new Set<string>();
   const concepts: SearchConcept[] = [];
   for (const raw of chosen) {
@@ -385,6 +669,7 @@ export function parseSearchQuery(rawQuery: string): ParsedSearchQuery {
       ftsOrExpression: null,
       ftsExpression: null,
       hasIdentifiers: false,
+      ...(wantDates ? { dateConcepts } : {}),
     };
   }
 
@@ -420,6 +705,7 @@ export function parseSearchQuery(rawQuery: string): ParsedSearchQuery {
     ftsOrExpression,
     ftsExpression: ftsOrExpression,
     hasIdentifiers: concepts.some((c) => c.isIdentifier),
+    ...(wantDates ? { dateConcepts } : {}),
   };
 }
 
@@ -4472,6 +4758,27 @@ export class SqliteDb implements DbPort {
       where.push(`d.occurred_at IS NOT NULL AND d.occurred_at <= ?`);
       sqlParams.push(params.until);
     }
+    if (params.dateWindows && params.dateWindows.length > 0) {
+      const dateOrClauses: string[] = [];
+      for (const w of params.dateWindows) {
+        if (w.startDate && w.endDate) {
+          dateOrClauses.push(
+            `(substr(d.occurred_at, 1, 10) >= ? AND substr(d.occurred_at, 1, 10) <= ?)`,
+          );
+          sqlParams.push(w.startDate, w.endDate);
+        } else if (w.monthDays && w.monthDays.length > 0) {
+          dateOrClauses.push(
+            `(substr(d.occurred_at, 6, 5) IN (${placeholders(w.monthDays.length)}))`,
+          );
+          sqlParams.push(...w.monthDays);
+        }
+      }
+      if (dateOrClauses.length > 0) {
+        where.push(
+          `d.occurred_at IS NOT NULL AND (${dateOrClauses.join(" OR ")})`,
+        );
+      }
+    }
     if (params.allowedEntryIds && params.allowedEntryIds.length > 0) {
       where.push(`d.item_id IN (SELECT value FROM json_each(?))`);
       sqlParams.push(JSON.stringify(params.allowedEntryIds));
@@ -4521,6 +4828,175 @@ export class SqliteDb implements DbPort {
         realmId: String(r.realm_id),
         status: String(r.status),
         rank: Number(r.rank),
+      };
+    });
+
+    return { rows, total, ledgerCount, seabedCount };
+  }
+
+  listEntriesByDateWindow(
+    params: DateWindowQueryParams,
+  ): DateWindowQueryResult {
+    const empty: DateWindowQueryResult = {
+      rows: [],
+      total: 0,
+      ledgerCount: 0,
+      seabedCount: 0,
+    };
+    if (
+      !params.dateWindows ||
+      params.dateWindows.length === 0 ||
+      params.perBucketLimit <= 0
+    ) {
+      return empty;
+    }
+    if (
+      params.ledgerRealmIds.length === 0 &&
+      params.seabedRealmIds.length === 0
+    ) {
+      return empty;
+    }
+    if (
+      params.allowedEntryIds !== undefined &&
+      params.allowedEntryIds.length === 0
+    ) {
+      return empty;
+    }
+
+    const hasRecKinds = Boolean(
+      params.recordKinds && params.recordKinds.length > 0,
+    );
+    const hasSeaKinds = Boolean(
+      params.seabedKinds && params.seabedKinds.length > 0,
+    );
+    if (hasRecKinds && !hasSeaKinds && params.ledgerRealmIds.length === 0) {
+      return empty;
+    }
+    if (hasSeaKinds && !hasRecKinds && params.seabedRealmIds.length === 0) {
+      return empty;
+    }
+
+    const where: string[] = [];
+    const sqlParams: SQLInputValue[] = [];
+
+    // Strict ledger vs seabed realm scope isolation (matching searchFtsUnified)
+    if (
+      params.ledgerRealmIds.length > 0 &&
+      params.seabedRealmIds.length > 0
+    ) {
+      where.push(
+        `((d.source_type IN ('record', 'distillation') AND d.realm_id IN (${placeholders(params.ledgerRealmIds.length)})) OR (d.source_type = 'seabed' AND d.realm_id IN (${placeholders(params.seabedRealmIds.length)})))`,
+      );
+      sqlParams.push(...params.ledgerRealmIds, ...params.seabedRealmIds);
+    } else if (params.ledgerRealmIds.length > 0) {
+      where.push(
+        `d.source_type IN ('record', 'distillation') AND d.realm_id IN (${placeholders(params.ledgerRealmIds.length)})`,
+      );
+      sqlParams.push(...params.ledgerRealmIds);
+    } else {
+      where.push(
+        `d.source_type = 'seabed' AND d.realm_id IN (${placeholders(params.seabedRealmIds.length)})`,
+      );
+      sqlParams.push(...params.seabedRealmIds);
+    }
+
+    if (!params.includeSuperseded) {
+      where.push(`d.status IN ('active', 'evidence')`);
+    }
+
+    if (hasRecKinds && hasSeaKinds) {
+      where.push(
+        `((d.source_type = 'record' AND d.kind IN (${placeholders(params.recordKinds!.length)})) OR (d.source_type = 'seabed' AND d.kind IN (${placeholders(params.seabedKinds!.length)})))`,
+      );
+      sqlParams.push(...params.recordKinds!, ...params.seabedKinds!);
+    } else if (hasRecKinds) {
+      where.push(
+        `d.source_type = 'record' AND d.kind IN (${placeholders(params.recordKinds!.length)})`,
+      );
+      sqlParams.push(...params.recordKinds!);
+    } else if (hasSeaKinds) {
+      where.push(
+        `d.source_type = 'seabed' AND d.kind IN (${placeholders(params.seabedKinds!.length)})`,
+      );
+      sqlParams.push(...params.seabedKinds!);
+    }
+
+    if (params.since) {
+      where.push(`d.occurred_at IS NOT NULL AND d.occurred_at >= ?`);
+      sqlParams.push(params.since);
+    }
+    if (params.until) {
+      where.push(`d.occurred_at IS NOT NULL AND d.occurred_at <= ?`);
+      sqlParams.push(params.until);
+    }
+
+    const dateOrClauses: string[] = [];
+    for (const w of params.dateWindows) {
+      if (w.startDate && w.endDate) {
+        dateOrClauses.push(
+          `(substr(d.occurred_at, 1, 10) >= ? AND substr(d.occurred_at, 1, 10) <= ?)`,
+        );
+        sqlParams.push(w.startDate, w.endDate);
+      } else if (w.monthDays && w.monthDays.length > 0) {
+        dateOrClauses.push(
+          `(substr(d.occurred_at, 6, 5) IN (${placeholders(w.monthDays.length)}))`,
+        );
+        sqlParams.push(...w.monthDays);
+      }
+    }
+    if (dateOrClauses.length === 0) {
+      return empty;
+    }
+    where.push(`d.occurred_at IS NOT NULL AND (${dateOrClauses.join(" OR ")})`);
+
+    if (params.allowedEntryIds && params.allowedEntryIds.length > 0) {
+      where.push(`d.item_id IN (SELECT value FROM json_each(?))`);
+      sqlParams.push(JSON.stringify(params.allowedEntryIds));
+    }
+
+    const sql = `
+      WITH m AS MATERIALIZED (
+        SELECT d.item_id, d.source_type, d.realm_id, d.status, d.occurred_at
+        FROM fts_docs d
+        WHERE ${where.join(" AND ")}
+      )
+      SELECT item_id, source_type, realm_id, status, occurred_at,
+             (SELECT COUNT(*) FROM m) AS total
+      FROM (
+        SELECT m.*,
+               ROW_NUMBER() OVER (
+                 PARTITION BY CASE WHEN source_type = 'seabed' THEN 1 ELSE 0 END
+                 ORDER BY occurred_at DESC, item_id ASC
+               ) AS rn
+        FROM m
+      )
+      WHERE rn <= ?
+      ORDER BY occurred_at DESC, item_id ASC
+    `;
+
+    const rawRows = this.db
+      .prepare(sql)
+      .all(...sqlParams, params.perBucketLimit) as Array<
+      Record<string, unknown>
+    >;
+
+    if (rawRows.length === 0) {
+      return empty;
+    }
+
+    const total = Number(rawRows[0]!.total ?? 0);
+    let ledgerCount = 0;
+    let seabedCount = 0;
+    const rows: DateWindowMatch[] = rawRows.map((r) => {
+      const sourceType = String(r.source_type) as DateWindowMatch["sourceType"];
+      if (sourceType === "seabed") seabedCount += 1;
+      else ledgerCount += 1;
+      return {
+        itemId: String(r.item_id),
+        sourceType,
+        realmId: String(r.realm_id),
+        status: String(r.status),
+        occurredAt: r.occurred_at == null ? null : String(r.occurred_at),
       };
     });
 
