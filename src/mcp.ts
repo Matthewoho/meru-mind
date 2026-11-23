@@ -47,7 +47,6 @@ function errResult(
 
 export interface MindMcpServerOptions {
   homeDir?: string;
-  driveMode?: "local" | "layerfs";
   orgId?: string;
   viewerRealmId?: string;
   actorId?: string;
@@ -61,10 +60,6 @@ export interface MindMcpServerOptions {
 export async function createMindMcpServer(options?: MindMcpServerOptions) {
   const engine = await createMindEngine({
     homeDir: options?.homeDir,
-    driveMode:
-      options?.driveMode ??
-      ((process.env.MERU_MIND_DRIVE as "local" | "layerfs" | undefined) ??
-        "local"),
   });
 
   const envOrgId = options?.orgId ?? process.env.MERU_MIND_ORG_ID?.trim();

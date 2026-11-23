@@ -548,7 +548,7 @@ export interface DbPort {
 
 /**
  * Immutable content-addressed blob storage for seabed attachments, evidence, and drive snapshots.
- * Survives LayerFS crash/loss so the entire drive can be rebuilt from SQLite + blobs.
+ * Enables rebuilding the local shared drive working tree from SQLite + blobs after crash/reset.
  */
 export interface BlobPort {
   put(content: Buffer | string): { sha256: string; bytes: number };
@@ -564,18 +564,17 @@ export interface DriveWriteResult {
 }
 
 /**
- * Concurrent MindRealm shared file drive port.
- * Primary concurrent adapter: LayerFSDriveAdapter (branch-per-write + native Conflict detection).
- * Local fallback adapter: LocalFsDriveAdapter (optimistic version check on local disk).
+ * MindRealm shared file drive port (experimental).
+ * Default zero-Docker adapter: LocalFsDriveAdapter (optimistic version check on local disk).
  */
 export interface DrivePort {
-  readonly kind: "layerfs" | "local";
+  readonly kind: "local";
   init(): Promise<void>;
   readFile(realmId: string, relPath: string): Promise<DriveFileContent | null>;
   listFiles(realmId: string): Promise<DriveFileMeta[]>;
   /**
    * Optimistic concurrent write:
-   * - If expectedVersion is provided and does not match the current version (or LayerFS reports Conflict),
+   * - If expectedVersion is provided and does not match the current version,
    *   MUST throw MindError("CONFLICT", ...) without overwriting the winning version.
    */
   writeFile(params: {

@@ -2241,7 +2241,7 @@ export class LedgerEngine {
     };
   }
 
-  // ---- MindRealm Shared Drive (LayerFS / Local + Immutable Blob Mirror) ----
+  // ---- MindRealm Shared Drive (Local + Immutable Blob Mirror, Experimental) ----
 
   async writeDriveFile(params: {
     actor: Actor;
@@ -2284,7 +2284,7 @@ export class LedgerEngine {
       }
     }
 
-    // Write via DrivePort (LayerFS or LocalFs) with optimistic conflict detection
+    // Write via DrivePort (LocalFs) with optimistic conflict detection
     const res = await this.drive.writeFile({
       realmId: targetRealmId,
       relPath: params.relPath,
@@ -2295,7 +2295,7 @@ export class LedgerEngine {
     });
 
     // Mirror committed snapshot into immutable BlobPort + SQLite metadata
-    // so the entire drive survives a LayerFS volume loss/reset.
+    // so the entire drive survives a working-tree loss/reset.
     const blob = this.blobs.put(params.content);
     const meta: DriveFileMeta = {
       ...res.meta,

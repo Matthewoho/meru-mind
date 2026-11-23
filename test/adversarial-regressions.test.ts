@@ -10,8 +10,6 @@ import {
   restoreWritablePermissions,
   type Actor,
   type EmbedderPort,
-  type LayerFSClientLike,
-  type LayerFSWorkspaceHandle,
   type MindEngine,
   type RecordKind,
 } from "../src/index.js";
@@ -404,53 +402,9 @@ describe("Adversarial security & invariant regressions", () => {
     expect(verdict.extKind).toBe("review_verdict");
   });
 
-  it("rolls back LayerFS workspace file cleanly on Conflict so winner content stays intact", async () => {
-    const workDir = makeTempDir("meru-mind-lfs-rb-");
-    let conflictNext = false;
-    const client: LayerFSClientLike = {
-      projectName: "test",
-      branch: { async fork() { return {}; } },
-      sandbox: {
-        async create() { return { sandbox: "sb_1" }; },
-        async close() { return {}; },
-      },
-      workspace: {
-        async mount(sandbox: string): Promise<LayerFSWorkspaceHandle> {
-          return { sandbox, path: workDir };
-        },
-        async exec(_ws, command) {
-          const { execFileSync } = await import("node:child_process");
-          try {
-            const stdout = execFileSync("sh", ["-c", command], {
-              cwd: workDir,
-              encoding: "utf8",
-            });
-            return { exitCode: 0, stdout, stderr: "" };
-          } catch (err: unknown) {
-            const e = err as { status?: number; stdout?: string; stderr?: string };
-            return {
-              exitCode: e.status ?? 1,
-              stdout: String(e.stdout ?? ""),
-              stderr: String(e.stderr ?? ""),
-            };
-          }
-        },
-        async commit() {
-          if (conflictNext) {
-            conflictNext = false;
-            return { kind: "Conflict" };
-          }
-          return { kind: "Committed", commitId: "c1" };
-        },
-        async unmount() { return {}; },
-      },
-      async close() { return; },
-    };
-
+  it("preserves winner content cleanly in LocalFsDriveAdapter when a stale expectedVersion hits Conflict", async () => {
     const engine = await createMindEngine({
-      homeDir: makeTempDir("meru-mind-lfs-rb-home-"),
-      driveMode: "layerfs",
-      layerfsClient: client,
+      homeDir: makeTempDir("meru-mind-local-rb-home-"),
     });
     engines.push(engine);
 
@@ -463,18 +417,17 @@ describe("Adversarial security & invariant regressions", () => {
       expectedVersion: 0,
     });
 
-    conflictNext = true;
     await expect(
       engine.ledger.writeDriveFile({
         actor: agentGemini,
         viewerRealmId: rootRealm.id,
         relPath: "STATE.md",
         content: "LOSER_CONFLICT",
-        expectedVersion: 1,
+        expectedVersion: 0,
       }),
     ).rejects.toMatchObject({ code: "CONFLICT" });
 
-    // Winner MUST still be in the live mounted LayerFS workspace
+    // Winner MUST still be intact on disk
     const live = await engine.ledger.readDriveFile({
       actor: humanAlice,
       viewerRealmId: rootRealm.id,

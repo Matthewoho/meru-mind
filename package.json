@@ -37,7 +37,9 @@
   "files": [
     "dist",
     "skills",
+    "docs",
     "README.md",
+    "README.zh-CN.md",
     "ARCHITECTURE.md",
     "LICENSE"
   ],
@@ -46,7 +48,7 @@
   },
   "packageManager": "pnpm@11.5.1",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
     "pretest": "pnpm build",
     "test": "vitest run",

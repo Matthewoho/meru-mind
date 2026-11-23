@@ -17,8 +17,8 @@ Meru Mind separates **space & visibility (`MindRealm`)** from **time & memory de
 | Thin Ports:  DbPort | DrivePort | BlobPort | EmbedderPort   |
 +-------------------------------------------------------------+
 | Adapters:                                                   |
-|   SqliteDb (Node 22 node:sqlite + WAL + FTS5 + sqlite-vec)  |
-|   LayerFSDriveAdapter / LocalFsDriveAdapter                 |
+|   SqliteDb (Node 22+ node:sqlite + WAL + FTS5 + sqlite-vec) |
+|   LocalFsDriveAdapter (experimental local shared drive)     |
 |   LocalBlobStore (sha256, 0o444 immutable)                  |
 |   OpenAICompatibleEmbedder (off-write-path batch sync)      |
 +-------------------------------------------------------------+
@@ -35,8 +35,9 @@ Meru Mind separates **space & visibility (`MindRealm`)** from **time & memory de
 7. **Local-Passage Windowed Coverage in Search**: For long documents (`> 2000` chars), lexical and query-side date coverage is evaluated over fixed-stride overlapping local windows (`W = 2000`, `stride = 1000`) with seam year-prefix and word-boundary protection so long multi-topic documents cannot inflate coverage scores by scattering unrelated terms across distant sections.
 8. **Deterministic Hard Facts in Distillations**: Counts, IDs, and participants in `distillations.hardFacts` are computed solely by code; narrative text references verified `sourceIds`.
 9. **Sensitivity Enforcement**: `secret` entries bypass FTS5, `vec_pending`, `vec_items`, `brief`, `exportSlice`, `change_log` summaries, and all list/timeline paths; they are only readable by exact ID lookup within visible scope. `confidential` entries participate in in-org recall and `brief`, but are strictly excluded from `exportSlice`.
-10. **Crash-Safe Drive Mirroring & Durable Change Log**: Every committed drive file (whether via `LayerFSDriveAdapter` or `LocalFsDriveAdapter`) is mirrored into immutable `blobs/<sha256>` and indexed in `drive_files`. Calling `rebuild()` restores FTS5, `sqlite-vec`, and the entire drive working tree from canonical truth while preserving `change_log` and `change_log_generation`.
+10. **Crash-Safe Drive Mirroring & Durable Change Log**: Every committed local drive file (`LocalFsDriveAdapter`, experimental) is mirrored into immutable `blobs/<sha256>` and indexed in `drive_files`. Calling `rebuild()` restores FTS5, `sqlite-vec`, and the entire local drive working tree from canonical truth while preserving `change_log` and `change_log_generation`.
 11. **Zero Data Inside Repository**: `createMindEngine` refuses to initialize a runtime home inside the `@meru-mind/core` source tree.
+12. **SQLite Canonical Backend & Forward-Only Migrations**: SQLite (`node:sqlite` + WAL) is the sole core storage backend and canonical online source of truth (switching to Postgres/remote DB is a future trigger-based migration project, not a zero-rewrite swap). Every `mind.sqlite` created by `v0.2.0` is guaranteed to remain forward-compatible with newer releases (downgrades are unsupported). Note that `node:sqlite` is currently a Node.js experimental built-in module tested in CI on Node 22 and Node 24.
 
 ## Threat Model & Operational Semantics
 

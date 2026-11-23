@@ -1983,7 +1983,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
     const blockingList = path.join(tmpDir, "block.txt");
     fs.writeFileSync(
       blockingList,
-      "# comment line should be ignored\n\nLayerFSDriveAdapter\n",
+      "# comment line should be ignored\n\nLocalFsDriveAdapter\n",
       "utf8",
     );
     let blockedExit = 0;

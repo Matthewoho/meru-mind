@@ -379,7 +379,7 @@ RECORD [write]:
         [--about <obj>]... [--supersedes <entry>]... [--because <ref>]...
         [--occurred-at <iso|none>] [--sensitivity public|internal|confidential|secret]
 
-MANAGE [write / human]:
+MANAGE [write / human] (experimental: file, raw, settle):
   realm | entry | object | file | rule | raw | redact | settle | import | org | admin
 
 OUTPUT:
@@ -530,8 +530,8 @@ Examples:
   meru-mind object set service:payment-api --state inactive --label deprecated --since 2026-10-26 --because rec_0123456789abcdef
   meru-mind object alias service:payment-api --add "Payment API"
 `,
-  file: `Risk: write
-When to use: Write a versioned file to a MindRealm shared drive (use 'meru-mind show file:...' to read).
+  file: `Risk: write [experimental]
+When to use: Write a versioned file to a MindRealm shared drive (experimental; use 'meru-mind show file:...' to read).
 Usage:
   meru-mind file write <file:/realm/relPath> (--content <text> | --file <localPath>) [--expected-version <n>] [--message <msg>]
 Examples:
@@ -545,8 +545,8 @@ Usage:
 Examples:
   meru-mind rule add --in / --title "Require CI" --body "All merges must pass CI." --as-human
 `,
-  raw: `Risk: write
-When to use: Append immutable raw seabed entries (messages, artifacts, evidence, signals) from scripts/collectors.
+  raw: `Risk: write [experimental]
+When to use: Append immutable raw seabed entries (messages, artifacts, evidence, signals) from scripts/collectors (experimental).
 Usage:
   meru-mind raw add --in <realm> --kind <message|artifact|evidence|signal> --text <T> [--topic <id>] [--file <localPath>] [--source-ref <ref>] [--about <obj>]... [--occurred-at <iso|none>] [--sensitivity <level>] [--idempotency-key <key>]
 Examples:
@@ -560,8 +560,8 @@ Usage:
 Examples:
   meru-mind redact rec_0123456789abcdef --reason "secret leaked" --as-human
 `,
-  settle: `Risk: write
-When to use: Create a deterministic distillation slice or cognitive card for a realm.
+  settle: `Risk: write [experimental]
+When to use: Create a deterministic distillation slice or cognitive card for a realm (experimental).
 Usage:
   meru-mind settle --in <realm> --layer <layer> --period <key> [--narrative <text>] [--sources <a,b>]
 Examples:
@@ -870,11 +870,8 @@ async function main(): Promise<void> {
     });
   }
 
-  const driveMode =
-    (flagStr(flags, "drive") as "local" | "layerfs" | undefined) ?? "local";
   const engine = await createMindEngine({
     homeDir: flagStr(flags, "home"),
-    driveMode,
   });
 
   // Discover hardened `.meru-mind-realm` marker strictly at CLI process entrypoint.

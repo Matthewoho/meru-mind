@@ -3,10 +3,6 @@ import os from "node:os";
 import path from "node:path";
 import { LocalBlobStore } from "./adapters/blob-store.js";
 import { createEmbedderFromEnv } from "./adapters/embedder.js";
-import {
-  LayerFSDriveAdapter,
-  type LayerFSClientLike,
-} from "./adapters/layerfs-drive.js";
 import { LocalFsDriveAdapter } from "./adapters/local-drive.js";
 import { SqliteDb } from "./adapters/sqlite-db.js";
 import { LedgerEngine } from "./engine/ledger.js";
@@ -41,13 +37,6 @@ export {
   LocalFsDriveAdapter,
   normalizeSafeRelPath,
 } from "./adapters/local-drive.js";
-export {
-  LayerFSDriveAdapter,
-  type LayerFSClientLike,
-  type LayerFSDriveOptions,
-  type LayerFSRuntimeLike,
-  type LayerFSWorkspaceHandle,
-} from "./adapters/layerfs-drive.js";
 export {
   LedgerEngine,
   computePayloadHash,
@@ -178,17 +167,10 @@ export {
 export interface MindEngineOptions {
   /** Runtime data home directory. Defaults to MERU_MIND_HOME or ~/.meru-mind */
   homeDir?: string;
-  /** Drive backend: "local" (default, zero-Docker) or "layerfs" (concurrent LayerFS SDK) */
-  driveMode?: "local" | "layerfs";
-  /** LayerFS project name when driveMode === "layerfs" */
-  layerfsProjectName?: string;
-  /** Optional explicit LayerFS SDK module path */
-  layerfsSdkSpecifier?: string;
-  /** Optional custom ports (for testing or cloud adapters) */
+  /** Optional custom ports (for testing or custom adapters) */
   db?: DbPort;
   blobs?: BlobPort;
   drive?: DrivePort;
-  layerfsClient?: LayerFSClientLike;
   embedder?: EmbedderPort;
   /** Override vector dimensions (must match embedder.dimensions) */
   vectorDimensions?: number;
@@ -288,21 +270,8 @@ export async function createMindEngine(
   const blobs =
     options.blobs ?? new LocalBlobStore(path.join(homeDir, "blobs"));
 
-  let drive: DrivePort;
-  if (options.drive) {
-    drive = options.drive;
-  } else if (options.driveMode === "layerfs") {
-    drive = new LayerFSDriveAdapter({
-      projectName: options.layerfsProjectName ?? "meru-mind-drive",
-      homeDir: path.join(homeDir, "layerfs"),
-      sdkSpecifier: options.layerfsSdkSpecifier,
-      client: options.layerfsClient,
-      getCanonicalMeta: (realmId, relPath) =>
-        db.getDriveFileMeta(realmId, relPath),
-    });
-  } else {
-    drive = new LocalFsDriveAdapter(path.join(homeDir, "drive"));
-  }
+  const drive: DrivePort =
+    options.drive ?? new LocalFsDriveAdapter(path.join(homeDir, "drive"));
 
   await drive.init();
 

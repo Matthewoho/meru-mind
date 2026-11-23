@@ -56,8 +56,7 @@ function assertSafeRealmId(realmId: string): void {
 
 /**
  * Local filesystem DrivePort adapter with optimistic version conflict detection.
- * Used as the zero-Docker local fallback and test adapter; shares the exact DrivePort
- * contract with LayerFSDriveAdapter.
+ * Zero-Docker local drive adapter backed by SQLite + immutable blob mirrors.
  */
 export class LocalFsDriveAdapter implements DrivePort {
   readonly kind = "local" as const;

@@ -4,12 +4,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createMindEngine,
-  LayerFSDriveAdapter,
+  LocalFsDriveAdapter,
   restoreWritablePermissions,
   type Actor,
   type EmbedderPort,
-  type LayerFSClientLike,
-  type LayerFSWorkspaceHandle,
   type MindEngine,
 } from "../src/index.js";
 
@@ -50,81 +48,7 @@ class SimpleEmbedder implements EmbedderPort {
   }
 }
 
-/**
- * In-memory LayerFS client harness simulating real workspace.exec / workspace.commit
- * including native LayerFS `{ kind: "Conflict" }` responses and volume wipes.
- */
-function createFakeLayerFSClient() {
-  const workDir = makeTempDir("meru-mind-fake-lfs-");
-  let nextCommitConflict = false;
-  let commitCounter = 0;
-
-  const client: LayerFSClientLike = {
-    projectName: "meru-mind-test",
-    branch: {
-      async fork() {
-        return {};
-      },
-    },
-    sandbox: {
-      async create() {
-        return { sandbox: "sb_1" };
-      },
-      async close() {
-        return {};
-      },
-    },
-    workspace: {
-      async mount(sandbox: string): Promise<LayerFSWorkspaceHandle> {
-        return { sandbox, path: workDir };
-      },
-      async exec(_ws, command) {
-        const { execFileSync } = await import("node:child_process");
-        try {
-          const stdout = execFileSync("sh", ["-c", command], {
-            cwd: workDir,
-            encoding: "utf8",
-          });
-          return { exitCode: 0, stdout, stderr: "" };
-        } catch (err: unknown) {
-          const e = err as { status?: number; stdout?: string; stderr?: string };
-          return {
-            exitCode: e.status ?? 1,
-            stdout: String(e.stdout ?? ""),
-            stderr: String(e.stderr ?? ""),
-          };
-        }
-      },
-      async commit(_ws, _message, force) {
-        if (nextCommitConflict && !force) {
-          nextCommitConflict = false;
-          return { kind: "Conflict" };
-        }
-        commitCounter += 1;
-        return { kind: "Committed", commitId: `lfs_c_${commitCounter}` };
-      },
-      async unmount() {
-        return {};
-      },
-    },
-    async close() {
-      return;
-    },
-  };
-
-  return {
-    client,
-    workDir,
-    triggerNextConflict() {
-      nextCommitConflict = true;
-    },
-    wipeVolume() {
-      fs.rmSync(path.join(workDir, "realms"), { recursive: true, force: true });
-    },
-  };
-}
-
-describe("Drive concurrency (Local & LayerFS), crash rebuild, slice tamper & home guard", () => {
+describe("Local drive concurrency, crash rebuild, slice tamper & home guard", () => {
   it("detects optimistic concurrency conflicts on LocalFsDriveAdapter without overwriting winner", async () => {
     const engine = await createMindEngine({
       homeDir: makeTempDir("meru-mind-local-drive-"),
@@ -170,19 +94,16 @@ describe("Drive concurrency (Local & LayerFS), crash rebuild, slice tamper & hom
     expect(after?.content).toBe("version 2 winner");
   });
 
-  it("handles LayerFSDriveAdapter native Conflict and recovers full drive + FTS5 + sqlite-vec via rebuild()", async () => {
-    const fakeLfs = createFakeLayerFSClient();
-    const homeDir = makeTempDir("meru-mind-lfs-rebuild-");
+  it("recovers full local drive working tree + FTS5 + sqlite-vec via rebuild() after catastrophic loss", async () => {
+    const homeDir = makeTempDir("meru-mind-local-rebuild-");
     const engine = await createMindEngine({
       homeDir,
-      driveMode: "layerfs",
-      layerfsClient: fakeLfs.client,
       embedder: new SimpleEmbedder(),
       vectorDimensions: 4,
     });
     engines.push(engine);
 
-    expect(engine.drive).toBeInstanceOf(LayerFSDriveAdapter);
+    expect(engine.drive).toBeInstanceOf(LocalFsDriveAdapter);
     const { rootRealm } = engine.ledger.createOrg({ name: "Acme" });
 
     const dec = await engine.ledger.appendRecord({
@@ -207,7 +128,7 @@ describe("Drive concurrency (Local & LayerFS), crash rebuild, slice tamper & hom
     });
     expect(settled.hardFacts.activeRecordCount).toBe(1);
 
-    // Successful LayerFS write mirrors into immutable BlobPort
+    // Successful local drive write mirrors into immutable BlobPort
     const written = await engine.ledger.writeDriveFile({
       actor: humanAlice,
       viewerRealmId: rootRealm.id,
@@ -215,27 +136,14 @@ describe("Drive concurrency (Local & LayerFS), crash rebuild, slice tamper & hom
       content: "# Architecture Spec v1",
       expectedVersion: 0,
     });
-    expect(written.commitId).toBe("lfs_c_1");
     expect(engine.blobs.has(written.meta.sha256)).toBe(true);
 
-    // Native LayerFS Conflict response throws CONFLICT
-    fakeLfs.triggerNextConflict();
-    await expect(
-      engine.ledger.writeDriveFile({
-        actor: agentWorker,
-        viewerRealmId: rootRealm.id,
-        relPath: "specs/design.md",
-        content: "# Conflicting edit",
-        expectedVersion: 1,
-      }),
-    ).rejects.toMatchObject({ code: "CONFLICT" });
-
-    // Simulate catastrophic loss of all derived indexes + disposable LayerFS volume
+    // Simulate catastrophic loss of all derived indexes + local drive working tree
     engine.db.clearFtsIndex();
     engine.db.clearVectorIndex();
-    fakeLfs.wipeVolume();
+    fs.rmSync(path.join(homeDir, "drive"), { recursive: true, force: true });
 
-    // Before rebuild: search and LayerFS read are empty
+    // Before rebuild: search and drive read are empty
     const beforeRebuildSearch = await engine.sea.recall({
       actor: humanAlice,
       viewerRealmId: rootRealm.id,
@@ -250,14 +158,14 @@ describe("Drive concurrency (Local & LayerFS), crash rebuild, slice tamper & hom
       }),
     ).toBeNull();
 
-    // Run rebuild(): reconstructs FTS5, sqlite-vec, and LayerFS volume from SQLite + blobs
+    // Run rebuild(): reconstructs FTS5, sqlite-vec, and local drive tree from SQLite + blobs
     const rebuilt = await engine.sea.rebuild();
     expect(rebuilt.ftsIndexed).toBeGreaterThanOrEqual(3);
     expect(rebuilt.vectorsIndexed).toBeGreaterThanOrEqual(3);
     expect(rebuilt.driveFilesRestored).toBe(1);
     expect(rebuilt.distillationMismatches).toEqual([]);
 
-    // After rebuild: hybrid recall AND LayerFS drive file are 100% restored
+    // After rebuild: hybrid recall AND drive file are 100% restored
     const afterRebuildSearch = await engine.sea.recall({
       actor: humanAlice,
       viewerRealmId: rootRealm.id,
