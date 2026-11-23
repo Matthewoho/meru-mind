@@ -1540,6 +1540,18 @@ describe("V0.2a-Polish: P0-1 zero-leak, O(1) queries, CJK bigrams, lexicographic
       },
     );
     expect(epipeResult.code).toBe(0);
-    expect(epipeResult.stderr).toBe("");
+    // Node 22 emits an ExperimentalWarning for built-in node:sqlite on stderr;
+    // strip only that runtime banner so any EPIPE/stack-trace output still fails.
+    const cleanedStderr = epipeResult.stderr
+      .split("\n")
+      .filter(
+        (line) =>
+          !/^\(node:\d+\) ExperimentalWarning: SQLite is an experimental feature/.test(
+            line,
+          ) && !/^\(Use `node --trace-warnings/.test(line),
+      )
+      .join("\n")
+      .trim();
+    expect(cleanedStderr).toBe("");
   });
 });
