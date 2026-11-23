@@ -585,7 +585,7 @@ export function formatRecallMarkdown(res: RecallResult): string {
           : item.kind === "rule"
             ? "rule"
             : "conclusion");
-      const badge = formatBehaviorBadge(cls, item.kind);
+      const badge = formatBehaviorBadge(cls, item.kind, item.extKind);
       const headHint = item.orphanSuperseded
         ? " (orphan superseded)"
         : item.currentHeadId !== undefined
@@ -1028,7 +1028,7 @@ export function formatSearchMarkdown(res: SearchResult): string {
           : item.kind === "rule"
             ? "rule"
             : "conclusion");
-      const badge = formatBehaviorBadge(cls, item.kind);
+      const badge = formatBehaviorBadge(cls, item.kind, item.extKind);
       const headHint = item.orphanSuperseded
         ? " (orphan superseded)"
         : item.currentHeadId !== undefined

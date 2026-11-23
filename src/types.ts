@@ -436,6 +436,7 @@ export interface RecallItem {
   /** @deprecated Will be removed in v0.3.0; prefer behaviorClass */
   sourceType: "record" | "seabed" | "distillation";
   kind: string;
+  extKind?: string | null;
   realmId: string;
   realmPath?: string;
   status: RecallItemStatus;

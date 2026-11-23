@@ -1113,6 +1113,19 @@ describe("V0.2a Causal Entity Lifecycle & Round-3 UX Polish", () => {
       occurredAt: "2026-10-25T10:00:00Z",
     });
 
+    // Verify tree-mode --because visibility check: /beta cannot cite hidden /alpha evidence!
+    expect(() =>
+      eng.objects.setObjectState({
+        actor: agentWorker,
+        viewerRealmId: beta.id,
+        objectId: betaParent.id,
+        state: "inactive",
+        label: "deprecated",
+        since: "2026-10-26",
+        because: hiddenEvidence.id,
+      }),
+    ).toThrow(/not found|visible/i);
+
     // Check EVERY object-returning endpoint from viewer = /beta: hiddenEvidence.id MUST NEVER LEAK!
     const fromGetObj = eng.objects.getObject({
       viewerRealmId: beta.id,
@@ -1628,6 +1641,24 @@ describe("V0.2a Causal Entity Lifecycle & Round-3 UX Polish", () => {
       expect(showAroundDate.window.aroundMatched).toBe(true);
       expect(showAroundDate.content).toContain("10月10日完成切换");
     }
+
+    // ISO-year upper-bound UTC inclusivity: 2026-10-10T23:00:00Z MUST match query "2026-10-10"
+    const lateUtcRec = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Late UTC deploy note",
+      payload: { body: "Deployed late in UTC day." },
+      occurredAt: "2026-10-10T23:00:00Z",
+    });
+    const lateUtcRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "2026-10-10",
+      limit: 20,
+    });
+    expect(lateUtcRes.items.map((i) => i.id)).toContain(lateUtcRec.id);
 
     // Non-date query stays byte-identical (no interpretedDates key, no dates= header)
     const nonDateRes = await eng.sea.search({

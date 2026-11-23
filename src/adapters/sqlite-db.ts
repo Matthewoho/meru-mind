@@ -354,7 +354,7 @@ function makeDateConcept(
       cnMdBodyRe.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = cnMdBodyRe.exec(text)) !== null) {
-        const before = text.slice(0, m.index);
+        const before = text.slice(Math.max(0, m.index - 12), m.index);
         const yearPrefix = /(\d{4})\s*年\s*$/.exec(before);
         if (yearPrefix && Number.parseInt(yearPrefix[1]!, 10) !== year) {
           continue;

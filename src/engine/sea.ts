@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import {
   CJK_COVERAGE_THRESHOLD,
   parseSearchQuery,
+  type DateConcept,
   type SearchConcept,
 } from "../adapters/sqlite-db.js";
 import { createInactiveBadgeResolver } from "../format/inactive-badges.js";
@@ -672,6 +673,7 @@ export class SeaEngine {
       matchedBy: RecallItem["matchedBy"],
       score: number,
       concepts?: SearchConcept[],
+      passage?: { text: string; start: number; end: number; totalLen: number },
     ): RecallItem => {
       const clean = vis.sanitizeRecord(rec);
       const isSuperseded = rec.status === "superseded";
@@ -681,11 +683,26 @@ export class SeaEngine {
       const orphanSuperseded = isSuperseded
         ? vis.isOrphanSuperseded(rec)
         : undefined;
-      const snippetMeta = buildSnippetWithMeta({
-        title: clean.title,
-        payload: clean.payload,
-        concepts,
-      });
+      const snippetMeta = passage
+        ? buildSnippetWithMeta({
+            title: clean.title,
+            text: passage.text,
+            concepts,
+          })
+        : buildSnippetWithMeta({
+            title: clean.title,
+            payload: clean.payload,
+            concepts,
+          });
+      let snippet = snippetMeta.snippet;
+      if (passage && snippet) {
+        if (passage.start > 0 && !snippet.startsWith("...")) {
+          snippet = `...${snippet}`;
+        }
+        if (passage.end < passage.totalLen && !snippet.endsWith("...")) {
+          snippet = `${snippet}...`;
+        }
+      }
       const canonical = buildCanonicalEntryContent({
         kind: "record",
         payload: clean.payload,
@@ -697,14 +714,15 @@ export class SeaEngine {
         behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
         sourceType: "record",
         kind: clean.kind,
+        ...(clean.extKind ? { extKind: clean.extKind } : {}),
         realmId: clean.realmId,
         realmPath: vis.getSanitizedRealmPath(clean.realmId),
         status: clean.status,
         title: clean.title,
-        snippet: snippetMeta.snippet,
+        snippet,
         contentChars,
-        shownChars: snippetMeta.snippet.length,
-        truncated: snippetMeta.truncated,
+        shownChars: snippet.length,
+        truncated: snippetMeta.truncated || Boolean(passage),
         authorId: clean.authorId,
         createdAt: clean.createdAt,
         occurredAt: clean.occurredAt,
@@ -723,9 +741,22 @@ export class SeaEngine {
       matchedBy: RecallItem["matchedBy"],
       score: number,
       concepts?: SearchConcept[],
+      passage?: { text: string; start: number; end: number; totalLen: number },
     ): RecallItem => {
       const clean = vis.sanitizeSeabed(sea);
-      const snippetMeta = buildSnippetWithMeta({ text: clean.text, concepts });
+      const snippetMeta = buildSnippetWithMeta({
+        text: passage ? passage.text : clean.text,
+        concepts,
+      });
+      let snippet = snippetMeta.snippet;
+      if (passage && snippet) {
+        if (passage.start > 0 && !snippet.startsWith("...")) {
+          snippet = `...${snippet}`;
+        }
+        if (passage.end < passage.totalLen && !snippet.endsWith("...")) {
+          snippet = `${snippet}...`;
+        }
+      }
       return {
         id: clean.id,
         behaviorClass: "raw",
@@ -735,10 +766,10 @@ export class SeaEngine {
         realmPath: vis.getSanitizedRealmPath(clean.realmId),
         status: clean.redactedAt ? "retracted" : "evidence",
         title: `${clean.kind}${clean.topicId ? ` (${clean.topicId})` : ""}`,
-        snippet: snippetMeta.snippet,
+        snippet,
         contentChars: clean.text.length,
-        shownChars: snippetMeta.snippet.length,
-        truncated: snippetMeta.truncated,
+        shownChars: snippet.length,
+        truncated: snippetMeta.truncated || Boolean(passage),
         authorId: clean.authorId,
         createdAt: clean.createdAt,
         occurredAt: clean.occurredAt,
@@ -760,13 +791,23 @@ export class SeaEngine {
       matchedBy: RecallItem["matchedBy"],
       score: number,
       concepts?: SearchConcept[],
+      passage?: { text: string; start: number; end: number; totalLen: number },
     ): RecallItem => {
       const clean = vis.sanitizeDistillation(dist);
       const canonical = clean.narrativeMd || JSON.stringify(clean.hardFacts);
       const snippetMeta = buildSnippetWithMeta({
-        text: canonical,
+        text: passage ? passage.text : canonical,
         concepts,
       });
+      let snippet = snippetMeta.snippet;
+      if (passage && snippet) {
+        if (passage.start > 0 && !snippet.startsWith("...")) {
+          snippet = `...${snippet}`;
+        }
+        if (passage.end < passage.totalLen && !snippet.endsWith("...")) {
+          snippet = `${snippet}...`;
+        }
+      }
       return {
         id: clean.id,
         behaviorClass: "conclusion",
@@ -776,10 +817,10 @@ export class SeaEngine {
         realmPath: vis.getSanitizedRealmPath(clean.realmId),
         status: clean.status,
         title: `${clean.layer} (${clean.periodKey})`,
-        snippet: snippetMeta.snippet,
+        snippet,
         contentChars: canonical.length,
-        shownChars: snippetMeta.snippet.length,
-        truncated: snippetMeta.truncated,
+        shownChars: snippet.length,
+        truncated: snippetMeta.truncated || Boolean(passage),
         authorId: "system",
         createdAt: clean.createdAt,
         occurredAt: clean.createdAt,
@@ -1305,7 +1346,12 @@ export class SeaEngine {
       isOlderSameObjectSibling: number;
       focusFlag: number;
       objectIds: string[];
+      bestPassage?: { text: string; start: number; end: number; totalLen: number };
     }
+
+    const PASSAGE_WINDOW_CHARS = 2000;
+    const PASSAGE_STRIDE_CHARS = 1000;
+    const PASSAGE_DATE_LEFT_PAD = 8;
 
     const concepts = parsedQuery.concepts;
     const totalConceptCount = concepts.length + dateConcepts.length;
@@ -1335,40 +1381,297 @@ export class SeaEngine {
       // Pre-compute lowercased title & body ONCE per candidate
       const titleLower = params.titleText.toLowerCase();
       const bodyLower = params.bodyText.toLowerCase();
-      const fullText = `${params.titleText}\n${params.bodyText}`;
-      const fullLower = `${titleLower}\n${bodyLower}`;
 
-      // Explicitly compute JS title vs title+body coverage (never rely solely on Pass 1 membership)
+      // Title coverage & occurredAt date matches apply globally across all passages
+      const titleScores: number[] = [];
       let textTitleAllCovered = concepts.length > 0;
-      let textFullAllCovered = concepts.length > 0;
-      let scoreSum = 0;
       for (const c of concepts) {
         const threshold = c.isCjk ? CJK_COVERAGE_THRESHOLD : 1.0;
-        if (c.scoreText(params.titleText, titleLower) < threshold) {
+        const ts = c.scoreText(params.titleText, titleLower);
+        titleScores.push(ts);
+        if (ts < threshold) {
           textTitleAllCovered = false;
         }
-        const fullScore = c.scoreText(fullText, fullLower);
-        if (fullScore < threshold) {
-          textFullAllCovered = false;
-        }
-        scoreSum += fullScore;
       }
 
-      let dateSatisfiedCount = 0;
-      let dateAllSatisfied = hasDates;
+      const dateTitleHits: boolean[] = [];
       let dateTitleAllSatisfied = hasDates;
       if (hasDates) {
         for (const dc of dateConcepts) {
           const occHit = dc.matchOccurredAt(params.occurredAt);
           const titleHit = occHit || dc.matchLiteralText(params.titleText);
-          const fullHit = titleHit || dc.matchLiteralText(params.bodyText);
-          if (fullHit) {
-            dateSatisfiedCount += 1;
-          } else {
-            dateAllSatisfied = false;
-          }
+          dateTitleHits.push(titleHit);
           if (!titleHit) {
             dateTitleAllSatisfied = false;
+          }
+        }
+      }
+
+      let textFullAllCovered = concepts.length > 0;
+      let scoreSum = 0;
+      let dateSatisfiedCount = 0;
+      let dateAllSatisfied = hasDates;
+      let bestPassage:
+        | { text: string; start: number; end: number; totalLen: number }
+        | undefined;
+
+      const bodyLen = params.bodyText.length;
+      if (bodyLen <= PASSAGE_WINDOW_CHARS) {
+        const fullText = `${params.titleText}\n${params.bodyText}`;
+        const fullLower = `${titleLower}\n${bodyLower}`;
+        for (const c of concepts) {
+          const threshold = c.isCjk ? CJK_COVERAGE_THRESHOLD : 1.0;
+          const fullScore = c.scoreText(fullText, fullLower);
+          if (fullScore < threshold) {
+            textFullAllCovered = false;
+          }
+          scoreSum += fullScore;
+        }
+        if (hasDates) {
+          for (let j = 0; j < dateConcepts.length; j += 1) {
+            const dc = dateConcepts[j]!;
+            const fullHit =
+              dateTitleHits[j]! || dc.matchLiteralText(params.bodyText);
+            if (fullHit) {
+              dateSatisfiedCount += 1;
+            } else {
+              dateAllSatisfied = false;
+            }
+          }
+        }
+      } else {
+        // Fixed-stride overlapping local-passage evaluation (W=2000, stride=1000, threshold=W).
+        // Pre-filter concepts absent from the entire body and reuse title scores to avoid redundant
+        // per-window regex allocations on multi-hundred-KB documents (exact same mathematical result).
+        let baseTitleScoreSum = 0;
+        let baseTitleCoveredCount = 0;
+        let baseTitleLexAll = concepts.length > 0;
+        const activeBodyConcepts: Array<{
+          concept: SearchConcept;
+          threshold: number;
+          titleScore: number;
+          needsTitleUnion: boolean;
+        }> = [];
+        for (let i = 0; i < concepts.length; i += 1) {
+          const c = concepts[i]!;
+          const threshold = c.isCjk ? CJK_COVERAGE_THRESHOLD : 1.0;
+          const ts = titleScores[i]!;
+          if (ts >= 1.0) {
+            baseTitleScoreSum += ts;
+            baseTitleCoveredCount += 1;
+            continue;
+          }
+          // When activeBodyDates is empty, the branch-and-bound indexOf pass below
+          // already discovers absent concepts in a single pass without scanning bodyLower twice.
+          if (hasDates && c.scoreText(params.bodyText, bodyLower) === 0) {
+            baseTitleScoreSum += ts;
+            if (ts >= threshold) {
+              baseTitleCoveredCount += 1;
+            } else {
+              baseTitleLexAll = false;
+            }
+            continue;
+          }
+          activeBodyConcepts.push({
+            concept: c,
+            threshold,
+            titleScore: ts,
+            needsTitleUnion: ts > 0 && c.isCjk,
+          });
+        }
+
+        const activeBodyDates: DateConcept[] = [];
+        let baseDateCount = 0;
+        let baseDateAll = hasDates;
+        if (hasDates) {
+          for (let j = 0; j < dateConcepts.length; j += 1) {
+            if (dateTitleHits[j]!) {
+              baseDateCount += 1;
+            } else if (dateConcepts[j]!.matchLiteralText(params.bodyText)) {
+              activeBodyDates.push(dateConcepts[j]!);
+            } else {
+              baseDateAll = false;
+            }
+          }
+        }
+
+        if (activeBodyConcepts.length === 0 && activeBodyDates.length === 0) {
+          textFullAllCovered = baseTitleLexAll;
+          scoreSum = baseTitleScoreSum;
+          dateSatisfiedCount = baseDateCount;
+          dateAllSatisfied = baseDateAll;
+        } else {
+          const needTitleUnion = activeBodyConcepts.some((a) => a.needsTitleUnion);
+          const titlePrefix = needTitleUnion ? `${params.titleText}\n` : "";
+          const titleLowerPrefix = needTitleUnion ? `${titleLower}\n` : "";
+          const numWindows = Math.max(
+            1,
+            Math.ceil((bodyLen - PASSAGE_WINDOW_CHARS) / PASSAGE_STRIDE_CHARS) +
+              1,
+          );
+          let bestAllCovered = -1;
+          let bestTotalScore = -1;
+          let bestLexCoveredCount = -1;
+          let bestStart = 0;
+          let bestEnd = Math.min(bodyLen, PASSAGE_WINDOW_CHARS);
+
+          const evaluateWindow = (w: number): void => {
+            const start = w * PASSAGE_STRIDE_CHARS;
+            const end = Math.min(bodyLen, start + PASSAGE_WINDOW_CHARS);
+            const slice = params.bodyText.slice(start, end);
+            const sliceLower = bodyLower.slice(start, end);
+            const winText = needTitleUnion ? titlePrefix + slice : slice;
+            const winLower = needTitleUnion ? titleLowerPrefix + sliceLower : sliceLower;
+
+            let winLexAll = baseTitleLexAll;
+            let winScoreSum = baseTitleScoreSum;
+            let winLexCoveredCount = baseTitleCoveredCount;
+            for (let k = 0; k < activeBodyConcepts.length; k += 1) {
+              const ac = activeBodyConcepts[k]!;
+              const s = ac.needsTitleUnion
+                ? ac.concept.scoreText(winText, winLower)
+                : Math.max(ac.titleScore, ac.concept.scoreText(slice, sliceLower));
+              if (s >= ac.threshold) {
+                winLexCoveredCount += 1;
+              } else {
+                winLexAll = false;
+              }
+              winScoreSum += s;
+            }
+
+            let winDateCount = baseDateCount;
+            let winDateAll = baseDateAll;
+            if (activeBodyDates.length > 0) {
+              const padStart = Math.max(0, start - PASSAGE_DATE_LEFT_PAD);
+              const dateSlice =
+                padStart === start
+                  ? slice
+                  : params.bodyText.slice(padStart, end);
+              for (let j = 0; j < activeBodyDates.length; j += 1) {
+                if (activeBodyDates[j]!.matchLiteralText(dateSlice)) {
+                  winDateCount += 1;
+                } else {
+                  winDateAll = false;
+                }
+              }
+            }
+
+            const winFullAll =
+              concepts.length > 0 && hasDates
+                ? winLexAll && winDateAll
+                : concepts.length > 0
+                  ? winLexAll
+                  : hasDates
+                    ? winDateAll
+                    : false;
+            const winAllFlag = winFullAll ? 1 : 0;
+            const winTotalScore = winScoreSum + winDateCount;
+
+            if (
+              winAllFlag > bestAllCovered ||
+              (winAllFlag === bestAllCovered && winTotalScore > bestTotalScore) ||
+              (winAllFlag === bestAllCovered &&
+                winTotalScore === bestTotalScore &&
+                winLexCoveredCount > bestLexCoveredCount) ||
+              (winAllFlag === bestAllCovered &&
+                winTotalScore === bestTotalScore &&
+                winLexCoveredCount === bestLexCoveredCount &&
+                start < bestStart)
+            ) {
+              bestAllCovered = winAllFlag;
+              bestTotalScore = winTotalScore;
+              bestLexCoveredCount = winLexCoveredCount;
+              textFullAllCovered = winLexAll;
+              scoreSum = winScoreSum;
+              dateSatisfiedCount = winDateCount;
+              dateAllSatisfied = winDateAll;
+              bestStart = start;
+              bestEnd = end;
+            }
+          };
+
+          if (activeBodyDates.length === 0 && numWindows > 4) {
+            // Exact branch-and-bound pre-filter: mark windows containing >=1 term per active concept
+            // via SIMD indexOf (jumping past already-marked blocks), then evaluate highest-hit buckets first.
+            const winHits = new Uint16Array(numWindows);
+            const winSeen = new Int32Array(numWindows).fill(-1);
+            let maxHits = 0;
+            for (let k = 0; k < activeBodyConcepts.length; k += 1) {
+              const terms = activeBodyConcepts[k]!.concept.terms;
+              for (let ti = 0; ti < terms.length; ti += 1) {
+                const needle = terms[ti]!.toLowerCase();
+                if (!needle) continue;
+                const nLen = needle.length;
+                let pos = bodyLower.indexOf(needle, 0);
+                while (pos !== -1) {
+                  const wMax = Math.min(
+                    numWindows - 1,
+                    Math.floor(pos / PASSAGE_STRIDE_CHARS),
+                  );
+                  const wMin = Math.max(
+                    0,
+                    Math.ceil(
+                      (pos + nLen - PASSAGE_WINDOW_CHARS) / PASSAGE_STRIDE_CHARS,
+                    ),
+                  );
+                  for (let w = wMin; w <= wMax; w += 1) {
+                    if (winSeen[w] !== k) {
+                      winSeen[w] = k;
+                      const nh = winHits[w]! + 1;
+                      winHits[w] = nh;
+                      if (nh > maxHits) maxHits = nh;
+                    }
+                  }
+                  if (wMax >= numWindows - 1) break;
+                  const nextFrom = (wMax + 1) * PASSAGE_STRIDE_CHARS;
+                  if (nextFrom >= bodyLen) break;
+                  pos = bodyLower.indexOf(needle, nextFrom);
+                }
+              }
+            }
+
+            if (maxHits === 0) {
+              evaluateWindow(0);
+            } else {
+              for (let h = maxHits; h >= 1; h -= 1) {
+                const upperScore = baseTitleScoreSum + h;
+                if (bestTotalScore > upperScore) break;
+                if (
+                  bestTotalScore >= upperScore &&
+                  (bestAllCovered === 1 ||
+                    baseTitleCoveredCount + h < concepts.length)
+                ) {
+                  break;
+                }
+                let bucketSaturated = false;
+                for (let w = 0; w < numWindows; w += 1) {
+                  if (winHits[w] === h) {
+                    evaluateWindow(w);
+                    if (
+                      bestTotalScore >= upperScore &&
+                      bestLexCoveredCount >= baseTitleCoveredCount + h
+                    ) {
+                      bucketSaturated = true;
+                      break;
+                    }
+                  }
+                }
+                if (bucketSaturated) break;
+              }
+            }
+          } else {
+            for (let w = 0; w < numWindows; w += 1) {
+              evaluateWindow(w);
+            }
+          }
+
+          if (bestTotalScore > 0) {
+            bestPassage = {
+              text: params.bodyText.slice(bestStart, bestEnd),
+              start: bestStart,
+              end: bestEnd,
+              totalLen: bodyLen,
+            };
           }
         }
       }
@@ -1534,6 +1837,7 @@ export class SeaEngine {
         isOlderSameObjectSibling: 0,
         focusFlag: 0,
         objectIds: [],
+        bestPassage,
       };
     };
 
@@ -1901,16 +2205,29 @@ export class SeaEngine {
       pageCandidates.map((c) => {
         const displayScore = computeDisplayScore(c);
         if (c.record) {
-          return toRecordItem(c.record, c.matchedBy, displayScore, concepts);
+          return toRecordItem(
+            c.record,
+            c.matchedBy,
+            displayScore,
+            concepts,
+            c.bestPassage,
+          );
         }
         if (c.seabed) {
-          return toSeabedItem(c.seabed, c.matchedBy, displayScore, concepts);
+          return toSeabedItem(
+            c.seabed,
+            c.matchedBy,
+            displayScore,
+            concepts,
+            c.bestPassage,
+          );
         }
         return toDistillationItem(
           c.distillation!,
           c.matchedBy,
           displayScore,
           concepts,
+          c.bestPassage,
         );
       }),
     );
