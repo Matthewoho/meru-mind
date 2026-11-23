@@ -57,7 +57,7 @@ node dist/cli.js show /backend
 node dist/cli.js search "PostgreSQL" --in /backend
 
 # 7. Export a read-only slice for sandboxed agents
-node dist/cli.js admin export-slice --realm /backend --out /tmp/agent-slice/.meru/.mindrealm
+node dist/cli.js admin export-slice --in /backend --out /tmp/agent-slice/.meru/.mindrealm
 ```
 
 ### MCP Server Usage

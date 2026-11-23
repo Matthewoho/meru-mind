@@ -75,6 +75,15 @@ function readAndValidateMarker(filePath: string): WorkspaceRealmMarker {
  * - When `cwd` is outside `homeDir` (e.g. `/tmp/...`), inspects ONLY `cwd` itself.
  * - Rejects symlinks, non-regular files, files > 512 bytes, and invalid syntax without echoing content.
  */
+function markerPathExists(filePath: string): boolean {
+  try {
+    fs.lstatSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function discoverWorkspaceRealmMarker(
   cwd: string,
   homeDir: string = os.homedir(),
@@ -86,7 +95,7 @@ export function discoverWorkspaceRealmMarker(
   let current = startDir;
   while (true) {
     const candidate = path.join(current, WORKSPACE_REALM_MARKER_FILE);
-    if (fs.existsSync(candidate)) {
+    if (markerPathExists(candidate)) {
       return readAndValidateMarker(candidate);
     }
     if (!allowWalkUp) {

@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +14,7 @@ import {
   resolveAccessScope,
   resolveWriteTargetRealm,
   type Actor,
+  type EmbedderPort,
 } from "../src/index.js";
 
 const tmpDirs: string[] = [];
@@ -108,9 +109,13 @@ describe("V0.2a Slice 4 — Pillar 1: Local-Passage Windowed Coverage & Search e
     expect(idxDeep).toBeGreaterThanOrEqual(0);
     expect(idxScattered).toBeGreaterThanOrEqual(0);
 
-    // Both co-located entries (concise fact AND deep offset-42k SOP) MUST beat the scattered mega-doc!
+    // Both co-located entries (concise fact AND deep offset-42k SOP) MUST reach tier 3 (>=3000),
+    // while the scattered mega-doc MUST drop to tier 2 (<3000)! (Kills M01)
     expect(idxFact).toBeLessThan(idxScattered);
     expect(idxDeep).toBeLessThan(idxScattered);
+    expect(Math.floor(res.items[idxFact]!.score / 1000)).toBe(3);
+    expect(Math.floor(res.items[idxDeep]!.score / 1000)).toBe(3);
+    expect(Math.floor(res.items[idxScattered]!.score / 1000)).toBe(2);
 
     // Deep SOP snippet MUST come from the winning offset-42k passage (not the beginning filler!)
     const deepItem = res.items[idxDeep]!;
@@ -1147,5 +1152,550 @@ describe("V0.2a Slice 4 — Pillar 5: 4-Tier Write Routing, Lazy /inbox, Hardene
     expect(who.inbox?.path).toBe("/inbox");
     expect(who.inbox?.activeEntries).toBe(1);
     expect(formatWhoamiMarkdown(who as never)).toContain("`/inbox` (1 active pending triage)");
+  });
+});
+
+describe("V0.2a Slice 4 — Post-Build Regression & T1 Mutation-Killer Suite (N1-N4, P2-1/2/6)", () => {
+  it("kills M03/M04/M05/N3/P2-1/P2-2: overlapping stride, bucket saturation, partial-title CJK, word boundary & date seam", async () => {
+    const homeDir = makeTempHome();
+    const eng = await createMindEngine({ homeDir });
+    const { rootRealm } = eng.ledger.createOrg({
+      name: "WindowMathOrg",
+      policy: "open",
+      actor: humanAdmin,
+    });
+
+    // 1. M05 (overlapping stride=1000 vs 2000): concepts 100 chars apart straddling index 2000
+    const straddleDoc = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "claim",
+      title: "Straddle doc",
+      payload: {
+        body: `${"x".repeat(1940)} straddleAlpha ${"y".repeat(70)} straddleBeta ${"z".repeat(2500)}`,
+      },
+    });
+    const straddleRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "straddleAlpha straddleBeta",
+    });
+    expect(straddleRes.items[0]?.id).toBe(straddleDoc.id);
+    expect(Math.floor(straddleRes.items[0]!.score / 1000)).toBe(3);
+
+    // 2. M03 (bucket early-exit): window 0 has partial CJK (1/3 bigrams), window 5 has full CJK (3/3)
+    const bucketDoc = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "claim",
+      title: "Long ops manual",
+      payload: {
+        body: `前期讨论系统集群架构。${"a".repeat(5200)} 最终确认：集群容灾演练通过 MarkerWin5。${"b".repeat(1500)}`,
+      },
+    });
+    const bucketRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "集群容灾",
+    });
+    expect(bucketRes.items[0]?.id).toBe(bucketDoc.id);
+    expect(Math.floor(bucketRes.items[0]!.score / 1000)).toBe(3);
+    expect(bucketRes.items[0]!.snippet).toContain("MarkerWin5");
+
+    // 3. N3 (partial-title CJK > 5000 chars): branch-and-bound MUST match exhaustive tier 3
+    const partialTitleDoc = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "claim",
+      title: "数据库 迁移手册",
+      payload: {
+        body: `${"普通日志记录。".repeat(900)} 应急章节：执行 rollback 回退步骤。${"尾部填充。".repeat(300)}`,
+      },
+    });
+    const partialRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "数据库迁移 rollback",
+    });
+    expect(partialRes.items[0]?.id).toBe(partialTitleDoc.id);
+    expect(Math.floor(partialRes.items[0]!.score / 1000)).toBe(3);
+
+    // 4. M04 & P2-2: "2025年" at 995..999 + "10月10日" at 1000..1004 MUST NOT false-match "2026年10月10日"
+    const dateSeamDoc = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "claim",
+      title: "Archive log",
+      payload: {
+        body: `${"p".repeat(995)}2025年10月10日 seamTopicXYZ 处理完毕。${"q".repeat(1800)}`,
+      },
+      occurredAt: "2024-01-01T00:00:00Z",
+    });
+    const seamRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "2026年10月10日 seamTopicXYZ",
+    });
+    const seamHit = seamRes.items.find((i) => i.id === dateSeamDoc.id);
+    expect(seamHit).toBeDefined();
+    expect(Math.floor(seamHit!.score / 1000)).toBe(2);
+
+    // P2-2: real 2026 date 3000 chars away from topic+2025 date must stay tier 2
+    const farDateDoc = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "claim",
+      title: "Far date log",
+      payload: {
+        body: `${"k".repeat(985)}2026年10月10日 远端段落。${"m".repeat(3100)} farTopicABC 发生在 2025年10月10日。${"n".repeat(1200)}`,
+      },
+      occurredAt: "2024-01-01T00:00:00Z",
+    });
+    const farRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "2026年10月10日 farTopicABC",
+    });
+    const farHit = farRes.items.find((i) => i.id === farDateDoc.id);
+    expect(farHit).toBeDefined();
+    expect(Math.floor(farHit!.score / 1000)).toBe(2);
+
+    // 5. P2-1: window cut mid-word ("config|uration") MUST NOT fabricate a false word boundary
+    const cutWordDoc = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "claim",
+      title: "Word boundary cut",
+      payload: {
+        body: `cutZebraOnly ${"w".repeat(1981)}configuration ${"v".repeat(2500)}`,
+      },
+    });
+    const cutRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "cutZebraOnly config",
+    });
+    const cutHit = cutRes.items.find((i) => i.id === cutWordDoc.id);
+    expect(cutHit).toBeDefined();
+    expect(Math.floor(cutHit!.score / 1000)).toBe(2);
+    eng.close();
+  });
+
+  it("kills N1, M08, M16, N2/M19 & P2-6: real CLI --all/--dry-run, check order, vec_items move, importer tree/open moves & dangling symlink", async () => {
+    // 1. N1: real CLI --all and --dry-run in ALL flag positions
+    const cliHome = makeTempHome();
+    const cliBin = path.resolve("dist/cli.js");
+    const runCli = (args: string[]) =>
+      JSON.parse(
+        execFileSync(process.execPath, [cliBin, ...args, "--json"], {
+          env: { ...process.env, MERU_MIND_HOME: cliHome, MERU_MIND_VIEWER_REALM_ID: "" },
+          cwd: cliHome,
+          encoding: "utf8",
+        }),
+      );
+    runCli(["admin", "init", "--org", "CliBoolOrg"]);
+    runCli(["realm", "create", "--parent", "/", "--slug", "eng", "--name", "Eng", "--scope", "Engineering", "--as-human"]);
+    runCli(["realm", "create", "--parent", "/", "--slug", "old", "--name", "Old", "--scope", "Old work", "--as-human"]);
+    const recA = runCli(["write", "--in", "/old", "--title", "A", "--body", "Body A"]) as { id: string };
+    const recB = runCli(["write", "--in", "/old", "--title", "B", "--body", "Body B"]) as { id: string };
+    runCli(["realm", "archive", "/old", "--as-human"]);
+
+    // tree --all and realm list --all MUST work on real CLI!
+    const treeAll = runCli(["tree", "--all"]) as { realms: Array<{ path: string }> };
+    expect(treeAll.realms.map((r) => r.path)).toContain("/old");
+    const listAll = runCli(["realm", "list", "--all"]) as Array<{ path: string }>;
+    expect(listAll.map((r) => r.path)).toContain("/old");
+
+    // entry move --dry-run in BOTH argument orders MUST NOT move A or B!
+    const dry1 = runCli([
+      "entry",
+      "move",
+      "--dry-run",
+      recA.id,
+      recB.id,
+      "--to",
+      "/eng",
+      "--as-human",
+    ]) as { dryRun: boolean; moved: Array<{ id: string }> };
+    expect(dry1.dryRun).toBe(true);
+    expect(dry1.moved.length).toBe(2);
+
+    const dry2 = runCli([
+      "entry",
+      "move",
+      recA.id,
+      recB.id,
+      "--to",
+      "/eng",
+      "--dry-run",
+      "--as-human",
+    ]) as { dryRun: boolean; moved: Array<{ id: string }> };
+    expect(dry2.dryRun).toBe(true);
+    expect(dry2.moved.length).toBe(2);
+
+    // Verify neither A nor B actually moved!
+    const showA = runCli(["show", recA.id]) as { entry: { realmPath: string } };
+    const showB = runCli(["show", recB.id]) as { entry: { realmPath: string } };
+    expect(showA.entry.realmPath).toBe("/old");
+    expect(showB.entry.realmPath).toBe("/old");
+
+    // 2. M08: in tree mode, writing to an invisible archived sibling throws ACCESS_DENIED (NOT CONFLICT) without leaking path
+    const treeHome = makeTempHome();
+    const tEng = await createMindEngine({ homeDir: treeHome });
+    const { org: tOrg, rootRealm: tRoot } = tEng.ledger.createOrg({
+      name: "OrderOrg",
+      policy: "tree",
+      actor: humanAdmin,
+    });
+    const secretArchived = tEng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: tOrg.id,
+      parentId: tRoot.id,
+      slug: "hidden-archived-xyz",
+      name: "Hidden Archived",
+    });
+    const viewer = tEng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: tOrg.id,
+      parentId: tRoot.id,
+      slug: "viewer",
+      name: "Viewer",
+    });
+    tEng.ledger.archiveRealm({
+      actor: humanAdmin,
+      orgId: tOrg.id,
+      realmId: secretArchived.id,
+    });
+    let m08Err: unknown;
+    try {
+      await tEng.ledger.appendRecord({
+        actor: agentWorker,
+        viewerRealmId: viewer.id,
+        targetRealmId: secretArchived.id,
+        kind: "finding",
+        title: "Probe",
+        payload: { body: "Probe" },
+      });
+    } catch (e) {
+      m08Err = e;
+    }
+    expect(m08Err).toBeInstanceOf(MindError);
+    expect((m08Err as MindError).code).toBe("ACCESS_DENIED");
+    expect((m08Err as MindError).message).not.toContain("hidden-archived-xyz");
+    expect((m08Err as MindError).message).not.toMatch(/archived/i);
+
+    // 3. N2 / M19: tree-mode 2-revision moved record + open-mode --in /beta moved record
+    const tBeta = tEng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: tOrg.id,
+      parentId: tRoot.id,
+      slug: "beta",
+      name: "Beta",
+    });
+    const tOps = tEng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: tOrg.id,
+      parentId: tRoot.id,
+      slug: "ops",
+      name: "Ops",
+    });
+    const treeDocs = makeTempHome();
+    const treeFile = path.join(treeDocs, "sop.md");
+    fs.writeFileSync(treeFile, "# SOP\n\nRev 1\n", "utf8");
+    const ti1 = await tEng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: tBeta.id,
+      inputPath: treeDocs,
+      syncEmbeddings: false,
+    });
+    fs.writeFileSync(treeFile, "# SOP\n\nRev 2\n", "utf8");
+    const ti2 = await tEng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: tBeta.id,
+      inputPath: treeDocs,
+      syncEmbeddings: false,
+    });
+    const rev2Id = ti2.items[0]!.recordId!;
+    expect(ti1.created).toBe(1);
+    expect(ti2.superseded).toBe(1);
+    // Human moves 2-rev chain from /beta to /ops
+    tEng.ledger.moveEntries({
+      actor: humanAdmin,
+      orgId: tOrg.id,
+      entryIds: [rev2Id],
+      targetRealmId: tOps.id,
+    });
+    // Re-importing in /beta (both without --in and with explicit --in /beta) MUST skip cleanly (0 duplicates, 0 crash)!
+    const ti3 = await tEng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: tBeta.id,
+      inputPath: treeDocs,
+      syncEmbeddings: false,
+    });
+    expect(ti3.skippedUnchanged).toBe(1);
+    expect(ti3.created).toBe(0);
+    const ti4 = await tEng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: tBeta.id,
+      targetRealmRef: "/beta",
+      inputPath: treeDocs,
+      syncEmbeddings: false,
+    });
+    expect(ti4.skippedUnchanged).toBe(1);
+    expect(ti4.created).toBe(0);
+    tEng.close();
+
+    // N2 open mode: explicit --in /beta after human entry move to /ops MUST stay in /ops!
+    const openImpHome = makeTempHome();
+    const oEng = await createMindEngine({ homeDir: openImpHome });
+    const { org: oOrg, rootRealm: oRoot } = oEng.ledger.createOrg({
+      name: "OpenN2Org",
+      policy: "open",
+      actor: humanAdmin,
+    });
+    const oBeta = oEng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: oOrg.id,
+      parentId: oRoot.id,
+      slug: "beta",
+      name: "Beta",
+    });
+    const oOps = oEng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: oOrg.id,
+      parentId: oRoot.id,
+      slug: "ops",
+      name: "Ops",
+    });
+    const oDocs = makeTempHome();
+    fs.writeFileSync(path.join(oDocs, "guide.md"), "# Guide\n\nBody\n", "utf8");
+    const oi1 = await oEng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: oRoot.id,
+      targetRealmRef: "/beta",
+      inputPath: oDocs,
+      syncEmbeddings: false,
+    });
+    const movedId = oi1.items[0]!.recordId!;
+    oEng.ledger.moveEntries({
+      actor: humanAdmin,
+      orgId: oOrg.id,
+      entryIds: [movedId],
+      targetRealmId: oOps.id,
+    });
+    const oi2 = await oEng.importer.importMd({
+      actor: agentWorker,
+      viewerRealmId: oRoot.id,
+      targetRealmRef: "/beta",
+      inputPath: oDocs,
+      syncEmbeddings: false,
+    });
+    expect(oi2.skippedUnchanged).toBe(1);
+    expect(oi2.superseded).toBe(0);
+    expect(oEng.db.getRecord(movedId)?.realmId).toBe(oOps.id);
+    oEng.close();
+
+    // 4. M16: vec_items partition key updated on entry move!
+    const vecHome = makeTempHome();
+    const stubEmbedder: EmbedderPort = {
+      configured: true,
+      model: "stub-4d",
+      dimensions: 4,
+      embed: async () => new Float32Array([0.5, 0.5, 0.5, 0.5]),
+    };
+    const vEng = await createMindEngine({ homeDir: vecHome, embedder: stubEmbedder });
+    if (vEng.db.vecEnabled) {
+      const { org: vOrg, rootRealm: vRoot } = vEng.ledger.createOrg({
+        name: "VecMoveOrg",
+        policy: "open",
+        actor: humanAdmin,
+      });
+      const vSrc = vEng.ledger.createRealm({
+        actor: humanAdmin,
+        orgId: vOrg.id,
+        parentId: vRoot.id,
+        slug: "src",
+        name: "Src",
+      });
+      const vDst = vEng.ledger.createRealm({
+        actor: humanAdmin,
+        orgId: vOrg.id,
+        parentId: vRoot.id,
+        slug: "dst",
+        name: "Dst",
+      });
+      const vRec = await vEng.ledger.appendRecord({
+        actor: agentWorker,
+        viewerRealmId: vSrc.id,
+        targetRealmId: vSrc.id,
+        kind: "finding",
+        title: "Vector entry",
+        payload: { body: "Vectorized body" },
+      });
+      await vEng.sea.syncEmbeddings();
+      const qVec = new Float32Array([0.5, 0.5, 0.5, 0.5]);
+      expect(
+        vEng.db.searchVectors({ embedding: qVec, realmIds: [vSrc.id], limit: 5 }).map((m) => m.itemId),
+      ).toContain(vRec.id);
+      vEng.ledger.moveEntries({
+        actor: humanAdmin,
+        orgId: vOrg.id,
+        entryIds: [vRec.id],
+        targetRealmId: vDst.id,
+      });
+      expect(
+        vEng.db.searchVectors({ embedding: qVec, realmIds: [vSrc.id], limit: 5 }).map((m) => m.itemId),
+      ).not.toContain(vRec.id);
+      expect(
+        vEng.db.searchVectors({ embedding: qVec, realmIds: [vDst.id], limit: 5 }).map((m) => m.itemId),
+      ).toContain(vRec.id);
+    }
+    vEng.close();
+
+    // 5. P2-6: dangling symlink marker MUST throw (not be silently ignored!)
+    const dangDir = makeTempHome();
+    fs.symlinkSync("/nonexistent/dangling/target/xyz", path.join(dangDir, ".meru-mind-realm"));
+    expect(() => discoverWorkspaceRealmMarker(dangDir, dangDir)).toThrow(
+      /symlink|non-regular/i,
+    );
+  });
+
+  it("kills M29/M30/M31: real dist/mcp.js stdio mind_write with omitted in routes to /inbox and echoes realmPath + routedBy", async () => {
+    const mcpHome = makeTempHome();
+    const eng = await createMindEngine({ homeDir: mcpHome });
+    const { org, rootRealm } = eng.ledger.createOrg({
+      name: "McpRouteOrg",
+      policy: "open",
+      actor: humanAdmin,
+    });
+    const ops = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "ops",
+      name: "Ops",
+      scope: "Operations",
+    });
+    eng.objects.createObject({
+      actor: agentWorker,
+      viewerRealmId: ops.id,
+      targetRealmRef: "/ops",
+      kind: "service",
+      name: "ops-edge",
+    });
+    eng.close();
+
+    const child = spawn(process.execPath, [path.resolve("dist/mcp.js")], {
+      env: { ...process.env, MERU_MIND_HOME: mcpHome, MERU_MIND_VIEWER_REALM_ID: "" },
+      cwd: mcpHome,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const responses = new Map<number, unknown>();
+    let buf = "";
+    const waitForId = (id: number): Promise<any> =>
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`Timeout waiting for MCP id=${id}`)), 8000);
+        const check = () => {
+          if (responses.has(id)) {
+            clearTimeout(timer);
+            resolve(responses.get(id));
+          }
+        };
+        child.stdout.on("data", (chunk: Buffer) => {
+          buf += chunk.toString("utf8");
+          let nl = buf.indexOf("\n");
+          while (nl !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (line) {
+              try {
+                const msg = JSON.parse(line) as { id?: number };
+                if (typeof msg.id === "number") {
+                  responses.set(msg.id, msg);
+                  check();
+                }
+              } catch {
+                // ignore
+              }
+            }
+            nl = buf.indexOf("\n");
+          }
+        });
+        check();
+      });
+
+    const send = (msg: unknown) => {
+      child.stdin.write(`${JSON.stringify(msg)}\n`);
+    };
+
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "test", version: "1.0.0" },
+        },
+      });
+      await waitForId(1);
+      send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+      // 1. mind_write WITHOUT `in` and WITHOUT `about` -> routes to /inbox (kills M29, M30, M31!)
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "mind_write",
+          arguments: {
+            title: "MCP inbox note",
+            body: "No in specified; must land in /inbox.",
+          },
+        },
+      });
+      const r2 = await waitForId(2);
+      expect(r2.result?.isError).not.toBe(true);
+      const parsed2 = JSON.parse(r2.result.content[0].text) as {
+        id: string;
+        realmPath: string;
+        routedBy: string;
+      };
+      expect(parsed2.realmPath).toBe("/inbox");
+      expect(parsed2.routedBy).toBe("inbox");
+
+      // 2. mind_write WITHOUT `in` and WITH `about: ["service:ops-edge"]` -> routes to /ops!
+      send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "mind_write",
+          arguments: {
+            title: "MCP about-routed note",
+            body: "Edge latency alert.",
+            about: ["service:ops-edge"],
+          },
+        },
+      });
+      const r3 = await waitForId(3);
+      expect(r3.result?.isError).not.toBe(true);
+      const parsed3 = JSON.parse(r3.result.content[0].text) as {
+        realmPath: string;
+        routedBy: string;
+      };
+      expect(parsed3.realmPath).toBe("/ops");
+      expect(parsed3.routedBy).toBe("about");
+    } finally {
+      child.kill();
+    }
   });
 });

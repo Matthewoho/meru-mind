@@ -62,7 +62,9 @@ function adaptTryHintForMcp(
   if (code === "AMBIGUOUS_REF" && candidates.length > 0) {
     const first = candidates[0]!;
     if (explicitTry && explicitTry.includes("meru-mind write")) {
-      return `mind_write({ in: ${JSON.stringify(writeRealmRef)}, title: "<title>", body: "<body>", about: [${JSON.stringify(first)}] })`;
+      return options?.orgPolicy === "tree"
+        ? `mind_write({ in: ${JSON.stringify(writeRealmRef)}, title: "<title>", body: "<body>", about: [${JSON.stringify(first)}] })`
+        : `mind_write({ title: "<title>", body: "<body>", about: [${JSON.stringify(first)}] })`;
     }
     return `mind_show({ ref: ${JSON.stringify(first)} })`;
   }
@@ -117,10 +119,14 @@ function adaptTryHintForMcp(
     return `mind_search({ query: "keyword", in: ${JSON.stringify(realmRef)} })`;
   }
   if (explicitTry.startsWith("meru-mind write")) {
+    const inPart =
+      options?.orgPolicy === "tree"
+        ? `in: ${JSON.stringify(writeRealmRef)}, `
+        : "";
     if (explicitTry.includes("--about")) {
-      return `mind_write({ in: ${JSON.stringify(writeRealmRef)}, title: "<title>", body: "<body>", about: ["service:api"] })`;
+      return `mind_write({ ${inPart}title: "<title>", body: "<body>", about: ["service:api"] })`;
     }
-    return `mind_write({ in: ${JSON.stringify(writeRealmRef)}, kind: "finding", title: "<title>", body: "<body>" })`;
+    return `mind_write({ ${inPart}kind: "finding", title: "<title>", body: "<body>" })`;
   }
 
   return explicitTry;

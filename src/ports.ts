@@ -463,6 +463,12 @@ export interface DbPort {
     includeSecret?: boolean;
   }): number;
   getChangeLogSeqForEntity(entityType: string, entityId: string): number | null;
+  hasEntityChangeLogOp(
+    orgId: string,
+    entityType: string,
+    entityId: string,
+    op: string,
+  ): boolean;
   countChangeLogSince(params: {
     orgId: string;
     realmIds: string[];

@@ -4394,29 +4394,32 @@ export class SqliteDb implements DbPort {
     }
     const rows = this.db
       .prepare(
-        `SELECT id, supersedes_ids_json FROM records
+        `SELECT id, supersedes_id, superseded_by_id, supersedes_ids_json FROM records
          WHERE org_id = ?
            AND (supersedes_id = ? OR superseded_by_id = ? OR supersedes_ids_json LIKE ?)`,
       )
       .all(orgId, recordId, recordId, `%"${recordId}"%`) as Array<{
       id: string;
+      supersedes_id: string | null;
+      superseded_by_id: string | null;
       supersedes_ids_json: string | null;
     }>;
     for (const r of rows) {
       if (r.id === recordId) continue;
-      // Double-check exact JSON membership if matched via LIKE
+      if (r.supersedes_id === recordId || r.superseded_by_id === recordId) {
+        out.add(String(r.id));
+        continue;
+      }
       if (r.supersedes_ids_json) {
         try {
           const arr = JSON.parse(String(r.supersedes_ids_json)) as unknown[];
           if (Array.isArray(arr) && arr.includes(recordId)) {
             out.add(String(r.id));
-            continue;
           }
         } catch {
-          // ignore
+          // ignore malformed json
         }
       }
-      out.add(String(r.id));
     }
     out.delete(recordId);
     return Array.from(out);
@@ -4501,6 +4504,22 @@ export class SqliteDb implements DbPort {
       )
       .get(entityType, entityId) as { seq: number } | undefined;
     return row ? Number(row.seq) : null;
+  }
+
+  hasEntityChangeLogOp(
+    orgId: string,
+    entityType: string,
+    entityId: string,
+    op: string,
+  ): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS hit FROM change_log
+         WHERE org_id = ? AND entity_type = ? AND entity_id = ? AND op = ?
+         LIMIT 1`,
+      )
+      .get(orgId, entityType, entityId, op) as { hit: number } | undefined;
+    return Boolean(row);
   }
 
   countChangeLogSince(params: {

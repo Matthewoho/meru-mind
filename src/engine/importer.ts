@@ -749,26 +749,16 @@ export class ImporterEngine {
               targetRealm.id,
             );
 
-      // P0-2 protection against undoing human `entry move`:
-      // Only treat targetRealm as a non-overriding fallback when mapping didn't assign a realm AND
-      // caller did not explicitly target a specific non-root/non-inbox realm (e.g. --in /beta).
-      const isFallbackRealm =
-        usedDefaultRealm &&
-        (!params.targetRealmRef?.trim() ||
-          defaultRealm.path === "/" ||
-          defaultRealm.path === "/inbox");
-
-      if (orgPolicy === "tree" && !head && isFallbackRealm) {
-        const initKey = `import-md:${sourceRef}:init:${newSha256}:${initialStatus}`;
-        const existingInit = this.db.getIdempotencyKey(
+      // P0-2 / N2 protection against undoing human `entry move`:
+      // 1) In `tree` mode, if no active head exists in `targetRealm`, check whether an active head
+      //    for this sourceRef already lives in another realm of the same org (single-rev or multi-rev
+      //    moved by a human admin). Skip cleanly without leaking the other realm or crashing mid-batch.
+      if (orgPolicy === "tree" && !head) {
+        const orgHead = this.db.findActiveRecordBySourceRef(
           viewerRealm.orgId,
-          initKey,
+          sourceRef,
         );
-        if (
-          existingInit &&
-          existingInit.targetTable === "records" &&
-          existingInit.realmId !== targetRealm.id
-        ) {
+        if (orgHead && orgHead.realmId !== targetRealm.id) {
           skippedUnchanged += 1;
           items.push({
             filePath,
@@ -784,9 +774,30 @@ export class ImporterEngine {
         }
       }
 
+      // 2) In `open` mode, when no per-file mapping.realm override is active, honor BOTH fallback
+      //    defaults (!targetRealmRef, "/", "/inbox") AND any prior explicit human `entry move`
+      //    (recorded via `move_in` in change_log) so re-importing with `--in /ops` never reverts
+      //    a human-triaged entry back to the import's default realm.
+      const isFallbackRealm =
+        usedDefaultRealm &&
+        (!params.targetRealmRef?.trim() ||
+          defaultRealm.path === "/" ||
+          defaultRealm.path === "/inbox");
+      const wasHumanMoved =
+        orgPolicy === "open" &&
+        usedDefaultRealm &&
+        head !== null &&
+        head.realmId !== targetRealm.id &&
+        this.db.hasEntityChangeLogOp(
+          viewerRealm.orgId,
+          "record",
+          head.id,
+          "move_in",
+        );
+
       const effectiveRealmId =
         orgPolicy === "open" &&
-        isFallbackRealm &&
+        (isFallbackRealm || wasHumanMoved) &&
         head &&
         head.realmId !== targetRealm.id &&
         !isRealmEffectivelyArchived(realms, head.realmId)

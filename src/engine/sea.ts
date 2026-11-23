@@ -1539,6 +1539,20 @@ export class SeaEngine {
             const end = Math.min(bodyLen, start + PASSAGE_WINDOW_CHARS);
             const slice = params.bodyText.slice(start, end);
             const sliceLower = bodyLower.slice(start, end);
+            // P2-1: pad 1 word-character on left/right for non-CJK boundary regexes so a
+            // window cut mid-word (e.g. "config|uration") never fabricates a false word boundary.
+            const leftWordPad =
+              start > 0 && /[A-Za-z0-9_:/-]/.test(params.bodyText[start - 1]!)
+                ? params.bodyText[start - 1]!
+                : "";
+            const rightWordPad =
+              end < bodyLen && /[A-Za-z0-9_:/-]/.test(params.bodyText[end]!)
+                ? params.bodyText[end]!
+                : "";
+            const boundarySlice =
+              leftWordPad || rightWordPad
+                ? `${leftWordPad}${slice}${rightWordPad}`
+                : slice;
             const winText = needTitleUnion ? titlePrefix + slice : slice;
             const winLower = needTitleUnion ? titleLowerPrefix + sliceLower : sliceLower;
 
@@ -1549,7 +1563,12 @@ export class SeaEngine {
               const ac = activeBodyConcepts[k]!;
               const s = ac.needsTitleUnion
                 ? ac.concept.scoreText(winText, winLower)
-                : Math.max(ac.titleScore, ac.concept.scoreText(slice, sliceLower));
+                : Math.max(
+                    ac.titleScore,
+                    ac.concept.isCjk
+                      ? ac.concept.scoreText(slice, sliceLower)
+                      : ac.concept.scoreText(boundarySlice),
+                  );
               if (s >= ac.threshold) {
                 winLexCoveredCount += 1;
               } else {
@@ -1561,11 +1580,20 @@ export class SeaEngine {
             let winDateCount = baseDateCount;
             let winDateAll = baseDateAll;
             if (activeBodyDates.length > 0) {
-              const padStart = Math.max(0, start - PASSAGE_DATE_LEFT_PAD);
-              const dateSlice =
-                padStart === start
-                  ? slice
-                  : params.bodyText.slice(padStart, end);
+              // P2-2: prepend ONLY an immediately preceding "YYYY年" prefix before `start`
+              // so a split year-prefix ("2025年|10月10日") is preserved without dragging a
+              // separate date from the pad region into this window.
+              let dateSlice = slice;
+              if (start > 0) {
+                const lookBack = params.bodyText.slice(
+                  Math.max(0, start - PASSAGE_DATE_LEFT_PAD),
+                  start,
+                );
+                const yearPrefixMatch = /(\d{4}\s*年\s*)$/.exec(lookBack);
+                if (yearPrefixMatch) {
+                  dateSlice = yearPrefixMatch[1]! + slice;
+                }
+              }
               for (let j = 0; j < activeBodyDates.length; j += 1) {
                 if (activeBodyDates[j]!.matchLiteralText(dateSlice)) {
                   winDateCount += 1;
@@ -1609,7 +1637,7 @@ export class SeaEngine {
             }
           };
 
-          if (activeBodyDates.length === 0 && numWindows > 4) {
+          if (!needTitleUnion && activeBodyDates.length === 0 && numWindows > 4) {
             // Exact branch-and-bound pre-filter: mark windows containing >=1 term per active concept
             // via SIMD indexOf (jumping past already-marked blocks), then evaluate highest-hit buckets first.
             const winHits = new Uint16Array(numWindows);
@@ -2449,7 +2477,7 @@ export class SeaEngine {
     return out;
   }
 
-    tree(params: {
+  tree(params: {
     actor: Actor;
     viewerRealmId: string;
     target?: string;
@@ -2889,7 +2917,7 @@ export class SeaEngine {
       aboutEntryIdsFilter = aboutResolved.entryIds;
     }
 
-      let resolvedId = normalizedRef;
+    let resolvedId = normalizedRef;
     let displayTarget = rawTarget;
     let targetRealmArchived = false;
     let driveFiles: LsDriveFileItem[] | undefined;

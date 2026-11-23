@@ -2,20 +2,20 @@
 
 ## Purpose
 
-Define durable SQLite schema migrations (v1–v7), SQLite version and `busy_timeout` guards, `fts_docs` side-table and partial covering indexes, causal object lifecycle columns and `object_aliases`, nullable `occurred_at` vs `created_at` semantics, atomic single- and multi-predecessor CAS supersede DAGs, orphan superseded ingestion, organization-scoped and auto-generated idempotency keys, operational change logging, and off-write-path vector indexing.
+Define durable SQLite schema migrations (v1–v8), SQLite version and `busy_timeout` guards, `fts_docs` side-table and partial covering indexes, causal object lifecycle columns and `object_aliases`, realm `scope` and archive freeze metadata, atomic `entry move` across realms, nullable `occurred_at` vs `created_at` semantics, atomic single- and multi-predecessor CAS supersede DAGs, orphan superseded ingestion, organization-scoped and auto-generated idempotency keys, operational change logging, and off-write-path vector indexing.
 
 ## Requirements
 
-### Requirement: Connection-Level Secure Delete and Concurrent Migrations v1–v7
-`SqliteDb` SHALL require SQLite `>= 3.43.0`, set shared `DEFAULT_BUSY_TIMEOUT_MS = 30000`, enable `secure_delete = ON`, `foreign_keys = ON`, and `WAL`, and run migrations `[1..7]` in one `BEGIN IMMEDIATE` transaction. Migration v6 SHALL create zero-plaintext `fts_docs`, contentless_delete `fts_index`, and partial covering indexes. Migration v7 SHALL add `objects.(state, state_label, state_since, state_evidence_id)`, `idx_objects_inactive`, and `object_aliases` with keyset `is_name = 1` backfill.
+### Requirement: Connection-Level Secure Delete and Concurrent Migrations v1–v8
+`SqliteDb` SHALL require SQLite `>= 3.43.0`, set shared `DEFAULT_BUSY_TIMEOUT_MS = 30000`, enable `secure_delete = ON`, `foreign_keys = ON`, and `WAL`, and run migrations `[1..8]` in one `BEGIN IMMEDIATE` transaction. Migration v6 SHALL create zero-plaintext `fts_docs`, contentless_delete `fts_index`, and partial covering indexes. Migration v7 SHALL add `objects.(state, state_label, state_since, state_evidence_id)`, `idx_objects_inactive`, and `object_aliases` with keyset `is_name = 1` backfill. Migration v8 SHALL add nullable `realms.scope TEXT` without mutating existing rows.
 
-#### Scenario: Upgrading a V0.1, v5, or v6 database preserves isolation and records migrations 1 through 7
-- **WHEN** `SqliteDb` opens an existing V0.1, v5, or v6 database containing records, seabed entries, objects, secrets, and redacted rows
-- **THEN** migrations `[1, 2, 3, 4, 5, 6, 7]` complete cleanly with `fts_docs` populated via keyset batches, `object_aliases` backfilled with `is_name = 1` (skipping empty normalized names), and `PRAGMA busy_timeout = 30000` before and after `redact()`
+#### Scenario: Upgrading a V0.1, v5, v6, or v7 database preserves isolation and records migrations 1 through 8
+- **WHEN** `SqliteDb` opens an existing V0.1, v5, v6, or v7 database containing records, seabed entries, objects, secrets, and redacted rows
+- **THEN** migrations `[1, 2, 3, 4, 5, 6, 7, 8]` complete cleanly with `fts_docs` populated via keyset batches, `object_aliases` backfilled with `is_name = 1` (skipping empty normalized names), `realms.scope` added as nullable TEXT, and `PRAGMA busy_timeout = 30000` before and after `redact()`
 
 #### Scenario: Multiple OS processes open an unmigrated database simultaneously
-- **WHEN** multiple OS processes invoke `new SqliteDb(...)` against the same V0.1, v2, v5, or v6 file concurrently
-- **THEN** all processes complete initialization with zero `duplicate column` or lock-race failures and record `[1, 2, 3, 4, 5, 6, 7]`
+- **WHEN** multiple OS processes invoke `new SqliteDb(...)` against the same V0.1, v2, v5, v6, or v7 file concurrently
+- **THEN** all processes complete initialization with zero `duplicate column` or lock-race failures and record `[1, 2, 3, 4, 5, 6, 7, 8]`
 
 #### Scenario: Migration v5, v6, and v7 preserve pre-v5 redacted_blocklist rows
 - **WHEN** a v4 database containing a pre-v5 `redacted_blocklist` row is reopened on v7

@@ -86,6 +86,8 @@ const BOOLEAN_FLAGS = new Set([
   "include-secret",
   "objects",
   "no-objects",
+  "all",
+  "dry-run",
   // Legacy boolean flags parsed without swallowing the next token so UNKNOWN_FLAG reports cleanly
   "include-superseded",
   "include-history",
@@ -256,6 +258,11 @@ function flagBool(
   flags: Record<string, string | boolean>,
   key: string,
 ): boolean {
+  if (!BOOLEAN_FLAGS.has(key)) {
+    throw new Error(
+      `Internal CLI error: boolean flag "--${key}" is not registered in BOOLEAN_FLAGS`,
+    );
+  }
   return flags[key] === true || flags[key] === "true";
 }
 

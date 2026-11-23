@@ -37,7 +37,7 @@ When a Markdown file or JSONL row has no declared timestamp in frontmatter, head
 - **AND** expired `validUntil` items persist as orphan `'superseded'`, while `supersedes: ["s1", "s2"]` supersedes both atomically or rolls back on conflict
 
 ### Requirement: Global Redaction Blocklist and Rollback-Safe Markdown Revisioning
-`importMd()` SHALL check `db.isContentShaBlocked(orgId, sha)` globally regardless of `source_ref`, skipping redacted content (`skippedRedacted += 1`) even if the file was renamed, while allowing sanitized new content. It SHALL skip unchanged active heads (`skippedUnchanged += 1`) and create superseding revisions (`import-md:${sourceRef}:after:${head.id}:${newSha256}`) on edits, `v1 -> v2 -> v1` rollbacks, or `open`-mode realm reassignments.
+`importMd()` SHALL check `db.isContentShaBlocked(orgId, sha)` globally regardless of `source_ref`, skipping redacted content (`skippedRedacted += 1`) even if the file was renamed, while allowing sanitized new content. It SHALL skip unchanged active heads (`skippedUnchanged += 1`), preserve human `entry move` realm placements when re-importing without an explicit per-file mapping realm (skipping cleanly in `tree` mode when the moved head lives in another realm), and create superseding revisions (`import-md:${sourceRef}:after:${head.id}:${newSha256}`) on edits, `v1 -> v2 -> v1` rollbacks, or explicit `open`-mode realm reassignments.
 
 #### Scenario: Unchanged re-import skips, v1->v2->v1 rollback succeeds, and renamed redacted file is blocked
 - **WHEN** a Markdown file is imported as `v1`, re-imported unchanged, updated to `v2`, and rolled back to `v1`
