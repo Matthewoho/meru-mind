@@ -2,9 +2,9 @@
 
 **Scoped, versioned shared context for human-AI teams.**
 
-[中文文档 (README.zh-CN.md)](./README.zh-CN.md) · [Architecture](./ARCHITECTURE.md) · [Cloud Deployment & Composable UI Guide](./docs/deployment-and-frontend.md)
+[中文文档 (README.zh-CN.md)](./README.zh-CN.md) · [Architecture](./ARCHITECTURE.md) · [Threat Model](./THREAT_MODEL.md) · [Cloud Deployment & Composable UI Guide](./docs/deployment-and-frontend.md) · [UI Builder Skill](./docs/UI_BUILDER_SKILL.md)
 
-Meru Mind is a zero-Docker, single-SQLite TypeScript engine (`CLI` + `MCP Server` + `SDK`) that separates **space & visibility (`MindRealm`)** from **time & truth depth (`MindSea`)** — so multiple humans and coding agents can share rules, decisions, and evidence without context flooding, stale-fact regressions, or cross-branch leakage.
+Meru Mind is a zero-Docker, single-SQLite TypeScript engine (`CLI` + `MCP Server` + `HTTP/WS Server` + `Composable Web UI` + `SDK`) that separates **space & visibility (`MindRealm`)** from **time & truth depth (`MindSea`)** — so multiple humans and coding agents can share rules, decisions, and evidence without context flooding, stale-fact regressions, or cross-branch leakage.
 
 ```mermaid
 flowchart LR
@@ -81,6 +81,13 @@ node dist/cli.js search "SQLite WAL" --in /backend
 # 6. Triage /inbox and archive obsolete realms (human-only)
 node dist/cli.js entry move <rec_id> --to /backend --dry-run --as-human
 node dist/cli.js realm archive /marketing --as-human
+
+# 7. Start the single-writer HTTP + Pump WS + Streamable HTTP MCP + Web UI server (seeded demo)
+node dist/cli.js serve --demo --host 127.0.0.1 --port 3800
+
+# 8. Optional: eject the built-in shell for custom Agent-authored UI, or bind Linear/GitHub SSOT
+node dist/cli.js ui eject ./my-custom-ui
+node dist/cli.js work bind --in /backend --provider github --repo acme/api --token-env GITHUB_TOKEN --as-human
 ```
 
 ---
@@ -121,42 +128,46 @@ export MERU_MIND_EMBED_DIM="1536"
 ## Stability Guarantees, Experimental Surfaces & Known Limitations
 
 ### Stability & Storage Guarantees (`0.x`)
-- **Stable in `0.x`**: the **7 everyday CLI verb names** (`whoami`, `tree`, `ls`, `show`, `search`, `changes`, `write`), the **7 MCP tool names**, and **forward-only SQLite schema compatibility** (`mind.sqlite` files created by `v0.2.0` will remain readable by future versions; downgrades are unsupported).
-- **Unstable in `0.x`**: Markdown output formatting, ranking weights, and TypeScript internal module exports (`src/index.ts` exports internal adapters/helpers for now; the first stable programmatic facade will be `MindSurface` in `v0.3`).
+- **Stable in `0.x`**: the **7 everyday CLI verb names** (`whoami`, `tree`, `ls`, `show`, `search`, `changes`, `write`), the **7 MCP tool names**, the **`MindSurface` TypeScript facade**, and **forward-only SQLite schema compatibility** (`mind.sqlite` files created by `v0.2.0` remain readable by newer releases, with automatic pre-migration `VACUUM INTO` backups; downgrades are unsupported).
+- **Unstable in `0.x`**: Markdown output formatting, ranking weights, and lower-level internal adapter exports.
 - **Experimental surfaces** (marked `[experimental]` in `--help`, excluded from the official Agent Skill): `file` (local shared drive), `raw` (direct seabed CLI capture), `settle` (distillation cards), and the `thing` record kind.
 - **SQLite canonical backend**: SQLite (`node:sqlite` WAL) is the sole core backend and online source of truth. Migrating to Postgres is a future trigger-based project (not a zero-rewrite port swap).
 
-### Known Limitations (`v0.2.0`)
+### Known Limitations (`v0.5.0`)
 1. **Lexical-only by default**: Without an external embedding endpoint configured, recall relies purely on CJK-bigram + Latin FTS5 and windowed coverage.
-2. **Bulk import does not auto-link `supersedes`**: Imported Markdown/JSONL entries without explicit `supersedes` references remain active side-by-side until explicitly linked.
-3. **Same-day undated timestamps**: When multiple imported records share a date-only `occurred_at` (`YYYY-MM-DDT00:00:00.000Z`), recency tie-breaking currently falls back to ingestion `created_at` order (scheduled for fix in `v0.2.1`).
+2. **Bulk import does not auto-link `supersedes`**: Imported Markdown/JSONL entries without explicit `supersedes` references remain active side-by-side until explicitly linked (live writes return a neutral related-active echo so agents can link them explicitly).
+3. **Single-writer SQLite server model**: `meru-mind serve` takes an exclusive writer lock on `mind.sqlite` and expects persistent local block storage (avoid multi-replica containers over NFS/SMB).
 4. **`node:sqlite` experimental runtime**: Node.js currently marks `node:sqlite` experimental; CI verifies both Node 22 and Node 24.
 
 ---
 
 ## Internal Benchmark Methodology & Results (With Full Caveats)
 
-We evaluated Meru Mind (lexical-only, `vector_enabled: false`) against a real-world Markdown/JSONL file-based knowledge vault baseline across **5 zero-overlap holdout rounds (Rounds 2–6, 159 paired questions)** using air-gapped blind agents under equal tool-call and stdout-character budgets, graded by anonymized blind judges (with Round 6 independently pre-audited for blinding leaks, air-gapped from host memory/rules, and double-graded across independently flipped/shuffled A/B orders):
+We evaluated Meru Mind (lexical-only, `vector_enabled: false`) against a real-world Markdown/JSONL file-based knowledge vault baseline across **6 zero-overlap holdout rounds (Rounds 2–7, 191 paired questions)** using air-gapped blind agents under equal tool-call and stdout-character budgets, graded by anonymized blind judges (Rounds 6–7 were independently pre-audited for blinding leaks, air-gapped from host memory/rules, and double-graded across independently flipped/shuffled A/B orders):
 
-- **5-round cumulative (159 zero-overlap paired questions)**: Meru Mind **`127/159 (79.9%)`** full-correct vs baseline **`114/159 (71.7%)`**; strict paired score wins **`31W / 14L / 114T`** (exact two-sided binomial sign test `p = 0.016`).
-- **Latest Round 6 (air-gapped Skill-vs-Skill, 31 valid paired questions)**: Meru Mind **`25/31 (80.6%)`** vs baseline **`21/31 (67.7%)`** across both blind judges (`8W / 4L / 19T` and `7W / 3L / 21T`), `0` superseded regressions, `4/4` negative abstention, MCP warm latency **`p50 = 32.1 ms / p95 = 71.6 ms`**, average tool time **`293 ms`** vs **`6,750 ms`** (`23×` faster).
+- **6-round cumulative (191 zero-overlap paired questions, R2–R7)**: Meru Mind **`155/191 (81.2%)`** full-correct vs baseline **`138/191 (72.3%)`** (`+8.9 pp`); strict paired score wins **`39W / 15L / 137T`** (exact two-sided binomial sign test **`p = 0.0015`**).
+- **Latest Round 7 (`v0.2.1`, air-gapped Skill-vs-Skill, 32/32 valid paired questions, 0 errors)**:
+  - **Primary blind judge**: Meru Mind **`28/32 (87.5%)`** (`93.8%` avg score, `24/28` answerable, `4/4` negative abstention, `0` superseded regressions) vs baseline **`24/32 (75.0%)`** (`78.1%` avg score, `20/28` answerable, `4/4` negative abstention, `1` superseded regression on a same-day rule replacement); strict paired **`8W / 1L / 23T`** (exact sign test **`p = 0.039`**).
+  - **Second blind judge (independently reversed/shuffled)**: Meru Mind **`28/32 (87.5%)`** (`89.1%` avg) vs baseline **`24/32 (75.0%)`** (`76.6%` avg), paired **`7W / 2L / 23T`**; strict order agreement **`30/32 (93.8%)`** (`17/18 = 94.4%` on opposite A/B flips).
+  - **Kernel retrieval & latency**: Gold Hit@10 **`24/28 (85.7%)`** vs baseline **`14/28 (50.0%)`** (`+35.7 pp`), MCP warm **`p50 = 32.3 ms / p95 = 53.3 ms`**, CLI cold **`p50 = 99.9 ms`** vs **`5,102.7 ms`** (`51.1×` faster), average end-to-end tool time **`367 ms`** vs **`7,407 ms`** (`20.2×` faster).
 
 > **Honest Caveats**:
-> 1. The evaluation corpus is a private personal/engineering vault and cannot be redistributed publicly (benchmark scripts are kept outside this repository).
-> 2. Vector search was disabled throughout (`vector_enabled: false`) to isolate the deterministic kernel.
-> 3. The 159-question cumulative result spans iterative V0.2a slices (Rounds 2–6) rather than a single frozen commit.
-> 4. Round 6 alone (`n = 31`, `8W / 4L`, `p = 0.39`) is directional and does not reach standalone `p < 0.05` significance on its own.
+> 1. The evaluation corpus is a private personal/engineering vault (21,166 atoms + 2,104 Markdown docs) and cannot be redistributed publicly (benchmark scripts stay outside this repository).
+> 2. Vector search was disabled throughout (`vector_enabled: false`) to isolate the deterministic SQLite FTS5 + realm/supersede kernel.
+> 3. The 191-question cumulative result spans iterative releases (`v0.2a Slice 1` through `v0.2.1`, zero overlap across rounds) rather than a single frozen commit.
+> 4. Both blind judges belong to the same model family (same-family dual audit with independent A/B reversal and batch shuffling, not cross-family independence); single-round sample size is `n = 32`.
 
 ---
 
-## Roadmap & Cloud / UI Vision
+## Shipped Capabilities (`v0.2.0` → `v0.5.0`)
 
-See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md) for the full cloud self-hosting guide and composable AI-built frontend architecture:
+See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md), [`docs/UI_BUILDER_SKILL.md`](./docs/UI_BUILDER_SKILL.md), and [`THREAT_MODEL.md`](./THREAT_MODEL.md) for deployment, security, and custom UI authoring details:
 
-- **`v0.2.1`**: Cross-kind `supersedes`, neutral write-time related-entry echo, exact timestamp preservation on import, deterministic L1 brief selection (rules never silently truncated).
-- **`v0.3`**: Single-process `meru-mind serve` (token hashes + `Principal`, unified `MindSurface` facade, single-writer lock, Pump Model + long-poll, cursor collision hints, `VACUUM INTO` CI restore drills, Docker/Caddy/Fly.io deployment kit).
-- **`v0.4`**: Composable Web Governance UI (`@meru-mind/client` headless pump SDK + `@meru-mind/ui-atoms` + default shell + `UI_BUILDER_SKILL.md` so users can have their own Agent craft a bespoke UI in 60 seconds), Pump-backed `WS /v1/ws` with long-poll fallback, and ultra-thin `MindPulse`.
-- **`v0.5`**: Single-source-of-truth `WorkProvider` narrow contract (zero task tables in core, MCP stays 7 tools) with official Linear & GitHub providers + `deliveries` retry queue.
+- **`v0.2.0`**: Scoped `MindRealm` (`open | tree` + `@mount`), single-store layered `MindSea` (`Seabed ⊥ Ledger`), 7-verb CLI, 7-tool stdio MCP + 23-line Skill, compliance `redact`, read-only slices, and Node 22/24 CI.
+- **`v0.2.1`**: Directional cross-kind `supersedes`, neutral write-time related-entry echo, exact same-day timestamp preservation on import, deterministic L1 brief selection (rules never silently truncated), and automatic pre-migration `VACUUM INTO` backups.
+- **`v0.3.0`**: Unified `MindSurface` (`LocalMindSurface` / `RemoteMindSurface`), single-writer `meru-mind serve` with exclusive lock, hashed Bearer tokens (`meru-mind token`), write-time Secret Guard, Pump Model + Long-Poll (`GET /v1/changes?wait=25`), Streamable HTTP MCP (`/mcp`), `meru-mind admin backup`, and Cloud Deploy Kit (`deploy/Dockerfile`, `docker-compose.yml`, `Caddyfile`, `fly.toml`).
+- **`v0.4.0`**: 1.5-layer zero-extra-package composable Web Governance UI — server-hosted `/_meru/client.js` (Pump, CAS `inbox.triage()`, sanitized Shadow DOM `<meru-entry>`, visible-scope snapshots), built-in `/_meru/shell`, 7-condition Pump WebSocket (`WS /v1/ws`), in-process `MindPulse`, 60s single-use CLI browser login (`meru-mind ui login` -> weakened `HttpOnly; SameSite=Strict` Cookie), `meru-mind ui eject`, `--demo` adversarial sandbox, and 6 hard security guardrails.
+- **`v0.5.0`**: Narrow SSOT `WorkProvider` contract (zero task tables in `mind-core`, MCP stays strictly 7 tools), official Linear & GitHub providers, `work_bindings` (`env:VAR` secret refs only), circuit-breaker degradation, `DeliveryRetryWorker` exponential backoff + dead-lettering, and local/remote `meru-mind work` CLI commands.
 
 ## License
 

@@ -2,9 +2,9 @@
 
 **面向下一代人机团队的「空间隔离 × 单真相库分层演化」共享上下文内核。**
 
-[English README](./README.md) · [架构设计 (ARCHITECTURE.md)](./ARCHITECTURE.md) · [云端部署与可组合前端指南](./docs/deployment-and-frontend.md)
+[English README](./README.md) · [架构设计 (ARCHITECTURE.md)](./ARCHITECTURE.md) · [安全威胁模型 (THREAT_MODEL.md)](./THREAT_MODEL.md) · [云端部署与可组合前端指南](./docs/deployment-and-frontend.md) · [自定义前端搭建 Skill](./docs/UI_BUILDER_SKILL.md)
 
-Meru Mind 是一个**零 Docker、单 SQLite、MIT 开源**的 TypeScript 引擎（`CLI` + `MCP Server` + `SDK`），将 **空间与可见性（`MindRealm`）** 与 **时间与真相深度（`MindSea`）** 正交分离——让多个人类与编码 Agent 共享规矩、决策与排查证据，彻底告别上下文爆炸、过期结论复活与跨分支泄密。
+Meru Mind 是一个**零 Docker、单 SQLite、MIT 开源**的 TypeScript 引擎（`CLI` + `MCP Server` + `HTTP/WS 服务` + `可组合 Web 治理前端` + `SDK`），将 **空间与可见性（`MindRealm`）** 与 **时间与真相深度（`MindSea`）** 正交分离——让多个人类与编码 Agent 共享规矩、决策与排查证据，避免上下文爆炸、过期结论复活与跨分支泄密。
 
 ```mermaid
 flowchart LR
@@ -81,6 +81,13 @@ node dist/cli.js search "SQLite WAL" --in /backend
 # 6. 人工分拣 /inbox 与归档旧域
 node dist/cli.js entry move <rec_id> --to /backend --dry-run --as-human
 node dist/cli.js realm archive /marketing --as-human
+
+# 7. 启动单写者 HTTP + Pump WS + Streamable HTTP MCP + Web 治理前端（内置 Demo 数据）
+node dist/cli.js serve --demo --host 127.0.0.1 --port 3800
+
+# 8. 按需弹出官方前端壳让 Agent 定制，或绑定外部 Linear / GitHub 单真源任务
+node dist/cli.js ui eject ./my-custom-ui
+node dist/cli.js work bind --in /backend --provider github --repo acme/api --token-env GITHUB_TOKEN --as-human
 ```
 
 ---
@@ -110,42 +117,46 @@ node dist/cli.js realm archive /marketing --as-human
 ## 稳定性承诺、实验面与已知局限
 
 ### 稳定性与落盘承诺（`0.x`）
-- **`0.x` 稳定契约**：仅承诺 **7 个日常 CLI 动词名**、**7 个 MCP 工具名**，以及 **SQLite 数据库只向前兼容迁移**（`v0.2.0` 创建的 `mind.sqlite` 后续版本皆可无损打开；不支持降级）。
-- **`0.x` 非稳定面**：Markdown 输出排版、排序权重与 TypeScript 内部导出符号在 `0.x` 期间可能调整；首个稳定编程门面将在 `v0.3` 以 `MindSurface` 形式提供。
+- **`0.x` 稳定契约**：承诺 **7 个日常 CLI 动词名**、**7 个 MCP 工具名**、**`MindSurface` TypeScript 统一门面**，以及 **SQLite 数据库只向前兼容迁移**（`v0.2.0` 创建的 `mind.sqlite` 后续版本皆可无损打开，迁移前自动做 `VACUUM INTO` 快照；不支持降级）。
+- **`0.x` 非稳定面**：Markdown 输出排版、排序权重与底层内部适配器导出符号在 `0.x` 期间可能调整。
 - **实验功能面**（已在 `--help` 标注 `[experimental]`，未写入官方 Skill）：`file`（本地共享文件盘）、`raw`（直接写入海床 CLI）、`settle`（蒸馏卡片）及 `thing` 记录类型。
 - **SQLite 唯一核心后端**：SQLite（`node:sqlite` WAL）是唯一核心存储与在线真源；未来迁移至 Postgres 属于由明确容量指标触发的独立迁移项目，不承诺接口层零重写替换。
 
-### 已知局限（`v0.2.0`）
+### 已知局限（`v0.5.0`）
 1. **默认纯字面检索**：未配置外部 Embedding 时仅使用 CJK 双字 + 拉丁 FTS5 与局部窗口覆盖度。
-2. **批量导入不自动建 `supersedes` 链**：导入语料中未声明取代关系的新旧文档会并排保持 `active`。
-3. **同日无时分秒时间戳回落入库序**：同一天仅有日期（`YYYY-MM-DDT00:00:00.000Z`）的多条导入记录，当前新旧平局排序会回落到入库 `created_at`（已在 `v0.2.1` 排期修复）。
+2. **批量导入不自动建 `supersedes` 链**：导入语料中未声明取代关系的新旧文档会并排保持 `active`（日常写入已提供中性相似条目回显，方便 Agent 显式挂取代链）。
+3. **单写者 SQLite 服务约束**：`meru-mind serve` 持有独占写锁，需部署在带持久本地块存储的单实例节点（避免多副本共享 NFS/SMB）。
 4. **`node:sqlite` 实验接口**：属于 Node.js 当前实验内置 API，CI 已覆盖 Node 22 与 Node 24 矩阵。
 
 ---
 
 ## 内部评测方法与实测结果（附 4 条诚实限定）
 
-我们在关闭向量检索（`vector_enabled: false`）的纯确定性内核下，对照真实文件型个人/工程知识库基线进行了 **5 轮零重叠留出集（R2–R6，共 159 道配对题）** 盲测（同等调用次数与字符预算；Round 6 在开跑前经独立盲审审计修清全部泄露点，全链路空气隔离宿主记忆，并由双盲裁判在独立平衡翻转与乱序批次上交叉评分）：
+我们在关闭向量检索（`vector_enabled: false`）的纯确定性内核下，对照真实文件型个人/工程知识库基线进行了 **6 轮零重叠留出集（R2–R7，共 191 道配对题）** 盲测（同等调用次数与字符预算；Round 6–7 在开跑前经独立盲审审计修清全部泄露点，全链路空气隔离宿主记忆，并由双盲裁判在独立平衡翻转与乱序批次上交叉评分）：
 
-- **五轮累计（159 道零重叠配对题）**：Meru Mind 全对 **`127/159 (79.9%)`** vs 基线 **`114/159 (71.7%)`**；严格分数配对 **`31W / 14L / 114T`**（双侧精确二项符号检验 `p = 0.016`）。
-- **最新 Round 6（空气隔离 Skill-vs-Skill，31 道有效配对题）**：双盲裁判一致给出 Meru Mind **`25/31 (80.6%)`** vs 基线 **`21/31 (67.7%)`**（配对 `8W / 4L / 19T` 与 `7W / 3L / 21T`），被取代回归 `0`，负样本正确弃权 `4/4`，MCP 常驻热态延迟 **`p50 = 32.1 ms / p95 = 71.6 ms`**，平均单题工具耗时 **`293 ms`** vs **`6,750 ms`**（快 **`23×`**）。
+- **六轮累计（191 道零重叠配对题，R2–R7）**：Meru Mind 全对 **`155/191 (81.2%)`** vs 基线 **`138/191 (72.3%)`**（`+8.9 pp`）；严格分数配对 **`39W / 15L / 137T`**（双侧精确二项符号检验 **`p = 0.0015`**）。
+- **最新 Round 7（`v0.2.1`，空气隔离 Skill-vs-Skill，32/32 双臂零报错）**：
+  - **主盲评裁判**：Meru Mind **`28/32 (87.5%)`**（均分 `93.8%`、可答 `24/28`、负样本弃权 `4/4`、被取代回归 `0`）vs 基线 **`24/32 (75.0%)`**（均分 `78.1%`、可答 `20/28`、负样本弃权 `4/4`、被取代回归 `1`——同日规则更新回归）；单轮严格配对 **`8W / 1L / 23T`**（exact sign-test **`p = 0.039`**）。
+  - **第二盲评裁判（独立反向翻转 + 乱序）**：Meru Mind **`28/32 (87.5%)`**（均分 `89.1%`）vs 基线 **`24/32 (75.0%)`**（均分 `76.6%`），配对 `7W / 2L / 23T`；双裁判严格胜负序一致率 **`30/32 (93.8%)`**（A/B 互换题 `17/18 = 94.4%`）。
+  - **内核召回与延迟**：Gold Hit@10 **`24/28 (85.7%)`** vs 基线 **`14/28 (50.0%)`**（`+35.7 pp`），MCP 常驻热态 **`p50 = 32.3 ms / p95 = 53.3 ms`**，CLI 冷启动 **`99.9 ms`** vs **`5,102.7 ms`**（快 **`51.1×`**），端到端单题工具耗时 **`367 ms`** vs **`7,407 ms`**（快 **`20.2×`**）。
 
 > **4 条诚实限定**：
-> 1. 评测语料为真实私有工作库，外部开发者无法直接下载复现（评测脚本不入本开源仓）。
-> 2. 全程关闭向量检索（`vector_enabled: false`），只衡量确定性存储与字面检索内核。
-> 3. 159 题累计跨越 V0.2a 多个演进切片（R2–R6），并非单一冻结提交。
-> 4. 最新单轮 Round 6（`n = 31`, `8W / 4L`, `p = 0.39`）在单轮样本量下尚不构成独立显著性。
+> 1. 评测语料为作者私有真实工作库（21,166 条 Atom + 2,104 篇 Markdown），外部开发者无法直接下载复现（评测脚本不入本开源仓）。
+> 2. 全程关闭向量检索（`vector_enabled: false`），只衡量确定性 SQLite FTS5 + 领域结构 + 时间戳/取代图谱内核。
+> 3. 191 题累计跨越 `v0.2a Slice 1` 至 `v0.2.1` 多个演进版本（各轮零重叠），并非单一冻结提交。
+> 4. 双裁判属同模型家族双盲交叉审计（独立平衡翻转与乱序），非跨模型家族裁判；单轮样本量 `n = 32`。
 
 ---
 
-## 演进路线图与云端/前端设计
+## 已交付能力演进（`v0.2.0` → `v0.5.0`）
 
-完整云端自托管部署方案与「原子组件 + Agent 现搓独特前端」设计见 [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md)：
+完整云端自托管部署方案、安全模型与自定义前端指南见 [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md)、[`docs/UI_BUILDER_SKILL.md`](./docs/UI_BUILDER_SKILL.md) 与 [`THREAT_MODEL.md`](./THREAT_MODEL.md)：
 
-- **`v0.2.1`**：有方向跨 kind 取代、中性写入回显、导入保留精确时间戳修同日排反 Bug、L1 确定性简报选材（规则永不截断）。
-- **`v0.3`**：单进程 `meru-mind serve`（Token 哈希 + `Principal`、`MindSurface` 契约双跑、单写者独占锁、泵模型 + 长轮询、游标碰撞提示、`VACUUM INTO` CI 恢复演练、Docker/Caddy/Fly.io 部署套件）。
-- **`v0.4`**：可组合 Web 治理前端（`@meru-mind/client` Headless 泵 SDK + `@meru-mind/ui-atoms` 8 个原子积木 + 极简默认壳 + `UI_BUILDER_SKILL.md` 让用户 Agent 60 秒按个人品味搓出独特界面）、泵上 `WS /v1/ws` + 长轮询降级、极薄 `MindPulse`。
-- **`v0.5`**：单真源 `WorkProvider` 窄契约（内核 0 任务表、MCP 保持 7 动词）+ Linear & GitHub 双官方 Provider + `deliveries` 退避队列。
+- **`v0.2.0`**：树状空间隔离 `MindRealm`（`open | tree` + `@mount`）、单真相库分层 `MindSea`（证据 `Seabed` ⊥ 定论 `Ledger`）、7 动词 CLI、7 工具 stdio MCP + 23 行官方 Skill、合规级 `redact`、只读切片导出与 Node 22/24 CI。
+- **`v0.2.1`**：有方向跨 kind 取代、中性写入相似回显、导入保留同日精确时间戳、确定性 L1 简报（规则永不截断）与迁移前自动 `VACUUM INTO` 快照。
+- **`v0.3.0`**：统一 `MindSurface` 门面（`LocalMindSurface` / `RemoteMindSurface`）、单写者 `meru-mind serve` 独占锁、哈希 Bearer Token 管理（`meru-mind token`）、写期 Secret Guard、泵模型 + 长轮询（`GET /v1/changes?wait=25`）、Streamable HTTP MCP（`/mcp`）、`meru-mind admin backup` 与云端部署套件（`deploy/Dockerfile`、`docker-compose.yml`、`Caddyfile`、`fly.toml`）。
+- **`v0.4.0`**：零新增依赖 1.5 层可组合 Web 治理前端——服务端托管 `/_meru/client.js`（泵状态、CAS `inbox.triage()`、消毒 Shadow DOM `<meru-entry>`、可见作用域快照）、内置 `/_meru/shell` 官方壳、7 条件泵 WebSocket（`WS /v1/ws`）、进程内 `MindPulse`、60 秒一次性 CLI 登录码换弱化 `HttpOnly; SameSite=Strict` Cookie（`meru-mind ui login`）、`meru-mind ui eject`、`--demo` 对抗演练沙箱与 6 条安全硬护栏。
+- **`v0.5.0`**：单真源 `WorkProvider` 窄契约（`mind-core` 零任务表、MCP 严格保持 7 工具）、官方 Linear 与 GitHub Provider、`work_bindings`（强制仅存 `env:VAR` 凭据引用）、熔断降级、`DeliveryRetryWorker` 指数退避重试与死信、以及本地/远程 `meru-mind work` 命令。
 
 ## 开源协议
 

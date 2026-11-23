@@ -5,23 +5,28 @@ Meru Mind separates **space & visibility (`MindRealm`)** from **time & memory de
 ## Layer Overview
 
 ```
-+-------------------------------------------------------------+
-| Entrypoints: CLI (meru-mind) | MCP (meru-mind-mcp) | SDK    |
-+-------------------------------------------------------------+
-| Core Engine:                                                |
-|   VisibilityPolicy (open | tree access & scope intersection)|
-|   LedgerEngine     (append-only records, rules, redact)     |
-|   SeaEngine        (brief, 4-stage recall, settle, rebuild) |
-|   SliceExporter    (read-only .mindrealm/ & tamper check)   |
-+-------------------------------------------------------------+
-| Thin Ports:  DbPort | DrivePort | BlobPort | EmbedderPort   |
-+-------------------------------------------------------------+
-| Adapters:                                                   |
-|   SqliteDb (Node 22+ node:sqlite + WAL + FTS5 + sqlite-vec) |
-|   LocalFsDriveAdapter (experimental local shared drive)     |
-|   LocalBlobStore (sha256, 0o444 immutable)                  |
-|   OpenAICompatibleEmbedder (off-write-path batch sync)      |
-+-------------------------------------------------------------+
++-------------------------------------------------------------------+
+| Entrypoints: CLI (meru-mind) | stdio MCP | HTTP/WS/MCP Server     |
+|              Composable Web UI (/_meru/client.js + /_meru/shell)  |
++-------------------------------------------------------------------+
+| Unified Policy Choke Point: MindSurface (Local | Remote)          |
+|   Tokens / Weakened Cookie / ChangeWakeBus + MindPump / MindPulse |
+|   WorkProvider SSOT Registry (Linear | GitHub) + DeliveryWorker   |
++-------------------------------------------------------------------+
+| Core Engine:                                                      |
+|   VisibilityPolicy (open | tree access & scope intersection)      |
+|   LedgerEngine     (append-only records, rules, redact)           |
+|   SeaEngine        (brief, 4-stage recall, settle, rebuild)       |
+|   SliceExporter    (read-only .mindrealm/ & tamper check)         |
++-------------------------------------------------------------------+
+| Thin Ports:  DbPort | DrivePort | BlobPort | EmbedderPort         |
++-------------------------------------------------------------------+
+| Adapters:                                                         |
+|   SqliteDb (Node 22+ node:sqlite + WAL + FTS5 + sqlite-vec)       |
+|   LocalFsDriveAdapter (experimental local shared drive)           |
+|   LocalBlobStore (sha256, 0o444 immutable)                        |
+|   OpenAICompatibleEmbedder (off-write-path batch sync)            |
++-------------------------------------------------------------------+
 ```
 
 ## Core Invariants
