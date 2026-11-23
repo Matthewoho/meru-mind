@@ -1,3 +1,5 @@
+import type { WorkBindingRecord } from "./work/provider.js";
+import type { SafeListReadyResult, SafeResolveResult } from "./work/registry.js";
 import type {
   MindSurface,
   SurfaceAddRuleInput,
@@ -396,6 +398,52 @@ export class RemoteMindSurface implements MindSurface {
       { body: params },
     );
     return res.revoked;
+  }
+
+  async bindWork(params: {
+    realmRef: string;
+    provider: string;
+    config: Record<string, unknown>;
+  }): Promise<WorkBindingRecord> {
+    return this.request<WorkBindingRecord>("POST", "/v1/work/bindings", {
+      body: params,
+    });
+  }
+
+  async unbindWork(params: { realmRef: string }): Promise<boolean> {
+    const res = await this.request<{ unbound: boolean }>(
+      "POST",
+      "/v1/work/unbind",
+      { body: params },
+    );
+    return res.unbound;
+  }
+
+  async listWorkBindings(): Promise<WorkBindingRecord[]> {
+    return this.request<WorkBindingRecord[]>("GET", "/v1/work/bindings");
+  }
+
+  async resolveWork(params: {
+    realmRef?: string;
+    items: string[];
+  }): Promise<SafeResolveResult> {
+    return this.request<SafeResolveResult>("POST", "/v1/work/resolve", {
+      body: params,
+    });
+  }
+
+  async listReadyWork(params?: {
+    realmRef?: string;
+    limit?: number;
+    cursor?: string;
+  }): Promise<SafeListReadyResult> {
+    return this.request<SafeListReadyResult>("GET", "/v1/work/ready", {
+      query: {
+        ref: params?.realmRef,
+        limit: params?.limit,
+        cursor: params?.cursor,
+      },
+    });
   }
 
   async close(): Promise<void> {

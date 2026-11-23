@@ -118,6 +118,40 @@ export {
   isOriginAllowed,
   type AttachPumpWsOptions,
 } from "./server/ws-pump.js";
+export {
+  validateWorkBindingConfig,
+  resolveEnvSecretRef,
+  formatDefaultAnnotateComment,
+  type WorkRef,
+  type WorkLocator,
+  type StatusType,
+  type ProviderCtx,
+  type WorkItemSnapshot,
+  type WorkResolveOutcome,
+  type AnnotateNote,
+  type WorkProvider,
+  type WorkBindingRecord,
+} from "./work/provider.js";
+export {
+  LinearWorkProvider,
+  type LinearProviderOptions,
+} from "./work/linear-provider.js";
+export {
+  GitHubWorkProvider,
+  type GitHubProviderOptions,
+} from "./work/github-provider.js";
+export {
+  WorkProviderRegistry,
+  resolveWorkBindingForRealm,
+  type CircuitBreakerConfig,
+  type SafeResolveResult,
+  type SafeListReadyResult,
+} from "./work/registry.js";
+export {
+  DeliveryRetryWorker,
+  type DeliveryWorkerOptions,
+  type DeliveryDrainResult,
+} from "./work/delivery-worker.js";
 export { LocalBlobStore } from "./adapters/blob-store.js";
 export {
   NoopEmbedder,

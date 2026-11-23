@@ -371,6 +371,95 @@ export async function runRemoteCliCommand(
       }
     }
 
+    if (cmd === "work") {
+      if (sub === "bind") {
+        let config: Record<string, unknown> = {};
+        const rawConfig = str(flags, "config");
+        if (rawConfig) {
+          try {
+            const parsed = JSON.parse(rawConfig) as unknown;
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+              throw new Error("must be a JSON object");
+            }
+            config = parsed as Record<string, unknown>;
+          } catch (err) {
+            throw new MindError(
+              "INVALID_INPUT",
+              `Invalid --config JSON: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+        const provider = reqStr(flags, "provider", "work bind");
+        const team = str(flags, "team");
+        const project = str(flags, "project");
+        const repo = str(flags, "repo");
+        const tokenEnv = str(flags, "token-env");
+        if (team) config.teamKey = team;
+        if (project) config.projectSlug = project;
+        if (repo) {
+          const slash = repo.indexOf("/");
+          if (slash > 0 && slash < repo.length - 1) {
+            config.owner = repo.slice(0, slash);
+            config.repo = repo.slice(slash + 1);
+          } else {
+            config.repo = repo;
+          }
+        }
+        if (tokenEnv) {
+          const envRef = tokenEnv.startsWith("env:")
+            ? tokenEnv
+            : `env:${tokenEnv}`;
+          if (provider === "linear") {
+            config.apiKeyRef = envRef;
+          } else {
+            config.tokenRef = envRef;
+          }
+        }
+        const res = await surface.bindWork({
+          realmRef: reqStr(flags, "in", "work bind"),
+          provider,
+          config,
+        });
+        output(res, formatGenericMarkdown("Work Provider Bound", res));
+        return;
+      }
+      if (sub === "unbind") {
+        const realmRef = reqStr(flags, "in", "work unbind");
+        const unbound = await surface.unbindWork({ realmRef });
+        output({ realmRef, unbound }, formatGenericMarkdown("Work Provider Unbound", { realmRef, unbound }));
+        return;
+      }
+      if (sub === "list") {
+        const bindings = await surface.listWorkBindings();
+        output(bindings, formatGenericMarkdown("Work Provider Bindings", bindings));
+        return;
+      }
+      if (sub === "ready") {
+        const res = await surface.listReadyWork({
+          realmRef: str(flags, "in"),
+          limit: intFlag(flags, "limit"),
+          cursor: str(flags, "cursor"),
+        });
+        output(res, formatGenericMarkdown("Ready Work Items", res));
+        return;
+      }
+      if (sub === "resolve") {
+        const items = positionals.slice(2).filter(Boolean);
+        if (items.length === 0) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "work resolve requires one or more <itemRef> arguments",
+          );
+        }
+        const res = await surface.resolveWork({
+          realmRef: str(flags, "in"),
+          items,
+        });
+        output(res, formatGenericMarkdown("Resolved Work Items", res));
+        return;
+      }
+    }
+
     throw new MindError(
       "UNKNOWN_COMMAND",
       `Command "${positionals.join(" ")}" is not supported in remote HTTP mode`,

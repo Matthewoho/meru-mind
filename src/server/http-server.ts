@@ -44,8 +44,9 @@ import {
   type ServeWriterLockHandle,
 } from "./writer-lock.js";
 import { attachPumpWebSocketServer } from "./ws-pump.js";
+import { WorkProviderRegistry } from "../work/registry.js";
 
-export const SERVER_VERSION = "0.4.0";
+export const SERVER_VERSION = "0.5.0";
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
 
 export interface AccessLogEntry {
@@ -71,6 +72,8 @@ export interface MindServerOptions {
   allowedOrigins?: string[];
   /** Seed demo org with rule-tail sentinel, stored-XSS probe, redacted tombstone, unknown extKind & inbox item */
   demo?: boolean;
+  /** Optional custom WorkProviderRegistry (defaults to official Linear + GitHub static registry) */
+  workRegistry?: WorkProviderRegistry;
   /** Custom access logger (pass false to disable stderr logging in tests) */
   accessLog?: ((entry: AccessLogEntry) => void) | false;
   /** Optional custom request hook invoked for non-/v1, non-/mcp paths (used by v0.4 Web UI shell) */
@@ -291,6 +294,8 @@ export async function startMindServer(
       : undefined;
 
     const wakeBus = new ChangeWakeBus();
+    const workRegistry =
+      options.workRegistry ?? WorkProviderRegistry.createDefault();
     const pulseStore = new MindPulseStore();
     const uiSessions = new UiSessionManager();
     const builtInUiHandler = createUiRouteHandler({
@@ -351,6 +356,7 @@ export async function startMindServer(
         engine: engine!,
         principal,
         wakeBus,
+        workRegistry,
         defaultWorkspaceHint: workspaceHint,
         storeDescriptor: {
           path: serverUrlRef.value,
@@ -703,6 +709,50 @@ export async function startMindServer(
                 note: body.note,
               });
               sendJson(res, 200, pulse);
+              return;
+            }
+
+            if (method === "GET" && pathname === "/v1/work/bindings") {
+              const out = await surface.listWorkBindings();
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/work/bindings") {
+              const body = (await readJsonBody(req)) as {
+                realmRef: string;
+                provider: string;
+                config: Record<string, unknown>;
+              };
+              const out = await surface.bindWork(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/work/unbind") {
+              const body = (await readJsonBody(req)) as { realmRef: string };
+              const unbound = await surface.unbindWork(body);
+              sendJson(res, 200, { unbound });
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/work/resolve") {
+              const body = (await readJsonBody(req)) as {
+                realmRef?: string;
+                items: string[];
+              };
+              const out = await surface.resolveWork(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "GET" && pathname === "/v1/work/ready") {
+              const out = await surface.listReadyWork({
+                realmRef: sp.get("ref") ?? undefined,
+                limit: parseOptionalInt(sp.get("limit")),
+                cursor: sp.get("cursor") ?? undefined,
+              });
+              sendJson(res, 200, out);
               return;
             }
 

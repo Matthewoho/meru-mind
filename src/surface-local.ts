@@ -14,6 +14,16 @@ import {
   isPrincipalTokenActive,
   toPublicToken,
 } from "./server/tokens.js";
+import {
+  validateWorkBindingConfig,
+  type WorkBindingRecord,
+} from "./work/provider.js";
+import {
+  resolveWorkBindingForRealm,
+  WorkProviderRegistry,
+  type SafeListReadyResult,
+  type SafeResolveResult,
+} from "./work/registry.js";
 import type {
   MindSurface,
   SurfaceAddRuleInput,
@@ -61,6 +71,8 @@ export interface LocalMindSurfaceOptions {
   principal: Principal;
   /** Optional shared ChangeWakeBus (owned by `meru-mind serve`) */
   wakeBus?: ChangeWakeBus;
+  /** Optional WorkProviderRegistry (defaults to official Linear + GitHub static registry) */
+  workRegistry?: WorkProviderRegistry;
   /** Optional untrusted workspace hint (.meru-mind-realm); intersected with principal scope */
   defaultWorkspaceHint?: string | null;
   /** Optional store descriptor shown in whoami (defaults to engine.homeDir) */
@@ -79,6 +91,7 @@ export class LocalMindSurface implements MindSurface {
 
   private readonly engine: MindEngine;
   private readonly wakeBus: ChangeWakeBus;
+  private readonly workRegistry: WorkProviderRegistry;
   private readonly ownsWakeBusSubscription: (() => void) | null;
   private readonly ownsEngine: boolean;
   private readonly defaultWorkspaceHint: string | null;
@@ -88,6 +101,8 @@ export class LocalMindSurface implements MindSurface {
   constructor(options: LocalMindSurfaceOptions) {
     this.engine = options.engine;
     this.principal = options.principal;
+    this.workRegistry =
+      options.workRegistry ?? WorkProviderRegistry.createDefault();
     this.ownsEngine = options.ownsEngine ?? false;
     this.defaultWorkspaceHint = options.defaultWorkspaceHint ?? null;
     this.storeDescriptor = options.storeDescriptor ?? {
@@ -783,6 +798,139 @@ export class LocalMindSurface implements MindSurface {
       params.tokenId,
       new Date().toISOString(),
     );
+  }
+
+  async bindWork(params: {
+    realmRef: string;
+    provider: string;
+    config: Record<string, unknown>;
+  }): Promise<WorkBindingRecord> {
+    const cliCmd = `meru-mind work bind --in ${params.realmRef} --provider ${params.provider} --config-json '${JSON.stringify(params.config)}' --as-human`;
+    this.assertNotWeakenedCookie("work bind", cliCmd);
+    this.assertHuman("bind external work providers", cliCmd);
+    validateWorkBindingConfig(params.config);
+    if (!this.workRegistry.get(params.provider)) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Unknown work provider "${params.provider}". Registered official providers: ${this.workRegistry.listIds().join(", ")}`,
+      );
+    }
+    const ctx = this.resolveScopeContext(false);
+    const target = resolveVisibleRealm({
+      realms: ctx.realms,
+      orgId: ctx.org.id,
+      ref: params.realmRef,
+      scope: ctx.scope,
+    });
+    const now = new Date().toISOString();
+    const existing = this.engine.db.getWorkBinding(ctx.org.id, target.id);
+    const binding: WorkBindingRecord = {
+      orgId: ctx.org.id,
+      realmId: target.id,
+      provider: params.provider,
+      config: params.config,
+      createdBy: existing?.createdBy ?? this.principal.actor.id,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.engine.db.upsertWorkBinding(binding);
+    return binding;
+  }
+
+  async unbindWork(params: { realmRef: string }): Promise<boolean> {
+    const cliCmd = `meru-mind work unbind --in ${params.realmRef} --as-human`;
+    this.assertNotWeakenedCookie("work unbind", cliCmd);
+    this.assertHuman("unbind external work providers", cliCmd);
+    const ctx = this.resolveScopeContext(false);
+    const target = resolveVisibleRealm({
+      realms: ctx.realms,
+      orgId: ctx.org.id,
+      ref: params.realmRef,
+      scope: ctx.scope,
+    });
+    return this.engine.db.deleteWorkBinding(ctx.org.id, target.id);
+  }
+
+  async listWorkBindings(): Promise<WorkBindingRecord[]> {
+    const ctx = this.resolveScopeContext(false);
+    const visible = new Set(ctx.scope.readableLedgerIds);
+    return this.engine.db
+      .listWorkBindings(ctx.org.id)
+      .filter((b) => visible.has(b.realmId));
+  }
+
+  async resolveWork(params: {
+    realmRef?: string;
+    items: string[];
+  }): Promise<SafeResolveResult> {
+    const ctx = this.resolveScopeContext(false);
+    const targetRealm = params.realmRef
+      ? resolveVisibleRealm({
+          realms: ctx.realms,
+          orgId: ctx.org.id,
+          ref: params.realmRef,
+          scope: ctx.scope,
+        })
+      : ctx.realms.find((r) => r.id === this.principal.boundRealmId)!;
+    const binding = resolveWorkBindingForRealm({
+      db: this.engine.db,
+      realms: ctx.realms,
+      orgId: ctx.org.id,
+      realmId: targetRealm.id,
+    });
+    if (!binding) {
+      return {
+        unavailable: true,
+        provider: "none",
+        reason: `status unavailable: no work provider bound to "${targetRealm.path}" or its ancestors`,
+      };
+    }
+    const parsedItems = params.items.map((raw) => {
+      const loc = this.workRegistry.parseLocator(raw, binding.provider);
+      return loc ?? (raw as `work:${string}:${string}`);
+    });
+    return this.workRegistry.resolveSafe({
+      binding,
+      items: parsedItems,
+      principalId: this.principal.actor.id,
+      realmId: targetRealm.id,
+    });
+  }
+
+  async listReadyWork(params?: {
+    realmRef?: string;
+    limit?: number;
+    cursor?: string;
+  }): Promise<SafeListReadyResult> {
+    const ctx = this.resolveScopeContext(false);
+    const targetRealm = params?.realmRef
+      ? resolveVisibleRealm({
+          realms: ctx.realms,
+          orgId: ctx.org.id,
+          ref: params.realmRef,
+          scope: ctx.scope,
+        })
+      : ctx.realms.find((r) => r.id === this.principal.boundRealmId)!;
+    const binding = resolveWorkBindingForRealm({
+      db: this.engine.db,
+      realms: ctx.realms,
+      orgId: ctx.org.id,
+      realmId: targetRealm.id,
+    });
+    if (!binding) {
+      return {
+        unavailable: true,
+        provider: "none",
+        reason: `status unavailable: no work provider bound to "${targetRealm.path}" or its ancestors`,
+      };
+    }
+    return this.workRegistry.listReadySafe({
+      binding,
+      limit: params?.limit,
+      cursor: params?.cursor,
+      principalId: this.principal.actor.id,
+      realmId: targetRealm.id,
+    });
   }
 
   async close(): Promise<void> {

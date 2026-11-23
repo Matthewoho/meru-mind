@@ -19,6 +19,7 @@ import {
   formatTreeMarkdown,
   formatWhoamiMarkdown,
   isRealmEffectivelyArchived,
+  LocalMindSurface,
   MindError,
   OPAQUE_OBJECT_NOT_FOUND,
   OPAQUE_REALM_NOT_FOUND,
@@ -390,7 +391,7 @@ RECORD [write]:
         [--occurred-at <iso|none>] [--sensitivity public|internal|confidential|secret]
 
 MANAGE [write / human] (experimental: file, raw, settle):
-  realm | entry | object | file | rule | raw | redact | settle | import | serve | ui | token | org | admin
+  realm | entry | object | file | rule | raw | redact | settle | import | serve | ui | token | work | org | admin
 
 OUTPUT:
   Markdown capped with next-page --cursor; pass --json for JSON; errors include try:.
@@ -643,6 +644,20 @@ Usage:
 Examples:
   meru-mind token create --actor-id claude-ci --kind agent --in /ops --as-human
   meru-mind token list --as-human
+`,
+  work: `Risk: read (list/ready/resolve) / high-risk-write (bind/unbind, human-only)
+When to use: Bind a realm to an external WorkProvider SSOT (linear or github) using env-var token refs only, or query live ready/resolved items without duplicating task tables in mind-core.
+Usage:
+  meru-mind work bind --in <realm> --provider linear|github [--config '<json>'] [--team <key>] [--project <slug>] [--repo <owner/name>] [--token-env <VAR>] [--as-human]
+  meru-mind work unbind --in <realm> [--as-human]
+  meru-mind work list
+  meru-mind work ready [--in <realm>] [--limit <n>] [--cursor <c>]
+  meru-mind work resolve <itemRef...> [--in <realm>]
+Examples:
+  meru-mind work bind --in /ops --provider linear --team OPS --token-env LINEAR_API_KEY --as-human
+  meru-mind work bind --in /eng --provider github --repo acme/api --token-env GITHUB_TOKEN --as-human
+  meru-mind work ready --in /ops
+  meru-mind work resolve OPS-42 --in /ops
 `,
 };
 
@@ -909,6 +924,7 @@ async function main(): Promise<void> {
     "serve",
     "ui",
     "token",
+    "work",
     "org",
     "admin",
   ]);
@@ -1609,6 +1625,127 @@ async function main(): Promise<void> {
         `Unknown token subcommand "${sub ?? ""}"`,
         { try: "meru-mind token --help" },
       );
+    }
+
+    if (cmd === "work") {
+      const ctx = resolveSessionContext({ engine, flags });
+      const surface = new LocalMindSurface({
+        engine,
+        principal: {
+          tokenId: null,
+          orgId: ctx.org.id,
+          actor,
+          boundRealmId: ctx.boundViewerRealmId,
+          boundSource: ctx.boundSource,
+          authKind: "local",
+        },
+        ownsEngine: false,
+      });
+      try {
+        if (sub === "bind") {
+          assertAllowedFlags(
+            flags,
+            ["in", "provider", "config", "team", "project", "repo", "token-env"],
+            "work bind",
+          );
+          let config: Record<string, unknown> = {};
+          const rawConfig = flagStr(flags, "config");
+          if (rawConfig) {
+            try {
+              const parsed = JSON.parse(rawConfig) as unknown;
+              if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+                throw new Error("must be a JSON object");
+              }
+              config = parsed as Record<string, unknown>;
+            } catch (err) {
+              throw new MindError(
+                "INVALID_INPUT",
+                `Invalid --config JSON: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+          const provider = requireFlag(flags, "provider", "work bind");
+          const team = flagStr(flags, "team");
+          const project = flagStr(flags, "project");
+          const repo = flagStr(flags, "repo");
+          const tokenEnv = flagStr(flags, "token-env");
+          if (team) config.teamKey = team;
+          if (project) config.projectSlug = project;
+          if (repo) {
+            const slash = repo.indexOf("/");
+            if (slash > 0 && slash < repo.length - 1) {
+              config.owner = repo.slice(0, slash);
+              config.repo = repo.slice(slash + 1);
+            } else {
+              config.repo = repo;
+            }
+          }
+          if (tokenEnv) {
+            const envRef = tokenEnv.startsWith("env:")
+              ? tokenEnv
+              : `env:${tokenEnv}`;
+            if (provider === "linear") {
+              config.apiKeyRef = envRef;
+            } else {
+              config.tokenRef = envRef;
+            }
+          }
+          const res = await surface.bindWork({
+            realmRef: requireFlag(flags, "in", "work bind"),
+            provider,
+            config,
+          });
+          output(res, formatGenericMarkdown("Work Provider Bound", res));
+          return;
+        }
+        if (sub === "unbind") {
+          assertAllowedFlags(flags, ["in"], "work unbind");
+          const realmRef = requireFlag(flags, "in", "work unbind");
+          const unbound = await surface.unbindWork({ realmRef });
+          output({ realmRef, unbound }, formatGenericMarkdown("Work Provider Unbound", { realmRef, unbound }));
+          return;
+        }
+        if (sub === "list") {
+          assertAllowedFlags(flags, [], "work list");
+          const bindings = await surface.listWorkBindings();
+          output(bindings, formatGenericMarkdown("Work Provider Bindings", bindings));
+          return;
+        }
+        if (sub === "ready") {
+          assertAllowedFlags(flags, ["in", "limit", "cursor"], "work ready");
+          const res = await surface.listReadyWork({
+            realmRef: flagStr(flags, "in"),
+            limit: parseIntFlag(flags, "limit", { min: 1 }),
+            cursor: flagStr(flags, "cursor"),
+          });
+          output(res, formatGenericMarkdown("Ready Work Items", res));
+          return;
+        }
+        if (sub === "resolve") {
+          assertAllowedFlags(flags, ["in"], "work resolve");
+          const items = positionals.slice(2).filter(Boolean);
+          if (items.length === 0) {
+            throw new MindError(
+              "INVALID_INPUT",
+              "work resolve requires one or more <itemRef> arguments",
+              { try: "meru-mind work resolve OPS-42 --in /ops" },
+            );
+          }
+          const res = await surface.resolveWork({
+            realmRef: flagStr(flags, "in"),
+            items,
+          });
+          output(res, formatGenericMarkdown("Resolved Work Items", res));
+          return;
+        }
+        throw new MindError(
+          "UNKNOWN_COMMAND",
+          `Unknown work subcommand "${sub ?? ""}"`,
+          { try: "meru-mind work --help" },
+        );
+      } finally {
+        await surface.close();
+      }
     }
 
     if (cmd === "org") {

@@ -30,6 +30,10 @@ import type {
   VectorMatch,
 } from "../ports.js";
 import {
+  validateWorkBindingConfig,
+  type WorkBindingRecord,
+} from "../work/provider.js";
+import {
   MindError,
   type AuthTokenRecord,
   type ChangeAssetClass,
@@ -346,7 +350,7 @@ export class SqliteDb implements DbPort {
 
   private initSchema(): void {
     this.assertMinSqliteVersion(3, 43);
-    this.maybeBackupBeforeMigration(9);
+    this.maybeBackupBeforeMigration(10);
     this.transaction(() => {
       const now = new Date().toISOString();
 
@@ -1243,6 +1247,29 @@ export class SqliteDb implements DbPort {
             `INSERT INTO schema_migrations (version, name, applied_at) VALUES (9, 'v9_v03_server_tokens_pump_outbox', ?)`,
           )
           .run(nowV9);
+      }
+
+      // Migration v10: v0.5 WorkProvider realm bindings (zero task tables in mind-core; config_json env refs only)
+      if (!applied.has(10)) {
+        const nowV10 = new Date().toISOString();
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS work_bindings (
+            org_id TEXT NOT NULL REFERENCES orgs(id),
+            realm_id TEXT NOT NULL REFERENCES realms(id),
+            provider TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (org_id, realm_id)
+          );
+          CREATE INDEX IF NOT EXISTS idx_work_bindings_org ON work_bindings(org_id);
+        `);
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (10, 'v10_v05_work_bindings', ?)`,
+          )
+          .run(nowV10);
       }
 
       if (this.vecEnabled && !this.tableExists("vec_items")) {
@@ -4596,6 +4623,76 @@ export class SqliteDb implements DbPort {
         params.consumer,
         params.seq,
       );
+    return Number(res.changes) > 0;
+  }
+
+  // ---- External Work Bindings (Migration v10) ----
+
+  upsertWorkBinding(binding: WorkBindingRecord): void {
+    validateWorkBindingConfig(binding.config);
+    this.db
+      .prepare(
+        `INSERT INTO work_bindings (org_id, realm_id, provider, config_json, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(org_id, realm_id) DO UPDATE SET
+           provider = excluded.provider,
+           config_json = excluded.config_json,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        binding.orgId,
+        binding.realmId,
+        binding.provider,
+        JSON.stringify(binding.config),
+        binding.createdBy,
+        binding.createdAt,
+        binding.updatedAt,
+      );
+  }
+
+  private mapWorkBinding(row: Record<string, unknown>): WorkBindingRecord {
+    let config: Record<string, unknown> = {};
+    try {
+      config = JSON.parse(String(row.config_json ?? "{}")) as Record<
+        string,
+        unknown
+      >;
+    } catch {
+      config = {};
+    }
+    return {
+      orgId: String(row.org_id),
+      realmId: String(row.realm_id),
+      provider: String(row.provider),
+      config,
+      createdBy: String(row.created_by),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  getWorkBinding(orgId: string, realmId: string): WorkBindingRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM work_bindings WHERE org_id = ? AND realm_id = ?`,
+      )
+      .get(orgId, realmId) as Record<string, unknown> | undefined;
+    return row ? this.mapWorkBinding(row) : null;
+  }
+
+  listWorkBindings(orgId: string): WorkBindingRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM work_bindings WHERE org_id = ? ORDER BY created_at ASC`,
+      )
+      .all(orgId) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapWorkBinding(r));
+  }
+
+  deleteWorkBinding(orgId: string, realmId: string): boolean {
+    const res = this.db
+      .prepare(`DELETE FROM work_bindings WHERE org_id = ? AND realm_id = ?`)
+      .run(orgId, realmId);
     return Number(res.changes) > 0;
   }
 

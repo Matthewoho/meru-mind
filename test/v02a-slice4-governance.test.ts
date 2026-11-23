@@ -299,7 +299,7 @@ describe("V0.2a Slice 4 — Pillar 3: Migration v8 realms.scope, realm set & arc
     const homeDir = makeTempHome();
     const eng = await createMindEngine({ homeDir });
     expect(eng.db.listSchemaMigrations().map((m) => m.version)).toEqual([
-      1, 2, 3, 4, 5, 6, 7, 8, 9,
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
     ]);
 
     const { org, rootRealm } = eng.ledger.createOrg({

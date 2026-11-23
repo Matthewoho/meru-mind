@@ -1,4 +1,6 @@
 import type { RelatedActiveEcho } from "./engine/surface-write.js";
+import type { WorkBindingRecord } from "./work/provider.js";
+import type { SafeListReadyResult, SafeResolveResult } from "./work/registry.js";
 import type {
   AuthTokenPublic,
   ChangeLogEntry,
@@ -203,6 +205,24 @@ export interface MindSurface {
   createToken(params: SurfaceCreateTokenInput): Promise<SurfaceCreateTokenResult>;
   listTokens(params?: { includeRevoked?: boolean }): Promise<AuthTokenPublic[]>;
   revokeToken(params: { tokenId: string }): Promise<boolean>;
+
+  // External WorkProvider SSOT bindings & live queries (v0.5; zero task tables in mind-core)
+  bindWork(params: {
+    realmRef: string;
+    provider: string;
+    config: Record<string, unknown>;
+  }): Promise<WorkBindingRecord>;
+  unbindWork(params: { realmRef: string }): Promise<boolean>;
+  listWorkBindings(): Promise<WorkBindingRecord[]>;
+  resolveWork(params: {
+    realmRef?: string;
+    items: string[];
+  }): Promise<SafeResolveResult>;
+  listReadyWork(params?: {
+    realmRef?: string;
+    limit?: number;
+    cursor?: string;
+  }): Promise<SafeListReadyResult>;
 
   close(): Promise<void>;
 }

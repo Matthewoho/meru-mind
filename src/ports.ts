@@ -1,3 +1,4 @@
+import type { WorkBindingRecord } from "./work/provider.js";
 import type {
   AuthTokenRecord,
   ChangeAssetClass,
@@ -542,6 +543,12 @@ export interface DbPort {
     lastError: string | null;
     updatedAt: string;
   }): boolean;
+
+  // External Work Bindings (Migration v10; config_json stores env:VAR refs ONLY)
+  upsertWorkBinding(binding: WorkBindingRecord): void;
+  getWorkBinding(orgId: string, realmId: string): WorkBindingRecord | null;
+  listWorkBindings(orgId: string): WorkBindingRecord[];
+  deleteWorkBinding(orgId: string, realmId: string): boolean;
 
   // Rebuildable FTS5 index
   upsertFtsItem(item: {
