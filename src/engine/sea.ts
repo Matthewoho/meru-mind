@@ -3270,7 +3270,7 @@ export class SeaEngine {
     context?: number;
     around?: string;
     cursor?: string;
-    limit?: number;
+    chars?: number;
     full?: boolean;
     includeDescendantSeabed?: boolean;
     scopeCeiling?: AccessScope;
@@ -3285,14 +3285,14 @@ export class SeaEngine {
       );
     }
     if (
-      params.limit !== undefined &&
-      (!Number.isInteger(params.limit) ||
-        params.limit < 1 ||
-        params.limit > MAX_SHOW_LIMIT)
+      params.chars !== undefined &&
+      (!Number.isInteger(params.chars) ||
+        params.chars < 1 ||
+        params.chars > MAX_SHOW_LIMIT)
     ) {
       throw new MindError(
         "INVALID_INPUT",
-        `--limit must be an integer between 1 and ${MAX_SHOW_LIMIT}, got ${String(params.limit)}`,
+        `--chars must be an integer between 1 and ${MAX_SHOW_LIMIT}, got ${String(params.chars)}`,
       );
     }
 
@@ -3300,7 +3300,7 @@ export class SeaEngine {
     const hasWindowFlags = Boolean(
       params.around !== undefined ||
         params.cursor !== undefined ||
-        params.limit !== undefined ||
+        params.chars !== undefined ||
         params.full === true,
     );
 
@@ -3308,7 +3308,7 @@ export class SeaEngine {
     if ((parsed.kind === "realm" || parsed.kind === "object") && hasWindowFlags) {
       throw new MindError(
         "INVALID_INPUT",
-        "--around/--cursor/--limit/--full are only supported when showing an entry (rec_/sea_) or file (file:...)",
+        "--around/--cursor/--chars/--full are only supported when showing an entry (rec_/sea_) or file (file:...)",
       );
     }
     if (aroundTrimmed && params.cursor !== undefined) {
@@ -3416,7 +3416,7 @@ export class SeaEngine {
     const aroundConcepts = aroundTrimmed
       ? parseSearchQuery(aroundTrimmed).concepts
       : undefined;
-    const effectiveLimit = params.limit ?? DEFAULT_SHOW_LIMIT;
+    const effectiveLimit = params.chars ?? DEFAULT_SHOW_LIMIT;
     const isFull = Boolean(params.full);
 
     // 3. File -> canonical file: read with longest visible realm prefix + version-pinned windowing

@@ -1046,7 +1046,7 @@ describe("V0.2a-Perf & Show-Window: Migration v6, Covering Indexes, CJK Bigrams,
       actor: agentWorker,
       viewerRealmId: rootRealm.id,
       ref: "file:/docs/handbook.md",
-      limit: 1200,
+      chars: 1200,
     });
     if (filePage1.refType !== "file") throw new Error("expected file");
     expect(filePage1.window.truncated).toBe(true);
@@ -1075,7 +1075,7 @@ describe("V0.2a-Perf & Show-Window: Migration v6, Covering Indexes, CJK Bigrams,
         actor: agentWorker,
         viewerRealmId: rootRealm.id,
         ref: "/",
-        limit: 1000,
+        chars: 1000,
       }),
     ).rejects.toMatchObject({ code: "INVALID_INPUT" });
     await expect(
@@ -1225,7 +1225,7 @@ describe("V0.2a-Perf & Show-Window: Migration v6, Covering Indexes, CJK Bigrams,
     await engine.close();
     engines.pop();
 
-    const cliShowMd = runCli(homeDir, ["show", bigRec.id, "--limit", "1000"]);
+    const cliShowMd = runCli(homeDir, ["show", bigRec.id, "--chars", "1000"]);
     expect(cliShowMd).toContain("--- chars 0–");
     expect(cliShowMd).toContain("--cursor");
 
@@ -1251,7 +1251,7 @@ describe("V0.2a-Perf & Show-Window: Migration v6, Covering Indexes, CJK Bigrams,
 
       const mcpShow = await client.callTool({
         name: "mind_show",
-        arguments: { ref: bigRec.id, limit: 1200, history: true },
+        arguments: { ref: bigRec.id, chars: 1200, history: true },
       });
       const rawText = (mcpShow.content as Array<{ text: string }>)[0]!.text;
       // Compact JSON: no pretty-printed 2-space indentation
@@ -1267,7 +1267,7 @@ describe("V0.2a-Perf & Show-Window: Migration v6, Covering Indexes, CJK Bigrams,
 
       const mcpErr = await client.callTool({
         name: "mind_show",
-        arguments: { ref: "/", limit: 500 },
+        arguments: { ref: "/", chars: 500 },
       });
       expect(mcpErr.isError).toBe(true);
       const errText = (mcpErr.content as Array<{ text: string }>)[0]!.text;

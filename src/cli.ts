@@ -418,15 +418,19 @@ Examples:
 `,
   show: `Risk: read
 When to use: Inspect any ref verbatim: /realm (brief), kind:name (object card), rec_/sea_ (entry), or file:/realm/path.
-Usage: meru-mind show <ref> [--around "<words>"] [--cursor <cursor>] [--limit <N>] [--full] [--history] [--context <N>] [--include-descendant-seabed]
+Usage: meru-mind show <ref> [--around "<words>"] [--cursor <cursor>] [--chars <N>] [--full] [--history] [--context <N>] [--include-descendant-seabed]
 Flags:
+  --chars <N>            Character window size (default: 3500, max: 200000)
+  --around "<words>"     Center window around matching query words
+  --cursor <cursor>      Pagination cursor from previous window footer
+  --full                 Show full content without window truncation
   --history              Include supersede DAG history (on record entries)
   --context <N>          Include ±N timeline replay window (integer >= 0)
   --include-descendant-seabed  Include descendant raw seabed in context
 Examples:
   meru-mind show /ops/cicd
   meru-mind show service:payment-api
-  meru-mind show rec_0123456789abcdef --history --context 5
+  meru-mind show rec_0123456789abcdef --chars 1200 --history --context 5
   meru-mind show file:/ops/cicd/sop.md
 `,
   search: `Risk: read
@@ -941,12 +945,22 @@ async function main(): Promise<void> {
     }
 
     if (cmd === "show") {
+      if ("limit" in flags) {
+        const refHint = sub?.trim() || "<ref>";
+        const nHint =
+          typeof flags["limit"] === "string" ? flags["limit"] : "<N>";
+        throw new MindError(
+          "UNKNOWN_FLAG",
+          "show does not accept --limit (which counts items on search/ls)",
+          { try: `meru-mind show ${refHint} --chars ${nHint}` },
+        );
+      }
       assertAllowedFlags(
         flags,
         [
           "around",
           "cursor",
-          "limit",
+          "chars",
           "full",
           "history",
           "context",
@@ -976,7 +990,7 @@ async function main(): Promise<void> {
         ref: sub,
         around: flagStr(flags, "around"),
         cursor: flagStr(flags, "cursor"),
-        limit: parseIntFlag(flags, "limit", { min: 1 }),
+        chars: parseIntFlag(flags, "chars", { min: 1 }),
         full: flagBool(flags, "full") ? true : undefined,
         history: flagBool(flags, "history"),
         context: parseIntFlag(flags, "context", { min: 0 }),

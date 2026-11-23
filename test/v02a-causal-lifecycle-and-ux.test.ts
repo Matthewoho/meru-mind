@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createMindEngine,
@@ -16,6 +18,7 @@ import {
 } from "../src/index.js";
 
 const cliEntry = path.resolve(import.meta.dirname, "../dist/cli.js");
+const mcpEntry = path.resolve(import.meta.dirname, "../dist/mcp.js");
 const distIndexUrl = pathToFileURL(
   path.resolve(import.meta.dirname, "../dist/index.js"),
 ).href;
@@ -1208,5 +1211,109 @@ describe("V0.2a Causal Entity Lifecycle & Round-3 UX Polish", () => {
     });
     expect(alphaSetRes.affected.linked).toBe(0);
     expect(alphaSetRes.affected.mentions).toBe(0);
+  });
+
+  it("6. show --chars rename: --limit throws unknown_flag hinting --chars, show --help lists window flags, MCP mind_show uses chars with <= 6000 wire budget", async () => {
+    const homeDir = makeTempDir("meru-v7-show-chars-");
+    const eng = await createMindEngine({ homeDir, enableVector: false });
+    const { rootRealm } = eng.ledger.createOrg({
+      name: "Acme",
+      policy: "open",
+    });
+
+    const bigRec = await eng.ledger.appendRecord({
+      actor: humanAdmin,
+      viewerRealmId: rootRealm.id,
+      realmId: rootRealm.id,
+      kind: "finding",
+      title: "Long architecture note",
+      payload: { body: "Architecture paragraph content. ".repeat(250) },
+      occurredAt: "2026-10-20T10:00:00Z",
+    });
+    await eng.close();
+
+    // show --help documents all window flags
+    const helpText = runCli(homeDir, ["show", "--help"]);
+    for (const flag of [
+      "--chars",
+      "--around",
+      "--cursor",
+      "--full",
+      "--history",
+      "--context",
+    ]) {
+      expect(helpText).toContain(flag);
+    }
+    expect(helpText).not.toContain("--limit");
+
+    // show --limit fails with unknown_flag and try hint mentioning --chars
+    const failLimit = runCliFail(homeDir, [
+      "show",
+      bigRec.id,
+      "--limit",
+      "600",
+      "--json",
+    ]);
+    const parsedErr = JSON.parse(failLimit.stderr) as {
+      error: string;
+      message: string;
+      try?: string;
+    };
+    expect(parsedErr.error).toBe("unknown_flag");
+    expect(parsedErr.message).toContain("--limit");
+    expect(parsedErr.try).toContain(`meru-mind show ${bigRec.id} --chars 600`);
+
+    // show --chars bounds output cleanly
+    const okShow = JSON.parse(
+      runCli(homeDir, ["show", bigRec.id, "--chars", "600", "--json"]),
+    ) as {
+      window: { shownChars: number; truncated: boolean };
+    };
+    expect(okShow.window.truncated).toBe(true);
+    expect(okShow.window.shownChars).toBeLessThanOrEqual(600);
+
+    // Live MCP: 7 tools, <= 6000 wire chars, mind_show schema uses chars (not limit)
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [mcpEntry],
+      env: { ...process.env, MERU_MIND_HOME: homeDir },
+    });
+    const client = new Client({ name: "v7-show-chars-mcp", version: "0.2.0" });
+    await client.connect(transport);
+    try {
+      const toolsList = await client.listTools();
+      expect(toolsList.tools).toHaveLength(7);
+      expect(JSON.stringify(toolsList).length).toBeLessThanOrEqual(6000);
+      const showTool = toolsList.tools.find((t) => t.name === "mind_show")!;
+      const props = (
+        showTool.inputSchema as { properties?: Record<string, unknown> }
+      ).properties!;
+      expect("chars" in props).toBe(true);
+      expect("limit" in props).toBe(false);
+
+      const mcpOk = await client.callTool({
+        name: "mind_show",
+        arguments: { ref: bigRec.id, chars: 500 },
+      });
+      expect(mcpOk.isError).toBeFalsy();
+      const mcpParsed = JSON.parse(
+        (mcpOk.content as Array<{ text: string }>)[0]!.text,
+      ) as { window: { shownChars: number; truncated: boolean } };
+      expect(mcpParsed.window.truncated).toBe(true);
+      expect(mcpParsed.window.shownChars).toBeLessThanOrEqual(500);
+
+      const mcpRealmErr = await client.callTool({
+        name: "mind_show",
+        arguments: { ref: "/", chars: 500 },
+      });
+      expect(mcpRealmErr.isError).toBe(true);
+      const realmErrObj = JSON.parse(
+        (mcpRealmErr.content as Array<{ text: string }>)[0]!.text,
+      ) as { error: string; message: string };
+      expect(realmErrObj.error).toBe("invalid_input");
+      expect(realmErrObj.message).toContain("--chars");
+    } finally {
+      await client.close();
+    }
   });
 });

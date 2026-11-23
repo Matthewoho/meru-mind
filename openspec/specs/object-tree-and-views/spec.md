@@ -97,7 +97,7 @@ Across all read views (`whoami`, `listRealms`, `tree`, `ls`, `show`, `brief`, `s
 - **THEN** `show <parentRealm>` reports `activeConclusions`, `activeRules`, and `activeObjects` accurately excluding `secret` and hidden-realm items in both JSON and Markdown (`conclusions=..., rules=..., objects=...`)
 
 ### Requirement: Engine-Bounded `show` Window and Compact MCP JSON
-`SeaEngine.show()` SHALL enforce engine-level bounded windowing (default `3500` chars, `--around`, `--cursor`, `--limit`, `--full`; 1:1 CLI and compact-JSON MCP) across records (keeping non-metadata payload keys, stripping `payload` whenever `!full` and truncated/cursor/oversized), seabed, distillations, and files (version-pinned `v<ver>:<offset>` cursor with `CONFLICT` on drift), stripping `payload` in `history`/`context`, and rejecting window flags on realms/objects (`INVALID_INPUT`).
+`SeaEngine.show()` SHALL enforce engine-level bounded windowing (default `3500` chars, `--around`, `--cursor`, `--chars`, `--full`; 1:1 CLI and compact-JSON MCP `mind_show.chars`, with CLI `show --limit` failing as `UNKNOWN_FLAG` hinting `--chars`) across records (stripping `payload` whenever `!full` and truncated/cursor/oversized), seabed, distillations, and files (version-pinned `v<ver>:<offset>` cursor), rejecting window flags on realms/objects (`INVALID_INPUT`).
 
 #### Scenario: Engine-level show window bounds Markdown, JSON, and MCP with lossless cursor pagination
 - **WHEN** a caller inspects a multi-kilobyte entry or file via CLI Markdown, CLI `--json`, or MCP `mind_show` with default cap, `--around`, `--cursor`, `--history`, or `--context`
