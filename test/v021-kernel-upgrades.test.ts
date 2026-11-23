@@ -210,17 +210,27 @@ describe("v0.2.1 Kernel Upgrades: Cross-Kind Supersedes, Neutral Write Echo, Exa
     ];
     fs.writeFileSync(jsonlPath, rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
 
+    const tsMapping = {
+      id: "id",
+      title: "title",
+      body: "body",
+      occurredAt: ["valid_from", "created_at"],
+    };
     await engine.importer.importJsonl({
       actor: humanAlice,
       viewerRealmId: rootRealm.id,
       jsonlPath,
-      mapping: {
-        id: "id",
-        title: "title",
-        body: "body",
-        occurredAt: ["valid_from", "created_at"],
-      },
+      mapping: tsMapping,
     });
+
+    // Regression: verifyImportConsistency MUST agree with resolveMostPreciseDeclaredTimestamp (0 mismatches)
+    const verifyRes = engine.importer.verifyImportConsistency({
+      viewerRealmId: rootRealm.id,
+      sourcePath: jsonlPath,
+      mapping: tsMapping,
+    });
+    expect(verifyRes.passed).toBe(true);
+    expect(verifyRes.timestampMismatches).toEqual([]);
 
     const recall = await engine.sea.recall({
       actor: humanAlice,

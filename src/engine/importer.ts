@@ -1720,8 +1720,8 @@ export class ImporterEngine {
           continue;
         }
 
-        const expectedOccurredAt = normalizeDeclaredTimestamp(
-          getFirstField(row, mapping.occurredAt),
+        const expectedOccurredAt = resolveMostPreciseDeclaredTimestamp(
+          getAllFields(row, mapping.occurredAt),
         );
         if (expectedOccurredAt === null) undatedCount += 1;
 
@@ -1797,7 +1797,9 @@ export class ImporterEngine {
         }
 
         const mappedOccurred = mapping?.occurredAt
-          ? normalizeDeclaredTimestamp(getFirstField(fm, mapping.occurredAt))
+          ? resolveMostPreciseDeclaredTimestamp(
+              getAllFields(fm, mapping.occurredAt),
+            )
           : null;
         const expectedOccurredAt =
           mappedOccurred ??
