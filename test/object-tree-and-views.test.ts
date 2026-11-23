@@ -629,21 +629,21 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       policy: "open",
     });
     const alpha = engine.ledger.createRealm({
-      actor: agentBot,
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "alpha",
       name: "Alpha",
     });
     const beta = engine.ledger.createRealm({
-      actor: agentBot,
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "beta",
       name: "Beta",
     });
     const gamma = engine.ledger.createRealm({
-      actor: agentBot,
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "gamma",
@@ -1066,6 +1066,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       "ops",
       "--name",
       "Operations",
+      "--as-human",
     ]);
 
     // Create object, rule, conclusion, raw, and settle card via V0.2a-Surface CLI

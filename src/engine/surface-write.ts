@@ -87,7 +87,7 @@ export async function writeEverydayConclusion(
       "INVALID_INPUT",
       `Invalid write kind "${params.kind}". Allowed kinds: decision, finding, claim, proposal, verdict`,
       {
-        try: 'meru-mind write --in / --kind finding --title "<title>" --body "<body>"',
+        try: 'meru-mind write --in /ops --kind finding --title "<title>" --body "<body>"',
       },
     );
   }

@@ -1262,6 +1262,7 @@ describe("V0.2a-Surface Contract: 7-Tool MCP Budget, Typed Refs, Unified Objects
       "a",
       "--name",
       "A",
+      "--as-human",
     ]);
     runCliJson(homeDir, [
       "realm",
@@ -1272,6 +1273,7 @@ describe("V0.2a-Surface Contract: 7-Tool MCP Budget, Typed Refs, Unified Objects
       "b",
       "--name",
       "B",
+      "--as-human",
     ]);
     runCliJson(homeDir, [
       "object",

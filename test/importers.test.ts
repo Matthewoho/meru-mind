@@ -230,14 +230,14 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
       policy: "open",
     });
     const alpha = engine.ledger.createRealm({
-      actor: agentBot,
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "alpha",
       name: "Alpha",
     });
     const beta = engine.ledger.createRealm({
-      actor: agentBot,
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "beta",
@@ -396,14 +396,14 @@ describe("Slice 2a: Generic Markdown (import-md) and JSONL (import-jsonl) import
       policy: "open",
     });
     const alpha = engine.ledger.createRealm({
-      actor: agentBot,
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "alpha",
       name: "Alpha",
     });
     const beta = engine.ledger.createRealm({
-      actor: agentBot,
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "beta",

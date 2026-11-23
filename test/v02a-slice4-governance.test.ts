@@ -189,3 +189,94 @@ describe("V0.2a Slice 4 — Pillar 1: Local-Passage Windowed Coverage & Search e
     eng.close();
   });
 });
+
+describe("V0.2a Slice 4 — Pillar 2: Human-Only Realm Topology, Round-Trip Object Ref Validation & Ref-Safe Fallback", () => {
+  it("validates object kind & round-trip ref syntax (allowing repo:org/name, host:redis:6379, person:a@b.com, CJK) and falls back to obj_id on legacy space names", async () => {
+    const homeDir = makeTempHome();
+    const eng = await createMindEngine({ homeDir });
+    const { org, rootRealm } = eng.ledger.createOrg({
+      name: "RefCheckOrg",
+      policy: "open",
+      actor: humanAdmin,
+    });
+
+    // Valid real-world object names MUST succeed and round-trip
+    for (const [kind, name] of [
+      ["repo", "org/service-api"],
+      ["host", "redis:6379"],
+      ["person", "alice@example.com"],
+      ["service", "api/v2"],
+      ["release", "v1.2.3"],
+      ["person", "李明"],
+    ] as const) {
+      const obj = eng.objects.createObject({
+        actor: agentWorker,
+        viewerRealmId: rootRealm.id,
+        kind,
+        name,
+      });
+      const card = await eng.sea.show({
+        actor: agentWorker,
+        viewerRealmId: rootRealm.id,
+        ref: `${kind}:${name}`,
+      });
+      expect(card.refType).toBe("object");
+      if (card.refType === "object") {
+        expect(card.card.object?.id).toBe(obj.id);
+        expect(card.card.try).toBe(`meru-mind ls ${kind}:${name}`);
+      }
+    }
+
+    // Invalid kinds or non-round-trippable names MUST fail with INVALID_INPUT
+    for (const [badKind, badName] of [
+      ["2fa", "token"],
+      ["服务", "gateway"],
+      ["file", "readme"],
+      ["person", "Alex Smith"],
+      ["service", "api//v2"],
+      ["service", "api/"],
+      ["service", "bad\tname"],
+    ] as const) {
+      expect(() =>
+        eng.objects.createObject({
+          actor: agentWorker,
+          viewerRealmId: rootRealm.id,
+          kind: badKind,
+          name: badName,
+        }),
+      ).toThrow(/Invalid object|reserved/i);
+    }
+
+    // Simulate pre-existing legacy object with whitespace in name (inserted directly in DB)
+    const legacyId = "obj_legacy_space_01";
+    eng.db.insertObject({
+      id: legacyId,
+      orgId: org.id,
+      parentObjectId: null,
+      realmId: rootRealm.id,
+      kind: "person",
+      name: "Legacy Space Name",
+      createdAt: new Date().toISOString(),
+    });
+
+    const legacyShow = await eng.sea.show({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      ref: legacyId,
+    });
+    expect(legacyShow.refType).toBe("object");
+    if (legacyShow.refType === "object") {
+      // Centralized formatCanonicalObjectRef falls back to obj_... so Next: is directly pasteable!
+      expect(legacyShow.card.ref).toBe(legacyId);
+      expect(legacyShow.card.try).toBe(`meru-mind ls ${legacyId}`);
+    }
+
+    const lsLegacy = await eng.sea.ls({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      ref: legacyId,
+    });
+    expect(lsLegacy.resolvedId).toBe(legacyId);
+    eng.close();
+  });
+});

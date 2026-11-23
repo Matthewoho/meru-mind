@@ -1817,7 +1817,7 @@ async function main(): Promise<void> {
           throw new MindError(
             "INVALID_INPUT",
             "import md requires a Markdown file or directory path",
-            { try: "meru-mind import md ./notes --in /" },
+            { try: "meru-mind import md ./notes --in /ops" },
           );
         }
         const mapPath = flagStr(flags, "map");

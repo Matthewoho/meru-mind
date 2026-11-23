@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { assertSafeIdentifier } from "../adapters/local-drive.js";
 import { parseSearchQuery } from "../adapters/sqlite-db.js";
+import { assertValidObjectRefParts } from "./refs.js";
 import {
   compileAliasMatcher,
   isAliasRowMentionEligible,
@@ -272,11 +273,11 @@ export class ObjectEngine {
     id?: string;
     scopeCeiling?: AccessScope;
   }): MindObject {
-    const kind = params.kind.trim();
+    const kind = params.kind.trim().toLowerCase();
     if (!kind) {
       throw new MindError("INVALID_INPUT", "Object kind cannot be empty");
     }
-    if (kind.toLowerCase() === "file") {
+    if (kind === "file") {
       throw new MindError(
         "INVALID_INPUT",
         'Object kind "file" is reserved for file:<path> references',
@@ -286,6 +287,7 @@ export class ObjectEngine {
     if (!name) {
       throw new MindError("INVALID_INPUT", "Object name cannot be empty");
     }
+    assertValidObjectRefParts(kind, name);
     if (!params.actor?.id?.trim()) {
       throw new MindError("INVALID_INPUT", "Actor id cannot be empty");
     }

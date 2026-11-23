@@ -29,10 +29,10 @@ CLI SHALL expose 7 everyday verbs (`whoami`, `tree`, `ls`, `show`, `search`, `ch
 - **THEN** the CLI exits non-zero with `unknown_command` or `unknown_flag` and a runnable replacement command in `try:`
 
 ### Requirement: Realm Topology Authorization and Scoped Realm Listing
-In `tree` mode, `createRealm()`, `mountRealm()`, and `unmountRealm()` SHALL require `actor.kind === 'human'`. In `open` mode, same-organization writers MAY mutate realm topology and all mutations SHALL append to `change_log`. `LedgerEngine.listRealms()` SHALL require `orgId`, require `viewerRealmId` in `tree` mode, and return P0-1 sanitized realms only.
+In both `open` and `tree` modes, `createRealm()`, `mountRealm()`, and `unmountRealm()` SHALL require `actor.kind === 'human'` and all mutations SHALL append to `change_log`. `LedgerEngine.listRealms()` SHALL require `orgId`, require `viewerRealmId` in `tree` mode, and return P0-1 sanitized realms only.
 
-#### Scenario: Agent attempts to create or mount a realm in a tree organization
-- **WHEN** an `agent` actor invokes `createRealm()`, `mountRealm()`, or `unmountRealm()` in a `tree` organization
+#### Scenario: Agent attempts to create or mount a realm in an open or tree organization
+- **WHEN** an `agent` actor invokes `createRealm()`, `mountRealm()`, or `unmountRealm()` in either an `open` or `tree` organization
 - **THEN** the engine rejects the operation with `ACCESS_DENIED`
 
 ### Requirement: Strictly 7-Tool Process-Bound MCP Server and Wire Schema Budget
@@ -51,7 +51,7 @@ Every MCP read tool SHALL evaluate visibility strictly within `scope(in/ref) ∩
 - **AND** `mind_write` binds writes to `B2` and rejects `because` references pointing to `C1` with `not_found`
 
 ### Requirement: Default-Safe CLI Privilege Model and 11 Wire Error Codes
-CLI SHALL default `--actor-kind` to `'agent'`, reject `--actor-kind human` without `--as-human`, and require `--as-human` for `rule add`, `redact`, `org set-policy`, and `tree` realm mutations. CLI and MCP SHALL map errors via `src/format/errors.ts` to 11 codes (`unknown_command`, `unknown_flag`, `invalid_ref`, `not_found`, `ambiguous_ref`, `not_listable`, `not_bound`, `forbidden`, `conflict`, `idempotency_mismatch`, `invalid_input`) in 4 fields (`error`, `message`, `candidates?`, `try`).
+CLI SHALL default `--actor-kind` to `'agent'`, reject `--actor-kind human` without `--as-human`, and require `--as-human` for `rule add`, `redact`, `org set-policy`, and realm topology mutations (`realm create/set/archive/unarchive/mount/unmount`, `entry move`). CLI and MCP SHALL map errors via `src/format/errors.ts` to 11 codes (`unknown_command`, `unknown_flag`, `invalid_ref`, `not_found`, `ambiguous_ref`, `not_listable`, `not_bound`, `forbidden`, `conflict`, `idempotency_mismatch`, `invalid_input`) in 4 fields (`error`, `message`, `candidates?`, `try`).
 
 #### Scenario: Default CLI invocation attempts a human-only operation
 - **WHEN** `meru-mind` runs `rule add`, `redact`, or `org set-policy` without `--as-human`

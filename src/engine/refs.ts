@@ -24,6 +24,72 @@ const ENTRY_ID_RE = /^(rec|sea|dist)_[A-Za-z0-9_-]+$/;
 const OBJECT_ID_RE = /^obj_[A-Za-z0-9_-]+$/;
 const REALM_ID_RE = /^realm_[A-Za-z0-9_-]+$/;
 const OBJECT_TAG_RE = /^([a-z][a-z0-9_-]*):([^\s]+)$/i;
+const OBJECT_KIND_RE = /^[a-z][a-z0-9_-]*$/;
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+
+/**
+ * Returns true iff `<kind>:<name>` (and `/<realm>/<kind>:<name>`) cleanly round-trips
+ * through `parseRefSyntax` without whitespace, control characters, slash collapsing,
+ * or reserved prefix collision (`file:`, `drive://`).
+ * Allows valid real-world names such as `repo:org/name`, `host:redis:6379`, `person:a@b.com`,
+ * `service:api/v2`, `release:v1.2`, and Unicode/CJK names without whitespace.
+ */
+export function isRoundTrippableObjectRef(kind: string, name: string): boolean {
+  if (!OBJECT_KIND_RE.test(kind) || kind === "file") {
+    return false;
+  }
+  if (
+    !name ||
+    /\s/.test(name) ||
+    CONTROL_CHAR_RE.test(name) ||
+    name.includes("//") ||
+    name.endsWith("/")
+  ) {
+    return false;
+  }
+  try {
+    const bare = parseRefSyntax(`${kind}:${name}`);
+    if (
+      bare.kind !== "object" ||
+      bare.objectKind !== kind ||
+      bare.objectName !== name
+    ) {
+      return false;
+    }
+    const qualified = parseRefSyntax(`/r/${kind}:${name}`);
+    if (
+      qualified.kind !== "object" ||
+      qualified.objectKind !== kind ||
+      qualified.objectName !== name
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function assertValidObjectRefParts(kind: string, name: string): void {
+  if (!OBJECT_KIND_RE.test(kind) || kind === "file") {
+    throw new MindError(
+      "INVALID_INPUT",
+      `Invalid object kind "${kind}". Kind must match /^[a-z][a-z0-9_-]*$/ and cannot be reserved "file".`,
+      {
+        try: 'meru-mind object create --in /ops --kind service --name api-gateway',
+      },
+    );
+  }
+  if (!isRoundTrippableObjectRef(kind, name)) {
+    throw new MindError(
+      "INVALID_INPUT",
+      `Invalid object name "${name}" for kind "${kind}". Names cannot contain whitespace, control characters, "//", trailing "/", or collide with reserved ref prefixes.`,
+      {
+        try: `meru-mind object create --in /ops --kind ${kind} --name example-name`,
+      },
+    );
+  }
+}
 
 export type ParsedRef =
   | {
@@ -307,7 +373,11 @@ export function formatCanonicalObjectRef(
   sanitizedRealmPath: string,
   duplicateKeys: Set<string>,
 ): string {
-  const key = `${obj.kind.toLowerCase()}:${obj.name.toLowerCase()}`;
+  const normalizedKind = obj.kind.toLowerCase();
+  if (!isRoundTrippableObjectRef(normalizedKind, obj.name)) {
+    return obj.id;
+  }
+  const key = `${normalizedKind}:${obj.name.toLowerCase()}`;
   if (duplicateKeys.has(key)) {
     return formatRealmQualifiedObjectRef(sanitizedRealmPath, obj.kind, obj.name);
   }
@@ -771,14 +841,14 @@ export function resolveAboutRefsForWrite(params: {
       throw new MindError(
         "INVALID_INPUT",
         'Prefix "file:" is reserved for files and cannot be used with --about',
-        { try: 'meru-mind write --in / --title "..." --body "..." --about service:api' },
+        { try: 'meru-mind write --in /ops --title "..." --body "..." --about service:api' },
       );
     }
     if (parsed.kind !== "object") {
       throw new MindError(
         "INVALID_REF",
         `Invalid --about reference "${raw}": expected "<kind>:<name>", "/<realm>/<kind>:<name>", or "obj_..."`,
-        { try: 'meru-mind write --in / --title "..." --body "..." --about service:api' },
+        { try: 'meru-mind write --in /ops --title "..." --body "..." --about service:api' },
       );
     }
 

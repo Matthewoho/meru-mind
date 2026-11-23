@@ -40,6 +40,12 @@ function safeMcpRealmRef(options?: SurfaceErrorOptions): string {
   return options?.orgPolicy === "tree" ? "<bound-realm>" : "/";
 }
 
+function safeMcpWriteRealmRef(options?: SurfaceErrorOptions): string {
+  const bound = options?.boundRealmPath?.trim();
+  if (bound && bound !== "/") return bound;
+  return options?.orgPolicy === "tree" ? "<bound-realm>" : "/ops";
+}
+
 function adaptTryHintForMcp(
   code: MindErrorCode,
   explicitTry: string | undefined,
@@ -47,6 +53,7 @@ function adaptTryHintForMcp(
   options?: SurfaceErrorOptions,
 ): string | undefined {
   const realmRef = safeMcpRealmRef(options);
+  const writeRealmRef = safeMcpWriteRealmRef(options);
 
   if (code === "RULE_REQUIRES_HUMAN") {
     return "Rules are human-only and cannot be written over MCP; ask a human to run 'meru-mind rule add --as-human' on CLI";
@@ -55,7 +62,7 @@ function adaptTryHintForMcp(
   if (code === "AMBIGUOUS_REF" && candidates.length > 0) {
     const first = candidates[0]!;
     if (explicitTry && explicitTry.includes("meru-mind write")) {
-      return `mind_write({ in: ${JSON.stringify(realmRef)}, title: "<title>", body: "<body>", about: [${JSON.stringify(first)}] })`;
+      return `mind_write({ in: ${JSON.stringify(writeRealmRef)}, title: "<title>", body: "<body>", about: [${JSON.stringify(first)}] })`;
     }
     return `mind_show({ ref: ${JSON.stringify(first)} })`;
   }
@@ -111,9 +118,9 @@ function adaptTryHintForMcp(
   }
   if (explicitTry.startsWith("meru-mind write")) {
     if (explicitTry.includes("--about")) {
-      return `mind_write({ in: ${JSON.stringify(realmRef)}, title: "<title>", body: "<body>", about: ["service:api"] })`;
+      return `mind_write({ in: ${JSON.stringify(writeRealmRef)}, title: "<title>", body: "<body>", about: ["service:api"] })`;
     }
-    return `mind_write({ in: ${JSON.stringify(realmRef)}, kind: "finding", title: "<title>", body: "<body>" })`;
+    return `mind_write({ in: ${JSON.stringify(writeRealmRef)}, kind: "finding", title: "<title>", body: "<body>" })`;
   }
 
   return explicitTry;

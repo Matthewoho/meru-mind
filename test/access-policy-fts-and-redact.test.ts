@@ -199,7 +199,7 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       policy: "open",
     });
     const o1Child = setupEngine.ledger.createRealm({
-      actor: agentWorker,
+      actor: humanAlice,
       orgId: openOrg1.id,
       parentId: o1Root.id,
       slug: "eng",
@@ -655,31 +655,57 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       name: "OpenOrg",
       policy: "open",
     });
-    // Agent CAN create realms & mount/unmount in open mode (logged to change_log)
+    // Agents are denied realm topology mutations even in open mode; human succeeds & logs to change_log
+    expect(() =>
+      engine.ledger.createRealm({
+        actor: agentWorker,
+        orgId: openOrg.id,
+        parentId: oRoot.id,
+        slug: "agent-denied",
+        name: "Agent Denied",
+      }),
+    ).toThrow(/Only human actors can create realms/);
+
     const oA = engine.ledger.createRealm({
-      actor: agentWorker,
+      actor: humanAlice,
       orgId: openOrg.id,
       parentId: oRoot.id,
       slug: "a",
       name: "A",
     });
     const oB = engine.ledger.createRealm({
-      actor: agentWorker,
+      actor: humanAlice,
       orgId: openOrg.id,
       parentId: oRoot.id,
       slug: "b",
       name: "B",
     });
+    expect(() =>
+      engine.ledger.mountRealm({
+        actor: agentWorker,
+        viewerRealmId: oA.id,
+        targetRealmId: oB.id,
+        scope: "ledger",
+      }),
+    ).toThrow(/Only human actors can mount realms/);
+
     const openMount = engine.ledger.mountRealm({
-      actor: agentWorker,
+      actor: humanAlice,
       viewerRealmId: oA.id,
       targetRealmId: oB.id,
       scope: "ledger",
     });
     expect(openMount.viewerRealmId).toBe(oA.id);
-    expect(
+    expect(() =>
       engine.ledger.unmountRealm({
         actor: agentWorker,
+        viewerRealmId: oA.id,
+        targetRealmId: oB.id,
+      }),
+    ).toThrow(/Only human actors can unmount realms/);
+    expect(
+      engine.ledger.unmountRealm({
+        actor: humanAlice,
         viewerRealmId: oA.id,
         targetRealmId: oB.id,
       }),
@@ -1436,14 +1462,14 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       policy: "open",
     });
     const realmAlpha = engine.ledger.createRealm({
-      actor: agentWorker,
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "alpha",
       name: "Alpha",
     });
     const realmBeta = engine.ledger.createRealm({
-      actor: agentWorker,
+      actor: humanAlice,
       orgId: org.id,
       parentId: rootRealm.id,
       slug: "beta",

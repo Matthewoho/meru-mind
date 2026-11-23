@@ -35,28 +35,29 @@ Runtime data is always stored outside the repository (defaults to `~/.meru-mind`
 export MERU_MIND_HOME="$HOME/.meru-mind"
 
 # 1. Initialize personal root org & root realm
-node dist/cli.js init --org "Acme"
+node dist/cli.js admin init --org "Acme"
 
-# 2. Create child realms
-node dist/cli.js realm create --org <orgId> --parent <rootRealmId> --slug backend --name "Backend"
-node dist/cli.js realm create --org <orgId> --parent <rootRealmId> --slug marketing --name "Marketing"
+# 2. Create child realms (realm topology is human-only in both open and tree modes)
+node dist/cli.js realm create --parent / --slug backend --name "Backend" --as-human
+node dist/cli.js realm create --parent / --slug marketing --name "Marketing" --as-human
 
-# 3. Record a human rule & decision
-node dist/cli.js record --realm <rootRealmId> --kind rule --title "Never deploy without passing integration tests"
-node dist/cli.js record --realm <backendRealmId> --kind decision --title "Use PostgreSQL 17 for primary storage"
+# 3. Record a human rule & everyday conclusion
+node dist/cli.js rule add --in / --title "Never deploy without passing integration tests" --body "All merges require passing CI." --as-human
+node dist/cli.js write --in /backend --kind decision --title "Use PostgreSQL 17 for primary storage" --body "Standardize on PG 17."
 
 # 4. Capture seabed messages & write shared drive files
-node dist/cli.js capture --realm <backendRealmId> --kind message --text "Benchmarked PostgreSQL connection pool sizing"
-node dist/cli.js drive write --realm <backendRealmId> --path "STATE.md" --content "# Backend State"
+node dist/cli.js raw add --in /backend --kind message --text "Benchmarked PostgreSQL connection pool sizing"
+node dist/cli.js file write file:/backend/STATE.md --content "# Backend State"
 
-# 5. Get a budgeted boot brief (with mandatory omitted counts)
-node dist/cli.js brief --realm <backendRealmId>
+# 5. Inspect workspace tree & realm brief
+node dist/cli.js tree
+node dist/cli.js show /backend
 
-# 6. Scoped 4-stage recall (ID -> filter -> FTS5 -> sqlite-vec RRF)
-node dist/cli.js recall --realm <backendRealmId> --query "PostgreSQL"
+# 6. Scoped search (ID -> filter -> FTS5 -> sqlite-vec)
+node dist/cli.js search "PostgreSQL" --in /backend
 
 # 7. Export a read-only slice for sandboxed agents
-node dist/cli.js export-slice --realm <backendRealmId> --out /tmp/agent-slice/.meru/.mindrealm
+node dist/cli.js admin export-slice --realm /backend --out /tmp/agent-slice/.meru/.mindrealm
 ```
 
 ### MCP Server Usage

@@ -84,6 +84,7 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
       "eng",
       "--name",
       "Engineering",
+      "--as-human",
     ]) as { id: string; path: string };
     expect(eng.path).toBe("/eng");
 

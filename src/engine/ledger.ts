@@ -327,10 +327,13 @@ export class LedgerEngine {
           `Organization not found: ${params.orgId}`,
         );
       }
-      if (org.policy === "tree" && actor.kind !== "human") {
+      if (actor.kind !== "human") {
         throw new MindError(
           "ACCESS_DENIED",
-          `Only human actors can create realms in 'tree' policy organizations (actor "${actor.id}" is "${actor.kind}")`,
+          `Only human actors can create realms (actor "${actor.id}" is "${actor.kind}")`,
+          {
+            try: 'meru-mind realm create --parent / --slug <slug> --name "<name>" --as-human',
+          },
         );
       }
       const parent = this.db.getRealm(params.parentId);
@@ -483,11 +486,13 @@ export class LedgerEngine {
         );
       }
 
-      const orgPolicy = this.getOrgPolicy(viewer.orgId);
-      if (orgPolicy === "tree" && actor.kind !== "human") {
+      if (actor.kind !== "human") {
         throw new MindError(
           "ACCESS_DENIED",
-          `Only human actors can mount realms in 'tree' policy organizations (actor "${actor.id}" is "${actor.kind}")`,
+          `Only human actors can mount realms (actor "${actor.id}" is "${actor.kind}")`,
+          {
+            try: "meru-mind realm mount --viewer <realm> --target <realm> --as-human",
+          },
         );
       }
 
@@ -528,11 +533,13 @@ export class LedgerEngine {
           `Viewer realm not found: ${params.viewerRealmId}`,
         );
       }
-      const orgPolicy = this.getOrgPolicy(viewer.orgId);
-      if (orgPolicy === "tree" && actor.kind !== "human") {
+      if (actor.kind !== "human") {
         throw new MindError(
           "ACCESS_DENIED",
-          `Only human actors can unmount realms in 'tree' policy organizations (actor "${actor.id}" is "${actor.kind}")`,
+          `Only human actors can unmount realms (actor "${actor.id}" is "${actor.kind}")`,
+          {
+            try: "meru-mind realm unmount --viewer <realm> --target <realm> --as-human",
+          },
         );
       }
       const target = this.db.getRealm(params.targetRealmId);
