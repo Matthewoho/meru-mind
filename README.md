@@ -86,6 +86,10 @@ node dist/cli.js admin export-slice --in /backend --out /tmp/agent-slice/.meru/.
 }
 ```
 
+### Agent Skill
+
+Ship the official 23-line Agent Skill at [`skills/meru-mind/SKILL.md`](skills/meru-mind/SKILL.md) with any skill-capable coding agent (Claude Code, Codex, Antigravity, Cursor) so agents follow the cold-start `whoami -> tree -> show <realm>` rhythm, record `decision` / `--supersedes` updates cleanly, and route unassigned notes to `/inbox`.
+
 ### Optional Semantic Vector Search (`sqlite-vec`)
 
 By default, `sqlite-vec` loads automatically inside `node:sqlite` with `realm_id` partition-key pre-filtering. Configure any OpenAI-compatible embedding endpoint to enable hybrid FTS5 + vector RRF recall:
