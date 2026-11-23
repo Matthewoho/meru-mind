@@ -8,6 +8,8 @@ import type {
   IdempotencyRecord,
   LedgerRecord,
   MindObject,
+  ObjectAlias,
+  ObjectState,
   Organization,
   OrgPolicy,
   Realm,
@@ -272,6 +274,32 @@ export interface DbPort {
     kind?: string;
   }): MindObject[];
   updateObjectParent(id: string, parentObjectId: string | null): boolean;
+  updateObjectState(params: {
+    id: string;
+    state: ObjectState;
+    stateLabel: string | null;
+    stateSince: string | null;
+    stateEvidenceId: string | null;
+  }): boolean;
+  listInactiveObjects(orgId: string, realmIds: string[]): MindObject[];
+  listObjectAliases(objectIds: string[]): ObjectAlias[];
+  upsertObjectAlias(alias: ObjectAlias): void;
+  deleteObjectAlias(objectId: string, aliasNorm: string): boolean;
+  countVisibleAliasOwners(params: {
+    orgId: string;
+    realmIds: string[];
+    aliasNorms: string[];
+  }): Map<string, number>;
+  clearObjectStateEvidenceByEntry(
+    entryId: string,
+  ): Array<{ id: string; orgId: string; realmId: string }>;
+  countVisibleLinkedEntriesForObject(params: {
+    orgId: string;
+    objectId: string;
+    ledgerRealmIds: string[];
+    seabedRealmIds: string[];
+    excludeEntryId?: string | null;
+  }): number;
   countChildObjects(parentObjectId: string): number;
   deleteObject(id: string): boolean;
 

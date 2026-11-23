@@ -1,5 +1,17 @@
 import crypto from "node:crypto";
 import { assertSafeIdentifier } from "../adapters/local-drive.js";
+import { parseSearchQuery } from "../adapters/sqlite-db.js";
+import {
+  compileAliasMatcher,
+  isAliasRowMentionEligible,
+  MAX_EXPLICIT_ALIASES_PER_OBJECT,
+  matchesCompiledAlias,
+  normalizeAlias,
+  OBJECT_STATE_LABEL_RE,
+  validateExplicitAliasInput,
+  validateStrictIsoDate,
+} from "../format/inactive-badges.js";
+import { extractReadableText } from "../format/snippet.js";
 import {
   assertAccess,
   intersectAccessScopes,
@@ -13,6 +25,10 @@ import {
   type Actor,
   type EntryObjectLink,
   type MindObject,
+  type ObjectAlias,
+  type ObjectAliasUpdateResult,
+  type ObjectState,
+  type ObjectStateSetResult,
   type OrgPolicy,
   type Realm,
   type ResourceTag,
@@ -339,7 +355,15 @@ export class ObjectEngine {
         actorId: params.actor.id,
         createdAt: now,
       });
-      return obj;
+      const vis = createVisibilityHelpers({
+        db: this.db,
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        scope,
+      });
+      return vis.sanitizeObject(obj);
     });
   }
 
@@ -406,9 +430,442 @@ export class ObjectEngine {
         actorId: params.actor.id,
         createdAt: now,
       });
-      return {
+      const vis = createVisibilityHelpers({
+        db: this.db,
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        scope,
+      });
+      return vis.sanitizeObject({
         ...obj,
         parentObjectId: nextParentId,
+      });
+    });
+  }
+
+  setObjectState(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    objectId: string;
+    state: ObjectState;
+    label?: string;
+    since?: string;
+    because?: string;
+    scopeCeiling?: AccessScope;
+  }): ObjectStateSetResult {
+    if (!params.actor?.id?.trim()) {
+      throw new MindError("INVALID_INPUT", "Actor id cannot be empty");
+    }
+    if (params.state !== "active" && params.state !== "inactive") {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Invalid object state "${String(params.state)}": expected "active" or "inactive"`,
+      );
+    }
+
+    let stateLabel: string | null = null;
+    let stateSince: string | null = null;
+    let stateEvidenceId: string | null = null;
+
+    if (params.state === "active") {
+      if (
+        params.label !== undefined ||
+        params.since !== undefined ||
+        params.because !== undefined
+      ) {
+        throw new MindError(
+          "INVALID_INPUT",
+          "--state active cannot be combined with --label, --since, or --because",
+        );
+      }
+    } else {
+      const rawLabel = params.label?.trim() ?? "";
+      if (!rawLabel || !OBJECT_STATE_LABEL_RE.test(rawLabel)) {
+        throw new MindError(
+          "INVALID_INPUT",
+          `--state inactive requires a valid --label matching /^[a-z0-9][a-z0-9_-]{0,31}$/, got "${params.label ?? ""}"`,
+        );
+      }
+      stateLabel = rawLabel;
+
+      if (params.since !== undefined) {
+        stateSince = validateStrictIsoDate(params.since, "--since");
+      }
+
+      const rawBecause = params.because?.trim();
+      if (params.actor.kind !== "human" && !rawBecause) {
+        throw new MindError(
+          "INVALID_INPUT",
+          `Non-human actors must supply --because <rec_id> when marking an object inactive`,
+        );
+      }
+      if (rawBecause) {
+        stateEvidenceId = rawBecause;
+      }
+    }
+
+    return this.db.transaction(() => {
+      const { viewerRealm, orgPolicy, realms, scope } = this.resolveScope({
+        viewerRealmId: params.viewerRealmId,
+        scopeCeiling: params.scopeCeiling,
+      });
+      const mounts = this.db.listMounts();
+
+      const obj = this.db.getObject(params.objectId);
+      if (
+        !obj ||
+        obj.orgId !== viewerRealm.orgId ||
+        !scope.readableLedgerIds.includes(obj.realmId)
+      ) {
+        throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
+      }
+
+      assertAccess({
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        targetRealmId: obj.realmId,
+        assetKind: "ledger",
+        required: "write",
+        orgPolicy,
+      });
+
+      const vis = createVisibilityHelpers({
+        db: this.db,
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        scope,
+        ledgerRealmIds: scope.readableLedgerIds,
+        seabedRealmIds: scope.readableSeabedIds,
+      });
+
+      if (stateEvidenceId) {
+        const rec = this.db.getRecord(stateEvidenceId);
+        if (
+          !rec ||
+          rec.orgId !== viewerRealm.orgId ||
+          !vis.canSeeRecord(rec) ||
+          rec.sensitivity === "secret" ||
+          rec.redactedAt !== null
+        ) {
+          throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+        }
+        if (rec.status !== "active") {
+          throw new MindError(
+            "INVALID_INPUT",
+            `Evidence record "${stateEvidenceId}" has status "${rec.status}" and must be active`,
+          );
+        }
+      }
+
+      this.db.updateObjectState({
+        id: obj.id,
+        state: params.state,
+        stateLabel,
+        stateSince,
+        stateEvidenceId,
+      });
+
+      const now = new Date().toISOString();
+      // Store ONLY object.id in change_log.entity_id (never composite obj:rec)
+      this.db.appendChangeLog({
+        orgId: obj.orgId,
+        realmId: obj.realmId,
+        entityType: "object",
+        entityId: obj.id,
+        op: "object_state_changed",
+        actorId: params.actor.id,
+        createdAt: now,
+      });
+
+      const updatedRaw = this.db.getObject(obj.id)!;
+      const sanitizedUpdated = vis.sanitizeObject(updatedRaw);
+
+      // Visibility-scoped impact receipt (strictly within readableLedgerIds + readableSeabedIds, excluding stateEvidenceId)
+      const linked = this.db.countVisibleLinkedEntriesForObject({
+        orgId: viewerRealm.orgId,
+        objectId: obj.id,
+        ledgerRealmIds: scope.readableLedgerIds,
+        seabedRealmIds: scope.readableSeabedIds,
+        excludeEntryId: stateEvidenceId,
+      });
+
+      const aliases = this.db
+        .listObjectAliases([obj.id])
+        .filter(isAliasRowMentionEligible);
+      const uniqueNorms = Array.from(new Set(aliases.map((a) => a.aliasNorm)));
+      const ownerCounts =
+        uniqueNorms.length > 0
+          ? this.db.countVisibleAliasOwners({
+              orgId: viewerRealm.orgId,
+              realmIds: scope.readableLedgerIds,
+              aliasNorms: uniqueNorms,
+            })
+          : new Map<string, number>();
+
+      const allMatchedMentionIds = new Set<string>();
+      const aliasHits: Record<string, number> = {};
+      let mentionsApproximate = false;
+
+      const buildAliasFtsExpr = (aliasNorm: string): string | null => {
+        const parsed = parseSearchQuery(aliasNorm);
+        const clauses: string[] = [];
+        if (parsed.ftsAndExpression) {
+          clauses.push(`(${parsed.ftsAndExpression})`);
+        }
+        if (aliasNorm.includes(" ") && /^[a-z0-9 ]+$/.test(aliasNorm)) {
+          const underscored = aliasNorm.replace(/ /g, "_");
+          clauses.push(`"${underscored.replace(/"/g, '""')}"`);
+        }
+        if (clauses.length === 0) return null;
+        return clauses.length === 1 ? clauses[0]! : clauses.join(" OR ");
+      };
+
+      const MAX_FTS_CANDIDATES = 500;
+      for (const alias of aliases) {
+        if ((ownerCounts.get(alias.aliasNorm) ?? 0) >= 2) {
+          continue;
+        }
+        const ftsExpr = buildAliasFtsExpr(alias.aliasNorm);
+        if (!ftsExpr) {
+          aliasHits[alias.alias] = 0;
+          continue;
+        }
+        const ftsRes = this.db.searchFtsUnified({
+          ftsExpression: ftsExpr,
+          ledgerRealmIds: scope.readableLedgerIds,
+          seabedRealmIds: scope.readableSeabedIds,
+          includeSuperseded: false,
+          perBucketLimit: MAX_FTS_CANDIDATES + 1,
+        });
+        if (ftsRes.total > MAX_FTS_CANDIDATES) {
+          mentionsApproximate = true;
+        }
+
+        const candidateRecIds: string[] = [];
+        const candidateSeaIds: string[] = [];
+        for (const row of ftsRes.rows.slice(0, MAX_FTS_CANDIDATES)) {
+          if (stateEvidenceId && row.itemId === stateEvidenceId) continue;
+          if (row.sourceType === "record") candidateRecIds.push(row.itemId);
+          else if (row.sourceType === "seabed") candidateSeaIds.push(row.itemId);
+        }
+
+        const matcher = compileAliasMatcher(alias.aliasNorm);
+        const matchedForAlias = new Set<string>();
+
+        if (candidateRecIds.length > 0) {
+          const recs = this.db.getRecordsByIds(candidateRecIds);
+          for (const rec of recs) {
+            if (
+              rec.orgId !== viewerRealm.orgId ||
+              rec.status !== "active" ||
+              rec.redactedAt !== null ||
+              rec.sensitivity === "secret" ||
+              !vis.canSeeRecord(rec)
+            ) {
+              continue;
+            }
+            const text = `${rec.title}\n${extractReadableText(rec.payload)}`;
+            const nfkc = text.normalize("NFKC");
+            if (matchesCompiledAlias(nfkc, nfkc.toLowerCase(), matcher)) {
+              matchedForAlias.add(rec.id);
+              allMatchedMentionIds.add(rec.id);
+            }
+          }
+        }
+
+        if (candidateSeaIds.length > 0) {
+          const seas = this.db.getSeabedEntriesByIds(candidateSeaIds);
+          for (const sea of seas) {
+            if (
+              sea.orgId !== viewerRealm.orgId ||
+              sea.redactedAt !== null ||
+              sea.sensitivity === "secret" ||
+              !vis.canSeeSeabed(sea)
+            ) {
+              continue;
+            }
+            const title = `${sea.kind}${sea.topicId ? ` (${sea.topicId})` : ""}`;
+            const text = `${title}\n${sea.text}`;
+            const nfkc = text.normalize("NFKC");
+            if (matchesCompiledAlias(nfkc, nfkc.toLowerCase(), matcher)) {
+              matchedForAlias.add(sea.id);
+              allMatchedMentionIds.add(sea.id);
+            }
+          }
+        }
+
+        aliasHits[alias.alias] = matchedForAlias.size;
+      }
+
+      return {
+        object: sanitizedUpdated,
+        affected: {
+          linked,
+          mentions: allMatchedMentionIds.size,
+          ...(mentionsApproximate ? { mentionsApproximate: true } : {}),
+        },
+        aliasHits,
+      };
+    });
+  }
+
+  updateObjectAliases(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    objectId: string;
+    add?: string[];
+    remove?: string[];
+    scopeCeiling?: AccessScope;
+  }): ObjectAliasUpdateResult {
+    if (!params.actor?.id?.trim()) {
+      throw new MindError("INVALID_INPUT", "Actor id cannot be empty");
+    }
+    const rawAdds = params.add ?? [];
+    const rawRemoves = params.remove ?? [];
+    if (rawAdds.length === 0 && rawRemoves.length === 0) {
+      throw new MindError(
+        "INVALID_INPUT",
+        "object alias requires at least one --add or --remove value",
+      );
+    }
+
+    const validatedAdds = rawAdds.map((r) => validateExplicitAliasInput(r));
+    const validatedRemoves = rawRemoves.map((r) => {
+      if (/[\r\n]/.test(r)) {
+        throw new MindError(
+          "INVALID_INPUT",
+          "Alias must be a single line with no newline characters",
+        );
+      }
+      const trimmed = r.trim();
+      const norm = normalizeAlias(trimmed);
+      if (!trimmed || !norm) {
+        throw new MindError("INVALID_INPUT", "Alias to remove cannot be empty");
+      }
+      return { alias: trimmed, aliasNorm: norm };
+    });
+
+    return this.db.transaction(() => {
+      const { viewerRealm, orgPolicy, realms, scope } = this.resolveScope({
+        viewerRealmId: params.viewerRealmId,
+        scopeCeiling: params.scopeCeiling,
+      });
+      const mounts = this.db.listMounts();
+
+      const obj = this.db.getObject(params.objectId);
+      if (
+        !obj ||
+        obj.orgId !== viewerRealm.orgId ||
+        !scope.readableLedgerIds.includes(obj.realmId)
+      ) {
+        throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
+      }
+
+      assertAccess({
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        targetRealmId: obj.realmId,
+        assetKind: "ledger",
+        required: "write",
+        orgPolicy,
+      });
+
+      const existingMap = new Map<string, ObjectAlias>(
+        this.db
+          .listObjectAliases([obj.id])
+          .map((row) => [row.aliasNorm, row]),
+      );
+
+      const removed: string[] = [];
+      for (const rem of validatedRemoves) {
+        const existing = existingMap.get(rem.aliasNorm);
+        if (!existing) continue;
+        if (existing.isName && !existing.isExplicit) {
+          throw new MindError(
+            "INVALID_INPUT",
+            `Cannot remove object's own name alias "${existing.alias}"`,
+          );
+        }
+        if (existing.isName && existing.isExplicit) {
+          const reverted: ObjectAlias = {
+            ...existing,
+            isExplicit: false,
+          };
+          this.db.upsertObjectAlias(reverted);
+          existingMap.set(rem.aliasNorm, reverted);
+          removed.push(existing.alias);
+        } else {
+          this.db.deleteObjectAlias(obj.id, rem.aliasNorm);
+          existingMap.delete(rem.aliasNorm);
+          removed.push(existing.alias);
+        }
+      }
+
+      const added: string[] = [];
+      for (const addItem of validatedAdds) {
+        const existing = existingMap.get(addItem.aliasNorm);
+        if (existing && existing.isExplicit) {
+          continue;
+        }
+        const currentExplicitCount = Array.from(existingMap.values()).filter(
+          (a) => a.isExplicit,
+        ).length;
+        if (currentExplicitCount >= MAX_EXPLICIT_ALIASES_PER_OBJECT) {
+          throw new MindError(
+            "INVALID_INPUT",
+            `Object "${obj.id}" reached the maximum of ${MAX_EXPLICIT_ALIASES_PER_OBJECT} explicit aliases`,
+          );
+        }
+        const nextRow: ObjectAlias = {
+          orgId: obj.orgId,
+          objectId: obj.id,
+          alias: addItem.alias,
+          aliasNorm: addItem.aliasNorm,
+          isName: existing ? existing.isName : false,
+          isExplicit: true,
+        };
+        this.db.upsertObjectAlias(nextRow);
+        existingMap.set(addItem.aliasNorm, nextRow);
+        added.push(addItem.alias);
+      }
+
+      this.db.appendChangeLog({
+        orgId: obj.orgId,
+        realmId: obj.realmId,
+        entityType: "object",
+        entityId: obj.id,
+        op: "object_alias_updated",
+        actorId: params.actor.id,
+        createdAt: new Date().toISOString(),
+      });
+
+      const vis = createVisibilityHelpers({
+        db: this.db,
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        scope,
+      });
+
+      const aliases = Array.from(existingMap.values())
+        .filter((a) => a.isExplicit)
+        .map((a) => a.alias)
+        .sort();
+
+      return {
+        object: vis.sanitizeObject(obj),
+        aliases,
+        added,
+        removed,
       };
     });
   }
@@ -484,7 +941,7 @@ export class ObjectEngine {
     const vis = createVisibilityHelpers({
       db: this.db,
       realms,
-      mounts: [],
+      mounts: this.db.listMounts(),
       actor: { id: "reader", kind: "agent" },
       viewerRealmId: viewerRealm.id,
       scope,

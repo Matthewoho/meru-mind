@@ -34,6 +34,7 @@ import {
   type LsOnlyFilter,
   type MindEngine,
   type MountScope,
+  type ObjectState,
   type Organization,
   type OrgPolicy,
   type Realm,
@@ -486,16 +487,20 @@ Examples:
   meru-mind realm mount --viewer /team-b/c2 --target /team-a/c1 --scope ledger --as-human
 `,
   object: `Risk: write
-When to use: Create, reparent, delete, link, or unlink structured objects (kind "file" is reserved).
+When to use: Create, reparent, delete, link, unlink, set lifecycle state, or manage aliases on structured objects (kind "file" is reserved).
 Usage:
   meru-mind object create [--in <realm>] --kind <kind> --name <name> [--parent <objRef>]
   meru-mind object move <objRef> --parent <parentObjRef|none>
   meru-mind object delete <objRef>
   meru-mind object link <entryId> <objRef>
   meru-mind object unlink <entryId> <objRef>
+  meru-mind object set <objRef> --state inactive --label <slug> [--since YYYY-MM-DD] [--because <rec_id>]
+  meru-mind object set <objRef> --state active
+  meru-mind object alias <objRef> [--add <text>]... [--remove <text>]...
 Examples:
   meru-mind object create --in /ops --kind service --name payment-api
-  meru-mind object link rec_0123456789abcdef service:payment-api
+  meru-mind object set service:payment-api --state inactive --label deprecated --since 2026-10-26 --because rec_0123456789abcdef
+  meru-mind object alias service:payment-api --add "Payment API"
 `,
   file: `Risk: write
 When to use: Write a versioned file to a MindRealm shared drive (use 'meru-mind show file:...' to read).
@@ -780,7 +785,9 @@ function resolveSingleObjectIdForManage(params: {
     verb: "show",
   });
   if (!resolved.object) {
-    throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
+    throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND, {
+      try: `meru-mind object create --kind ${resolved.objectKind} --name ${resolved.objectName}`,
+    });
   }
   return resolved.object.id;
 }
@@ -1458,6 +1465,69 @@ async function main(): Promise<void> {
           { removed },
           formatGenericMarkdown("Entry Unlinked from Object", { removed }),
         );
+        return;
+      }
+      if (sub === "set") {
+        assertAllowedFlags(
+          flags,
+          ["state", "label", "since", "because"],
+          "object set",
+        );
+        const ctx = resolveSessionContext({ engine, flags });
+        if (!third?.trim()) {
+          throw new MindError(
+            "INVALID_REF",
+            "object set requires an <objRef> argument",
+            {
+              try: "meru-mind object set service:api --state inactive --label deprecated --because rec_...",
+            },
+          );
+        }
+        const objectId = resolveSingleObjectIdForManage({
+          engine,
+          ctx,
+          actor,
+          rawRef: third,
+        });
+        const state = requireFlag(flags, "state", "object set") as ObjectState;
+        const res = engine.objects.setObjectState({
+          actor,
+          viewerRealmId: ctx.boundViewerRealmId,
+          objectId,
+          state,
+          label: flagStr(flags, "label"),
+          since: flagStr(flags, "since"),
+          because: flagStr(flags, "because"),
+          scopeCeiling: ctx.boundScope,
+        });
+        output(res, formatGenericMarkdown("Object State Updated", res));
+        return;
+      }
+      if (sub === "alias") {
+        assertAllowedFlags(flags, ["add", "remove"], "object alias");
+        const ctx = resolveSessionContext({ engine, flags });
+        if (!third?.trim()) {
+          throw new MindError(
+            "INVALID_REF",
+            "object alias requires an <objRef> argument",
+            { try: 'meru-mind object alias service:api --add "Billing API"' },
+          );
+        }
+        const objectId = resolveSingleObjectIdForManage({
+          engine,
+          ctx,
+          actor,
+          rawRef: third,
+        });
+        const res = engine.objects.updateObjectAliases({
+          actor,
+          viewerRealmId: ctx.boundViewerRealmId,
+          objectId,
+          add: multiFlags["add"] ?? [],
+          remove: multiFlags["remove"] ?? [],
+          scopeCeiling: ctx.boundScope,
+        });
+        output(res, formatGenericMarkdown("Object Aliases Updated", res));
         return;
       }
       throw new MindError(

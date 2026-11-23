@@ -1602,6 +1602,23 @@ export class LedgerEngine {
       this.db.deleteResourceTagsByEntry(entryId);
       this.db.redactChangeLogForEntry(entryId);
 
+      // Clear state_label & state_evidence_id on inactive objects citing this evidence record
+      // (preserves state='inactive' and state_since; never resurrects to active)
+      const clearedObjects = this.db.clearObjectStateEvidenceByEntry(entryId);
+      const clearedObjectIds: string[] = [];
+      for (const clearedObj of clearedObjects) {
+        clearedObjectIds.push(clearedObj.id);
+        this.db.appendChangeLog({
+          orgId: clearedObj.orgId,
+          realmId: clearedObj.realmId,
+          entityType: "object",
+          entityId: clearedObj.id,
+          op: "object_evidence_redacted",
+          actorId: actor.id,
+          createdAt: now,
+        });
+      }
+
       // Cascade retraction to every distillation citing this entryId in source_ids
       const affectedDists = this.db.findDistillationsBySourceId(entryId);
       const retractedDistillationIds: string[] = [];
@@ -1676,6 +1693,7 @@ export class LedgerEngine {
         redactedBy: actor.id,
         reason,
         retractedDistillationIds,
+        clearedObjectIds,
         blobToDelete,
         blocklistRecorded: true,
         residualLocations,

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
+import { normalizeAlias } from "../format/inactive-badges.js";
 import { buildRecordFtsBody } from "../format/snippet.js";
 import type {
   DbPort,
@@ -23,6 +24,8 @@ import {
   type IdempotencyRecord,
   type LedgerRecord,
   type MindObject,
+  type ObjectAlias,
+  type ObjectState,
   type Organization,
   type OrgPolicy,
   type Realm,
@@ -1389,6 +1392,75 @@ export class SqliteDb implements DbPort {
         this.db
           .prepare(
             `INSERT INTO schema_migrations (version, name, applied_at) VALUES (6, 'v0.2a_perf_fts_docs', ?)`,
+          )
+          .run(now);
+      }
+
+      // Migration v7: V0.2a-Causal-Lifecycle (objects state columns + partial inactive index + object_aliases + keyset backfill)
+      if (!applied.has(7)) {
+        this.ensureColumn(
+          "objects",
+          "state",
+          "TEXT NOT NULL DEFAULT 'active'",
+        );
+        this.ensureColumn("objects", "state_label", "TEXT");
+        this.ensureColumn("objects", "state_since", "TEXT");
+        this.ensureColumn("objects", "state_evidence_id", "TEXT");
+
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_objects_inactive
+            ON objects(org_id, realm_id) WHERE state != 'active';
+
+          CREATE TABLE IF NOT EXISTS object_aliases (
+            org_id TEXT NOT NULL,
+            object_id TEXT NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+            alias TEXT NOT NULL,
+            alias_norm TEXT NOT NULL,
+            is_name INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (object_id, alias_norm)
+          );
+          CREATE INDEX IF NOT EXISTS idx_object_aliases_norm
+            ON object_aliases(org_id, alias_norm);
+        `);
+
+        const BATCH = 500;
+        const selectObjBatch = this.db.prepare(
+          `SELECT id, org_id, name
+           FROM objects
+           WHERE id > ?
+           ORDER BY id ASC
+           LIMIT ?`,
+        );
+        const insertNameAliasStmt = this.db.prepare(
+          `INSERT OR IGNORE INTO object_aliases (org_id, object_id, alias, alias_norm, is_name)
+           VALUES (?, ?, ?, ?, 1)`,
+        );
+        let lastObjId = "";
+        while (true) {
+          const rows = selectObjBatch.all(lastObjId, BATCH) as Array<{
+            id: string;
+            org_id: string;
+            name: string;
+          }>;
+          if (rows.length === 0) break;
+          for (const row of rows) {
+            const norm = normalizeAlias(String(row.name));
+            if (norm.length > 0) {
+              insertNameAliasStmt.run(
+                String(row.org_id),
+                String(row.id),
+                String(row.name),
+                norm,
+              );
+            }
+          }
+          lastObjId = String(rows[rows.length - 1]!.id);
+          if (rows.length < BATCH) break;
+        }
+
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (7, 'v0.2a_causal_object_lifecycle', ?)`,
           )
           .run(now);
       }
@@ -2981,20 +3053,36 @@ export class SqliteDb implements DbPort {
   // ---- Objects, Entry-Object Links & Resource Tags (Migration v3) ----
 
   insertObject(obj: MindObject): void {
-    this.db
-      .prepare(
-        `INSERT INTO objects (id, org_id, parent_object_id, realm_id, kind, name, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        obj.id,
-        obj.orgId,
-        obj.parentObjectId,
-        obj.realmId,
-        obj.kind,
-        obj.name,
-        obj.createdAt,
-      );
+    this.transaction(() => {
+      const state = obj.state ?? "active";
+      this.db
+        .prepare(
+          `INSERT INTO objects (id, org_id, parent_object_id, realm_id, kind, name, created_at, state, state_label, state_since, state_evidence_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          obj.id,
+          obj.orgId,
+          obj.parentObjectId,
+          obj.realmId,
+          obj.kind,
+          obj.name,
+          obj.createdAt,
+          state,
+          state !== "active" ? (obj.stateLabel ?? null) : null,
+          state !== "active" ? (obj.stateSince ?? null) : null,
+          state !== "active" ? (obj.stateEvidenceId ?? null) : null,
+        );
+      const norm = normalizeAlias(obj.name);
+      if (norm.length > 0) {
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO object_aliases (org_id, object_id, alias, alias_norm, is_name)
+             VALUES (?, ?, ?, ?, 1)`,
+          )
+          .run(obj.orgId, obj.id, obj.name, norm);
+      }
+    });
   }
 
   getObject(id: string): MindObject | null {
@@ -3064,6 +3152,235 @@ export class SqliteDb implements DbPort {
     return Number(res.changes) > 0;
   }
 
+  updateObjectState(params: {
+    id: string;
+    state: ObjectState;
+    stateLabel: string | null;
+    stateSince: string | null;
+    stateEvidenceId: string | null;
+  }): boolean {
+    const res = this.db
+      .prepare(
+        `UPDATE objects
+         SET state = ?,
+             state_label = ?,
+             state_since = ?,
+             state_evidence_id = ?
+         WHERE id = ?`,
+      )
+      .run(
+        params.state,
+        params.stateLabel,
+        params.stateSince,
+        params.stateEvidenceId,
+        params.id,
+      );
+    return Number(res.changes) > 0;
+  }
+
+  listInactiveObjects(orgId: string, realmIds: string[]): MindObject[] {
+    if (realmIds.length === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM objects
+         WHERE org_id = ? AND realm_id IN (${placeholders(realmIds.length)}) AND state != 'active'
+         ORDER BY created_at ASC, id ASC`,
+      )
+      .all(orgId, ...realmIds) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapObject(r));
+  }
+
+  listObjectAliases(objectIds: string[]): ObjectAlias[] {
+    const unique = Array.from(new Set(objectIds.filter(Boolean)));
+    if (unique.length === 0) return [];
+    const results: ObjectAlias[] = [];
+    const CHUNK = 500;
+    for (let i = 0; i < unique.length; i += CHUNK) {
+      const slice = unique.slice(i, i + CHUNK);
+      const rows = this.db
+        .prepare(
+          `SELECT org_id, object_id, alias, alias_norm, is_name
+           FROM object_aliases
+           WHERE object_id IN (${placeholders(slice.length)})
+           ORDER BY is_name ASC, alias_norm ASC`,
+        )
+        .all(...slice) as Array<Record<string, unknown>>;
+      for (const r of rows) {
+        const flag = Number(r.is_name ?? 0);
+        results.push({
+          orgId: String(r.org_id),
+          objectId: String(r.object_id),
+          alias: String(r.alias),
+          aliasNorm: String(r.alias_norm),
+          isName: flag === 1 || flag === 2,
+          isExplicit: flag === 0 || flag === 2,
+        });
+      }
+    }
+    return results;
+  }
+
+  upsertObjectAlias(alias: ObjectAlias): void {
+    const flag = alias.isName ? (alias.isExplicit ? 2 : 1) : 0;
+    this.db
+      .prepare(
+        `INSERT INTO object_aliases (org_id, object_id, alias, alias_norm, is_name)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(object_id, alias_norm) DO UPDATE SET
+           alias = excluded.alias,
+           is_name = excluded.is_name`,
+      )
+      .run(alias.orgId, alias.objectId, alias.alias, alias.aliasNorm, flag);
+  }
+
+  deleteObjectAlias(objectId: string, aliasNorm: string): boolean {
+    const res = this.db
+      .prepare(
+        `DELETE FROM object_aliases WHERE object_id = ? AND alias_norm = ?`,
+      )
+      .run(objectId, aliasNorm);
+    return Number(res.changes) > 0;
+  }
+
+  countVisibleAliasOwners(params: {
+    orgId: string;
+    realmIds: string[];
+    aliasNorms: string[];
+  }): Map<string, number> {
+    const out = new Map<string, number>();
+    if (params.realmIds.length === 0 || params.aliasNorms.length === 0) {
+      return out;
+    }
+    const uniqueNorms = Array.from(new Set(params.aliasNorms.filter(Boolean)));
+    if (uniqueNorms.length === 0) return out;
+    const CHUNK = 300;
+    for (let i = 0; i < uniqueNorms.length; i += CHUNK) {
+      const slice = uniqueNorms.slice(i, i + CHUNK);
+      const rows = this.db
+        .prepare(
+          `SELECT oa.alias_norm AS alias_norm, COUNT(DISTINCT oa.object_id) AS c
+           FROM object_aliases oa
+           JOIN objects o ON o.id = oa.object_id
+           WHERE oa.org_id = ?
+             AND o.org_id = ?
+             AND o.realm_id IN (${placeholders(params.realmIds.length)})
+             AND oa.alias_norm IN (${placeholders(slice.length)})
+           GROUP BY oa.alias_norm`,
+        )
+        .all(params.orgId, params.orgId, ...params.realmIds, ...slice) as Array<{
+        alias_norm: string;
+        c: number;
+      }>;
+      for (const r of rows) {
+        out.set(String(r.alias_norm), Number(r.c));
+      }
+    }
+    return out;
+  }
+
+  clearObjectStateEvidenceByEntry(
+    entryId: string,
+  ): Array<{ id: string; orgId: string; realmId: string }> {
+    // Keyed strictly on state_evidence_id + state != 'active' (NO org_id filter:
+    // redact() fallback orgId can be "" on edge cases). Preserves state and state_since.
+    const rows = this.db
+      .prepare(
+        `SELECT id, org_id, realm_id
+         FROM objects
+         WHERE state != 'active' AND state_evidence_id = ?
+         ORDER BY id ASC`,
+      )
+      .all(entryId) as Array<{
+      id: string;
+      org_id: string;
+      realm_id: string;
+    }>;
+    if (rows.length === 0) return [];
+    this.db
+      .prepare(
+        `UPDATE objects
+         SET state_label = NULL,
+             state_evidence_id = NULL
+         WHERE state != 'active' AND state_evidence_id = ?`,
+      )
+      .run(entryId);
+    return rows.map((r) => ({
+      id: String(r.id),
+      orgId: String(r.org_id),
+      realmId: String(r.realm_id),
+    }));
+  }
+
+  countVisibleLinkedEntriesForObject(params: {
+    orgId: string;
+    objectId: string;
+    ledgerRealmIds: string[];
+    seabedRealmIds: string[];
+    excludeEntryId?: string | null;
+  }): number {
+    let total = 0;
+    const excludeId = params.excludeEntryId?.trim() || null;
+
+    if (params.ledgerRealmIds.length > 0) {
+      const sqlParams: SQLInputValue[] = [
+        params.orgId,
+        params.objectId,
+        params.orgId,
+        ...params.ledgerRealmIds,
+      ];
+      let excludeClause = "";
+      if (excludeId) {
+        excludeClause = " AND r.id != ?";
+        sqlParams.push(excludeId);
+      }
+      const row = this.db
+        .prepare(
+          `SELECT COUNT(DISTINCT eo.entry_id) AS c
+           FROM entry_objects eo
+           JOIN records r ON r.id = eo.entry_id
+           WHERE eo.org_id = ?
+             AND eo.object_id = ?
+             AND r.org_id = ?
+             AND r.realm_id IN (${placeholders(params.ledgerRealmIds.length)})
+             AND r.status = 'active'
+             AND r.redacted_at IS NULL
+             AND r.sensitivity != 'secret'${excludeClause}`,
+        )
+        .get(...sqlParams) as { c: number };
+      total += Number(row.c);
+    }
+
+    if (params.seabedRealmIds.length > 0) {
+      const sqlParams: SQLInputValue[] = [
+        params.orgId,
+        params.objectId,
+        params.orgId,
+        ...params.seabedRealmIds,
+      ];
+      let excludeClause = "";
+      if (excludeId) {
+        excludeClause = " AND s.id != ?";
+        sqlParams.push(excludeId);
+      }
+      const row = this.db
+        .prepare(
+          `SELECT COUNT(DISTINCT eo.entry_id) AS c
+           FROM entry_objects eo
+           JOIN seabed_entries s ON s.id = eo.entry_id
+           WHERE eo.org_id = ?
+             AND eo.object_id = ?
+             AND s.org_id = ?
+             AND s.realm_id IN (${placeholders(params.seabedRealmIds.length)})
+             AND s.redacted_at IS NULL
+             AND s.sensitivity != 'secret'${excludeClause}`,
+        )
+        .get(...sqlParams) as { c: number };
+      total += Number(row.c);
+    }
+
+    return total;
+  }
+
   countChildObjects(parentObjectId: string): number {
     const row = this.db
       .prepare(`SELECT COUNT(*) AS c FROM objects WHERE parent_object_id = ?`)
@@ -3077,7 +3394,8 @@ export class SqliteDb implements DbPort {
   }
 
   private mapObject(row: Record<string, unknown>): MindObject {
-    return {
+    const state = row.state ? String(row.state) : "active";
+    const obj: MindObject = {
       id: String(row.id),
       orgId: String(row.org_id),
       parentObjectId: row.parent_object_id
@@ -3088,6 +3406,14 @@ export class SqliteDb implements DbPort {
       name: String(row.name),
       createdAt: String(row.created_at),
     };
+    if (state !== "active") {
+      obj.state = state as ObjectState;
+      obj.stateLabel = row.state_label == null ? null : String(row.state_label);
+      obj.stateSince = row.state_since == null ? null : String(row.state_since);
+      obj.stateEvidenceId =
+        row.state_evidence_id == null ? null : String(row.state_evidence_id);
+    }
+    return obj;
   }
 
   insertEntryObject(link: EntryObjectLink): void {

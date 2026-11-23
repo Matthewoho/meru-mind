@@ -2,6 +2,7 @@ import {
   computeDuplicateObjectKeys,
   formatCanonicalObjectRef,
 } from "../engine/refs.js";
+import { formatInactiveBadgesMarkdown } from "./inactive-badges.js";
 import type {
   BehaviorClass,
   BriefOutput,
@@ -90,7 +91,11 @@ function renderObjectTreeLines(
     const o = node.object;
     const rPath = realmPathById.get(o.realmId) ?? "/";
     const canonicalRef = formatCanonicalObjectRef(o, rPath, duplicateKeys);
-    lines.push(`${indent}- \`${canonicalRef}\` (\`${o.id}\`)`);
+    const stateSuffix =
+      o.state && o.state !== "active"
+        ? ` [${o.stateLabel || "inactive"}]`
+        : "";
+    lines.push(`${indent}- \`${canonicalRef}\` (\`${o.id}\`)${stateSuffix}`);
     if (remainingBudget) remainingBudget.left -= 1;
     if (node.children.length > 0 && (!remainingBudget || remainingBudget.left > 0)) {
       lines.push(
@@ -200,7 +205,8 @@ function formatLsEntryLine(item: LsEntry): string {
     item.status !== "active" && item.status !== "evidence"
       ? ` (${item.status})`
       : "";
-  return `- ${badge} \`${item.id}\` ${item.title}${ext}${statusTag} — ${item.realmPath} @ ${formatDateLabel(item.occurredAt)}${tags}`;
+  const inactiveSuffix = formatInactiveBadgesMarkdown(item.inactive);
+  return `- ${badge} \`${item.id}\` ${item.title}${ext}${statusTag} — ${item.realmPath} @ ${formatDateLabel(item.occurredAt)}${tags}${inactiveSuffix}`;
 }
 
 export function formatLsMarkdown(res: LsResult): string {
@@ -219,7 +225,13 @@ export function formatLsMarkdown(res: LsResult): string {
   }
   if (res.objects && res.objects.length > 0) {
     lines.push(
-      `Objects (${res.objects.length}): ${res.objects.map((o) => `\`${o.ref}\``).join(", ")}`,
+      `Objects (${res.objects.length}): ${res.objects
+        .map((o) =>
+          o.state && o.state !== "active"
+            ? `\`${o.ref}\` [${o.stateLabel || "inactive"}]`
+            : `\`${o.ref}\``,
+        )
+        .join(", ")}`,
     );
   }
   if (!res.only || res.only === "entries") {
@@ -575,8 +587,9 @@ export function formatRecallMarkdown(res: RecallResult): string {
         : item.currentHeadId !== undefined
           ? ` -> head:\`${item.currentHeadId ?? "none"}\``
           : "";
+      const inactiveSuffix = formatInactiveBadgesMarkdown(item.inactive);
       lines.push(
-        `- ${badge} \`${item.id}\` **${item.title}** (${item.status}${headHint}, @ ${formatDateLabel(item.occurredAt)}) — ${item.snippet}`,
+        `- ${badge} \`${item.id}\` **${item.title}** (${item.status}${headHint}, @ ${formatDateLabel(item.occurredAt)}) — ${item.snippet}${inactiveSuffix}`,
       );
     }
     if (res.omittedCount > 0) {
@@ -869,6 +882,16 @@ export function formatShowMarkdown(res: ShowResult): string {
     if (c.realmPath) {
       lines.push(`- **Realm**: \`${c.realmPath}\``);
     }
+    if (c.object && c.object.state && c.object.state !== "active") {
+      const stateParts: string[] = [];
+      if (c.object.stateLabel) stateParts.push(c.object.stateLabel);
+      if (c.object.stateSince) stateParts.push(`since ${c.object.stateSince}`);
+      if (c.object.stateEvidenceId) {
+        stateParts.push(`evidence: ${c.object.stateEvidenceId}`);
+      }
+      const detail = stateParts.length > 0 ? ` (${stateParts.join(", ")})` : "";
+      lines.push(`- **State**: ${c.object.state}${detail}`);
+    }
     lines.push(
       `- **Entries**: total=${c.counts.total} (object=${c.counts.viaObject}, tag=${c.counts.viaTag}, thing=${c.counts.viaThing})`,
       "",
@@ -919,9 +942,10 @@ export function formatShowMarkdown(res: ShowResult): string {
   const w = res.window;
   const isContinuation = w.start > 0 && w.around === undefined;
   const footer = formatShowWindowFooter(res.ref, w);
+  const inactiveSuffix = formatInactiveBadgesMarkdown(res.inactive);
   if (isContinuation) {
     const lines: string[] = [
-      `# ${res.ref} (continuation · chars ${w.start}–${w.end} of ${w.total})`,
+      `# ${res.ref} (continuation · chars ${w.start}–${w.end} of ${w.total})${inactiveSuffix}`,
     ];
     if (res.content) {
       lines.push("", res.content);
@@ -930,7 +954,11 @@ export function formatShowMarkdown(res: ShowResult): string {
     return lines.join("\n");
   }
 
-  const sections: string[] = [...formatEntryHeaderLines(res.entry)];
+  const headerLines = formatEntryHeaderLines(res.entry);
+  if (inactiveSuffix && headerLines.length > 0) {
+    headerLines[0] = `${headerLines[0]!}${inactiveSuffix}`;
+  }
+  const sections: string[] = [...headerLines];
   if (w.around && w.aroundMatched === false) {
     sections.push(
       "",
@@ -1004,8 +1032,9 @@ export function formatSearchMarkdown(res: SearchResult): string {
       if (item.truncated) {
         anyTruncated = true;
       }
+      const inactiveSuffix = formatInactiveBadgesMarkdown(item.inactive);
       lines.push(
-        `- ${badge} \`${item.id}\` **${item.title}**${realmLabel} (${item.status}${headHint}, @ ${formatDateLabel(item.occurredAt)}) — ${item.snippet}${truncBadge}`,
+        `- ${badge} \`${item.id}\` **${item.title}**${realmLabel} (${item.status}${headHint}, @ ${formatDateLabel(item.occurredAt)}) — ${item.snippet}${truncBadge}${inactiveSuffix}`,
       );
     }
     if (res.omittedCount > 0 && res.nextCursor) {

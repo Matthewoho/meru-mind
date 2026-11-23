@@ -158,6 +158,8 @@ export type RecordStatus = "active" | "superseded" | "retracted";
 
 export type BehaviorClass = "rule" | "conclusion" | "raw";
 
+export type ObjectState = "active" | "inactive";
+
 export interface MindObject {
   id: string;
   orgId: string;
@@ -166,6 +168,39 @@ export interface MindObject {
   kind: string;
   name: string;
   createdAt: string;
+  /** Omitted when active (byte-identical JSON when 0 inactive objects exist) */
+  state?: ObjectState;
+  stateLabel?: string | null;
+  stateSince?: string | null;
+  stateEvidenceId?: string | null;
+}
+
+export interface ObjectAlias {
+  orgId: string;
+  objectId: string;
+  alias: string;
+  aliasNorm: string;
+  /** True when seeded from objects.name (cannot be deleted via --remove) */
+  isName: boolean;
+  /** True when explicitly added via object alias --add (also true when single-token name is opted in) */
+  isExplicit: boolean;
+}
+
+export interface ObjectStateSetResult {
+  object: MindObject;
+  affected: {
+    linked: number;
+    mentions: number;
+    mentionsApproximate?: boolean;
+  };
+  aliasHits: Record<string, number>;
+}
+
+export interface ObjectAliasUpdateResult {
+  object: MindObject;
+  aliases: string[];
+  added: string[];
+  removed: string[];
 }
 
 export interface EntryObjectLink {
@@ -422,6 +457,7 @@ export interface RecallItem {
   orphanSuperseded?: boolean;
   matchedBy: Array<"id" | "filter" | "fts" | "vector">;
   score: number;
+  inactive?: string[];
 }
 
 export interface RecallResult {
@@ -518,6 +554,7 @@ export interface RedactResult {
   redactedBy: string;
   reason: string | null;
   retractedDistillationIds: string[];
+  clearedObjectIds: string[];
   deletedBlobSha256: string | null;
   blocklistRecorded: boolean;
   walCheckpoint: WalCheckpointResult;
@@ -588,6 +625,7 @@ export interface LsEntry {
   supersededById: string | null;
   objectIds: string[];
   resourceTags: string[];
+  inactive?: string[];
 }
 
 export type LsOnlyFilter = "realms" | "objects" | "entries" | "files";
@@ -600,6 +638,9 @@ export interface LsObjectSummary {
   realmId: string;
   realmPath: string;
   parentObjectId: string | null;
+  state?: ObjectState;
+  stateLabel?: string | null;
+  stateSince?: string | null;
 }
 
 export interface LsDriveFileItem extends DriveFileMeta {
@@ -699,6 +740,7 @@ export type ShowResult =
       window: ShowWindow;
       history?: ShowSupersedeChainResult;
       context?: ShowContextResult;
+      inactive?: string[];
     }
   | {
       refType: "file";

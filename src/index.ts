@@ -85,6 +85,25 @@ export {
   formatSurfaceErrorText,
 } from "./format/errors.js";
 export {
+  compileAliasMatcher,
+  createInactiveBadgeResolver,
+  formatInactiveBadge,
+  formatInactiveBadgesMarkdown,
+  isAliasRowMentionEligible,
+  isEligibleAliasForm,
+  isValidCalendarDate,
+  matchesAliasForm,
+  matchesCompiledAlias,
+  MAX_ALIAS_LENGTH,
+  MAX_EXPLICIT_ALIASES_PER_OBJECT,
+  normalizeAlias,
+  OBJECT_STATE_LABEL_RE,
+  validateExplicitAliasInput,
+  validateStrictIsoDate,
+  type CompiledAliasMatcher,
+  type InactiveBadgeResolver,
+} from "./format/inactive-badges.js";
+export {
   ObjectEngine,
   normalizeResourceTag,
   normalizeRealmPath,

@@ -46,12 +46,16 @@ Superseded records via `--history` or exact lookup SHALL include `currentHeadId`
 - **THEN** unfiltered `recall({ limit: 10 })` reports `totalMatched = 525` and `omittedCount = 515`
 
 ### Requirement: Full-Chain Human-Only Redaction and Byte-Level Purge
-`LedgerEngine.redact()` SHALL require `actor.kind === 'human'` and atomically wipe target rows, delete `fts_index` by `rowid` then `fts_docs` by `docid` plus `vec_items`/`vec_pending`/`entry_objects`/`resource_tags`, sanitize `change_log`, retract citing `distillations`, record canonical hashes in `redacted_blocklist`, and log `op = 'redact'`. Post-commit, it SHALL unlink unreferenced blobs, run FTS5 `'optimize'` and `wal_checkpoint(TRUNCATE)`, and report `walCheckpoint` and `residualLocations`.
+`LedgerEngine.redact()` SHALL require `actor.kind === 'human'` and atomically wipe target rows, purge `fts_index`/`fts_docs`/`vec_*`/`entry_objects`/`resource_tags`, clear `state_label`/`state_evidence_id` on citing inactive objects (keeping `state`/`state_since`, logging `object_evidence_redacted`), sanitize `change_log`, retract citing `distillations`, and record `redacted_blocklist`. Post-commit, it SHALL unlink unused blobs, optimize FTS5, checkpoint WAL, and return `clearedObjectIds`.
 
 #### Scenario: Byte-level sweep finds zero residual plaintext or CJK bigrams after redaction
 - **WHEN** a human redacts a record containing English and CJK canary tokens, a blob-backed seabed entry, and their citing distillation and closes all DB handles
 - **THEN** raw byte inspection of `.sqlite`, `-wal`, `-shm`, and `blobs/` finds zero redacted English tokens, CJK phrases, CJK bigrams, or tag plaintext
 - **AND** if a drive file still references a blob, `deletedBlobSha256` is `null` and `residualLocations` lists the live drive path
+
+#### Scenario: Redacting an object's state evidence clears label and pointer without resurrecting the object
+- **WHEN** a human redacts a record cited as `state_evidence_id` on an `inactive` object
+- **THEN** the object remains `state = 'inactive'` with `state_since` intact, `state_label` and `state_evidence_id` become `null`, `change_log` records `object_evidence_redacted` with `entityId = object.id`, `RedactResult.clearedObjectIds` lists the object, and badges degrade cleanly to `<kind>:<name> inactive[ <since>]`
 
 ### Requirement: Global Exact-Match Content-Hash Blocklist Across All Write Paths
 One shared helper (`src/engine/content-hash.ts`: `computeRecordContentSha256`, `computeSeabedContentSha256`, `computeFileContentSha256`, `buildWriteRecordPayload`) SHALL be used by `redact()` and all write paths (`appendRecord`, `captureSeabed`, `writeDriveFile`, `importMd`, `importJsonl`). Every path SHALL check `db.isContentShaBlocked(orgId, sha)` ignoring `source_ref`: interactive writes fail with `ACCESS_DENIED` (unless CLI `--as-human`), while importers skip (`skippedRedacted += 1`).

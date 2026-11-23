@@ -4,6 +4,7 @@ import {
   parseSearchQuery,
   type SearchConcept,
 } from "../adapters/sqlite-db.js";
+import { createInactiveBadgeResolver } from "../format/inactive-badges.js";
 import {
   buildCanonicalEntryContent,
   buildRecordFtsBody,
@@ -804,6 +805,31 @@ export class SeaEngine {
       return b.id.localeCompare(a.id);
     };
 
+    const annotateRecallPage = (items: RecallItem[]): RecallItem[] => {
+      if (items.length === 0 || !viewerRealm) return items;
+      const resolver = createInactiveBadgeResolver(
+        this.db,
+        viewerRealm.orgId,
+        scope.readableLedgerIds,
+      );
+      if (!resolver) return items;
+      const objIdsByEntry = this.db.listObjectIdsByEntryIds(
+        viewerRealm.orgId,
+        items.map((it) => it.id),
+      );
+      for (const it of items) {
+        const badges = resolver.resolveForItem({
+          itemId: it.id,
+          linkedObjectIds: objIdsByEntry.get(it.id) ?? [],
+          text: `${it.title}\n${it.snippet}`,
+        });
+        if (badges.length > 0) {
+          it.inactive = badges;
+        }
+      }
+      return items;
+    };
+
     // Stage 1: Direct ID lookup (explicitly allows secret entries if visible in scope)
     if (query.id) {
       const items: RecallItem[] = [];
@@ -827,6 +853,7 @@ export class SeaEngine {
         vis.preloadRefs(dist.sourceIds);
         items.push(toDistillationItem(dist, ["id"], 1));
       }
+      annotateRecallPage(items);
       return {
         viewerRealmId: query.viewerRealmId,
         items,
@@ -865,7 +892,9 @@ export class SeaEngine {
         if (r.supersededById) refsToPreload.push(r.supersededById);
       }
       vis.preloadRefs(refsToPreload);
-      const items = visible.map((r) => toRecordItem(r, ["id", "filter"], 1));
+      const items = annotateRecallPage(
+        visible.map((r) => toRecordItem(r, ["id", "filter"], 1)),
+      );
       return {
         viewerRealmId: query.viewerRealmId,
         items,
@@ -947,7 +976,7 @@ export class SeaEngine {
         ...rawSeas.map((s) => toSeabedItem(s, ["filter"], 0.9)),
       ];
       combined.sort(compareRecencyDesc);
-      const page = combined.slice(offset, offset + limit);
+      const page = annotateRecallPage(combined.slice(offset, offset + limit));
       return {
         viewerRealmId: query.viewerRealmId,
         items: page,
@@ -1663,21 +1692,23 @@ export class SeaEngine {
       c.isOlderSameObjectSibling * 0.5 +
       c.focusFlag * 0.1;
 
-    const page: RecallItem[] = pageCandidates.map((c) => {
-      const displayScore = computeDisplayScore(c);
-      if (c.record) {
-        return toRecordItem(c.record, c.matchedBy, displayScore, concepts);
-      }
-      if (c.seabed) {
-        return toSeabedItem(c.seabed, c.matchedBy, displayScore, concepts);
-      }
-      return toDistillationItem(
-        c.distillation!,
-        c.matchedBy,
-        displayScore,
-        concepts,
-      );
-    });
+    const page: RecallItem[] = annotateRecallPage(
+      pageCandidates.map((c) => {
+        const displayScore = computeDisplayScore(c);
+        if (c.record) {
+          return toRecordItem(c.record, c.matchedBy, displayScore, concepts);
+        }
+        if (c.seabed) {
+          return toSeabedItem(c.seabed, c.matchedBy, displayScore, concepts);
+        }
+        return toDistillationItem(
+          c.distillation!,
+          c.matchedBy,
+          displayScore,
+          concepts,
+        );
+      }),
+    );
 
     return {
       viewerRealmId: query.viewerRealmId,
@@ -1769,6 +1800,12 @@ export class SeaEngine {
     }
     params.vis.preloadRefs(refsToPreload);
 
+    const inactiveResolver = createInactiveBadgeResolver(
+      this.db,
+      params.orgId,
+      Array.from(params.readableLedgerSet),
+    );
+
     const out: LsEntry[] = [];
     for (const ref of params.refs) {
       const objectIds = (objIdsByEntry.get(ref.id) ?? []).filter((oid) =>
@@ -1783,6 +1820,17 @@ export class SeaEngine {
         }
         const clean = params.vis.sanitizeRecord(rec);
         const bodyText = extractReadableText(clean.payload);
+        const snippet = buildSnippet({
+          title: clean.title,
+          text: bodyText ? `${clean.title} — ${bodyText}` : clean.title,
+        });
+        const inactive = inactiveResolver
+          ? inactiveResolver.resolveForItem({
+              itemId: clean.id,
+              linkedObjectIds: objectIds,
+              text: `${clean.title}\n${snippet}`,
+            })
+          : [];
         out.push({
           id: clean.id,
           behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
@@ -1793,10 +1841,7 @@ export class SeaEngine {
           realmPath: params.vis.getSanitizedRealmPath(clean.realmId),
           status: clean.status,
           title: clean.title,
-          snippet: buildSnippet({
-            title: clean.title,
-            text: bodyText ? `${clean.title} — ${bodyText}` : clean.title,
-          }),
+          snippet,
           authorId: clean.authorId,
           confirmedByHuman: clean.confirmedByHuman,
           occurredAt: clean.occurredAt,
@@ -1809,6 +1854,7 @@ export class SeaEngine {
           supersededById: clean.supersededById,
           objectIds,
           resourceTags,
+          ...(inactive.length > 0 ? { inactive } : {}),
         });
       } else {
         const sea = seasMap.get(ref.id);
@@ -1820,6 +1866,15 @@ export class SeaEngine {
           clean.sourceRef,
           params.vis.getSanitizedRealmPath,
         );
+        const title = `${clean.kind}${clean.topicId ? ` (${clean.topicId})` : ""}`;
+        const snippet = buildSnippet({ text: clean.text });
+        const inactive = inactiveResolver
+          ? inactiveResolver.resolveForItem({
+              itemId: clean.id,
+              linkedObjectIds: objectIds,
+              text: `${title}\n${snippet}`,
+            })
+          : [];
         out.push({
           id: clean.id,
           behaviorClass: "raw",
@@ -1829,8 +1884,8 @@ export class SeaEngine {
           realmId: clean.realmId,
           realmPath: params.vis.getSanitizedRealmPath(clean.realmId),
           status: clean.redactedAt ? "retracted" : "evidence",
-          title: `${clean.kind}${clean.topicId ? ` (${clean.topicId})` : ""}`,
-          snippet: buildSnippet({ text: clean.text }),
+          title,
+          snippet,
           authorId: clean.authorId,
           confirmedByHuman: clean.authorKind === "human",
           occurredAt: clean.occurredAt,
@@ -1843,6 +1898,7 @@ export class SeaEngine {
           supersededById: null,
           objectIds,
           resourceTags,
+          ...(inactive.length > 0 ? { inactive } : {}),
         });
       }
     }
@@ -2340,6 +2396,13 @@ export class SeaEngine {
             realmId: o.realmId,
             realmPath: targetRealm.path,
             parentObjectId: o.parentObjectId,
+            ...(o.state && o.state !== "active"
+              ? {
+                  state: o.state,
+                  stateLabel: o.stateLabel ?? null,
+                  stateSince: o.stateSince ?? null,
+                }
+              : {}),
           }));
       }
 
@@ -3596,6 +3659,32 @@ export class SeaEngine {
       };
     }
 
+    const inactiveResolver = createInactiveBadgeResolver(
+      this.db,
+      viewerRealm.orgId,
+      scope.readableLedgerIds,
+    );
+    let inactiveBadges: string[] = [];
+    if (inactiveResolver) {
+      const linkedObjectIds =
+        catRes.kind === "record" || catRes.kind === "seabed"
+          ? catRes.objectIds
+          : [];
+      const entryTitle =
+        catRes.kind === "record"
+          ? catRes.record.title
+          : catRes.kind === "seabed"
+            ? `${catRes.seabed.kind}${catRes.seabed.topicId ? ` (${catRes.seabed.topicId})` : ""}`
+            : catRes.kind === "distillation"
+              ? `${catRes.distillation.layer} (${catRes.distillation.periodKey})`
+              : catRes.file.relPath;
+      inactiveBadges = inactiveResolver.resolveForItem({
+        itemId: parsed.entryId,
+        linkedObjectIds,
+        text: `${entryTitle}\n${win.slice}`,
+      });
+    }
+
     return {
       refType: "entry",
       ref: parsed.entryId,
@@ -3604,6 +3693,7 @@ export class SeaEngine {
       window: showWindow,
       ...(historyResult ? { history: historyResult } : {}),
       ...(contextResult ? { context: contextResult } : {}),
+      ...(inactiveBadges.length > 0 ? { inactive: inactiveBadges } : {}),
     };
   }
 

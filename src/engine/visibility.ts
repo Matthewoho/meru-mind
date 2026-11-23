@@ -332,9 +332,13 @@ export function createVisibilityHelpers(params: {
       byId.set(o.id, o);
     }
     const missingParents: string[] = [];
+    const evidenceIds: string[] = [];
     for (const o of objects) {
       if (o.parentObjectId && !byId.has(o.parentObjectId)) {
         missingParents.push(o.parentObjectId);
+      }
+      if (o.stateEvidenceId) {
+        evidenceIds.push(o.stateEvidenceId);
       }
     }
     if (missingParents.length > 0) {
@@ -342,18 +346,26 @@ export function createVisibilityHelpers(params: {
         byId.set(p.id, p);
       }
     }
+    if (evidenceIds.length > 0) {
+      preloadRefs(evidenceIds);
+    }
     const fullReadableLedger = new Set(scope.readableLedgerIds);
     return objects.map((o) => {
-      if (!o.parentObjectId) return { ...o };
-      const parent = byId.get(o.parentObjectId);
-      if (
-        !parent ||
-        parent.orgId !== scope.orgId ||
-        !fullReadableLedger.has(parent.realmId)
-      ) {
-        return { ...o, parentObjectId: null };
+      const next: MindObject = { ...o };
+      if (next.parentObjectId) {
+        const parent = byId.get(next.parentObjectId);
+        if (
+          !parent ||
+          parent.orgId !== scope.orgId ||
+          !fullReadableLedger.has(parent.realmId)
+        ) {
+          next.parentObjectId = null;
+        }
       }
-      return { ...o };
+      if (next.stateEvidenceId && !isRefVisible(next.stateEvidenceId)) {
+        next.stateEvidenceId = null;
+      }
+      return next;
     });
   };
 

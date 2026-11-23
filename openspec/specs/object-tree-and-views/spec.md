@@ -43,6 +43,14 @@ Everyday `write` / `mind_write` `--about <objRef>` SHALL attach unique visible `
 - **WHEN** a caller moves object `A` under its descendant `B`, or views a mounted object whose parent lies in a hidden sibling realm
 - **THEN** `moveObject()` throws `INVALID_INPUT`, and all read views sanitize hidden `parentObjectId` to `null`
 
+### Requirement: Causal Object Lifecycle State, Aliases, and Read-Time Inactive Badges
+CLI `object set` and `object alias` SHALL manage `objects` lifecycle state (`active`|`inactive`, validated `state_label`, strict `YYYY-MM-DD` `state_since`, mandatory active visible `--because` for non-humans) and explicit aliases (`<= 80` chars, `<= 32` per object, Latin `>= 3` / CJK `>= 2`, refusing `--remove` of `is_name = 1`), omitting active state JSON fields and stripping invisible `stateEvidenceId` everywhere. Read views SHALL add exception-only badges with zero ranking change.
+
+#### Scenario: Inactive objects annotate visible reads conservatively without leaking hidden realms
+- **WHEN** a visible object is marked `inactive` with `--label`, `--since`, `--because`, and aliases, while another inactive object exists in a hidden `tree` realm
+- **THEN** `search`, `ls`, `show`, and `tree` attach exception-only badges (`⚠ <kind>:<name> <label>[ <since>]`, capped at 2 + `(+N)`, suppressed on the evidence record itself, connector-bounded for Latin) with zero ranking change
+- **AND** hidden-realm inactive objects emit zero badges, zero `affected` counts, never trigger visible alias ambiguity, and have invisible `stateEvidenceId` stripped everywhere
+
 ### Requirement: Open-Mode Multi-Valued Realms and Tree-Mode Zero Amplification
 In `open` mode, `entry_objects` links SHALL derive multi-valued realm membership for realm aggregation in `ls <realm>` and SDK-only opt-in `recall({ focusBoost: true })`. In `tree` mode, physical `realm_id` SHALL remain the sole hard isolation boundary: `entry_objects` SHALL never widen visibility, and all read views SHALL intersect results with readable scope and exclude `secret` entries.
 
