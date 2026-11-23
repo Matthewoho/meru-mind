@@ -20,6 +20,7 @@ import {
   assertAccess,
   getDescendantIds,
   intersectAccessScopes,
+  isRealmEffectivelyArchived,
   resolveAccess,
   resolveAccessScope,
 } from "../policy.js";
@@ -534,8 +535,14 @@ export class SeaEngine {
           })
         : 0;
 
+    const targetRealmArchived = isRealmEffectivelyArchived(
+      realms,
+      targetRealm.id,
+    );
+
     return {
       realm: sanitizedCenterRealm,
+      ...(targetRealmArchived ? { realmArchived: true } : {}),
       generatedAt: new Date().toISOString(),
       kindHistogram,
       buckets: {
@@ -668,6 +675,15 @@ export class SeaEngine {
       includeDescendantSeabed,
     });
 
+    const orgRealmsForArchive = viewerRealm
+      ? realms.filter((r) => r.orgId === viewerRealm.orgId)
+      : [];
+    const archivedRealmIds = new Set<string>(
+      orgRealmsForArchive
+        .filter((r) => isRealmEffectivelyArchived(orgRealmsForArchive, r.id))
+        .map((r) => r.id),
+    );
+
     const toRecordItem = (
       rec: LedgerRecord,
       matchedBy: RecallItem["matchedBy"],
@@ -731,6 +747,7 @@ export class SeaEngine {
         supersedesIds: clean.supersedesIds,
         supersededById: clean.supersededById,
         ...(isSuperseded ? { currentHeadId, orphanSuperseded } : {}),
+        ...(archivedRealmIds.has(clean.realmId) ? { realmArchived: true } : {}),
         matchedBy,
         score,
       };
@@ -781,6 +798,7 @@ export class SeaEngine {
               ) ?? clean.sourceRef,
             ]
           : [],
+        ...(archivedRealmIds.has(clean.realmId) ? { realmArchived: true } : {}),
         matchedBy,
         score,
       };
@@ -825,6 +843,7 @@ export class SeaEngine {
         createdAt: clean.createdAt,
         occurredAt: clean.createdAt,
         sourceRefs: clean.sourceIds,
+        ...(archivedRealmIds.has(clean.realmId) ? { realmArchived: true } : {}),
         matchedBy,
         score,
       };
@@ -2430,12 +2449,13 @@ export class SeaEngine {
     return out;
   }
 
-  tree(params: {
+    tree(params: {
     actor: Actor;
     viewerRealmId: string;
     target?: string;
     depth?: number | "all";
     includeObjects?: boolean;
+    includeArchived?: boolean;
     limit?: number;
     scopeCeiling?: AccessScope;
   }): TreeResult {
@@ -2486,7 +2506,26 @@ export class SeaEngine {
     const lineLimit = Math.max(1, Math.min(params.limit ?? 60, 500));
 
     const orgRealms = realms.filter((r) => r.orgId === org.id);
-    const visibleRealms = vis.sanitizeRealms(orgRealms);
+    const effectivelyArchivedIds = new Set<string>(
+      orgRealms
+        .filter((r) => isRealmEffectivelyArchived(orgRealms, r.id))
+        .map((r) => r.id),
+    );
+    const allVisibleRealms = vis.sanitizeRealms(orgRealms);
+    const visibleArchivedIds = new Set<string>(
+      allVisibleRealms
+        .filter((r) => effectivelyArchivedIds.has(r.id))
+        .map((r) => r.id),
+    );
+    const effectiveIncludeArchived =
+      Boolean(params.includeArchived) ||
+      (Boolean(params.target) && visibleArchivedIds.has(targetRealm.id));
+    const visibleRealms = effectiveIncludeArchived
+      ? allVisibleRealms
+      : allVisibleRealms.filter((r) => !visibleArchivedIds.has(r.id));
+    const hiddenArchivedCount = effectiveIncludeArchived
+      ? 0
+      : visibleArchivedIds.size;
     const visibleRealmIds = new Set(visibleRealms.map((r) => r.id));
 
     const rawObjects = this.db.listObjects({
@@ -2641,6 +2680,9 @@ export class SeaEngine {
           ? this.buildObjectForest(objsByRealm.get(realm.id) ?? [])
           : [],
         children: childRealms.map((c) => buildNode(c, currentDepth + 1)),
+        ...(effectivelyArchivedIds.has(realm.id)
+          ? { effectivelyArchived: true }
+          : {}),
       };
     };
 
@@ -2666,6 +2708,7 @@ export class SeaEngine {
       objects: includeObjects ? visibleObjects : [],
       realmTree,
       objectTree: includeObjects ? this.buildObjectForest(visibleObjects) : [],
+      ...(hiddenArchivedCount > 0 ? { hiddenArchivedCount } : {}),
     };
   }
 
@@ -2846,8 +2889,9 @@ export class SeaEngine {
       aboutEntryIdsFilter = aboutResolved.entryIds;
     }
 
-    let resolvedId = normalizedRef;
+      let resolvedId = normalizedRef;
     let displayTarget = rawTarget;
+    let targetRealmArchived = false;
     let driveFiles: LsDriveFileItem[] | undefined;
     let subRealms: LsResult["subRealms"] | undefined;
     let objectsList: LsObjectSummary[] | undefined;
@@ -2865,6 +2909,7 @@ export class SeaEngine {
       });
       resolvedId = targetRealm.id;
       displayTarget = targetRealm.path;
+      targetRealmArchived = isRealmEffectivelyArchived(realms, targetRealm.id);
 
       const wantEntries = !onlyFilter || onlyFilter === "entries";
       const wantRealms = !onlyFilter || onlyFilter === "realms";
@@ -3092,6 +3137,7 @@ export class SeaEngine {
       target: displayTarget,
       resolvedId,
       viewerRealmId: viewerRealm.id,
+      ...(targetRealmArchived ? { realmArchived: true } : {}),
       ...(onlyFilter ? { only: onlyFilter } : {}),
       items: page,
       totalMatched: unifiedRes.total,

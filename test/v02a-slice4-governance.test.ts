@@ -4,7 +4,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createMindEngine,
+  formatBriefMarkdown,
   formatSearchMarkdown,
+  formatTreeMarkdown,
+  MindError,
   type Actor,
 } from "../src/index.js";
 
@@ -277,6 +280,322 @@ describe("V0.2a Slice 4 — Pillar 2: Human-Only Realm Topology, Round-Trip Obje
       ref: legacyId,
     });
     expect(lsLegacy.resolvedId).toBe(legacyId);
+    eng.close();
+  });
+});
+
+describe("V0.2a Slice 4 — Pillar 3: Migration v8 realms.scope, realm set & archive/unarchive write freeze", () => {
+  it("supports realm scope/set, ancestor-computed archive freeze across all write paths, searchable archived entries with [archived], and redact exemption", async () => {
+    const homeDir = makeTempHome();
+    const eng = await createMindEngine({ homeDir });
+    expect(eng.db.listSchemaMigrations().map((m) => m.version)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8,
+    ]);
+
+    const { org, rootRealm } = eng.ledger.createOrg({
+      name: "GovOrg",
+      policy: "open",
+      actor: humanAdmin,
+    });
+    const parent = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "legacy",
+      name: "Legacy Ops",
+      scope: "Include: legacy migrations. Exclude: active product work.",
+    });
+    const child = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: parent.id,
+      slug: "v1",
+      name: "Legacy v1",
+      scope: "Include: v1 sunset notes. Exclude: v2.",
+    });
+
+    // Seed an entry in child before archiving parent
+    const childRec = await eng.ledger.appendRecord({
+      actor: agentWorker,
+      viewerRealmId: child.id,
+      realmId: child.id,
+      kind: "decision",
+      title: "ArchiveSearchToken771 sunset plan",
+      payload: { body: "Sunset v1 endpoints by Q4." },
+      occurredAt: "2026-10-01T00:00:00Z",
+    });
+
+    // Root "/" cannot be archived
+    expect(() =>
+      eng.ledger.archiveRealm({
+        actor: humanAdmin,
+        orgId: org.id,
+        realmId: rootRealm.id,
+      }),
+    ).toThrow(/Root realm/);
+
+    // Agents cannot update or archive realms
+    expect(() =>
+      eng.ledger.updateRealm({
+        actor: agentWorker,
+        orgId: org.id,
+        realmId: parent.id,
+        scope: "Hijack",
+      }),
+    ).toThrow(/Only human actors/);
+    expect(() =>
+      eng.ledger.archiveRealm({
+        actor: agentWorker,
+        orgId: org.id,
+        realmId: parent.id,
+      }),
+    ).toThrow(/Only human actors/);
+
+    // Archive parent -> both parent and descendant child become effectively archived
+    const arch1 = eng.ledger.archiveRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      realmId: parent.id,
+    });
+    expect(arch1.alreadyArchived).toBe(false);
+    expect(arch1.effectivelyArchived).toBe(true);
+    // Idempotent second archive
+    const arch2 = eng.ledger.archiveRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      realmId: parent.id,
+    });
+    expect(arch2.alreadyArchived).toBe(true);
+
+    // realm set IS allowed on archived realm (slug/path remain immutable!)
+    const updated = eng.ledger.updateRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      realmId: parent.id,
+      name: "Legacy Ops (Sunset)",
+      scope: "Archived after v1 sunset; read-only history.",
+    });
+    expect(updated.name).toBe("Legacy Ops (Sunset)");
+    expect(updated.slug).toBe("legacy");
+    expect(updated.path).toBe("/legacy");
+    expect(updated.scope).toContain("Archived after v1 sunset");
+
+    // Single choke-point write freeze blocks ALL write paths on child (inherited archive) with CONFLICT
+    const assertConflictArchived = async (fn: () => unknown | Promise<unknown>) => {
+      let caught: unknown;
+      try {
+        await fn();
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(MindError);
+      expect((caught as MindError).code).toBe("CONFLICT");
+      expect((caught as MindError).details?.reason).toBe("realm_archived");
+    };
+
+    await assertConflictArchived(() =>
+      eng.ledger.appendRecord({
+        actor: agentWorker,
+        viewerRealmId: child.id,
+        realmId: child.id,
+        kind: "finding",
+        title: "Blocked write",
+        payload: { body: "Nope" },
+      }),
+    );
+    await assertConflictArchived(() =>
+      eng.ledger.captureSeabed({
+        actor: agentWorker,
+        viewerRealmId: child.id,
+        realmId: child.id,
+        kind: "message",
+        text: "Blocked raw",
+      }),
+    );
+    await assertConflictArchived(() =>
+      eng.ledger.writeDriveFile({
+        actor: agentWorker,
+        viewerRealmId: child.id,
+        realmId: child.id,
+        relPath: "frozen.md",
+        content: "Must never hit disk",
+      }),
+    );
+    // Verify writeDriveFile did NOT leave a partial file on disk!
+    expect(await eng.drive.listFiles(child.id)).toEqual([]);
+
+    await assertConflictArchived(() =>
+      eng.objects.createObject({
+        actor: agentWorker,
+        viewerRealmId: child.id,
+        kind: "service",
+        name: "frozen-svc",
+      }),
+    );
+    await assertConflictArchived(() =>
+      eng.sea.settle({
+        actor: agentWorker,
+        viewerRealmId: child.id,
+        realmId: child.id,
+        layer: "card_realm",
+        periodKey: "2026-11-23",
+      }),
+    );
+    await assertConflictArchived(() =>
+      eng.ledger.createRealm({
+        actor: humanAdmin,
+        orgId: org.id,
+        parentId: child.id,
+        slug: "sub",
+        name: "Sub",
+      }),
+    );
+
+    // Default tree hides archived realms & shows visible hidden count; --all shows them with [archived] + scope
+    const defaultTree = eng.sea.tree({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      depth: "all",
+    });
+    expect(defaultTree.hiddenArchivedCount).toBe(2);
+    expect(defaultTree.realms.map((r) => r.path)).toEqual(["/"]);
+    expect(formatTreeMarkdown(defaultTree)).toContain(
+      "2 archived realm(s) hidden; pass --all to show",
+    );
+
+    const fullTree = eng.sea.tree({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      depth: "all",
+      includeArchived: true,
+    });
+    expect(fullTree.hiddenArchivedCount).toBeUndefined();
+    const fullTreeMd = formatTreeMarkdown(fullTree);
+    expect(fullTreeMd).toContain("[archived]");
+    expect(fullTreeMd).toContain("Archived after v1 sunset");
+
+    // Default search STILL returns entries in archived realms with [archived] badge (Matthew decision 2a!)
+    const searchRes = await eng.sea.search({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      query: "ArchiveSearchToken771",
+    });
+    expect(searchRes.items[0]?.id).toBe(childRec.id);
+    expect(searchRes.items[0]?.realmArchived).toBe(true);
+    expect(formatSearchMarkdown(searchRes)).toContain("`/legacy/v1` [archived]");
+
+    // Brief on archived realm shows [archived] and Scope
+    const brief = eng.sea.brief({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      target: parent.path,
+    });
+    expect(brief.realmArchived).toBe(true);
+    expect(formatBriefMarkdown(brief)).toContain("[archived]");
+    expect(formatBriefMarkdown(brief)).toContain("Scope: Archived after v1 sunset");
+
+    // Unarchive child while parent is STILL archived reports effectivelyArchived=true + archivedAncestorPath
+    const childUnarch = eng.ledger.unarchiveRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      realmId: child.id,
+    });
+    expect(childUnarch.effectivelyArchived).toBe(true);
+    expect(childUnarch.archivedAncestorPath).toBe("/legacy");
+
+    // Compliance redact() is STILL allowed on archived realm!
+    const red = await eng.ledger.redact({
+      actor: humanAdmin,
+      orgId: org.id,
+      entryId: childRec.id,
+      reason: "compliance cleanup",
+    });
+    expect(red.entryId).toBe(childRec.id);
+    expect(red.redactedAt).toBeTruthy();
+
+    // Unarchive parent restores writes on child
+    const parentUnarch = eng.ledger.unarchiveRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      realmId: parent.id,
+    });
+    expect(parentUnarch.effectivelyArchived).toBe(false);
+    const afterRec = await eng.ledger.appendRecord({
+      actor: agentWorker,
+      viewerRealmId: child.id,
+      realmId: child.id,
+      kind: "finding",
+      title: "Restored write",
+      payload: { body: "Writes work again." },
+    });
+    expect(afterRec.status).toBe("active");
+    eng.close();
+  });
+
+  it("never leaks hidden archived ancestor paths or counts in tree mode", async () => {
+    const homeDir = makeTempHome();
+    const eng = await createMindEngine({ homeDir });
+    const { org, rootRealm } = eng.ledger.createOrg({
+      name: "TreeArchiveOrg",
+      policy: "tree",
+      actor: humanAdmin,
+    });
+    const secretBranch = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "secret-branch",
+      name: "Secret Branch",
+    });
+    const mountedLeaf = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: secretBranch.id,
+      slug: "leaf",
+      name: "Leaf",
+    });
+    const viewer = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "viewer",
+      name: "Viewer",
+    });
+
+    eng.ledger.mountRealm({
+      actor: humanAdmin,
+      viewerRealmId: viewer.id,
+      targetRealmId: mountedLeaf.id,
+      scope: "ledger",
+    });
+    // Archive hidden ancestor secret-branch
+    eng.ledger.archiveRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      realmId: secretBranch.id,
+    });
+
+    // Tree from /viewer: sees ONLY 1 hidden archived realm (mountedLeaf), NEVER secret-branch!
+    const treeDefault = eng.sea.tree({
+      actor: agentWorker,
+      viewerRealmId: viewer.id,
+      depth: "all",
+    });
+    expect(treeDefault.hiddenArchivedCount).toBe(1);
+    expect(JSON.stringify(treeDefault)).not.toContain("secret-branch");
+
+    const treeAll = eng.sea.tree({
+      actor: agentWorker,
+      viewerRealmId: viewer.id,
+      depth: "all",
+      includeArchived: true,
+    });
+    const mountedNode = treeAll.realmTree.find(
+      (n) => n.realm.id === mountedLeaf.id,
+    );
+    expect(mountedNode?.realm.path).toBe("@mounted/leaf");
+    expect(mountedNode?.effectivelyArchived).toBe(true);
+    expect(JSON.stringify(treeAll)).not.toContain("secret-branch");
     eng.close();
   });
 });

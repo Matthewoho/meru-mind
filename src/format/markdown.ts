@@ -126,8 +126,10 @@ function renderRealmTreeLines(
       node.counts.childRealmsCount - node.children.length,
     );
     const countsStr = formatCountsTag(node.counts, collapsed);
+    const archivedTag = node.effectivelyArchived ? " [archived]" : "";
+    const scopeSuffix = r.scope ? ` | ${r.scope}` : "";
     lines.push(
-      `${indent}- **${r.path}** — ${r.name} (\`${r.id}\`) ${countsStr}`,
+      `${indent}- **${r.path}** — ${r.name}${archivedTag} (\`${r.id}\`) ${countsStr}${scopeSuffix}`,
     );
     if (node.objects.length > 0) {
       const totalObjects = countObjectTreeNodes(node.objects);
@@ -184,6 +186,12 @@ export function formatTreeMarkdown(res: TreeResult): string {
   } else {
     lines.push(...renderRealmTreeLines(res.realmTree, realmPathById, duplicateKeys));
   }
+  if (res.hiddenArchivedCount && res.hiddenArchivedCount > 0) {
+    lines.push(
+      "",
+      `_(${res.hiddenArchivedCount} archived realm(s) hidden; pass --all to show)_`,
+    );
+  }
 
   const cap = Math.max(1, res.lineLimit || 60);
   if (lines.length > cap) {
@@ -210,8 +218,9 @@ function formatLsEntryLine(item: LsEntry): string {
 }
 
 export function formatLsMarkdown(res: LsResult): string {
+  const archivedTag = res.realmArchived ? " [archived]" : "";
   const lines: string[] = [
-    `# ls ${res.targetType}: \`${res.target}\` (resolved: \`${res.resolvedId}\`)`,
+    `# ls ${res.targetType}: \`${res.target}\`${archivedTag} (resolved: \`${res.resolvedId}\`)`,
   ];
   if (!res.only || res.only === "entries") {
     lines.push(
@@ -372,8 +381,10 @@ export function formatCatMarkdown(res: CatResult): string {
 }
 
 export function formatBriefMarkdown(brief: BriefOutput): string {
+  const archivedTag = brief.realmArchived ? " [archived]" : "";
   const lines: string[] = [
-    `# Brief: ${brief.realm.name} (\`${brief.realm.path}\`, \`${brief.realm.id}\`)`,
+    `# Brief: ${brief.realm.name}${archivedTag} (\`${brief.realm.path}\`, \`${brief.realm.id}\`)`,
+    ...(brief.realm.scope ? [`Scope: ${brief.realm.scope}`] : []),
     `Generated: ${brief.generatedAt}`,
   ];
   if (brief.buckets) {
@@ -591,9 +602,10 @@ export function formatRecallMarkdown(res: RecallResult): string {
         : item.currentHeadId !== undefined
           ? ` -> head:\`${item.currentHeadId ?? "none"}\``
           : "";
+      const archivedSuffix = item.realmArchived ? " [archived]" : "";
       const inactiveSuffix = formatInactiveBadgesMarkdown(item.inactive);
       lines.push(
-        `- ${badge} \`${item.id}\` **${item.title}** (${item.status}${headHint}, @ ${formatDateLabel(item.occurredAt)}) — ${item.snippet}${inactiveSuffix}`,
+        `- ${badge} \`${item.id}\` **${item.title}**${archivedSuffix} (${item.status}${headHint}, @ ${formatDateLabel(item.occurredAt)}) — ${item.snippet}${inactiveSuffix}`,
       );
     }
     if (res.omittedCount > 0) {
@@ -1034,7 +1046,11 @@ export function formatSearchMarkdown(res: SearchResult): string {
         : item.currentHeadId !== undefined
           ? ` -> head:\`${item.currentHeadId ?? "none"}\``
           : "";
-      const realmLabel = item.realmPath ? ` in \`${item.realmPath}\`` : "";
+      const realmLabel = item.realmPath
+        ? ` in \`${item.realmPath}\`${item.realmArchived ? " [archived]" : ""}`
+        : item.realmArchived
+          ? " [archived]"
+          : "";
       const truncBadge = item.truncated
         ? ` [${item.shownChars}/${item.contentChars} chars]`
         : "";

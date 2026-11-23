@@ -38,8 +38,8 @@ export MERU_MIND_HOME="$HOME/.meru-mind"
 node dist/cli.js admin init --org "Acme"
 
 # 2. Create child realms (realm topology is human-only in both open and tree modes)
-node dist/cli.js realm create --parent / --slug backend --name "Backend" --as-human
-node dist/cli.js realm create --parent / --slug marketing --name "Marketing" --as-human
+node dist/cli.js realm create --parent / --slug backend --name "Backend" --scope "Include: API design, storage, backend deploys. Exclude: marketing." --as-human
+node dist/cli.js realm create --parent / --slug marketing --name "Marketing" --scope "Include: launches, campaigns. Exclude: backend infra." --as-human
 
 # 3. Record a human rule & everyday conclusion
 node dist/cli.js rule add --in / --title "Never deploy without passing integration tests" --body "All merges require passing CI." --as-human

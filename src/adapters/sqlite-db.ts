@@ -1751,6 +1751,16 @@ export class SqliteDb implements DbPort {
           .run(now);
       }
 
+      if (!applied.has(8)) {
+        const now = new Date().toISOString();
+        this.ensureColumn("realms", "scope", "TEXT");
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (8, 'v8_realm_scope', ?)`,
+          )
+          .run(now);
+      }
+
       if (this.vecEnabled && !this.tableExists("vec_items")) {
         this.createVecItemsTable();
       }
@@ -1869,8 +1879,8 @@ export class SqliteDb implements DbPort {
   insertRealm(realm: Realm): void {
     this.db
       .prepare(
-        `INSERT INTO realms (id, org_id, parent_id, slug, path, name, archived_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO realms (id, org_id, parent_id, slug, path, name, scope, archived_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         realm.id,
@@ -1879,9 +1889,37 @@ export class SqliteDb implements DbPort {
         realm.slug,
         realm.path,
         realm.name,
+        realm.scope ?? null,
         realm.archivedAt,
         realm.createdAt,
       );
+  }
+
+  updateRealmMetadata(
+    id: string,
+    fields: { name?: string; scope?: string | null },
+  ): void {
+    const sets: string[] = [];
+    const args: Array<string | null> = [];
+    if (fields.name !== undefined) {
+      sets.push("name = ?");
+      args.push(fields.name);
+    }
+    if (fields.scope !== undefined) {
+      sets.push("scope = ?");
+      args.push(fields.scope);
+    }
+    if (sets.length === 0) return;
+    args.push(id);
+    this.db
+      .prepare(`UPDATE realms SET ${sets.join(", ")} WHERE id = ?`)
+      .run(...args);
+  }
+
+  setRealmArchivedAt(id: string, archivedAt: string | null): void {
+    this.db
+      .prepare(`UPDATE realms SET archived_at = ? WHERE id = ?`)
+      .run(archivedAt, id);
   }
 
   getRealm(id: string): Realm | null {
@@ -1912,6 +1950,8 @@ export class SqliteDb implements DbPort {
   }
 
   private mapRealm(row: Record<string, unknown>): Realm {
+    const scope =
+      row.scope !== null && row.scope !== undefined ? String(row.scope) : null;
     return {
       id: String(row.id),
       orgId: String(row.org_id),
@@ -1919,6 +1959,7 @@ export class SqliteDb implements DbPort {
       slug: String(row.slug),
       path: String(row.path),
       name: String(row.name),
+      ...(scope !== null ? { scope } : {}),
       archivedAt: row.archived_at ? String(row.archived_at) : null,
       createdAt: String(row.created_at),
     };

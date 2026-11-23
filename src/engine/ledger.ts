@@ -3,6 +3,7 @@ import { assertSafeIdentifier } from "../adapters/local-drive.js";
 import { buildRecordFtsBody } from "../format/snippet.js";
 import {
   assertAccess,
+  findEffectiveArchivedRealm,
   intersectAccessScopes,
   resolveAccess,
   resolveAccessScope,
@@ -24,7 +25,9 @@ import {
   type Organization,
   type OrgPolicy,
   type Realm,
+  type RealmArchiveResult,
   type RealmMount,
+  type RealmUnarchiveResult,
   type RecordKind,
   type RedactResult,
   type SeabedEntry,
@@ -131,6 +134,28 @@ function normalizeSlug(raw: string): string {
     throw new MindError("INVALID_INPUT", `Invalid slug: "${raw}"`);
   }
   return slug;
+}
+
+const MAX_REALM_SCOPE_CHARS = 280;
+
+function normalizeRealmScope(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new MindError("INVALID_INPUT", "Realm scope cannot be empty");
+  }
+  if (/[\r\n]/.test(trimmed)) {
+    throw new MindError(
+      "INVALID_INPUT",
+      "Realm scope must be a single line (newlines are not allowed)",
+    );
+  }
+  if (trimmed.length > MAX_REALM_SCOPE_CHARS) {
+    throw new MindError(
+      "INVALID_INPUT",
+      `Realm scope must be <= ${MAX_REALM_SCOPE_CHARS} characters (got ${trimmed.length})`,
+    );
+  }
+  return trimmed;
 }
 
 function stripIdFromHardFacts(value: unknown, entryId: string): unknown {
@@ -311,6 +336,7 @@ export class LedgerEngine {
     parentId: string;
     slug: string;
     name: string;
+    scope?: string | null;
     actor: Actor;
   }): Realm {
     const actor = validateActor(params.actor);
@@ -350,6 +376,25 @@ export class LedgerEngine {
         );
       }
 
+      const normalizedScope =
+        params.scope !== undefined && params.scope !== null
+          ? normalizeRealmScope(params.scope)
+          : null;
+
+      const allOrgRealms = this.db.listRealms(params.orgId);
+      const archivedParent = findEffectiveArchivedRealm(allOrgRealms, parent.id);
+      if (archivedParent) {
+        throw new MindError(
+          "CONFLICT",
+          `Cannot create child realm under archived realm "${archivedParent.path}".`,
+          {
+            reason: "realm_archived",
+            archivedRealmId: archivedParent.id,
+            try: `meru-mind realm unarchive ${archivedParent.path} --as-human`,
+          },
+        );
+      }
+
       const slug = normalizeSlug(params.slug);
       const realmPath =
         parent.path === "/" ? `/${slug}` : `${parent.path}/${slug}`;
@@ -370,6 +415,7 @@ export class LedgerEngine {
         slug,
         path: realmPath,
         name,
+        ...(normalizedScope !== null ? { scope: normalizedScope } : {}),
         archivedAt: null,
         createdAt: now,
       };
@@ -384,6 +430,185 @@ export class LedgerEngine {
         createdAt: now,
       });
       return realm;
+    });
+  }
+
+  /**
+   * Org-admin human-only realm metadata update (display name and/or single-line scope).
+   * Slug and path are strictly immutable. Allowed on archived realms (e.g. to document archive reason).
+   */
+  updateRealm(params: {
+    actor: Actor;
+    orgId: string;
+    realmId: string;
+    name?: string;
+    scope?: string;
+  }): Realm {
+    const actor = validateActor(params.actor);
+    if (actor.kind !== "human") {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Only human actors can update realm metadata (actor "${actor.id}" is "${actor.kind}")`,
+        {
+          try: 'meru-mind realm set <realm> --scope "<scope>" --as-human',
+        },
+      );
+    }
+    if (params.name === undefined && params.scope === undefined) {
+      throw new MindError(
+        "INVALID_INPUT",
+        "At least one of --name or --scope must be provided to update a realm",
+        {
+          try: 'meru-mind realm set <realm> --scope "<scope>" --as-human',
+        },
+      );
+    }
+    const nextName =
+      params.name !== undefined ? params.name.trim() : undefined;
+    if (nextName !== undefined && !nextName) {
+      throw new MindError("INVALID_INPUT", "Realm name cannot be empty");
+    }
+    const nextScope =
+      params.scope !== undefined ? normalizeRealmScope(params.scope) : undefined;
+
+    return this.db.transaction(() => {
+      const existing = this.db.getRealm(params.realmId);
+      if (!existing || existing.orgId !== params.orgId) {
+        throw new MindError("NOT_FOUND", `Realm not found: ${params.realmId}`);
+      }
+      this.db.updateRealmMetadata(existing.id, {
+        ...(nextName !== undefined ? { name: nextName } : {}),
+        ...(nextScope !== undefined ? { scope: nextScope } : {}),
+      });
+      const now = new Date().toISOString();
+      this.db.appendChangeLog({
+        orgId: existing.orgId,
+        realmId: existing.id,
+        entityType: "realm",
+        entityId: existing.id,
+        op: "update_realm",
+        actorId: actor.id,
+        createdAt: now,
+      });
+      return this.db.getRealm(existing.id)!;
+    });
+  }
+
+  /**
+   * Org-admin human-only realm archive (idempotent).
+   * Freezes writes on this realm and all descendants (computed at read/write time);
+   * root "/" and open-mode "/inbox" cannot be archived.
+   */
+  archiveRealm(params: {
+    actor: Actor;
+    orgId: string;
+    realmId: string;
+  }): RealmArchiveResult {
+    const actor = validateActor(params.actor);
+    if (actor.kind !== "human") {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Only human actors can archive realms (actor "${actor.id}" is "${actor.kind}")`,
+        {
+          try: "meru-mind realm archive <realm> --as-human",
+        },
+      );
+    }
+
+    return this.db.transaction(() => {
+      const org = this.db.getOrg(params.orgId);
+      if (!org) {
+        throw new MindError("NOT_FOUND", `Organization not found: ${params.orgId}`);
+      }
+      const existing = this.db.getRealm(params.realmId);
+      if (!existing || existing.orgId !== params.orgId) {
+        throw new MindError("NOT_FOUND", `Realm not found: ${params.realmId}`);
+      }
+      if (existing.path === "/") {
+        throw new MindError("INVALID_INPUT", 'Root realm "/" cannot be archived');
+      }
+      if (org.policy === "open" && existing.path === "/inbox") {
+        throw new MindError(
+          "INVALID_INPUT",
+          'Inbox realm "/inbox" cannot be archived in an open policy organization',
+        );
+      }
+      if (existing.archivedAt !== null) {
+        return {
+          realm: existing,
+          alreadyArchived: true,
+          effectivelyArchived: true,
+        };
+      }
+      const now = new Date().toISOString();
+      this.db.setRealmArchivedAt(existing.id, now);
+      this.db.appendChangeLog({
+        orgId: existing.orgId,
+        realmId: existing.id,
+        entityType: "realm",
+        entityId: existing.id,
+        op: "archive_realm",
+        actorId: actor.id,
+        createdAt: now,
+      });
+      const updated = this.db.getRealm(existing.id)!;
+      return {
+        realm: updated,
+        alreadyArchived: false,
+        effectivelyArchived: true,
+      };
+    });
+  }
+
+  /**
+   * Org-admin human-only realm unarchive (idempotent).
+   * If an ancestor realm is still archived, clears this realm's own archivedAt and reports
+   * `effectivelyArchived: true` plus `archivedAncestorPath`.
+   */
+  unarchiveRealm(params: {
+    actor: Actor;
+    orgId: string;
+    realmId: string;
+  }): RealmUnarchiveResult {
+    const actor = validateActor(params.actor);
+    if (actor.kind !== "human") {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Only human actors can unarchive realms (actor "${actor.id}" is "${actor.kind}")`,
+        {
+          try: "meru-mind realm unarchive <realm> --as-human",
+        },
+      );
+    }
+
+    return this.db.transaction(() => {
+      const existing = this.db.getRealm(params.realmId);
+      if (!existing || existing.orgId !== params.orgId) {
+        throw new MindError("NOT_FOUND", `Realm not found: ${params.realmId}`);
+      }
+      const alreadyActive = existing.archivedAt === null;
+      if (!alreadyActive) {
+        const now = new Date().toISOString();
+        this.db.setRealmArchivedAt(existing.id, null);
+        this.db.appendChangeLog({
+          orgId: existing.orgId,
+          realmId: existing.id,
+          entityType: "realm",
+          entityId: existing.id,
+          op: "unarchive_realm",
+          actorId: actor.id,
+          createdAt: now,
+        });
+      }
+      const updated = this.db.getRealm(existing.id)!;
+      const orgRealms = this.db.listRealms(existing.orgId);
+      const stillArchivedBy = findEffectiveArchivedRealm(orgRealms, updated.id);
+      return {
+        realm: updated,
+        alreadyActive,
+        effectivelyArchived: stillArchivedBy !== null,
+        ...(stillArchivedBy ? { archivedAncestorPath: stillArchivedBy.path } : {}),
+      };
     });
   }
 

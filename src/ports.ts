@@ -156,6 +156,11 @@ export interface DbPort {
   getRealm(id: string): Realm | null;
   getRealmByPath(orgId: string, realmPath: string): Realm | null;
   listRealms(orgId?: string): Realm[];
+  updateRealmMetadata(
+    id: string,
+    fields: { name?: string; scope?: string | null },
+  ): void;
+  setRealmArchivedAt(id: string, archivedAt: string | null): void;
 
   insertMount(mount: RealmMount): void;
   deleteMount(viewerRealmId: string, targetRealmId: string): boolean;

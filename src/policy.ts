@@ -11,6 +11,44 @@ import {
 } from "./types.js";
 
 /**
+ * Walks raw (unsanitized) realm ancestry from `realmId` up to root and returns
+ * the nearest realm (self or ancestor) with `archivedAt !== null`, or `null` if active.
+ * Always pass raw `db.listRealms()` — NEVER sanitized realms (whose mounted `parentId` is null).
+ */
+export function findEffectiveArchivedRealm(
+  realms: Realm[],
+  realmId: string,
+): Realm | null {
+  const byId = new Map(realms.map((r) => [r.id, r]));
+  const visited = new Set<string>();
+  let current = byId.get(realmId);
+  while (current) {
+    if (visited.has(current.id)) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Cycle detected in realm ancestry at ${current.id}`,
+      );
+    }
+    visited.add(current.id);
+    if (current.archivedAt !== null) {
+      return current;
+    }
+    if (!current.parentId) {
+      break;
+    }
+    current = byId.get(current.parentId);
+  }
+  return null;
+}
+
+export function isRealmEffectivelyArchived(
+  realms: Realm[],
+  realmId: string,
+): boolean {
+  return findEffectiveArchivedRealm(realms, realmId) !== null;
+}
+
+/**
  * Computes the strict ancestor chain of a realm from root down to parent (excluding self).
  */
 export function getAncestorIds(
@@ -380,6 +418,36 @@ export function assertAccess(params: {
           targetRealmId: params.targetRealmId,
           assetKind: params.assetKind,
           actual,
+        },
+      );
+    }
+    // Single choke-point write freeze for effectively archived realms (self or ancestor).
+    // Checked strictly AFTER visibility & write-permission checks so invisible realms never leak archive state.
+    const archivedSource = findEffectiveArchivedRealm(
+      params.realms,
+      params.targetRealmId,
+    );
+    if (archivedSource) {
+      const realmsById = new Map(params.realms.map((r) => [r.id, r]));
+      const viewerAncestors = getAncestorIds(realmsById, params.viewerRealmId);
+      const canShowArchivePath =
+        params.orgPolicy === "open" ||
+        archivedSource.id === params.targetRealmId ||
+        archivedSource.id === params.viewerRealmId ||
+        viewerAncestors.includes(archivedSource.id);
+      const tryHint = canShowArchivePath
+        ? `meru-mind realm unarchive ${archivedSource.path} --as-human`
+        : "meru-mind realm unarchive <realm> --as-human";
+      throw new MindError(
+        "CONFLICT",
+        canShowArchivePath
+          ? `Realm "${archivedSource.path}" is archived and frozen for writes.`
+          : `Target realm is archived and frozen for writes.`,
+        {
+          reason: "realm_archived",
+          targetRealmId: params.targetRealmId,
+          archivedRealmId: archivedSource.id,
+          try: tryHint,
         },
       );
     }

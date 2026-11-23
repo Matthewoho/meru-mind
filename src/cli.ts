@@ -14,6 +14,7 @@ import {
   formatSurfaceErrorText,
   formatTreeMarkdown,
   formatWhoamiMarkdown,
+  isRealmEffectivelyArchived,
   MindError,
   OPAQUE_OBJECT_NOT_FOUND,
   OPAQUE_REALM_NOT_FOUND,
@@ -391,10 +392,11 @@ Examples:
 `,
   tree: `Risk: read
 When to use: Discover visible realms, mounted realms (@mounted/<alias>), objects, and counts.
-Usage: meru-mind tree [ref] [-L|--depth <n|all>] [--objects|--no-objects] [--limit <n>]
+Usage: meru-mind tree [ref] [-L|--depth <n|all>] [--objects|--no-objects] [--all] [--limit <n>]
 Flags:
   -L, --depth <n|all>    Expansion depth (default: 1; 0 = target only; all = unlimited)
   --objects/--no-objects Include object hierarchy (default: true)
+  --all                  Include archived realms (default: hidden with count footer)
   --limit <n>            Max Markdown output lines (default: 60)
 Examples:
   meru-mind tree /
@@ -479,16 +481,20 @@ Examples:
   meru-mind write --in /ops --kind decision --title "Use WAL mode" --body "Enabled SQLite WAL."
   meru-mind write --in /ops --title "API timeout" --body "Raised timeout to 30s" --about service:api
 `,
-  realm: `Risk: high-risk-write (create/mount/unmount in tree orgs require --as-human)
-When to use: Manage realms and cross-branch read-only mounts.
+  realm: `Risk: high-risk-write (all realm mutations require --as-human in both open and tree orgs)
+When to use: Create, scope, archive/unarchive, list, or mount realms (slug is immutable; name & scope are mutable).
 Usage:
-  meru-mind realm create [--org <orgId>] --parent <realm> --slug <slug> --name <name> [--as-human]
-  meru-mind realm list [--limit <n>]
-  meru-mind realm mount --viewer <realm> --target <realm> [--scope all|ledger|drive] [--as-human]
-  meru-mind realm unmount --viewer <realm> --target <realm> [--as-human]
+  meru-mind realm create [--org <orgId>] --parent <realm> --slug <slug> --name <name> --scope <scope> --as-human
+  meru-mind realm set <realmRef> [--name <name>] [--scope <scope>] --as-human
+  meru-mind realm archive <realmRef> --as-human
+  meru-mind realm unarchive <realmRef> --as-human
+  meru-mind realm list [--all] [--limit <n>]
+  meru-mind realm mount --viewer <realm> --target <realm> [--scope all|ledger|drive] --as-human
+  meru-mind realm unmount --viewer <realm> --target <realm> --as-human
 Examples:
-  meru-mind realm create --parent / --slug ops --name "Operations" --as-human
-  meru-mind realm mount --viewer /team-b/c2 --target /team-a/c1 --scope ledger --as-human
+  meru-mind realm create --parent / --slug ops --name "Operations" --scope "Include: releases, alerts. Exclude: product specs." --as-human
+  meru-mind realm set /ops --scope "Include: prod deploys, rollbacks. Exclude: CI flakes." --as-human
+  meru-mind realm archive /old-project --as-human
 `,
   object: `Risk: write
 When to use: Create, reparent, delete, link, unlink, set lifecycle state, or manage aliases on structured objects (kind "file" is reserved).
@@ -884,7 +890,11 @@ async function main(): Promise<void> {
     }
 
     if (cmd === "tree") {
-      assertAllowedFlags(flags, ["depth", "objects", "no-objects", "limit"], "tree");
+      assertAllowedFlags(
+        flags,
+        ["depth", "objects", "no-objects", "all", "limit"],
+        "tree",
+      );
       const ctx = resolveSessionContext({ engine, flags });
       const includeObjects = flagBool(flags, "no-objects") ? false : true;
       const res = engine.sea.tree({
@@ -893,6 +903,7 @@ async function main(): Promise<void> {
         target: sub,
         depth: parseDepthFlag(flags),
         includeObjects,
+        includeArchived: flagBool(flags, "all"),
         limit: parseIntFlag(flags, "limit", { min: 1 }),
         scopeCeiling: ctx.boundScope,
       });
@@ -1251,38 +1262,119 @@ async function main(): Promise<void> {
       if (sub === "create") {
         assertAllowedFlags(
           flags,
-          ["parent", "slug", "name"],
+          ["parent", "slug", "name", "scope"],
           "realm create",
         );
         const orgId = resolveAdminOrgId(engine, orgFlag);
         const parentRef = requireFlag(flags, "parent", "realm create");
         const parentId = resolveAdminRealmId(engine, parentRef, orgId);
+        const scope = requireFlag(flags, "scope", "realm create");
         const res = engine.ledger.createRealm({
           actor,
           orgId,
           parentId,
           slug: requireFlag(flags, "slug", "realm create"),
           name: requireFlag(flags, "name", "realm create"),
+          scope,
         });
         output(res, formatGenericMarkdown("Realm Created", res));
         return;
       }
+      if (sub === "set") {
+        assertAllowedFlags(flags, ["name", "scope"], "realm set");
+        const realmRef = third?.trim();
+        if (!realmRef) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "Missing <realmRef> for 'realm set'",
+            {
+              try: 'meru-mind realm set /ops --scope "Include: ... Exclude: ..." --as-human',
+            },
+          );
+        }
+        const orgId = resolveAdminOrgId(engine, orgFlag);
+        const realmId = resolveAdminRealmId(engine, realmRef, orgId);
+        const res = engine.ledger.updateRealm({
+          actor,
+          orgId,
+          realmId,
+          name: flagStr(flags, "name"),
+          scope: flagStr(flags, "scope"),
+        });
+        output(res, formatGenericMarkdown("Realm Updated", res));
+        return;
+      }
+      if (sub === "archive") {
+        assertAllowedFlags(flags, [], "realm archive");
+        const realmRef = third?.trim();
+        if (!realmRef) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "Missing <realmRef> for 'realm archive'",
+            { try: "meru-mind realm archive /old-project --as-human" },
+          );
+        }
+        const orgId = resolveAdminOrgId(engine, orgFlag);
+        const realmId = resolveAdminRealmId(engine, realmRef, orgId);
+        const res = engine.ledger.archiveRealm({ actor, orgId, realmId });
+        output(res, formatGenericMarkdown("Realm Archived", res));
+        return;
+      }
+      if (sub === "unarchive") {
+        assertAllowedFlags(flags, [], "realm unarchive");
+        const realmRef = third?.trim();
+        if (!realmRef) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "Missing <realmRef> for 'realm unarchive'",
+            { try: "meru-mind realm unarchive /old-project --as-human" },
+          );
+        }
+        const orgId = resolveAdminOrgId(engine, orgFlag);
+        const realmId = resolveAdminRealmId(engine, realmRef, orgId);
+        const res = engine.ledger.unarchiveRealm({ actor, orgId, realmId });
+        output(res, formatGenericMarkdown("Realm Unarchived", res));
+        return;
+      }
       if (sub === "list") {
-        assertAllowedFlags(flags, ["limit"], "realm list");
+        assertAllowedFlags(flags, ["all", "limit"], "realm list");
         const ctx = resolveSessionContext({ engine, flags });
+        const includeArchived = flagBool(flags, "all");
+        const rawOrgRealms = engine.db.listRealms(ctx.org.id);
+        const archivedIds = new Set(
+          rawOrgRealms
+            .filter((r) => isRealmEffectivelyArchived(rawOrgRealms, r.id))
+            .map((r) => r.id),
+        );
         const allVisible = engine.ledger.listRealms({
           orgId: ctx.org.id,
           viewerRealmId: ctx.boundViewerRealmId,
           scopeCeiling: ctx.boundScope,
         });
+        const hiddenArchived = includeArchived
+          ? 0
+          : allVisible.filter((r) => archivedIds.has(r.id)).length;
+        const filtered = includeArchived
+          ? allVisible
+          : allVisible.filter((r) => !archivedIds.has(r.id));
         const limit = parseIntFlag(flags, "limit", { min: 1 }) ?? 50;
-        const sliced = allVisible.slice(0, limit);
-        const omitted = Math.max(0, allVisible.length - sliced.length);
+        const sliced = filtered.slice(0, limit);
+        const omitted = Math.max(0, filtered.length - sliced.length);
         const md = [
-          `# Realms (${sliced.length}/${allVisible.length}${omitted > 0 ? `, omitted: ${omitted}` : ""})`,
+          `# Realms (${sliced.length}/${filtered.length}${omitted > 0 ? `, omitted: ${omitted}` : ""})`,
           "",
-          ...sliced.map((r) => `- **${r.path}** — ${r.name} (\`${r.id}\`)`),
+          ...sliced.map((r) => {
+            const arch = archivedIds.has(r.id) ? " [archived]" : "";
+            const sc = r.scope ? ` | ${r.scope}` : "";
+            return `- **${r.path}** — ${r.name}${arch} (\`${r.id}\`)${sc}`;
+          }),
           ...(omitted > 0 ? [`... and ${omitted} more`] : []),
+          ...(hiddenArchived > 0
+            ? [
+                "",
+                `_(${hiddenArchived} archived realm(s) hidden; pass --all to show)_`,
+              ]
+            : []),
         ].join("\n");
         output(sliced, md);
         return;

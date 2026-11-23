@@ -81,8 +81,23 @@ export interface Realm {
   /** Hierarchical slash path, e.g. "/" or "/engineering/backend" */
   path: string;
   name: string;
+  /** Optional single-line ownership boundary (what belongs here and what does not) */
+  scope?: string | null;
   archivedAt: string | null;
   createdAt: string;
+}
+
+export interface RealmArchiveResult {
+  realm: Realm;
+  alreadyArchived: boolean;
+  effectivelyArchived: boolean;
+}
+
+export interface RealmUnarchiveResult {
+  realm: Realm;
+  alreadyActive: boolean;
+  effectivelyArchived: boolean;
+  archivedAncestorPath?: string | null;
 }
 
 export type MountScope = "all" | "ledger" | "drive";
@@ -355,6 +370,7 @@ export interface ChildRealmSummary {
 
 export interface BriefOutput {
   realm: Realm;
+  realmArchived?: boolean;
   generatedAt: string;
   kindHistogram: Record<string, number>;
   buckets?: {
@@ -459,6 +475,8 @@ export interface RecallItem {
   matchedBy: Array<"id" | "filter" | "fts" | "vector">;
   score: number;
   inactive?: string[];
+  /** True when the entry's realm (or an ancestor realm) is archived; omitted when active */
+  realmArchived?: boolean;
 }
 
 export interface RecallResult {
@@ -586,6 +604,7 @@ export interface RealmTreeNode {
   counts: RealmTreeCounts;
   objects: ObjectTreeNode[];
   children: RealmTreeNode[];
+  effectivelyArchived?: boolean;
 }
 
 export interface TreeResult {
@@ -599,6 +618,7 @@ export interface TreeResult {
   objects: MindObject[];
   realmTree: RealmTreeNode[];
   objectTree: ObjectTreeNode[];
+  hiddenArchivedCount?: number;
 }
 
 export type LsTargetType = "realm" | "object" | "thing" | "resource";
@@ -655,6 +675,7 @@ export interface LsResult {
   target: string;
   resolvedId: string;
   viewerRealmId: string;
+  realmArchived?: boolean;
   only?: LsOnlyFilter;
   items: LsEntry[];
   totalMatched: number;

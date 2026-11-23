@@ -1438,6 +1438,8 @@ describe("V0.2a-Polish: P0-1 zero-leak, O(1) queries, CJK bigrams, lexicographic
       "ops",
       "--name",
       "Ops",
+      "--scope",
+      "Ops work",
     ]) as { id: string; path: string };
     expect(child.path).toBe("/ops");
 

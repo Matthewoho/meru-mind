@@ -84,6 +84,8 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
       "eng",
       "--name",
       "Engineering",
+      "--scope",
+      "Engineering work",
       "--as-human",
     ]) as { id: string; path: string };
     expect(eng.path).toBe("/eng");
@@ -250,6 +252,8 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
       "alpha",
       "--name",
       "Alpha",
+      "--scope",
+      "Alpha team",
     ]) as { id: string };
     const beta = runCli(homeDir, [
       "--as-human",
@@ -263,6 +267,8 @@ describe("Real CLI binary and MCP stdio server E2E", () => {
       "beta",
       "--name",
       "Beta",
+      "--scope",
+      "Beta team",
     ]) as { id: string };
 
     // Plant a secret canary in alpha via CLI (tree org requires MERU_MIND_VIEWER_REALM_ID)

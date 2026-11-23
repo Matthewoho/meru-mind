@@ -532,6 +532,8 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
           "sub",
           "--name",
           "Sub",
+          "--scope",
+          "Sub workspace",
         ],
         rootEnv,
       ).stderr,
@@ -603,6 +605,8 @@ describe("Access policy (open|tree), process-bound MCP/CLI, field filtering, sen
       "sub",
       "--name",
       "Sub",
+      "--scope",
+      "Sub workspace",
     ]) as { id: string };
     expect(sub.id).toMatch(/^realm_/);
 
