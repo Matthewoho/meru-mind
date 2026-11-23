@@ -5,6 +5,7 @@ import {
   type DateConcept,
   type SearchConcept,
 } from "../adapters/sqlite-db.js";
+import { PASSAGE_SEAM_WORD_RE } from "../query/fts-query.js";
 import { createInactiveBadgeResolver } from "../format/inactive-badges.js";
 import {
   buildCanonicalEntryContent,
@@ -730,6 +731,7 @@ export class SeaEngine {
       score: number,
       concepts?: SearchConcept[],
       passage?: { text: string; start: number; end: number; totalLen: number },
+      conceptDf?: Int32Array,
     ): RecallItem => {
       const clean = vis.sanitizeRecord(rec);
       const isSuperseded = rec.status === "superseded";
@@ -739,16 +741,22 @@ export class SeaEngine {
       const orphanSuperseded = isSuperseded
         ? vis.isOrphanSuperseded(rec)
         : undefined;
+      const reservedEdgeChars = passage
+        ? (passage.start > 0 ? 3 : 0) + (passage.end < passage.totalLen ? 3 : 0)
+        : 0;
       const snippetMeta = passage
         ? buildSnippetWithMeta({
             title: clean.title,
             text: passage.text,
             concepts,
+            conceptDf,
+            reservedEdgeChars,
           })
         : buildSnippetWithMeta({
             title: clean.title,
             payload: clean.payload,
             concepts,
+            conceptDf,
           });
       let snippet = snippetMeta.snippet;
       if (passage && snippet) {
@@ -799,11 +807,17 @@ export class SeaEngine {
       score: number,
       concepts?: SearchConcept[],
       passage?: { text: string; start: number; end: number; totalLen: number },
+      conceptDf?: Int32Array,
     ): RecallItem => {
       const clean = vis.sanitizeSeabed(sea);
+      const reservedEdgeChars = passage
+        ? (passage.start > 0 ? 3 : 0) + (passage.end < passage.totalLen ? 3 : 0)
+        : 0;
       const snippetMeta = buildSnippetWithMeta({
         text: passage ? passage.text : clean.text,
         concepts,
+        conceptDf,
+        reservedEdgeChars,
       });
       let snippet = snippetMeta.snippet;
       if (passage && snippet) {
@@ -850,12 +864,18 @@ export class SeaEngine {
       score: number,
       concepts?: SearchConcept[],
       passage?: { text: string; start: number; end: number; totalLen: number },
+      conceptDf?: Int32Array,
     ): RecallItem => {
       const clean = vis.sanitizeDistillation(dist);
       const canonical = clean.narrativeMd || JSON.stringify(clean.hardFacts);
+      const reservedEdgeChars = passage
+        ? (passage.start > 0 ? 3 : 0) + (passage.end < passage.totalLen ? 3 : 0)
+        : 0;
       const snippetMeta = buildSnippetWithMeta({
         text: passage ? passage.text : canonical,
         concepts,
+        conceptDf,
+        reservedEdgeChars,
       });
       let snippet = snippetMeta.snippet;
       if (passage && snippet) {
@@ -1414,6 +1434,7 @@ export class SeaEngine {
 
     const concepts = parsedQuery.concepts;
     const totalConceptCount = concepts.length + dateConcepts.length;
+    const conceptDf = new Int32Array(concepts.length);
     let ftsRejectedByJsCount = 0;
     let vectorOnlyHydratedCount = 0;
 
@@ -1473,16 +1494,20 @@ export class SeaEngine {
       let bestPassage:
         | { text: string; start: number; end: number; totalLen: number }
         | undefined;
+      const matchedConceptFlags = new Uint8Array(concepts.length);
 
       const bodyLen = params.bodyText.length;
       if (bodyLen <= PASSAGE_WINDOW_CHARS) {
         const fullText = `${params.titleText}\n${params.bodyText}`;
         const fullLower = `${titleLower}\n${bodyLower}`;
-        for (const c of concepts) {
+        for (let i = 0; i < concepts.length; i += 1) {
+          const c = concepts[i]!;
           const threshold = c.isCjk ? CJK_COVERAGE_THRESHOLD : 1.0;
           const fullScore = c.scoreText(fullText, fullLower);
           if (fullScore < threshold) {
             textFullAllCovered = false;
+          } else {
+            matchedConceptFlags[i] = 1;
           }
           scoreSum += fullScore;
         }
@@ -1506,6 +1531,7 @@ export class SeaEngine {
         let baseTitleCoveredCount = 0;
         let baseTitleLexAll = concepts.length > 0;
         const activeBodyConcepts: Array<{
+          conceptIdx: number;
           concept: SearchConcept;
           threshold: number;
           titleScore: number;
@@ -1518,6 +1544,7 @@ export class SeaEngine {
           if (ts >= 1.0) {
             baseTitleScoreSum += ts;
             baseTitleCoveredCount += 1;
+            matchedConceptFlags[i] = 1;
             continue;
           }
           // When activeBodyDates is empty, the branch-and-bound indexOf pass below
@@ -1526,12 +1553,14 @@ export class SeaEngine {
             baseTitleScoreSum += ts;
             if (ts >= threshold) {
               baseTitleCoveredCount += 1;
+              matchedConceptFlags[i] = 1;
             } else {
               baseTitleLexAll = false;
             }
             continue;
           }
           activeBodyConcepts.push({
+            conceptIdx: i,
             concept: c,
             threshold,
             titleScore: ts,
@@ -1573,6 +1602,7 @@ export class SeaEngine {
           let bestLexCoveredCount = -1;
           let bestStart = 0;
           let bestEnd = Math.min(bodyLen, PASSAGE_WINDOW_CHARS);
+          const winHitScratch = new Uint8Array(activeBodyConcepts.length);
 
           const evaluateWindow = (w: number): void => {
             const start = w * PASSAGE_STRIDE_CHARS;
@@ -1585,15 +1615,15 @@ export class SeaEngine {
             const leftWordPad =
               start > 0 &&
               slice.length > 0 &&
-              /[A-Za-z0-9_:/-]/.test(slice[0]!) &&
-              /[A-Za-z0-9_:/-]/.test(params.bodyText[start - 1]!)
+              PASSAGE_SEAM_WORD_RE.test(slice[0]!) &&
+              PASSAGE_SEAM_WORD_RE.test(params.bodyText[start - 1]!)
                 ? params.bodyText[start - 1]!
                 : "";
             const rightWordPad =
               end < bodyLen &&
               slice.length > 0 &&
-              /[A-Za-z0-9_:/-]/.test(slice[slice.length - 1]!) &&
-              /[A-Za-z0-9_:/-]/.test(params.bodyText[end]!)
+              PASSAGE_SEAM_WORD_RE.test(slice[slice.length - 1]!) &&
+              PASSAGE_SEAM_WORD_RE.test(params.bodyText[end]!)
                 ? params.bodyText[end]!
                 : "";
             const boundarySlice =
@@ -1618,8 +1648,10 @@ export class SeaEngine {
                   );
               if (s >= ac.threshold) {
                 winLexCoveredCount += 1;
+                winHitScratch[k] = 1;
               } else {
                 winLexAll = false;
+                winHitScratch[k] = 0;
               }
               winScoreSum += s;
             }
@@ -1689,6 +1721,9 @@ export class SeaEngine {
               dateAllSatisfied = winDateAll;
               bestStart = start;
               bestEnd = end;
+              for (let k = 0; k < activeBodyConcepts.length; k += 1) {
+                matchedConceptFlags[activeBodyConcepts[k]!.conceptIdx] = winHitScratch[k]!;
+              }
             }
           };
 
@@ -1699,7 +1734,9 @@ export class SeaEngine {
             const winSeen = new Int32Array(numWindows).fill(-1);
             let maxHits = 0;
             for (let k = 0; k < activeBodyConcepts.length; k += 1) {
-              const terms = activeBodyConcepts[k]!.concept.terms;
+              const terms =
+                activeBodyConcepts[k]!.concept.prefilterTerms ??
+                activeBodyConcepts[k]!.concept.terms;
               for (let ti = 0; ti < terms.length; ti += 1) {
                 const needle = terms[ti]!.toLowerCase();
                 if (!needle) continue;
@@ -1917,6 +1954,13 @@ export class SeaEngine {
 
       if (!hasFts && !hasFilterDate && hasVector) {
         vectorOnlyHydratedCount += 1;
+      }
+
+      // Accumulate pre-limit candidate-pool document frequencies for snippet tie-breaking
+      for (let i = 0; i < concepts.length; i += 1) {
+        if (matchedConceptFlags[i] === 1) {
+          conceptDf[i] = conceptDf[i]! + 1;
+        }
       }
 
       return {
@@ -2313,6 +2357,7 @@ export class SeaEngine {
             displayScore,
             concepts,
             c.bestPassage,
+            conceptDf,
           );
         }
         if (c.seabed) {
@@ -2322,6 +2367,7 @@ export class SeaEngine {
             displayScore,
             concepts,
             c.bestPassage,
+            conceptDf,
           );
         }
         return toDistillationItem(
@@ -2330,6 +2376,7 @@ export class SeaEngine {
           displayScore,
           concepts,
           c.bestPassage,
+          conceptDf,
         );
       }),
     );

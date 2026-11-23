@@ -5,6 +5,10 @@ export interface SnippetConceptLike {
   raw: string;
   terms?: string[];
   isCjk?: boolean;
+  /** Optional boundary-aware regex for non-CJK concepts */
+  matchRegex?: RegExp;
+  /** Optional continuous coverage scorer (matches SeaEngine threshold: >= 0.75 CJK, 1.0 non-CJK) */
+  scoreText?: (text: string, lowerText?: string) => number;
 }
 
 export interface SnippetWithMeta {
@@ -174,10 +178,11 @@ export function extractReadableText(
 
 interface MatchSpan {
   pos: number;
+  end: number;
   conceptIdx: number;
 }
 
-function collectMatchSpans(
+function collectLegacySpans(
   lowerText: string,
   concepts: SnippetConceptLike[],
 ): MatchSpan[] {
@@ -197,7 +202,7 @@ function collectMatchSpans(
       while (from < lowerText.length && count < 12) {
         const found = lowerText.indexOf(needle, from);
         if (found === -1) break;
-        spans.push({ pos: found, conceptIdx: idx });
+        spans.push({ pos: found, end: found + needle.length, conceptIdx: idx });
         from = found + Math.max(1, needle.length);
         count += 1;
       }
@@ -207,36 +212,224 @@ function collectMatchSpans(
   return spans;
 }
 
+function collectExactSpansForConcept(
+  sourceText: string,
+  lowerText: string,
+  concept: SnippetConceptLike,
+  conceptIdx: number,
+): MatchSpan[] {
+  const out: MatchSpan[] = [];
+  if (concept.matchRegex) {
+    const globalFlags = concept.matchRegex.flags.includes("g")
+      ? concept.matchRegex.flags
+      : `${concept.matchRegex.flags}g`;
+    const re = new RegExp(concept.matchRegex.source, globalFlags);
+    let count = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(sourceText)) !== null && count < 16) {
+      const len = Math.max(1, m[0].length);
+      out.push({ pos: m.index, end: m.index + len, conceptIdx });
+      count += 1;
+      if (m[0].length === 0) re.lastIndex += 1;
+    }
+    return out;
+  }
+
+  // Prefer exact `raw` occurrence first for CJK / plain terms before falling back to bigrams
+  const rawLower = concept.raw.trim().toLowerCase();
+  if (rawLower) {
+    let from = 0;
+    let count = 0;
+    while (from < lowerText.length && count < 12) {
+      const found = lowerText.indexOf(rawLower, from);
+      if (found === -1) break;
+      out.push({ pos: found, end: found + rawLower.length, conceptIdx });
+      from = found + Math.max(1, rawLower.length);
+      count += 1;
+    }
+    if (out.length > 0) return out;
+  }
+
+  const needles = Array.from(
+    new Set(
+      (concept.terms ?? [])
+        .map((t) => t.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  );
+  for (const needle of needles) {
+    let from = 0;
+    let count = 0;
+    while (from < lowerText.length && count < 8) {
+      const found = lowerText.indexOf(needle, from);
+      if (found === -1) break;
+      out.push({ pos: found, end: found + needle.length, conceptIdx });
+      from = found + Math.max(1, needle.length);
+      count += 1;
+    }
+  }
+  return out;
+}
+
+function conceptMatchesText(
+  text: string | undefined,
+  lowerText: string,
+  concept: SnippetConceptLike,
+): boolean {
+  if (!text || !lowerText) return false;
+  if (concept.scoreText) {
+    const threshold = concept.isCjk ? 0.75 : 1.0;
+    return concept.scoreText(text, lowerText) >= threshold;
+  }
+  if (concept.matchRegex) {
+    return concept.matchRegex.test(text);
+  }
+  const rawLower = concept.raw.trim().toLowerCase();
+  if (rawLower && lowerText.includes(rawLower)) {
+    return true;
+  }
+  const terms = (concept.terms ?? [])
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+  if (terms.length === 0) return false;
+  let hits = 0;
+  for (const t of terms) {
+    if (lowerText.includes(t)) hits += 1;
+  }
+  return hits / terms.length >= 0.75;
+}
+
+function collectMatchSpans(
+  _sourceText: string,
+  lowerText: string,
+  concepts: SnippetConceptLike[],
+): MatchSpan[] {
+  return collectLegacySpans(lowerText, concepts);
+}
+
 function snapWindowStart(text: string, rawStart: number): number {
   if (rawStart <= 0) return 0;
   // Move forward slightly to a clean whitespace boundary if nearby (ASCII words)
   const lookAhead = Math.min(text.length, rawStart + 18);
   const spaceIdx = text.indexOf(" ", rawStart);
   if (spaceIdx !== -1 && spaceIdx <= lookAhead) {
-    return spaceIdx + 1;
+    return safeStart(text, spaceIdx + 1);
   }
-  return rawStart;
+  return safeStart(text, rawStart);
 }
 
-function snapWindowEnd(text: string, rawEnd: number): number {
+function snapWindowEnd(text: string, rawEnd: number, minStart = 0): number {
   if (rawEnd >= text.length) return text.length;
-  const lookBack = Math.max(0, rawEnd - 18);
+  const lookBack = Math.max(minStart, rawEnd - 18);
   const spaceIdx = text.lastIndexOf(" ", rawEnd);
   if (spaceIdx !== -1 && spaceIdx >= lookBack) {
-    return spaceIdx;
+    return safeEnd(text, spaceIdx, minStart);
   }
-  return rawEnd;
+  return safeEnd(text, rawEnd, minStart);
+}
+
+/**
+ * O(spans) two-pointer sliding window maximizing distinct matched concepts, then total hits.
+ * Mathematically identical selection to the O(spans^2) anchor scan for monotonically sorted spans.
+ */
+function pickBestSingleWindow(
+  spans: MatchSpan[],
+  sourceLen: number,
+  windowLen: number,
+  conceptCount: number,
+  minBound = 0,
+  maxBound = sourceLen,
+): number {
+  const effectiveMaxLen = Math.max(1, Math.min(windowLen, maxBound - minBound));
+  const half = Math.floor(effectiveMaxLen / 2);
+  const counts = new Int32Array(conceptCount);
+  let left = 0;
+  let right = 0;
+  let distinctCount = 0;
+
+  // Advance `left`/`right` to first span >= minBound
+  while (left < spans.length && spans[left]!.pos < minBound) {
+    left += 1;
+  }
+  right = left;
+
+  let bestStart = minBound;
+  let bestDistinct = -1;
+  let bestTotal = -1;
+
+  for (let i = left; i < spans.length; i += 1) {
+    const anchor = spans[i]!.pos;
+    if (anchor >= maxBound) break;
+    const winStart = Math.max(
+      minBound,
+      Math.min(maxBound - effectiveMaxLen, anchor - half),
+    );
+    const winEnd = Math.min(maxBound, winStart + effectiveMaxLen);
+
+    while (right < spans.length && spans[right]!.pos < winEnd) {
+      const cIdx = spans[right]!.conceptIdx;
+      if (counts[cIdx] === 0) distinctCount += 1;
+      counts[cIdx] = counts[cIdx]! + 1;
+      right += 1;
+    }
+    while (left < right && spans[left]!.pos < winStart) {
+      const cIdx = spans[left]!.conceptIdx;
+      const next = counts[cIdx]! - 1;
+      counts[cIdx] = next;
+      if (next === 0) distinctCount -= 1;
+      left += 1;
+    }
+
+    const total = right - left;
+    if (
+      distinctCount > bestDistinct ||
+      (distinctCount === bestDistinct && total > bestTotal)
+    ) {
+      bestDistinct = distinctCount;
+      bestTotal = total;
+      bestStart = winStart;
+    }
+  }
+  return bestStart;
+}
+
+function conceptsInRange(
+  spans: MatchSpan[],
+  start: number,
+  end: number,
+): Set<number> {
+  const found = new Set<number>();
+  for (let i = 0; i < spans.length; i += 1) {
+    const s = spans[i]!;
+    if (s.pos >= end) break;
+    if (s.pos >= start && s.end <= end) {
+      found.add(s.conceptIdx);
+    } else if (s.pos >= start && s.pos < end) {
+      found.add(s.conceptIdx);
+    }
+  }
+  return found;
 }
 
 /**
  * Single shared match-centered snippet builder with exact truncation metadata.
- * `truncated === true` iff characters were actually elided/sliced from the readable text.
+ * - Preserves byte-identical single-window output whenever Window 1 + Title already cover
+ *   every body-matched query concept.
+ * - When a body-matched query concept is absent from both Title and Window 1, splits the
+ *   strict `maxLen` budget into up to 2 chronological non-overlapping windows joined by ` … `,
+ *   prioritizing the rarest uncovered concept (pre-limit candidate pool `df`), with an ultra-short
+ *   tail tag `[+term]` if >=3 widely scattered concepts still remain uncovered — all strictly
+ *   within `maxLen` chars (zero char-budget regression).
  */
 export function buildSnippetWithMeta(params: {
   title?: string;
   text?: string;
   payload?: Record<string, unknown> | null;
   concepts?: SnippetConceptLike[];
+  /** Pre-limit candidate-pool document frequency per concept index (tie-breaker only when >1 uncovered concept) */
+  conceptDf?: ReadonlyArray<number> | Int32Array;
+  /** Optional prefix/suffix ellipsis chars reserved by caller (applied ONLY in multi-segment mode) */
+  reservedEdgeChars?: number;
   maxLen?: number;
 }): SnippetWithMeta {
   const maxLen = Math.max(40, params.maxLen ?? 240);
@@ -263,7 +456,7 @@ export function buildSnippetWithMeta(params: {
   }
 
   const lower = source.toLowerCase();
-  const spans = collectMatchSpans(lower, concepts);
+  const spans = collectMatchSpans(source, lower, concepts);
   if (spans.length === 0) {
     const end = snapWindowEnd(source, maxLen - 3);
     return {
@@ -272,46 +465,203 @@ export function buildSnippetWithMeta(params: {
     };
   }
 
-  // Evaluate candidate windows centered around each match cluster; maximize distinct concepts then total hits
-  let bestStart = 0;
-  let bestDistinct = -1;
-  let bestTotal = -1;
+  const bestStart = pickBestSingleWindow(spans, source.length, maxLen, concepts.length);
+  const snappedStart = snapWindowStart(source, bestStart);
+  const rawEnd = Math.min(source.length, snappedStart + maxLen);
+  const snappedEnd = snapWindowEnd(source, rawEnd, snappedStart);
 
-  const half = Math.floor(maxLen / 2);
-  for (let i = 0; i < spans.length; i += 1) {
-    const anchor = spans[i]!.pos;
-    const winStart = Math.max(0, Math.min(source.length - maxLen, anchor - half));
-    const winEnd = Math.min(source.length, winStart + maxLen);
+  // Check true concept coverage: only genuinely matched concepts (score >= threshold, never stray single CJK bigrams)
+  // that are absent from BOTH Title (binary check) and Window 1 trigger the 2-segment split!
+  const titleLower = (params.title ?? "").toLowerCase();
+  const win1Slice = source.slice(snappedStart, snappedEnd);
+  const win1Lower = lower.slice(snappedStart, snappedEnd);
 
-    const distinct = new Set<number>();
-    let total = 0;
-    for (let j = 0; j < spans.length; j += 1) {
-      const s = spans[j]!;
-      if (s.pos >= winStart && s.pos < winEnd) {
-        distinct.add(s.conceptIdx);
-        total += 1;
+  const uncovered: number[] = [];
+  for (let idx = 0; idx < concepts.length; idx += 1) {
+    const c = concepts[idx]!;
+    if (!conceptMatchesText(source, lower, c)) continue;
+    if (conceptMatchesText(params.title, titleLower, c)) continue;
+    if (conceptMatchesText(win1Slice, win1Lower, c)) continue;
+    uncovered.push(idx);
+  }
+
+  // Fast path: 1 window + title already covers every genuinely matched concept -> 100% byte-identical output!
+  if (uncovered.length === 0 || maxLen < 80) {
+    const prefix = snappedStart > 0 ? "..." : "";
+    const suffix = snappedEnd < source.length ? "..." : "";
+    const body = win1Slice.trim();
+    return {
+      snippet: `${prefix}${body}${suffix}`,
+      truncated: true,
+    };
+  }
+
+  // Collect exact spans for uncovered concepts only when 2-segment mode actually triggers
+  const exactUncoveredSpans = new Map<number, MatchSpan[]>();
+  for (const idx of uncovered) {
+    exactUncoveredSpans.set(
+      idx,
+      collectExactSpansForConcept(source, lower, concepts[idx]!, idx),
+    );
+  }
+
+  // Multi-segment coverage-first path: strict <= hardCap budget (zero tolerance)
+  const hardCap = Math.max(60, maxLen - (params.reservedEdgeChars ?? 0));
+  const df = params.conceptDf;
+  uncovered.sort((a, b) => {
+    const dfA = df && a < df.length ? df[a]! : Number.MAX_SAFE_INTEGER;
+    const dfB = df && b < df.length ? df[b]! : Number.MAX_SAFE_INTEGER;
+    if (dfA !== dfB) return dfA - dfB;
+    const lenDiff = concepts[b]!.raw.length - concepts[a]!.raw.length;
+    if (lenDiff !== 0) return lenDiff;
+    return a - b;
+  });
+
+  const uncoveredSet = new Set<number>(uncovered);
+  const targetIdx = uncovered[0]!;
+  const SEP = " … "; // 3 chars
+
+  // Build 2 non-overlapping segments within a given per-segment budget
+  const buildTwoSegmentSnippet = (
+    perSegBudget: number,
+    tailTag: string,
+  ): { text: string; covered: Set<number> } => {
+    const segBudget = Math.max(24, perSegBudget);
+    const halfSeg = Math.floor(segBudget / 2);
+
+    // Segment A: densest sub-window inside Window 1
+    const rawStartA = pickBestSingleWindow(
+      spans,
+      source.length,
+      segBudget,
+      concepts.length,
+      snappedStart,
+      snappedEnd,
+    );
+
+    // Segment B: best span of rarest uncovered concept `targetIdx` maximizing uncovered concepts
+    const targetSpans = exactUncoveredSpans.get(targetIdx) ?? [];
+    let bestAnchorB = targetSpans[0]?.pos ?? 0;
+    let bestUncoveredHits = -1;
+    for (let i = 0; i < targetSpans.length; i += 1) {
+      const anchor = targetSpans[i]!.pos;
+      const wStart = Math.max(0, Math.min(source.length - segBudget, anchor - halfSeg));
+      const wEnd = Math.min(source.length, wStart + segBudget);
+      let hitCount = 0;
+      for (const uIdx of uncovered) {
+        const uSpans = exactUncoveredSpans.get(uIdx);
+        if (uSpans?.some((sp) => sp.pos >= wStart && sp.pos < wEnd)) {
+          hitCount += 1;
+        }
+      }
+      if (hitCount > bestUncoveredHits) {
+        bestUncoveredHits = hitCount;
+        bestAnchorB = anchor;
       }
     }
+    const rawStartB = Math.max(
+      0,
+      Math.min(source.length - segBudget, bestAnchorB - halfSeg),
+    );
 
-    if (
-      distinct.size > bestDistinct ||
-      (distinct.size === bestDistinct && total > bestTotal)
-    ) {
-      bestDistinct = distinct.size;
-      bestTotal = total;
-      bestStart = winStart;
+    const segs = [
+      { start: rawStartA, end: Math.min(source.length, rawStartA + segBudget) },
+      { start: rawStartB, end: Math.min(source.length, rawStartB + segBudget) },
+    ].sort((a, b) => a.start - b.start);
+
+    const first = segs[0]!;
+    const second = segs[1]!;
+
+    // If segments overlap or nearly touch, merge into one clean slice strictly <= hardCap
+    if (first.end + 6 >= second.start) {
+      const mergedBudget = Math.max(24, hardCap - 6 - tailTag.length);
+      const mStart = snapWindowStart(source, first.start);
+      const mEnd = snapWindowEnd(
+        source,
+        Math.min(source.length, mStart + mergedBudget),
+        mStart,
+      );
+      const lead = mStart > 0 ? "..." : "";
+      const trail = mEnd < source.length ? "..." : "";
+      const body = source.slice(mStart, mEnd).trim();
+      const text = `${lead}${body}${trail}${tailTag}`;
+      const bodyLower = body.toLowerCase();
+      const covered = new Set<number>();
+      for (const uIdx of uncovered) {
+        if (conceptMatchesText(body, bodyLower, concepts[uIdx]!)) {
+          covered.add(uIdx);
+        }
+      }
+      return { text, covered };
+    }
+
+    const s1Start = snapWindowStart(source, first.start);
+    const s1End = snapWindowEnd(
+      source,
+      Math.min(second.start - 1, s1Start + segBudget),
+      s1Start,
+    );
+    const s2Start = snapWindowStart(source, Math.max(s1End + 1, second.start));
+    const s2End = snapWindowEnd(
+      source,
+      Math.min(source.length, s2Start + segBudget),
+      s2Start,
+    );
+
+    const lead = s1Start > 0 ? "..." : "";
+    const trail = s2End < source.length ? "..." : "";
+    const body1 = source.slice(s1Start, s1End).trim();
+    const body2 = source.slice(s2Start, s2End).trim();
+    const b1Lower = body1.toLowerCase();
+    const b2Lower = body2.toLowerCase();
+    const covered = new Set<number>();
+    for (const uIdx of uncovered) {
+      const c = concepts[uIdx]!;
+      if (
+        conceptMatchesText(body1, b1Lower, c) ||
+        conceptMatchesText(body2, b2Lower, c)
+      ) {
+        covered.add(uIdx);
+      }
+    }
+    return {
+      text: `${lead}${body1}${SEP}${body2}${trail}${tailTag}`,
+      covered,
+    };
+  };
+
+  // Reserve 9 chars worst-case for leading "..." (3) + middle " … " (3) + trailing "..." (3)
+  const basePerSeg = Math.floor((hardCap - 9) / 2);
+  let built = buildTwoSegmentSnippet(basePerSeg, "");
+
+  // Tail fallback: if >= 3 scattered body concepts remain uncovered outside title + both segments,
+  // append an ultra-short `[+term1,+term2]` hint while trimming segment budgets so total <= hardCap.
+  const stillMissing = uncovered.filter((idx) => !built.covered.has(idx));
+  if (stillMissing.length > 0) {
+    const parts: string[] = [];
+    let tagLen = 3; // " []"
+    for (const idx of stillMissing) {
+      const token = `+${concepts[idx]!.raw.slice(0, 14)}`;
+      const addLen = (parts.length > 0 ? 1 : 0) + token.length;
+      if (tagLen + addLen > 32) break;
+      parts.push(token);
+      tagLen += addLen;
+    }
+    if (parts.length > 0) {
+      const tailTag = ` [${parts.join(",")}]`;
+      const trimmedPerSeg = Math.floor((hardCap - 9 - tailTag.length) / 2);
+      built = buildTwoSegmentSnippet(trimmedPerSeg, tailTag);
     }
   }
 
-  const snappedStart = snapWindowStart(source, bestStart);
-  const rawEnd = Math.min(source.length, snappedStart + maxLen);
-  const snappedEnd = snapWindowEnd(source, rawEnd);
-
-  const prefix = snappedStart > 0 ? "..." : "";
-  const suffix = snappedEnd < source.length ? "..." : "";
-  const body = source.slice(snappedStart, snappedEnd).trim();
+  // Final hard-cap safety guard (strictly <= hardCap, zero tolerance)
+  let finalText = built.text;
+  if (finalText.length > hardCap) {
+    const cut = safeEnd(finalText, hardCap - 3, 0);
+    finalText = `${finalText.slice(0, cut).trimEnd()}...`;
+  }
   return {
-    snippet: `${prefix}${body}${suffix}`,
+    snippet: finalText,
     truncated: true,
   };
 }
@@ -319,14 +669,15 @@ export function buildSnippetWithMeta(params: {
 /**
  * Single shared match-centered snippet builder across recall, ls, brief, and Markdown views.
  * - Extracts readable text from structured payloads (never dumping raw JSON metadata blobs).
- * - When query concepts are provided, centers the ~maxLen window around the highest concept-hit
- *   density region with `...` ellipsis.
+ * - Preserves byte-identical single-window output when all matched concepts fit in Title ∪ Window 1;
+ *   splits into up to 2 chronological windows within strict `maxLen` when a concept would otherwise vanish.
  */
 export function buildSnippet(params: {
   title?: string;
   text?: string;
   payload?: Record<string, unknown> | null;
   concepts?: SnippetConceptLike[];
+  conceptDf?: ReadonlyArray<number> | Int32Array;
   maxLen?: number;
 }): string {
   return buildSnippetWithMeta(params).snippet;
@@ -438,7 +789,7 @@ export function windowText(params: {
             .map((t) => ({ raw: t }));
 
     const lower = text.toLowerCase();
-    const spans = collectMatchSpans(lower, concepts);
+    const spans = collectMatchSpans(text, lower, concepts);
     if (spans.length === 0) {
       aroundMatched = false;
       start = 0;

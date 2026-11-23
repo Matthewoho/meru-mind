@@ -6,6 +6,13 @@ const CJK_CHAR_RE =
 const CJK_RUN_RE =
   /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
 
+/** Single source of truth for ASCII alphanumeric word characters (aligned with SQLite FTS5 unicode61, where `_` is a separator). */
+export const ASCII_WORD_CLASS = "A-Za-z0-9";
+/** Strict delimiter boundary class preserved for hyphen/slash/colon identifiers (e.g., `agent-worker` != `agent-worker-bridge`). */
+export const IDENTIFIER_STRICT_BOUNDARY_CLASS = "A-Za-z0-9:/-";
+/** Superset character class for 1-char passage seam padding in SeaEngine (never creates a false boundary). */
+export const PASSAGE_SEAM_WORD_RE = /[A-Za-z0-9_:/-]/;
+
 /**
  * Normalizes mixed CJK + Latin text for SQLite FTS5 unicode61:
  * - Preserves Latin/numeric words and exact word boundaries.
@@ -122,6 +129,10 @@ export interface SearchConcept {
   ftsPhrase: string;
   /** Retained terms for matching (2-char bigrams for CJK len>=3, [raw] for len 1-2 or non-CJK) */
   terms: string[];
+  /** Optional branch-and-bound pre-filter needles (e.g. longest subtoken for multi-word snake_case concepts) */
+  prefilterTerms?: string[];
+  /** Boundary-aware regex for non-CJK concepts (reused by snippet span matcher so display matches scoring) */
+  matchRegex?: RegExp;
   /** FTS5 expression for this concept: `"t"`, `"c"*`, or `("b1" OR "b2" ...)` */
   ftsGroupExpr: string;
   isCjk: boolean;
@@ -471,22 +482,48 @@ function makeNonCjkConcept(raw: string): SearchConcept | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
 
+  // Per-concept classification (v0.5.1 Option X):
+  // - Hyphen/slash/colon identifiers keep strict delimiter isolation (`agent-worker` != `agent-worker-bridge`),
+  //   with `_` removed from the lookaround since FTS5 unicode61 splits on `_`.
+  // - Plain words and pure snake_case / dotted compounds split on `[^A-Za-z0-9]+`, matching FTS5 unicode61 100%.
   const isIdentifier = /[-/:]/.test(trimmed);
   const ftsTokens = trimmed
-    .split(/[^A-Za-z0-9_]+/)
+    .split(/[^A-Za-z0-9]+/)
     .map((t) => t.trim())
     .filter(Boolean);
   if (ftsTokens.length === 0) return null;
   const ftsPhrase = ftsTokens.join(" ");
-  const boundaryRe = isIdentifier
-    ? new RegExp(
-        `(?<![A-Za-z0-9_:/-])${escapeRegExp(trimmed)}(?![A-Za-z0-9_:/-])`,
-        "i",
-      )
-    : new RegExp(
-        `(?<![A-Za-z0-9_])${escapeRegExp(trimmed)}(?![A-Za-z0-9_])`,
-        "i",
-      );
+
+  let boundaryRe: RegExp;
+  let prefilterTerms: string[] | undefined;
+  if (isIdentifier) {
+    boundaryRe = new RegExp(
+      `(?<![${IDENTIFIER_STRICT_BOUNDARY_CLASS}])${escapeRegExp(trimmed)}(?![${IDENTIFIER_STRICT_BOUNDARY_CLASS}])`,
+      "i",
+    );
+  } else if (ftsTokens.length === 1) {
+    boundaryRe = new RegExp(
+      `(?<![${ASCII_WORD_CLASS}])${escapeRegExp(ftsTokens[0]!)}(?![${ASCII_WORD_CLASS}])`,
+      "i",
+    );
+  } else {
+    const phrasePattern = ftsTokens
+      .map(escapeRegExp)
+      .join(`[^${ASCII_WORD_CLASS}]+`);
+    boundaryRe = new RegExp(
+      `(?<![${ASCII_WORD_CLASS}])${phrasePattern}(?![${ASCII_WORD_CLASS}])`,
+      "i",
+    );
+    // Longest subtoken is guaranteed present in any window matching the full multi-token phrase
+    // (even when separators differ, e.g. MODEL_MANAGER_SERVER_ADDRESS vs model-manager-server-address).
+    let longest = ftsTokens[0]!;
+    for (let i = 1; i < ftsTokens.length; i += 1) {
+      if (ftsTokens[i]!.length > longest.length) {
+        longest = ftsTokens[i]!;
+      }
+    }
+    prefilterTerms = [longest];
+  }
 
   const scoreText = (text: string): number => (boundaryRe.test(text) ? 1.0 : 0.0);
 
@@ -494,6 +531,8 @@ function makeNonCjkConcept(raw: string): SearchConcept | null {
     raw: trimmed,
     ftsPhrase,
     terms: [trimmed],
+    ...(prefilterTerms ? { prefilterTerms } : {}),
+    matchRegex: boundaryRe,
     ftsGroupExpr: quoteFtsPhrase(ftsPhrase),
     isCjk: false,
     isIdentifier,
