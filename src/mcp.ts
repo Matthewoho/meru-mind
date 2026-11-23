@@ -7,10 +7,12 @@ import { z } from "zod";
 import {
   assertAccess,
   createMindEngine,
+  discoverWorkspaceRealmMarker,
   MindError,
   resolveAccessScope,
   resolveRealmByPath,
   resolveVisibleRealm,
+  resolveWriteTargetRealm,
   sanitizeRealmsForScope,
   toSurfaceError,
   writeEverydayConclusion,
@@ -50,6 +52,10 @@ export interface MindMcpServerOptions {
   viewerRealmId?: string;
   actorId?: string;
   actorFamily?: string;
+  /** Optional validated workspace marker ref discovered strictly at stdio process entry */
+  workspaceMarkerRef?: string | null;
+  /** Optional marker discovery error deferred to routed writes (reads unaffected) */
+  workspaceMarkerError?: unknown;
 }
 
 export async function createMindMcpServer(options?: MindMcpServerOptions) {
@@ -217,7 +223,7 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
     if (!trimmed) {
       throw new MindError(
         "INVALID_REF",
-        'Parameter "in" is required for mind_write (e.g. "/ops" or realm ID)',
+        'Parameter "in" cannot be blank when provided (omit "in" to auto-route, or pass "/ops" / realm ID)',
       );
     }
     if (
@@ -479,9 +485,9 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
 
   server.tool(
     "mind_write",
-    "[write] Record a conclusion (decision|finding|claim|proposal|verdict; rule forbidden) in a writable realm. Auto-idempotent per minute.",
+    "[write] Record a conclusion (decision|finding|claim|proposal|verdict; rule forbidden). Optional in auto-routes via bound/marker/about->/inbox.",
     {
-      in: z.string(),
+      in: z.string().optional(),
       title: z.string(),
       body: z.string(),
       kind: z.string().optional(),
@@ -496,14 +502,70 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
     async (args) => {
       try {
         const ctx = resolveCallContext(false);
-        const targetRealmId = resolveWriteTargetRealmId(ctx, args.in);
-        assertMcpWrite(ctx, targetRealmId, "ledger");
+        const isExplicitlyBound =
+          boundSource === "MERU_MIND_VIEWER_REALM_ID" ||
+          boundSource === "options.viewerRealmId";
+        let targetRealmId: string;
+        let targetRealmPath: string;
+        let routedBy: "explicit" | "bound" | "workspace_marker" | "about" | "inbox";
+        let writeRealms = ctx.realms;
+        let writeScope = ctx.boundScope;
+
+        if (args.in !== undefined && args.in.trim() !== "") {
+          targetRealmId = resolveWriteTargetRealmId(ctx, args.in);
+          assertMcpWrite(ctx, targetRealmId, "ledger");
+          const targetRealm = ctx.realms.find((r) => r.id === targetRealmId);
+          targetRealmPath = targetRealm?.path ?? args.in.trim();
+          routedBy = "explicit";
+        } else {
+          if (
+            !isExplicitlyBound &&
+            ctx.org.policy === "open" &&
+            options?.workspaceMarkerError
+          ) {
+            throw options.workspaceMarkerError;
+          }
+          const routed = resolveWriteTargetRealm({
+            db: engine.db,
+            ledger: engine.ledger,
+            realms: ctx.realms,
+            mounts: ctx.mounts,
+            scope: ctx.boundScope,
+            orgId: boundOrgId,
+            orgPolicy: ctx.org.policy,
+            actor: boundActor,
+            viewerRealmId: boundViewerRealmId,
+            isExplicitlyBound,
+            explicitIn: undefined,
+            workspaceMarkerRef: options?.workspaceMarkerRef ?? null,
+            about: args.about,
+          });
+          targetRealmId = routed.realm.id;
+          targetRealmPath = routed.realm.path;
+          routedBy = routed.routedBy;
+          writeRealms = routed.realms;
+          if (routedBy === "inbox") {
+            writeScope = resolveAccessScope({
+              realms: writeRealms,
+              mounts: ctx.mounts,
+              viewerRealmId: boundViewerRealmId,
+              orgPolicy: ctx.org.policy,
+              includeDescendantSeabed: false,
+            });
+          }
+          assertMcpWrite(
+            { ...ctx, realms: writeRealms, boundScope: writeScope },
+            targetRealmId,
+            "ledger",
+          );
+        }
+
         const rec = await writeEverydayConclusion({
           db: engine.db,
           ledger: engine.ledger,
-          realms: ctx.realms,
+          realms: writeRealms,
           mounts: ctx.mounts,
-          scope: ctx.boundScope,
+          scope: writeScope,
           actor: boundActor,
           viewerRealmId: boundViewerRealmId,
           targetRealmId,
@@ -517,7 +579,11 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
           sensitivity: args.sensitivity,
           allowRedactedReingest: false,
         });
-        return okResult(rec);
+        return okResult({
+          ...rec,
+          realmPath: targetRealmPath,
+          routedBy,
+        });
       } catch (err) {
         return errResult(err, cachedErrorCtx);
       }
@@ -528,7 +594,18 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
 }
 
 async function runStdio(): Promise<void> {
-  const { server, engine } = await createMindMcpServer();
+  let workspaceMarkerRef: string | null = null;
+  let workspaceMarkerError: unknown = null;
+  try {
+    workspaceMarkerRef =
+      discoverWorkspaceRealmMarker(process.cwd())?.ref ?? null;
+  } catch (err) {
+    workspaceMarkerError = err;
+  }
+  const { server, engine } = await createMindMcpServer({
+    workspaceMarkerRef,
+    workspaceMarkerError,
+  });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 

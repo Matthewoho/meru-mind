@@ -78,9 +78,17 @@ export {
 } from "./engine/refs.js";
 export {
   writeEverydayConclusion,
+  resolveWriteTargetRealm,
   EVERYDAY_WRITE_KINDS,
   type SurfaceWriteParams,
+  type ResolveWriteTargetParams,
+  type ResolvedWriteTarget,
 } from "./engine/surface-write.js";
+export {
+  discoverWorkspaceRealmMarker,
+  WORKSPACE_REALM_MARKER_FILE,
+  type WorkspaceRealmMarker,
+} from "./engine/workspace-marker.js";
 export {
   mapMindErrorCodeToWire,
   toSurfaceError,

@@ -1,13 +1,19 @@
+import {
+  findEffectiveArchivedRealm,
+  isRealmEffectivelyArchived,
+} from "../policy.js";
 import type { DbPort } from "../ports.js";
 import {
   MindError,
   type AccessScope,
   type Actor,
   type LedgerRecord,
+  type OrgPolicy,
   type Realm,
   type RealmMount,
   type RecordKind,
   type Sensitivity,
+  type WriteRouteSource,
 } from "../types.js";
 import {
   buildWriteRecordPayload,
@@ -16,8 +22,152 @@ import {
   REDACTED_CONTENT_TRY_HINT,
 } from "./content-hash.js";
 import type { LedgerEngine } from "./ledger.js";
+import { resolveRealmByPath, resolveVisibleRealm } from "./objects.js";
 import { resolveAboutRefsForWrite } from "./refs.js";
 import { createVisibilityHelpers } from "./visibility.js";
+
+export interface ResolveWriteTargetParams {
+  db: DbPort;
+  ledger: LedgerEngine;
+  realms: Realm[];
+  mounts: RealmMount[];
+  scope: AccessScope;
+  orgId: string;
+  orgPolicy: OrgPolicy;
+  actor: Actor;
+  viewerRealmId: string;
+  /** True when viewerRealmId came from an explicit binding (MERU_MIND_VIEWER_REALM_ID or explicit option), NOT implicit open-default:/ */
+  isExplicitlyBound: boolean;
+  /** Explicit --in / MCP `in` parameter, if supplied */
+  explicitIn?: string | null;
+  /** Optional validated workspace marker ref (open mode only, discovered strictly at process entry) */
+  workspaceMarkerRef?: string | null;
+  /** Optional --about references used for Tier-3 unanimous non-root object-owner voting */
+  about?: string[];
+}
+
+export interface ResolvedWriteTarget {
+  realm: Realm;
+  routedBy: WriteRouteSource;
+  /** Refreshed realm list (updated if Tier-4 lazily created /inbox) */
+  realms: Realm[];
+}
+
+/**
+ * Deterministic 4-tier write target routing shared by CLI `write`, CLI `raw add`, and MCP `mind_write`:
+ * 1. Explicit `--in` / MCP `in` (strict resolution; never silently falls back).
+ * 2. Explicitly bound realm (`MERU_MIND_VIEWER_REALM_ID` / explicit option), OR in `open` mode a validated
+ *    workspace marker (`.meru-mind-realm`). Implicit `open-default:/` is NEVER treated as a write binding.
+ * 3. Unanimous `--about` existing-object owner vote (ignoring objects owned by `/` or archived realms).
+ * 4. Lazy `/inbox` fallback in `open` mode via `ledger.ensureInboxRealm()`.
+ */
+export function resolveWriteTargetRealm(
+  params: ResolveWriteTargetParams,
+): ResolvedWriteTarget {
+  const orgRealms = params.realms.filter((r) => r.orgId === params.orgId);
+
+  // Tier 1: Explicit --in / MCP in
+  const explicitIn = params.explicitIn?.trim();
+  if (explicitIn) {
+    const realm = resolveVisibleRealm({
+      realms: params.realms,
+      orgId: params.orgId,
+      ref: explicitIn,
+      scope: params.scope,
+    });
+    return { realm, routedBy: "explicit", realms: params.realms };
+  }
+
+  // Tier 2a: Explicitly bound realm (always set in tree mode; opt-in in open mode)
+  if (params.isExplicitlyBound) {
+    const bound = orgRealms.find((r) => r.id === params.viewerRealmId);
+    if (!bound) {
+      throw new MindError("NOT_FOUND", "Bound realm not found in visible scope");
+    }
+    return { realm: bound, routedBy: "bound", realms: params.realms };
+  }
+
+  // Tier 2b: Hardened workspace marker (.meru-mind-realm), open mode ONLY
+  const markerRef = params.workspaceMarkerRef?.trim();
+  if (params.orgPolicy === "open" && markerRef) {
+    const markerRealm = markerRef.startsWith("/")
+      ? resolveRealmByPath(orgRealms, markerRef)
+      : (orgRealms.find((r) => r.id === markerRef) ?? null);
+    if (!markerRealm) {
+      throw new MindError(
+        "NOT_FOUND",
+        `Workspace marker realm "${markerRef}" not found in organization "${params.orgId}"`,
+        { try: "meru-mind tree /" },
+      );
+    }
+    const archivedBy = findEffectiveArchivedRealm(orgRealms, markerRealm.id);
+    if (archivedBy) {
+      throw new MindError(
+        "CONFLICT",
+        `Workspace marker realm "${markerRealm.path}" is archived (via "${archivedBy.path}") and frozen for writes.`,
+        {
+          reason: "realm_archived",
+          targetRealmId: markerRealm.id,
+          archivedRealmId: archivedBy.id,
+          try: `meru-mind realm unarchive ${archivedBy.path} --as-human`,
+        },
+      );
+    }
+    return {
+      realm: markerRealm,
+      routedBy: "workspace_marker",
+      realms: params.realms,
+    };
+  }
+
+  // Tier 3: Unanimous --about object-owner vote (ignoring "/" and effectively archived realms)
+  if (params.about && params.about.length > 0) {
+    const vis = createVisibilityHelpers({
+      db: params.db,
+      realms: params.realms,
+      mounts: params.mounts,
+      actor: params.actor,
+      viewerRealmId: params.viewerRealmId,
+      scope: params.scope,
+    });
+    const resolvedAbout = resolveAboutRefsForWrite({
+      db: params.db,
+      realms: params.realms,
+      orgId: params.orgId,
+      about: params.about,
+      scope: params.scope,
+      vis,
+    });
+    if (resolvedAbout.objectIds.length > 0) {
+      const objs = params.db.getObjectsByIds(resolvedAbout.objectIds);
+      const candidateRealms = new Map<string, Realm>();
+      for (const obj of objs) {
+        const owner = orgRealms.find((r) => r.id === obj.realmId);
+        if (!owner) continue;
+        if (owner.path === "/") continue;
+        if (isRealmEffectivelyArchived(orgRealms, owner.id)) continue;
+        candidateRealms.set(owner.id, owner);
+      }
+      if (candidateRealms.size === 1) {
+        const [onlyRealm] = candidateRealms.values();
+        return { realm: onlyRealm!, routedBy: "about", realms: params.realms };
+      }
+    }
+  }
+
+  // Tier 4: Lazy /inbox fallback in open mode
+  if (params.orgPolicy === "open") {
+    const inbox = params.ledger.ensureInboxRealm(params.orgId);
+    const refreshedRealms = params.db.listRealms();
+    return { realm: inbox, routedBy: "inbox", realms: refreshedRealms };
+  }
+
+  throw new MindError(
+    "NOT_BOUND",
+    "Target realm could not be determined; pass --in <realm> or bind MERU_MIND_VIEWER_REALM_ID.",
+    { try: "MERU_MIND_VIEWER_REALM_ID=/team/project meru-mind whoami" },
+  );
+}
 
 export const EVERYDAY_WRITE_KINDS = new Set<string>([
   "decision",

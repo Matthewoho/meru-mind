@@ -704,6 +704,13 @@ export interface LsResult {
   driveFiles?: LsDriveFileItem[];
 }
 
+export type WriteRouteSource =
+  | "explicit"
+  | "bound"
+  | "workspace_marker"
+  | "about"
+  | "inbox";
+
 export interface WhoamiResult {
   org: {
     id: string;
@@ -743,6 +750,11 @@ export interface WhoamiResult {
   latestSeq: number;
   version: string;
   schemaVersion: number;
+  inbox?: {
+    realmId: string;
+    path: string;
+    activeEntries: number;
+  };
   next: string;
 }
 

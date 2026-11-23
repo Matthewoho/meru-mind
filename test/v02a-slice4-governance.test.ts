@@ -1,13 +1,18 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createMindEngine,
+  discoverWorkspaceRealmMarker,
   formatBriefMarkdown,
   formatSearchMarkdown,
   formatTreeMarkdown,
+  formatWhoamiMarkdown,
   MindError,
+  resolveAccessScope,
+  resolveWriteTargetRealm,
   type Actor,
 } from "../src/index.js";
 
@@ -886,5 +891,261 @@ describe("V0.2a Slice 4 — Pillar 4: Atomic entry move & Importer P0-2 preserva
     expect(imp3.superseded).toBe(1);
     expect(imp3.items[0]!.realmId).toBe(ops.id);
     eng.close();
+  });
+});
+
+describe("V0.2a Slice 4 — Pillar 5: 4-Tier Write Routing, Lazy /inbox, Hardened .meru-mind-realm & Optional --in", () => {
+  it("routes writes deterministically across all 4 tiers, lazily creates /inbox without dumping to /, surfaces inbox count in whoami, and hardens .meru-mind-realm", async () => {
+    const homeDir = makeTempHome();
+    const eng = await createMindEngine({ homeDir });
+    const { org, rootRealm } = eng.ledger.createOrg({
+      name: "RouteOrg",
+      policy: "open",
+      actor: humanAdmin,
+    });
+    const ops = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "ops",
+      name: "Operations",
+      scope: "Include: prod ops. Exclude: product.",
+    });
+    const engRealm = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "eng",
+      name: "Engineering",
+      scope: "Include: code architecture. Exclude: ops.",
+    });
+    const oldRealm = eng.ledger.createRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      parentId: rootRealm.id,
+      slug: "old",
+      name: "Old",
+      scope: "Sunset realm",
+    });
+
+    const opsObj = eng.objects.createObject({
+      actor: agentWorker,
+      viewerRealmId: ops.id,
+      targetRealmRef: "/ops",
+      kind: "service",
+      name: "ops-gateway",
+    });
+    const engObj = eng.objects.createObject({
+      actor: agentWorker,
+      viewerRealmId: engRealm.id,
+      targetRealmRef: "/eng",
+      kind: "service",
+      name: "eng-compiler",
+    });
+    const rootObj = eng.objects.createObject({
+      actor: agentWorker,
+      viewerRealmId: rootRealm.id,
+      targetRealmRef: "/",
+      kind: "concept",
+      name: "org-wide-tag",
+    });
+    const oldObj = eng.objects.createObject({
+      actor: agentWorker,
+      viewerRealmId: oldRealm.id,
+      targetRealmRef: "/old",
+      kind: "service",
+      name: "old-svc",
+    });
+    eng.ledger.archiveRealm({
+      actor: humanAdmin,
+      orgId: org.id,
+      realmId: oldRealm.id,
+    });
+
+    const runRoute = (opts: {
+      explicitIn?: string;
+      isExplicitlyBound?: boolean;
+      viewerRealmId?: string;
+      workspaceMarkerRef?: string | null;
+      about?: string[];
+    }) => {
+      const realms = eng.db.listRealms();
+      const mounts = eng.db.listMounts();
+      const viewerRealmId = opts.viewerRealmId ?? rootRealm.id;
+      const scope = resolveAccessScope({
+        realms,
+        mounts,
+        viewerRealmId,
+        orgPolicy: "open",
+        includeDescendantSeabed: false,
+      });
+      return resolveWriteTargetRealm({
+        db: eng.db,
+        ledger: eng.ledger,
+        realms,
+        mounts,
+        scope,
+        orgId: org.id,
+        orgPolicy: "open",
+        actor: agentWorker,
+        viewerRealmId,
+        isExplicitlyBound: opts.isExplicitlyBound ?? false,
+        explicitIn: opts.explicitIn,
+        workspaceMarkerRef: opts.workspaceMarkerRef ?? null,
+        about: opts.about,
+      });
+    };
+
+    // Tier 1: Explicit --in wins over everything
+    const t1 = runRoute({
+      explicitIn: "/ops",
+      isExplicitlyBound: true,
+      viewerRealmId: engRealm.id,
+      about: ["service:eng-compiler"],
+    });
+    expect(t1.routedBy).toBe("explicit");
+    expect(t1.realm.id).toBe(ops.id);
+
+    // Tier 2a: Explicit binding beats workspace marker and --about
+    const t2a = runRoute({
+      isExplicitlyBound: true,
+      viewerRealmId: engRealm.id,
+      workspaceMarkerRef: "/ops",
+      about: ["service:ops-gateway"],
+    });
+    expect(t2a.routedBy).toBe("bound");
+    expect(t2a.realm.id).toBe(engRealm.id);
+
+    // Tier 2b: Workspace marker beats --about when unbound
+    const t2b = runRoute({
+      workspaceMarkerRef: "/ops",
+      about: ["service:eng-compiler"],
+    });
+    expect(t2b.routedBy).toBe("workspace_marker");
+    expect(t2b.realm.id).toBe(ops.id);
+
+    // Tier 2b archived marker fails loudly with CONFLICT (realm_archived)
+    expect(() => runRoute({ workspaceMarkerRef: "/old" })).toThrow(/archived/i);
+
+    // Tier 3: Unanimous non-root, non-archived --about object owner wins
+    const t3 = runRoute({
+      about: [`service:${opsObj.name}`, `concept:${rootObj.name}`, `service:${oldObj.name}`],
+    });
+    expect(t3.routedBy).toBe("about");
+    expect(t3.realm.id).toBe(ops.id);
+
+    // Tier 3 conflict (2 distinct non-root realms) abstains -> Tier 4 lazy /inbox!
+    expect(eng.db.getRealmByPath(org.id, "/inbox")).toBeNull();
+    const t4Conflict = runRoute({
+      about: [`service:${opsObj.name}`, `service:${engObj.name}`],
+    });
+    expect(t4Conflict.routedBy).toBe("inbox");
+    expect(t4Conflict.realm.path).toBe("/inbox");
+
+    // Tier 4 also catches bare unbound writes (NEVER dumping into "/"!)
+    const t4Bare = runRoute({});
+    expect(t4Bare.routedBy).toBe("inbox");
+    expect(t4Bare.realm.path).toBe("/inbox");
+
+    // /inbox cannot be archived in open mode
+    expect(() =>
+      eng.ledger.archiveRealm({
+        actor: humanAdmin,
+        orgId: org.id,
+        realmId: t4Bare.realm.id,
+      }),
+    ).toThrow(/Inbox realm/);
+
+    // Hardened workspace marker discovery tests
+    const fakeHome = makeTempHome();
+    const gitRepo = path.join(fakeHome, "work", "repo");
+    const subDir = path.join(gitRepo, "packages", "core");
+    fs.mkdirSync(path.join(gitRepo, ".git"), { recursive: true });
+    fs.mkdirSync(subDir, { recursive: true });
+    fs.writeFileSync(path.join(fakeHome, ".meru-mind-realm"), "/eng\n", "utf8");
+    // Stops at .git boundary (does NOT walk past .git to fakeHome!)
+    expect(discoverWorkspaceRealmMarker(subDir, fakeHome)).toBeNull();
+
+    // Marker inside repo root IS found when walking up from subDir
+    fs.writeFileSync(path.join(gitRepo, ".meru-mind-realm"), "/ops\n", "utf8");
+    expect(discoverWorkspaceRealmMarker(subDir, fakeHome)?.ref).toBe("/ops");
+
+    // Symlink marker MUST be rejected without echoing target file content!
+    const secretFile = path.join(fakeHome, "secret-token.txt");
+    fs.writeFileSync(secretFile, "SUPER_SECRET_CANARY_999\n", "utf8");
+    const symDir = makeTempHome();
+    fs.symlinkSync(secretFile, path.join(symDir, ".meru-mind-realm"));
+    let symErr = "";
+    try {
+      discoverWorkspaceRealmMarker(symDir, fakeHome);
+    } catch (e) {
+      symErr = (e as Error).message;
+    }
+    expect(symErr).toMatch(/symlink|non-regular/i);
+    expect(symErr).not.toContain("SUPER_SECRET_CANARY_999");
+
+    // Oversized > 512 bytes marker rejected without echoing content
+    const bigDir = makeTempHome();
+    fs.writeFileSync(
+      path.join(bigDir, ".meru-mind-realm"),
+      "x".repeat(600),
+      "utf8",
+    );
+    expect(() => discoverWorkspaceRealmMarker(bigDir, fakeHome)).toThrow(
+      /exceeds maximum size/,
+    );
+
+    // Invalid syntax marker rejected without echoing content
+    const badSyntaxDir = makeTempHome();
+    fs.writeFileSync(
+      path.join(badSyntaxDir, ".meru-mind-realm"),
+      "SECRET_PASSWORD_LINE\n",
+      "utf8",
+    );
+    let badErr = "";
+    try {
+      discoverWorkspaceRealmMarker(badSyntaxDir, fakeHome);
+    } catch (e) {
+      badErr = (e as Error).message;
+    }
+    expect(badErr).toMatch(/syntax/i);
+    expect(badErr).not.toContain("SECRET_PASSWORD_LINE");
+
+    // Outside fakeHome: NEVER walks upward (prevents /tmp/.meru-mind-realm planting!)
+    const outsideParent = makeTempHome();
+    const outsideChild = path.join(outsideParent, "nested");
+    fs.mkdirSync(outsideChild, { recursive: true });
+    fs.writeFileSync(path.join(outsideParent, ".meru-mind-realm"), "/ops\n");
+    expect(discoverWorkspaceRealmMarker(outsideChild, fakeHome)).toBeNull();
+    eng.close();
+
+    // CLI E2E: write WITHOUT --in routes to /inbox, echoes realmPath+routedBy, and shows up in whoami!
+    const cliHome = makeTempHome();
+    const cliBin = path.resolve("dist/cli.js");
+    const runCli = (args: string[], cwd?: string) =>
+      JSON.parse(
+        execFileSync(process.execPath, [cliBin, ...args, "--json"], {
+          env: { ...process.env, MERU_MIND_HOME: cliHome, MERU_MIND_VIEWER_REALM_ID: "" },
+          cwd: cwd ?? cliHome,
+          encoding: "utf8",
+        }),
+      );
+    runCli(["admin", "init", "--org", "CliRouteOrg"]);
+    const written = runCli([
+      "write",
+      "--title",
+      "Unrouted CLI note",
+      "--body",
+      "Should land cleanly in /inbox, not root.",
+    ]) as { id: string; realmPath: string; routedBy: string };
+    expect(written.realmPath).toBe("/inbox");
+    expect(written.routedBy).toBe("inbox");
+
+    const who = runCli(["whoami"]) as {
+      inbox?: { path: string; activeEntries: number };
+    };
+    expect(who.inbox?.path).toBe("/inbox");
+    expect(who.inbox?.activeEntries).toBe(1);
+    expect(formatWhoamiMarkdown(who as never)).toContain("`/inbox` (1 active pending triage)");
   });
 });

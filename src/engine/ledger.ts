@@ -838,6 +838,76 @@ export class LedgerEngine {
     return this.db.getRealm(id);
   }
 
+  /**
+   * Lazily guarantees `/inbox` exists for Tier-4 automatic write routing in `open` organizations.
+   * - If `/inbox` exists and is active, returns it directly.
+   * - If `/inbox` exists but is archived, throws CONFLICT (reason="realm_archived") with unarchive hint.
+   * - If `/inbox` does not exist yet, creates it atomically under system actor with default triage scope.
+   */
+  ensureInboxRealm(orgId: string): Realm {
+    return this.db.transaction(() => {
+      const org = this.db.getOrg(orgId);
+      if (!org) {
+        throw new MindError("NOT_FOUND", `Organization not found: ${orgId}`);
+      }
+      if (org.policy !== "open") {
+        throw new MindError(
+          "INVALID_INPUT",
+          'Automatic "/inbox" routing is only available in open policy organizations',
+        );
+      }
+      const existing = this.db.getRealmByPath(org.id, "/inbox");
+      const orgRealms = this.db.listRealms(org.id);
+      if (existing) {
+        const archivedBy = findEffectiveArchivedRealm(orgRealms, existing.id);
+        if (archivedBy) {
+          throw new MindError(
+            "CONFLICT",
+            `Inbox realm "/inbox" is archived (via "${archivedBy.path}") and cannot accept routed writes.`,
+            {
+              reason: "realm_archived",
+              targetRealmId: existing.id,
+              archivedRealmId: archivedBy.id,
+              try: `meru-mind realm unarchive ${archivedBy.path} --as-human`,
+            },
+          );
+        }
+        return existing;
+      }
+      const root = this.db.getRealmByPath(org.id, "/");
+      if (!root) {
+        throw new MindError(
+          "NOT_FOUND",
+          `Root realm "/" not found in organization "${org.id}"`,
+        );
+      }
+      const now = new Date().toISOString();
+      const inbox: Realm = {
+        id: makeId("realm"),
+        orgId: org.id,
+        parentId: root.id,
+        slug: "inbox",
+        path: "/inbox",
+        name: "Inbox",
+        scope:
+          "Triage inbox: unrouted entries awaiting review via entry move. Exclude: entries whose owning realm is already known.",
+        archivedAt: null,
+        createdAt: now,
+      };
+      this.db.insertRealm(inbox);
+      this.db.appendChangeLog({
+        orgId: org.id,
+        realmId: inbox.id,
+        entityType: "realm",
+        entityId: inbox.id,
+        op: "create_realm",
+        actorId: "system",
+        createdAt: now,
+      });
+      return inbox;
+    });
+  }
+
   listRealms(params: {
     orgId: string;
     viewerRealmId?: string;

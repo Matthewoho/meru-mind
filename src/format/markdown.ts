@@ -780,6 +780,11 @@ export function formatWhoamiMarkdown(res: WhoamiResult): string {
     `- **Read**: policy=\`${res.read.policy}\`, realms=${res.read.ledgerRealms}, drive=${res.read.driveRealms}, raw=${res.read.seabedRealms}`,
     `- **Write**: ${res.write.allowed}`,
     `- **Corpus**: realms=${res.corpus.realms}, objects=${res.corpus.objects}, rules=${res.corpus.rules}, conclusions=${res.corpus.conclusions}, raw=${res.corpus.raw}, files=${res.corpus.files}`,
+    ...(res.inbox
+      ? [
+          `- **Inbox**: \`${res.inbox.path}\` (${res.inbox.activeEntries} active pending triage)`,
+        ]
+      : []),
     `- **Latest Seq**: ${res.latestSeq} (version ${res.version}, schema v${res.schemaVersion})`,
     `- **Store (local-only)**: \`${res.store.path}\``,
     `- **Next**: \`${res.next}\``,

@@ -3784,6 +3784,23 @@ export class SeaEngine {
       0,
     );
 
+    const inboxRealm = orgRealms.find((r) => r.path === "/inbox");
+    const inboxInfo =
+      inboxRealm && scope.readableLedgerIds.includes(inboxRealm.id)
+        ? (() => {
+            const rc = recCounts.get(inboxRealm.id);
+            const activeEntries =
+              (rc?.rules ?? 0) +
+              (rc?.conclusions ?? 0) +
+              (seaCounts.get(inboxRealm.id) ?? 0);
+            return {
+              realmId: inboxRealm.id,
+              path: inboxRealm.path,
+              activeEntries,
+            };
+          })()
+        : undefined;
+
     return {
       org: {
         id: org.id,
@@ -3826,6 +3843,7 @@ export class SeaEngine {
       latestSeq,
       version: "0.2.0",
       schemaVersion,
+      ...(inboxInfo ? { inbox: inboxInfo } : {}),
       next:
         org.policy === "open"
           ? "meru-mind tree /"

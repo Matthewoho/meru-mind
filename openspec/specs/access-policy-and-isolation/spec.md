@@ -14,7 +14,7 @@ Define organization visibility policies (`open` and `tree`), process-level bindi
 - **THEN** all checks return `'none'` / `ACCESS_DENIED` / `NOT_FOUND` and Org B entries never enter Org A outputs or counts
 
 ### Requirement: Session Binding and `not_bound` Enforcement in Tree Organizations
-In `open` orgs, a single org auto-resolves and missing `MERU_MIND_VIEWER_REALM_ID` defaults to `/`. In `tree` orgs, everyday commands, non-admin management commands, and MCP startup SHALL require `MERU_MIND_VIEWER_REALM_ID`, failing with `NOT_BOUND` (wire `not_bound`) and a non-root hint (never `=/`). Explicit `--as-human` org-admin commands (`org set-policy`, `realm create`, `realm mount/unmount`, `redact`) MAY run without viewer binding.
+In `open` orgs, a single org auto-resolves and missing `MERU_MIND_VIEWER_REALM_ID` defaults read visibility to `/` while everyday writes (`write`, `raw add`, `mind_write`) with omitted `--in`/`in` follow deterministic 4-tier routing (explicit `--in` -> explicit binding or hardened `.meru-mind-realm` marker -> unanimous non-root non-archived `--about` object owner -> lazy `/inbox`, never dumping implicitly into `/`). In `tree` orgs, everyday commands, non-admin management commands, and MCP startup SHALL require `MERU_MIND_VIEWER_REALM_ID` (`.meru-mind-realm` is ignored for `tree` auth), failing with `NOT_BOUND` (wire `not_bound`) and a non-root hint (never `=/`). Explicit `--as-human` org-admin commands (`org set-policy`, `realm create/set/archive/unarchive/mount/unmount`, `entry move`, `redact`) MAY run without viewer binding.
 
 #### Scenario: Missing MERU_MIND_VIEWER_REALM_ID in tree org fails with not_bound and non-root hint
 - **WHEN** `meru-mind whoami`, `meru-mind tree`, or `createMindMcpServer()` runs against a `tree` organization without `MERU_MIND_VIEWER_REALM_ID`
@@ -43,7 +43,7 @@ In both `open` and `tree` modes, `createRealm()`, `mountRealm()`, and `unmountRe
 - **THEN** `tools.length === 7`, `JSON.stringify(result).length <= 6000`, every `description.length <= 220`, and zero tools expose `actorKind` or `rule` writes
 
 ### Requirement: MCP Scope Intersection and Bound Write Enforcement
-Every MCP read tool SHALL evaluate visibility strictly within `scope(in/ref) ∩ scope(boundViewer)`, preventing child `@mount` and descendant seabed escalation. `mind_write` SHALL always pass `boundViewerRealmId` to the engine, enforce `assertMcpWrite`, accept `occurred_at: string | null | undefined`, and return 4-field errors using the 11 snake_case wire codes.
+Every MCP read tool SHALL evaluate visibility strictly within `scope(in/ref) ∩ scope(boundViewer)`, preventing child `@mount` and descendant seabed escalation. `mind_write` SHALL always pass `boundViewerRealmId` to the engine, accept optional `in` (auto-routing via bound/marker/about->`/inbox` when omitted), echo `realmPath` and `routedBy`, enforce `assertMcpWrite`, accept `occurred_at: string | null | undefined`, and return 4-field errors using the 11 snake_case wire codes.
 
 #### Scenario: Narrowing MCP reads to a child realm cannot escalate via child mounts or seabed
 - **WHEN** an MCP server bound to parent `B2` in a `tree` org calls `mind_search`, `mind_ls`, `mind_show`, or `mind_changes` targeting child `C2` (which mounts hidden `C1`)

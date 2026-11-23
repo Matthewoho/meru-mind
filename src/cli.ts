@@ -3,6 +3,7 @@ import fs from "node:fs";
 import {
   buildWriteRecordPayload,
   createMindEngine,
+  discoverWorkspaceRealmMarker,
   formatChangesMarkdown,
   formatGenericMarkdown,
   formatImportJsonlMarkdown,
@@ -25,6 +26,7 @@ import {
   resolveRealmByPath,
   resolveUnifiedObjectRead,
   resolveVisibleRealm,
+  resolveWriteTargetRealm,
   toSurfaceError,
   writeEverydayConclusion,
   type AccessScope,
@@ -366,7 +368,7 @@ READ [read]:
   whoami | tree [ref] | ls [ref] | show <ref> | search <query> | changes
 
 RECORD [write]:
-  write --in <realm> --title T --body B [--kind decision|finding|claim|proposal|verdict]
+  write [--in <realm>] --title T --body B [--kind decision|finding|claim|proposal|verdict]
         [--about <obj>]... [--supersedes <entry>]... [--because <ref>]...
         [--occurred-at <iso|none>] [--sensitivity public|internal|confidential|secret]
 
@@ -463,9 +465,10 @@ Examples:
 `,
   write: `Risk: write
 When to use: Record a conclusion (finding, decision, claim, proposal, verdict). Rules require 'meru-mind rule add --as-human'.
-Usage: meru-mind write --in <realm> --title <T> --body <B> [--kind <k>] [--about <obj>]... [--supersedes <id>]... [--because <ref>]... [--occurred-at <iso|none>] [--sensitivity <level>] [--idempotency-key <key>]
+Usage: meru-mind write [--in <realm>] --title <T> --body <B> [--kind <k>] [--about <obj>]... [--supersedes <id>]... [--because <ref>]... [--occurred-at <iso|none>] [--sensitivity <level>] [--idempotency-key <key>]
+Routing (when --in is omitted): bound realm / .meru-mind-realm -> unanimous --about owner -> /inbox (open mode).
 Flags:
-  --in <realm>           Target writable realm (/path or realm_...) [required]
+  --in <realm>           Optional target writable realm (/path or realm_...); auto-routed if omitted
   --title <text>         Short conclusion title [required]
   --body <text>          Conclusion details [required]
   --kind <kind>          decision|finding|claim|proposal|verdict (default: finding; rule forbidden)
@@ -479,7 +482,7 @@ Flags:
                          explicit --occurred-at or --idempotency-key is supplied)
 Examples:
   meru-mind write --in /ops --kind decision --title "Use WAL mode" --body "Enabled SQLite WAL."
-  meru-mind write --in /ops --title "API timeout" --body "Raised timeout to 30s" --about service:api
+  meru-mind write --title "API timeout" --body "Raised timeout to 30s" --about service:api
 `,
   realm: `Risk: high-risk-write (all realm mutations require --as-human in both open and tree orgs)
 When to use: Create, scope, archive/unarchive, list, or mount realms (slug is immutable; name & scope are mutable).
@@ -867,6 +870,17 @@ async function main(): Promise<void> {
     driveMode,
   });
 
+  // Discover hardened `.meru-mind-realm` marker strictly at CLI process entrypoint.
+  // Invalid markers fail only on routed writes (never breaking read commands).
+  let workspaceMarkerRef: string | null = null;
+  let workspaceMarkerError: unknown = null;
+  try {
+    workspaceMarkerRef =
+      discoverWorkspaceRealmMarker(process.cwd())?.ref ?? null;
+  } catch (err) {
+    workspaceMarkerError = err;
+  }
+
   const actor = buildActor(flags);
   const asJson = flagBool(flags, "json");
   const orgFlag = flagStr(flags, "org");
@@ -1119,26 +1133,56 @@ async function main(): Promise<void> {
         "write",
       );
       const ctx = resolveSessionContext({ engine, flags });
-      const inRef = requireFlag(flags, "in", "write");
-      const targetRealm = resolveVisibleRealm({
-        realms: ctx.realms,
-        orgId: ctx.org.id,
-        ref: inRef,
-        scope: ctx.boundScope,
-      });
-      const rec = await writeEverydayConclusion({
+      const mounts = engine.db.listMounts();
+      const explicitIn = flagStr(flags, "in");
+      const isExplicitlyBound = ctx.boundSource === "MERU_MIND_VIEWER_REALM_ID";
+      if (
+        !explicitIn &&
+        !isExplicitlyBound &&
+        ctx.org.policy === "open" &&
+        workspaceMarkerError
+      ) {
+        throw workspaceMarkerError;
+      }
+      const aboutRefs = flagMulti(multiFlags, "about");
+      const routed = resolveWriteTargetRealm({
         db: engine.db,
         ledger: engine.ledger,
         realms: ctx.realms,
-        mounts: engine.db.listMounts(),
+        mounts,
         scope: ctx.boundScope,
+        orgId: ctx.org.id,
+        orgPolicy: ctx.org.policy,
         actor,
         viewerRealmId: ctx.boundViewerRealmId,
-        targetRealmId: targetRealm.id,
+        isExplicitlyBound,
+        explicitIn,
+        workspaceMarkerRef,
+        about: aboutRefs,
+      });
+      const effectiveScope =
+        routed.routedBy === "inbox"
+          ? resolveAccessScope({
+              realms: routed.realms,
+              mounts,
+              viewerRealmId: ctx.boundViewerRealmId,
+              orgPolicy: ctx.org.policy,
+              includeDescendantSeabed: false,
+            })
+          : ctx.boundScope;
+      const rec = await writeEverydayConclusion({
+        db: engine.db,
+        ledger: engine.ledger,
+        realms: routed.realms,
+        mounts,
+        scope: effectiveScope,
+        actor,
+        viewerRealmId: ctx.boundViewerRealmId,
+        targetRealmId: routed.realm.id,
         title: requireFlag(flags, "title", "write"),
         body: requireFlag(flags, "body", "write"),
         kind: flagStr(flags, "kind"),
-        about: flagMulti(multiFlags, "about"),
+        about: aboutRefs,
         supersedes: flagMulti(multiFlags, "supersedes"),
         because: flagMulti(multiFlags, "because"),
         occurredAt: parseOccurredAtFlag(flags),
@@ -1146,7 +1190,18 @@ async function main(): Promise<void> {
         explicitIdempotencyKey: flagStr(flags, "idempotency-key"),
         allowRedactedReingest: flagBool(flags, "as-human"),
       });
-      output(rec, formatGenericMarkdown(`Written [${rec.kind}]`, rec));
+      const payloadOut = {
+        ...rec,
+        realmPath: routed.realm.path,
+        routedBy: routed.routedBy,
+      };
+      output(
+        payloadOut,
+        formatGenericMarkdown(
+          `Written [${rec.kind}] -> \`${routed.realm.path}\` (routed: ${routed.routedBy})`,
+          payloadOut,
+        ),
+      );
       return;
     }
 
@@ -1834,27 +1889,57 @@ async function main(): Promise<void> {
           "raw add",
         );
         const ctx = resolveSessionContext({ engine, flags });
-        const inRef = requireFlag(flags, "in", "raw add");
-        const targetRealm = resolveVisibleRealm({
-          realms: ctx.realms,
-          orgId: ctx.org.id,
-          ref: inRef,
-          scope: ctx.boundScope,
-        });
-        const vis = createVisibilityHelpers({
+        const mounts = engine.db.listMounts();
+        const explicitIn = flagStr(flags, "in");
+        const isExplicitlyBound = ctx.boundSource === "MERU_MIND_VIEWER_REALM_ID";
+        if (
+          !explicitIn &&
+          !isExplicitlyBound &&
+          ctx.org.policy === "open" &&
+          workspaceMarkerError
+        ) {
+          throw workspaceMarkerError;
+        }
+        const aboutRefs = flagMulti(multiFlags, "about");
+        const routed = resolveWriteTargetRealm({
           db: engine.db,
+          ledger: engine.ledger,
           realms: ctx.realms,
-          mounts: engine.db.listMounts(),
+          mounts,
+          scope: ctx.boundScope,
+          orgId: ctx.org.id,
+          orgPolicy: ctx.org.policy,
           actor,
           viewerRealmId: ctx.boundViewerRealmId,
-          scope: ctx.boundScope,
+          isExplicitlyBound,
+          explicitIn,
+          workspaceMarkerRef,
+          about: aboutRefs,
+        });
+        const effectiveScope =
+          routed.routedBy === "inbox"
+            ? resolveAccessScope({
+                realms: routed.realms,
+                mounts,
+                viewerRealmId: ctx.boundViewerRealmId,
+                orgPolicy: ctx.org.policy,
+                includeDescendantSeabed: false,
+              })
+            : ctx.boundScope;
+        const vis = createVisibilityHelpers({
+          db: engine.db,
+          realms: routed.realms,
+          mounts,
+          actor,
+          viewerRealmId: ctx.boundViewerRealmId,
+          scope: effectiveScope,
         });
         const resolvedAbout = resolveAboutRefsForWrite({
           db: engine.db,
-          realms: ctx.realms,
+          realms: routed.realms,
           orgId: ctx.org.id,
-          about: flagMulti(multiFlags, "about"),
-          scope: ctx.boundScope,
+          about: aboutRefs,
+          scope: effectiveScope,
           vis,
         });
         const filePath = flagStr(flags, "file");
@@ -1862,7 +1947,7 @@ async function main(): Promise<void> {
         const entry = await engine.ledger.captureSeabed({
           actor,
           viewerRealmId: ctx.boundViewerRealmId,
-          targetRealmId: targetRealm.id,
+          targetRealmId: routed.realm.id,
           kind: requireFlag(flags, "kind", "raw add") as SeabedKind,
           text: flagStr(flags, "text") ?? "",
           topicId: flagStr(flags, "topic"),
@@ -1875,7 +1960,18 @@ async function main(): Promise<void> {
           idempotencyKey: flagStr(flags, "idempotency-key"),
           allowRedactedReingest: flagBool(flags, "as-human"),
         });
-        output(entry, formatGenericMarkdown("Raw Entry Added", entry));
+        const payloadOut = {
+          ...entry,
+          realmPath: routed.realm.path,
+          routedBy: routed.routedBy,
+        };
+        output(
+          payloadOut,
+          formatGenericMarkdown(
+            `Raw Entry Added -> \`${routed.realm.path}\` (routed: ${routed.routedBy})`,
+            payloadOut,
+          ),
+        );
         return;
       }
       throw new MindError(
