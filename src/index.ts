@@ -93,6 +93,31 @@ export {
   type MindServerHandle,
 } from "./server/http-server.js";
 export { createSurfaceMcpServer } from "./server/mcp-http.js";
+export { MindPulseStore, type PulseEntry } from "./server/pulse.js";
+export {
+  UiSessionManager,
+  UI_SESSION_COOKIE_NAME,
+  parseCookieHeader,
+} from "./server/ui-auth.js";
+export {
+  STRICT_UI_CSP,
+  isLoopbackHost,
+  assertWebDirAllowed,
+  createUiRouteHandler,
+  ejectDefaultUiShell,
+} from "./server/ui-router.js";
+export {
+  CLIENT_JS_SOURCE,
+  DEFAULT_SHELL_HTML,
+  DEFAULT_SHELL_CSS,
+  DEFAULT_SHELL_JS,
+} from "./server/ui-assets.js";
+export { seedDemoOrg, type DemoSeedSummary } from "./server/demo-seed.js";
+export {
+  attachPumpWebSocketServer,
+  isOriginAllowed,
+  type AttachPumpWsOptions,
+} from "./server/ws-pump.js";
 export { LocalBlobStore } from "./adapters/blob-store.js";
 export {
   NoopEmbedder,

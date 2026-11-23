@@ -29,18 +29,23 @@ import {
   type Principal,
 } from "../types.js";
 import { createSurfaceMcpServer } from "./mcp-http.js";
+import { seedDemoOrg, type DemoSeedSummary } from "./demo-seed.js";
+import { MindPulseStore } from "./pulse.js";
 import { ChangeWakeBus } from "./pump.js";
 import {
   createAuthToken,
   resolvePrincipalFromToken,
   type CreateAuthTokenResult,
 } from "./tokens.js";
+import { UiSessionManager } from "./ui-auth.js";
+import { assertWebDirAllowed, createUiRouteHandler } from "./ui-router.js";
 import {
   acquireServeWriterLock,
   type ServeWriterLockHandle,
 } from "./writer-lock.js";
+import { attachPumpWebSocketServer } from "./ws-pump.js";
 
-export const SERVER_VERSION = "0.3.0";
+export const SERVER_VERSION = "0.4.0";
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
 
 export interface AccessLogEntry {
@@ -60,6 +65,12 @@ export interface MindServerOptions {
   orgId?: string;
   enableVector?: boolean;
   embedder?: EmbedderPort;
+  /** Optional loopback-only custom UI directory (--web-dir). Refused on non-loopback hosts in v0.4. */
+  webDir?: string;
+  /** Optional explicit WebSocket Origin allowlist (defaults to same-host origin) */
+  allowedOrigins?: string[];
+  /** Seed demo org with rule-tail sentinel, stored-XSS probe, redacted tombstone, unknown extKind & inbox item */
+  demo?: boolean;
   /** Custom access logger (pass false to disable stderr logging in tests) */
   accessLog?: ((entry: AccessLogEntry) => void) | false;
   /** Optional custom request hook invoked for non-/v1, non-/mcp paths (used by v0.4 Web UI shell) */
@@ -88,6 +99,9 @@ export interface MindServerHandle {
   readonly orgId: string;
   readonly engine: MindEngine;
   readonly wakeBus: ChangeWakeBus;
+  readonly pulseStore: MindPulseStore;
+  readonly uiSessions: UiSessionManager;
+  readonly demoSeed?: DemoSeedSummary;
   readonly httpServer: http.Server;
   createToken(params: {
     actorId: string;
@@ -97,6 +111,11 @@ export interface MindServerHandle {
     label?: string | null;
     createdBy?: string;
   }): CreateAuthTokenResult;
+  mintUiLoginCode(principal: Principal): {
+    code: string;
+    loginUrl: string;
+    expiresAt: string;
+  };
   close(): Promise<void>;
 }
 
@@ -221,6 +240,9 @@ export async function startMindServer(
   const host = options.host ?? "127.0.0.1";
   const requestedPort = options.port ?? 3800;
 
+  // Guardrail #6: validate loopback-only --web-dir BEFORE acquiring lock or opening DB
+  const resolvedWebDir = assertWebDirAllowed(options.webDir, host);
+
   // Acquire exclusive single-writer lock BEFORE opening SQLite
   let lockHandle: ServeWriterLockHandle = acquireServeWriterLock({
     homeDir,
@@ -229,6 +251,7 @@ export async function startMindServer(
 
   let engine: MindEngine | null = null;
   let unsubChangeLog: (() => void) | null = null;
+  let detachWs: (() => void) | null = null;
 
   try {
     engine = await createMindEngine({
@@ -249,7 +272,7 @@ export async function startMindServer(
       orgId = found.id;
     } else if (orgs.length === 0) {
       const created = engine.ledger.createOrg({
-        name: "Default",
+        name: options.demo ? "Meru Demo" : "Default",
         isPersonalRoot: true,
         policy: "open",
       });
@@ -263,10 +286,29 @@ export async function startMindServer(
       );
     }
 
+    const demoSeed = options.demo
+      ? await seedDemoOrg(engine, orgId)
+      : undefined;
+
     const wakeBus = new ChangeWakeBus();
+    const pulseStore = new MindPulseStore();
+    const uiSessions = new UiSessionManager();
+    const builtInUiHandler = createUiRouteHandler({
+      uiSessions,
+      webDir: resolvedWebDir,
+    });
+
     unsubChangeLog = engine.db.onChangeCommitted((events) =>
       wakeBus.notifyEvents(events),
     );
+
+    const resolveCookiePrincipal = (req: IncomingMessage): Principal | null => {
+      if (options.cookieAuthenticator) {
+        const custom = options.cookieAuthenticator(req, orgId);
+        if (custom) return custom;
+      }
+      return uiSessions.authenticateRequest(req, engine!.db, orgId);
+    };
 
     const authenticate = (
       req: IncomingMessage,
@@ -281,8 +323,8 @@ export async function startMindServer(
           authKind: "bearer",
         });
       }
-      if (authOpts?.allowCookie !== false && options.cookieAuthenticator) {
-        const cookiePrincipal = options.cookieAuthenticator(req, orgId);
+      if (authOpts?.allowCookie !== false) {
+        const cookiePrincipal = resolveCookiePrincipal(req);
         if (cookiePrincipal) {
           return cookiePrincipal;
         }
@@ -291,7 +333,7 @@ export async function startMindServer(
         "ACCESS_DENIED",
         "Missing or invalid authentication credentials",
         {
-          try: "Pass Authorization: Bearer <MERU_MIND_TOKEN>",
+          try: "Pass Authorization: Bearer <MERU_MIND_TOKEN> or run 'meru-mind ui login'",
         },
       );
     };
@@ -627,6 +669,43 @@ export async function startMindServer(
               return;
             }
 
+            if (method === "POST" && pathname === "/v1/ui/login-code") {
+              const minted = uiSessions.mintLoginCode(principal);
+              sendJson(res, 200, {
+                ...minted,
+                loginUrl: `${serverUrlRef.value}/_meru/auth?code=${encodeURIComponent(minted.code)}`,
+              });
+              return;
+            }
+
+            if (method === "GET" && pathname === "/v1/pulse") {
+              const pulses = pulseStore.listVisible({
+                db: engine!.db,
+                principal,
+              });
+              sendJson(res, 200, { pulses });
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/pulse") {
+              const body = (await readJsonBody(req)) as {
+                sessionId?: string;
+                realmRef?: string;
+                focus?: string[];
+                note?: string | null;
+              };
+              const pulse = pulseStore.declare({
+                db: engine!.db,
+                principal,
+                sessionId: body.sessionId,
+                realmRef: body.realmRef,
+                focus: body.focus,
+                note: body.note,
+              });
+              sendJson(res, 200, pulse);
+              return;
+            }
+
             sendJson(res, 404, {
               error: "not_found",
               message: `Unknown API route: ${method} ${pathname}`,
@@ -637,7 +716,7 @@ export async function startMindServer(
           }
         }
 
-        // Optional extra routes (v0.4 Web UI shell, /_meru/client.js, /_meru/shell, auth code exchange)
+        // Optional custom route hook first, then built-in v0.4 1.5-layer UI router (/_meru/* & / & --web-dir)
         if (options.extraRouteHandler) {
           const handled = await options.extraRouteHandler({
             req,
@@ -652,6 +731,16 @@ export async function startMindServer(
           if (handled) return;
         }
 
+        const uiHandled = await builtInUiHandler({
+          req,
+          res,
+          url: parsedUrl,
+          engine: engine!,
+          orgId,
+          authenticate,
+        });
+        if (uiHandled) return;
+
         sendJson(res, 404, {
           error: "not_found",
           message: `Route not found: ${method} ${pathname}`,
@@ -665,6 +754,15 @@ export async function startMindServer(
           sendJson(res, status, payload);
         }
       }
+    });
+
+    detachWs = attachPumpWebSocketServer({
+      httpServer,
+      db: engine.db,
+      wakeBus,
+      orgId,
+      allowedOrigins: options.allowedOrigins,
+      authenticateCookie: resolveCookiePrincipal,
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -687,6 +785,10 @@ export async function startMindServer(
     const close = async () => {
       if (closed) return;
       closed = true;
+      if (detachWs) {
+        detachWs();
+        detachWs = null;
+      }
       await new Promise<void>((resolve) => {
         httpServer.close(() => resolve());
         httpServer.closeAllConnections?.();
@@ -710,6 +812,9 @@ export async function startMindServer(
       orgId,
       engine,
       wakeBus,
+      pulseStore,
+      uiSessions,
+      ...(demoSeed ? { demoSeed } : {}),
       httpServer,
       createToken(params) {
         return createAuthToken({
@@ -723,9 +828,17 @@ export async function startMindServer(
           createdBy: params.createdBy ?? "serve-bootstrap",
         });
       },
+      mintUiLoginCode(principal) {
+        const minted = uiSessions.mintLoginCode(principal);
+        return {
+          ...minted,
+          loginUrl: `${url}/_meru/auth?code=${encodeURIComponent(minted.code)}`,
+        };
+      },
       close,
     };
   } catch (err) {
+    if (detachWs) detachWs();
     if (unsubChangeLog) unsubChangeLog();
     if (engine) {
       await engine.close().catch(() => {});

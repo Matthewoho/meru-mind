@@ -5,6 +5,7 @@ import {
   createAuthToken,
   createMindEngine,
   discoverWorkspaceRealmMarker,
+  ejectDefaultUiShell,
   findRelatedActiveForEcho,
   formatChangesMarkdown,
   formatGenericMarkdown,
@@ -86,6 +87,7 @@ const BOOLEAN_FLAGS = new Set([
   "personal",
   "as-human",
   "init-token",
+  "demo",
   "history",
   "full",
   "include-descendant-seabed",
@@ -388,7 +390,7 @@ RECORD [write]:
         [--occurred-at <iso|none>] [--sensitivity public|internal|confidential|secret]
 
 MANAGE [write / human] (experimental: file, raw, settle):
-  realm | entry | object | file | rule | raw | redact | settle | import | serve | token | org | admin
+  realm | entry | object | file | rule | raw | redact | settle | import | serve | ui | token | org | admin
 
 OUTPUT:
   Markdown capped with next-page --cursor; pass --json for JSON; errors include try:.
@@ -608,16 +610,29 @@ Examples:
   meru-mind admin init --org "Acme" --policy open
   meru-mind admin backup --out ./backups/mind-snapshot.sqlite
 `,
-  serve: `Risk: write (starts single-writer HTTP + Streamable HTTP MCP server with exclusive store lock)
-When to use: Serve one organization over HTTP (/v1/*) and Streamable HTTP MCP (/mcp) for human + multi-agent teams.
+  serve: `Risk: write (starts single-writer HTTP + WebSocket + Streamable HTTP MCP + Web Governance UI server)
+When to use: Serve one organization over HTTP (/v1/*), Pump WS (/v1/ws), Streamable HTTP MCP (/mcp), and the composable Web UI (/).
 Usage:
-  meru-mind serve [--host 127.0.0.1] [--port 3800] [--org <orgId>] [--init-token]
+  meru-mind serve [--host 127.0.0.1] [--port 3800] [--org <orgId>] [--init-token] [--demo] [--web-dir <dir>] [--origin <origin>]
 Flags:
   --host <addr>      Bind address (default: 127.0.0.1)
   --port <port>      Listen port (default: 3800)
   --init-token       If no active tokens exist, mint and print one bootstrap human admin token once
+  --demo             Seed demo realms, 12 rules (with sentinel), XSS probe, supersede chain, redacted tombstone & inbox item
+  --web-dir <dir>    Serve custom UI bundle on loopback hosts only (/_meru/* and /v1/* stay reserved)
+  --origin <origin>  Explicit WebSocket Origin allowlist (repeatable)
 Examples:
-  meru-mind serve --host 127.0.0.1 --port 3800 --init-token
+  meru-mind serve --demo --host 127.0.0.1 --port 3800
+  meru-mind serve --host 127.0.0.1 --port 3800 --web-dir ./my-ui
+`,
+  ui: `Risk: read / write (CLI helper for browser login codes and ejecting the official shell)
+When to use: Mint a 60-second single-use browser login URL or eject the built-in official shell for custom UI authoring.
+Usage:
+  meru-mind ui login --url <serverUrl> --token <humanToken>
+  meru-mind ui eject <targetDir>
+Examples:
+  MERU_MIND_URL=http://127.0.0.1:3800 MERU_MIND_TOKEN=mm_live_... meru-mind ui login
+  meru-mind ui eject ./my-custom-ui
 `,
   token: `Risk: high-risk-write (human-only)
 When to use: Issue, list, or revoke hashed authentication tokens for meru-mind serve.
@@ -892,6 +907,7 @@ async function main(): Promise<void> {
     "settle",
     "import",
     "serve",
+    "ui",
     "token",
     "org",
     "admin",
@@ -926,28 +942,119 @@ async function main(): Promise<void> {
     workspaceMarkerError = err;
   }
 
+  // `meru-mind ui eject <dir>` and `meru-mind ui login` work without opening local SQLite directly.
+  if (cmd === "ui") {
+    if (sub === "eject") {
+      assertAllowedFlags(flags, [], "ui eject");
+      if (!third?.trim()) {
+        throw new MindError("INVALID_INPUT", "ui eject requires a <targetDir> path", {
+          try: "meru-mind ui eject ./my-ui",
+        });
+      }
+      const files = ejectDefaultUiShell(third.trim());
+      output(
+        { ejected: true, targetDir: third.trim(), files },
+        formatGenericMarkdown("Ejected Official Default Shell (imports /_meru/client.js)", {
+          targetDir: third.trim(),
+          files,
+          next: `meru-mind serve --demo --host 127.0.0.1 --web-dir ${third.trim()}`,
+        }),
+      );
+      return;
+    }
+    if (sub === "login") {
+      assertAllowedFlags(flags, [], "ui login");
+      const targetUrl = (
+        flagStr(flags, "url") ??
+        process.env.MERU_MIND_URL?.trim() ??
+        "http://127.0.0.1:3800"
+      ).replace(/\/+$/, "");
+      const targetToken = (
+        flagStr(flags, "token") ?? process.env.MERU_MIND_TOKEN?.trim()
+      )?.trim();
+      if (!targetToken) {
+        throw new MindError(
+          "ACCESS_DENIED",
+          "ui login requires --token or MERU_MIND_TOKEN (human Bearer token)",
+          { try: `MERU_MIND_URL=${targetUrl} MERU_MIND_TOKEN=<token> meru-mind ui login` },
+        );
+      }
+      const resp = await fetch(`${targetUrl}/v1/ui/login-code`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${targetToken}`,
+          Accept: "application/json",
+        },
+      });
+      const body = (await resp.json()) as {
+        code?: string;
+        loginUrl?: string;
+        expiresAt?: string;
+        message?: string;
+      };
+      if (!resp.ok) {
+        throw new MindError(
+          resp.status === 401 || resp.status === 403 ? "ACCESS_DENIED" : "INVALID_INPUT",
+          body.message ?? `Failed to mint login code (HTTP ${resp.status})`,
+        );
+      }
+      output(
+        body,
+        [
+          "One-time browser login URL (valid 60s, single-use, HttpOnly Cookie):",
+          `  ${body.loginUrl}`,
+        ].join("\n"),
+      );
+      return;
+    }
+    throw new MindError("UNKNOWN_COMMAND", `Unknown ui subcommand "${sub ?? ""}"`, {
+      try: "meru-mind ui --help",
+    });
+  }
+
   // `meru-mind serve` owns the exclusive writer lock itself before opening SQLite.
   if (cmd === "serve") {
-    assertAllowedFlags(flags, ["host", "port", "init-token"], "serve");
+    assertAllowedFlags(
+      flags,
+      ["host", "port", "init-token", "demo", "web-dir", "origin"],
+      "serve",
+    );
     const host = flagStr(flags, "host") ?? "127.0.0.1";
     const port = parseIntFlag(flags, "port", { min: 0 }) ?? 3800;
+    const isDemo = flagBool(flags, "demo");
+    const allowedOrigins = flagMulti(multiFlags, "origin");
     const srv = await startMindServer({
       homeDir: flagStr(flags, "home"),
       host,
       port,
       orgId: orgFlag,
+      demo: isDemo,
+      webDir: flagStr(flags, "web-dir"),
+      allowedOrigins: allowedOrigins.length > 0 ? allowedOrigins : undefined,
     });
     let bootstrapToken: string | null = null;
-    if (flagBool(flags, "init-token")) {
+    let demoLoginUrl: string | null = null;
+    if (flagBool(flags, "init-token") || isDemo) {
       const existing = srv.engine.db.listTokens(srv.orgId, false);
       if (existing.length === 0) {
         const minted = srv.createToken({
-          actorId: flagStr(flags, "actor") ?? "admin",
+          actorId: flagStr(flags, "actor") ?? (isDemo ? "demo-lead" : "admin"),
           actorKind: "human",
-          label: "bootstrap-admin",
+          label: isDemo ? "demo-human" : "bootstrap-admin",
           createdBy: "serve-init",
         });
         bootstrapToken = minted.token;
+        if (isDemo) {
+          const root = srv.engine.db.getRealmByPath(srv.orgId, "/")!;
+          demoLoginUrl = srv.mintUiLoginCode({
+            tokenId: minted.record.id,
+            orgId: srv.orgId,
+            actor: { id: minted.record.actorId, kind: "human" },
+            boundRealmId: root.id,
+            boundSource: "demo",
+            authKind: "bearer",
+          }).loginUrl;
+        }
       }
     }
     const startPayload = {
@@ -955,21 +1062,29 @@ async function main(): Promise<void> {
       orgId: srv.orgId,
       homeDir: srv.homeDir,
       mcpEndpoint: `${srv.url}/mcp`,
+      wsEndpoint: `${srv.url.replace(/^http/, "ws")}/v1/ws`,
+      officialShellUrl: `${srv.url}/_meru/shell`,
       ...(bootstrapToken
         ? {
             bootstrapToken,
             note: "Save this human admin token now; plaintext is shown ONCE.",
           }
         : {}),
+      ...(demoLoginUrl ? { demoLoginUrl } : {}),
     };
     output(
       startPayload,
       [
         `Meru Mind server listening at ${srv.url} (org: ${srv.orgId})`,
+        `  UI:   ${srv.url}/   (official fallback: ${srv.url}/_meru/shell)`,
         `  REST: ${srv.url}/v1/whoami`,
+        `  WS:   ${srv.url.replace(/^http/, "ws")}/v1/ws`,
         `  MCP:  ${srv.url}/mcp`,
         ...(bootstrapToken
           ? [`  Admin Token (shown ONCE): ${bootstrapToken}`]
+          : []),
+        ...(demoLoginUrl
+          ? [`  Demo 60s Login URL: ${demoLoginUrl}`]
           : []),
       ].join("\n"),
     );
