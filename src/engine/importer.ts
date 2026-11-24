@@ -12,6 +12,8 @@ import {
   type Actor,
   type ImportConsistencyMismatch,
   type ImportConsistencyResult,
+  type ImportDryRunResult,
+  type ImportDryRunUnresolvedRealm,
   type ImportJsonlResult,
   type ImportMappingConfig,
   type ImportMdItemResult,
@@ -641,6 +643,19 @@ export class ImporterEngine {
           })
         : viewerRealm;
 
+    if (mapping?.realmMap) {
+      for (const targetRef of Object.values(mapping.realmMap)) {
+        if (targetRef && targetRef.trim()) {
+          resolveVisibleRealm({
+            realms,
+            orgId: viewerRealm.orgId,
+            ref: targetRef.trim(),
+            scope,
+          });
+        }
+      }
+    }
+
     const orgObjects = this.db.listObjects({
       orgId: viewerRealm.orgId,
       realmIds: scope.readableLedgerIds,
@@ -1117,6 +1132,19 @@ export class ImporterEngine {
             scope,
           })
         : viewerRealm;
+
+    if (mapping.realmMap) {
+      for (const targetRef of Object.values(mapping.realmMap)) {
+        if (targetRef && targetRef.trim()) {
+          resolveVisibleRealm({
+            realms,
+            orgId: viewerRealm.orgId,
+            ref: targetRef.trim(),
+            scope,
+          });
+        }
+      }
+    }
 
     const orgObjects = this.db.listObjects({
       orgId: viewerRealm.orgId,
@@ -1606,6 +1634,22 @@ export class ImporterEngine {
       includeDescendantSeabed: false,
     });
 
+    const defaultRealm: Realm = params.targetRealmRef
+      ? resolveVisibleRealm({
+          realms,
+          orgId: viewerRealm.orgId,
+          ref: params.targetRealmRef,
+          scope,
+        })
+      : mapping?.defaultRealm
+        ? resolveVisibleRealm({
+            realms,
+            orgId: viewerRealm.orgId,
+            ref: mapping.defaultRealm,
+            scope,
+          })
+        : viewerRealm;
+
     const abs = path.resolve(params.sourcePath);
     if (!fs.existsSync(abs)) {
       throw new MindError("NOT_FOUND", `Source path not found: ${params.sourcePath}`);
@@ -1733,7 +1777,7 @@ export class ImporterEngine {
         const mappedRealmRef = rawRealmStr
           ? (mapping.realmMap?.[rawRealmStr] ?? rawRealmStr)
           : "";
-        let realmId = viewerRealm.id;
+        let realmId = defaultRealm.id;
         if (mappedRealmRef) {
           realmId = resolveVisibleRealm({
             realms,
@@ -1807,7 +1851,7 @@ export class ImporterEngine {
           extractFilenameDate(filenameDateRe, filePath, sourceRef);
         if (expectedOccurredAt === null) undatedCount += 1;
 
-        let realmId = viewerRealm.id;
+        let realmId = defaultRealm.id;
         let usedDefault = true;
         if (mapping?.realmPath) {
           const rawRealmVal = getFieldByPath(fm, mapping.realmPath);
@@ -1861,6 +1905,258 @@ export class ImporterEngine {
       defaultRealmFallbackCount,
       activeSupersededMismatches,
       timestampMismatches,
+    };
+  }
+
+  /**
+   * Read-only dry-run preview for `import md` or `import jsonl`.
+   * Never mutates SQLite and never lazily creates `/inbox`.
+   * Reports exact target realm distribution, unmatched raw realm field values,
+   * and any unresolved realm references before a single row is written.
+   */
+  previewImport(params: {
+    viewerRealmId: string;
+    sourcePath: string;
+    sourceType?: "md" | "jsonl";
+    mapping?: ImportMappingConfig;
+    baseDir?: string;
+    targetRealmRef?: string;
+    /** Virtual fallback path (e.g. "/inbox") when default realm does not exist yet */
+    virtualDefaultRealmPath?: string;
+    skipSecret?: boolean;
+  }): ImportDryRunResult {
+    const mapping = params.mapping;
+    const filenameDateRe = validateMappingConfig(mapping);
+    const skipSecret = params.skipSecret ?? mapping?.skipSecret ?? true;
+
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
+    const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+    if (!viewerRealm) {
+      throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+    }
+    const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+    const scope = resolveAccessScope({
+      realms,
+      mounts,
+      viewerRealmId: viewerRealm.id,
+      orgPolicy,
+      includeDescendantSeabed: false,
+    });
+
+    let plannedDefaultRealm: string;
+    if (params.targetRealmRef) {
+      plannedDefaultRealm = resolveVisibleRealm({
+        realms,
+        orgId: viewerRealm.orgId,
+        ref: params.targetRealmRef,
+        scope,
+      }).path;
+    } else if (mapping?.defaultRealm) {
+      plannedDefaultRealm = resolveVisibleRealm({
+        realms,
+        orgId: viewerRealm.orgId,
+        ref: mapping.defaultRealm,
+        scope,
+      }).path;
+    } else if (params.virtualDefaultRealmPath) {
+      plannedDefaultRealm = params.virtualDefaultRealmPath;
+    } else {
+      plannedDefaultRealm = viewerRealm.path;
+    }
+
+    const abs = path.resolve(params.sourcePath);
+    if (!fs.existsSync(abs)) {
+      throw new MindError("NOT_FOUND", `Source path not found: ${params.sourcePath}`);
+    }
+    const stat = fs.statSync(abs);
+    const sourceType: "md" | "jsonl" =
+      params.sourceType ?? (stat.isFile() && /\.jsonl$/i.test(abs) ? "jsonl" : "md");
+
+    let totalItems = 0;
+    let defaultRealmCount = 0;
+    let undatedCount = 0;
+    let skippedSecret = 0;
+    let skippedRedacted = 0;
+    const realmDistribution: Record<string, number> = {};
+    const unmatchedRealmValues: Record<string, number> = {};
+    const unresolvedMap = new Map<string, ImportDryRunUnresolvedRealm>();
+
+    const bump = (map: Record<string, number>, key: string) => {
+      map[key] = (map[key] ?? 0) + 1;
+    };
+
+    const resolveRowRealm = (rawRealmVal: unknown): void => {
+      const rawRealmStr =
+        rawRealmVal !== undefined && rawRealmVal !== null
+          ? String(rawRealmVal).trim()
+          : "";
+      if (!rawRealmStr) {
+        defaultRealmCount += 1;
+        bump(realmDistribution, plannedDefaultRealm);
+        return;
+      }
+      const inMap = mapping?.realmMap ? Object.prototype.hasOwnProperty.call(mapping.realmMap, rawRealmStr) : false;
+      const mappedRef = inMap ? mapping!.realmMap![rawRealmStr]!.trim() : rawRealmStr;
+      if (!mappedRef) {
+        defaultRealmCount += 1;
+        bump(unmatchedRealmValues, rawRealmStr);
+        bump(realmDistribution, plannedDefaultRealm);
+        return;
+      }
+      try {
+        const resolved = resolveVisibleRealm({
+          realms,
+          orgId: viewerRealm.orgId,
+          ref: mappedRef,
+          scope,
+        });
+        bump(realmDistribution, resolved.path);
+      } catch {
+        if (!inMap) {
+          bump(unmatchedRealmValues, rawRealmStr);
+        }
+        const key = `${rawRealmStr}\u0000${mappedRef}`;
+        const existing = unresolvedMap.get(key);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          unresolvedMap.set(key, {
+            rawValue: rawRealmStr,
+            targetRef: mappedRef,
+            count: 1,
+          });
+        }
+      }
+    };
+
+    if (sourceType === "jsonl") {
+      if (!mapping) {
+        throw new MindError(
+          "INVALID_INPUT",
+          "JSONL import dry-run requires a --map configuration",
+        );
+      }
+      const lines = fs
+        .readFileSync(abs, "utf8")
+        .replace(/\r\n/g, "\n")
+        .split("\n");
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i]!.trim();
+        if (!line) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch (err) {
+          throw new MindError(
+            "INVALID_INPUT",
+            `Invalid JSON on line ${i + 1}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new MindError("INVALID_INPUT", `Expected JSON object on line ${i + 1}`);
+        }
+        const row = parsed as Record<string, unknown>;
+        totalItems += 1;
+
+        const occurredAt = resolveMostPreciseDeclaredTimestamp(
+          getAllFields(row, mapping.occurredAt),
+        );
+        if (occurredAt === null) undatedCount += 1;
+
+        const rawSens = getFieldByPath(row, mapping.sensitivity);
+        const sens =
+          typeof rawSens === "string" &&
+          VALID_SENSITIVITIES.has(rawSens.trim().toLowerCase())
+            ? (rawSens.trim().toLowerCase() as Sensitivity)
+            : (mapping.defaultSensitivity ?? "internal");
+        if (skipSecret && sens === "secret") {
+          skippedSecret += 1;
+          continue;
+        }
+        const contentSha256 = computePayloadHash(row);
+        if (this.db.isContentShaBlocked(viewerRealm.orgId, contentSha256)) {
+          skippedRedacted += 1;
+          continue;
+        }
+
+        const rawRealmVal = mapping.realmPath
+          ? getFieldByPath(row, mapping.realmPath)
+          : undefined;
+        resolveRowRealm(rawRealmVal);
+      }
+    } else {
+      const { baseDir, isSingleFile, files } = collectMarkdownFiles(
+        params.sourcePath,
+        params.baseDir,
+      );
+      const hasExplicitBaseDir = Boolean(params.baseDir?.trim());
+      for (const filePath of files) {
+        totalItems += 1;
+        const rawContent = fs.readFileSync(filePath, "utf8");
+        const sha = sha256Text(rawContent);
+        const sourceRef = deriveDefaultSourceRef({
+          filePath,
+          baseDir,
+          isSingleFile,
+          hasExplicitBaseDir,
+        });
+        const fallbackTitle = path.basename(filePath, path.extname(filePath));
+        const parsed = parseMarkdownDocument(rawContent, fallbackTitle);
+        const fm = parsed.frontmatter;
+
+        const mappedOccurred = mapping?.occurredAt
+          ? normalizeDeclaredTimestamp(getFirstField(fm, mapping.occurredAt))
+          : null;
+        const occurredAt =
+          mappedOccurred ??
+          parsed.occurredAt ??
+          extractFilenameDate(filenameDateRe, filePath, sourceRef);
+        if (occurredAt === null) undatedCount += 1;
+
+        const rawMappedSens = mapping?.sensitivity
+          ? getFieldByPath(fm, mapping.sensitivity)
+          : undefined;
+        const mappedSens =
+          typeof rawMappedSens === "string" &&
+          VALID_SENSITIVITIES.has(rawMappedSens.trim().toLowerCase())
+            ? (rawMappedSens.trim().toLowerCase() as Sensitivity)
+            : null;
+        const sens =
+          mappedSens ?? parsed.sensitivity ?? mapping?.defaultSensitivity ?? "internal";
+        if (skipSecret && sens === "secret") {
+          skippedSecret += 1;
+          continue;
+        }
+        if (this.db.isContentShaBlocked(viewerRealm.orgId, sha)) {
+          skippedRedacted += 1;
+          continue;
+        }
+
+        const rawRealmVal = mapping?.realmPath
+          ? getFieldByPath(fm, mapping.realmPath)
+          : undefined;
+        resolveRowRealm(rawRealmVal);
+      }
+    }
+
+    const unresolvedRealms = Array.from(unresolvedMap.values()).sort(
+      (a, b) => b.count - a.count,
+    );
+
+    return {
+      dryRun: true,
+      sourceType,
+      totalItems,
+      plannedDefaultRealm,
+      defaultRealmCount,
+      undatedCount,
+      skippedSecret,
+      skippedRedacted,
+      realmDistribution,
+      unmatchedRealmValues,
+      unresolvedRealms,
+      valid: unresolvedRealms.length === 0,
     };
   }
 }

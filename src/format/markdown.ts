@@ -3,12 +3,14 @@ import {
   formatCanonicalObjectRef,
 } from "../engine/refs.js";
 import { formatInactiveBadgesMarkdown } from "./inactive-badges.js";
+import type { DoctorReport } from "../engine/doctor.js";
 import type {
   BehaviorClass,
   BriefOutput,
   CatResult,
   ChangesResult,
   ImportConsistencyResult,
+  ImportDryRunResult,
   ImportJsonlResult,
   ImportMdResult,
   LedgerRecord,
@@ -1098,6 +1100,68 @@ export function formatSearchMarkdown(res: SearchResult): string {
         `Hits marked [shown/total chars] are excerpts. Inspect full entry: meru-mind show <id> --around "<query>"`,
       );
     }
+  }
+  return lines.join("\n");
+}
+
+export function formatImportDryRunMarkdown(res: ImportDryRunResult): string {
+  const lines: string[] = [
+    `# Import Dry Run (${res.sourceType.toUpperCase()}) — ${res.valid ? "READY" : "UNRESOLVED REALMS"}`,
+    "",
+    `- **Total items**: ${res.totalItems}`,
+    `- **Planned default realm**: \`${res.plannedDefaultRealm}\` (${res.defaultRealmCount} fallback item(s))`,
+    `- **Undated**: ${res.undatedCount} | **Skipped secret**: ${res.skippedSecret} | **Skipped redacted**: ${res.skippedRedacted}`,
+    "",
+    "## Planned Realm Distribution",
+  ];
+  const distEntries = Object.entries(res.realmDistribution).sort(
+    (a, b) => b[1] - a[1],
+  );
+  if (distEntries.length === 0) {
+    lines.push("_(none)_");
+  } else {
+    for (const [realmPath, count] of distEntries) {
+      lines.push(`- \`${realmPath}\`: ${count}`);
+    }
+  }
+  const unmatchedEntries = Object.entries(res.unmatchedRealmValues).sort(
+    (a, b) => b[1] - a[1],
+  );
+  if (unmatchedEntries.length > 0) {
+    lines.push("", "## Unmatched Raw Realm Field Values");
+    for (const [val, count] of unmatchedEntries) {
+      lines.push(`- \`${val}\`: ${count}`);
+    }
+  }
+  if (res.unresolvedRealms.length > 0) {
+    lines.push("", "## Unresolved Realm Targets (Fix Before Importing)");
+    for (const u of res.unresolvedRealms) {
+      lines.push(
+        `- raw \`${u.rawValue}\` -> \`${u.targetRef}\` (${u.count} item(s))`,
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
+export function formatDoctorMarkdown(report: DoctorReport): string {
+  const status = report.healthy ? "HEALTHY" : "NEEDS ATTENTION";
+  const lines: string[] = [
+    `# Meru Mind Realm Doctor — ${status}`,
+    "",
+    `- **Org**: ${report.orgName} (\`${report.orgId}\`, policy: \`${report.orgPolicy}\`)`,
+    `- **Visible active realms**: ${report.summary.visibleActiveRealms} | **Conclusions**: ${report.summary.totalDirectConclusions} | **Rules**: ${report.summary.totalDirectRules}`,
+    `- **Findings**: ${report.summary.warnCount} warn, ${report.summary.infoCount} info`,
+  ];
+  if (report.findings.length === 0) {
+    lines.push("", "No hygiene issues detected in visible scope.");
+    return lines.join("\n");
+  }
+  lines.push("");
+  for (const f of report.findings) {
+    const tag = f.severity === "warn" ? "[WARN]" : "[INFO]";
+    lines.push(`- ${tag} \`${f.code}\` (\`${f.realmPath}\`): ${f.summary}`);
+    lines.push(`  - Next: \`${f.try}\``);
   }
   return lines.join("\n");
 }

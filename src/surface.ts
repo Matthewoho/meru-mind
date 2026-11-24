@@ -152,6 +152,12 @@ export interface SurfaceCreateRealmInput {
   scope?: string | null;
 }
 
+export interface SurfaceUpdateRealmInput {
+  ref: string;
+  name?: string;
+  scope?: string;
+}
+
 export interface SurfaceMountRealmInput {
   viewerRef: string;
   targetRef: string;
@@ -195,6 +201,7 @@ export interface MindSurface {
   addRule(params: SurfaceAddRuleInput): Promise<LedgerRecord>;
   redact(params: SurfaceRedactInput): Promise<RedactResult>;
   createRealm(params: SurfaceCreateRealmInput): Promise<Realm>;
+  updateRealm(params: SurfaceUpdateRealmInput): Promise<Realm>;
   mountRealm(params: SurfaceMountRealmInput): Promise<RealmMount>;
   unmountRealm(params: { viewerRef: string; targetRef: string }): Promise<boolean>;
   archiveRealm(params: { ref: string }): Promise<RealmArchiveResult>;

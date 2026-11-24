@@ -2,7 +2,7 @@
 
 **Scoped, versioned shared context for human-AI teams.**
 
-[中文文档 (README.zh-CN.md)](./README.zh-CN.md) · [Architecture](./ARCHITECTURE.md) · [Threat Model](./THREAT_MODEL.md) · [Cloud Deployment & Composable UI Guide](./docs/deployment-and-frontend.md) · [UI Builder Skill](./docs/UI_BUILDER_SKILL.md)
+[中文文档 (README.zh-CN.md)](./README.zh-CN.md) · [Realm Method](./docs/REALM_METHOD.md) · [Architecture](./ARCHITECTURE.md) · [Threat Model](./THREAT_MODEL.md) · [Cloud Deployment & Composable UI Guide](./docs/deployment-and-frontend.md) · [UI Builder Skill](./docs/UI_BUILDER_SKILL.md)
 
 Meru Mind is a zero-Docker, single-SQLite TypeScript engine (`CLI` + `MCP Server` + `HTTP/WS Server` + `Composable Web UI` + `SDK`) that separates **space & visibility (`MindRealm`)** from **time & truth depth (`MindSea`)** — so multiple humans and coding agents can share rules, decisions, and evidence without context flooding, stale-fact regressions, or cross-branch leakage.
 
@@ -110,7 +110,7 @@ node dist/cli.js work bind --in /backend --provider github --repo acme/api --tok
 }
 ```
 
-Pair it with the official 23-line skill at [`skills/meru-mind/SKILL.md`](./skills/meru-mind/SKILL.md) for Claude Code, Codex, Cursor, or Antigravity.
+Pair it with the official 23-line everyday skill at [`skills/meru-mind/SKILL.md`](./skills/meru-mind/SKILL.md) for Claude Code, Codex, Cursor, or Antigravity. For bootstrapping realm trees, migrating legacy vaults, or periodic `admin doctor` hygiene, see [`docs/REALM_METHOD.md`](./docs/REALM_METHOD.md) and the on-demand curator skill at [`skills/meru-mind-curator/SKILL.md`](./skills/meru-mind-curator/SKILL.md).
 
 ### Optional Semantic Vector Search (`sqlite-vec`)
 

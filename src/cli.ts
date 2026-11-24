@@ -8,7 +8,9 @@ import {
   ejectDefaultUiShell,
   findRelatedActiveForEcho,
   formatChangesMarkdown,
+  formatDoctorMarkdown,
   formatGenericMarkdown,
+  formatImportDryRunMarkdown,
   formatImportJsonlMarkdown,
   formatImportMdMarkdown,
   formatImportVerifyMarkdown,
@@ -31,6 +33,7 @@ import {
   resolveUnifiedObjectRead,
   resolveVisibleRealm,
   resolveWriteTargetRealm,
+  runRealmDoctor,
   startMindServer,
   toPublicToken,
   toSurfaceError,
@@ -520,10 +523,10 @@ Examples:
   entry: `Risk: high-risk-write (requires --as-human)
 When to use: Move misplaced ledger/raw entries (e.g. triaging /inbox or evacuating an archived realm) in-place without breaking history.
 Usage:
-  meru-mind entry move <entryId>... --to <realmRef> [--dry-run] [--org <orgId>] --as-human
+  meru-mind entry move <entryId>... --to <realmRef> [--from <realmRef>] [--ids-file <path|->] [--dry-run] [--org <orgId>] --as-human
 Examples:
   meru-mind entry move rec_0123456789abcdef --to /ops --as-human
-  meru-mind entry move rec_aaa rec_bbb --to /eng --dry-run --as-human
+  meru-mind entry move --ids-file ids.txt --from / --to /ops --dry-run --as-human
 `,
   object: `Risk: write
 When to use: Create, reparent, delete, link, unlink, set lifecycle state, or manage aliases on structured objects (kind "file" is reserved).
@@ -581,8 +584,8 @@ Examples:
   import: `Risk: write
 When to use: Import Markdown or JSONL corpora and verify DB consistency against sources.
 Usage:
-  meru-mind import md <file-or-dir> [--in <realm>] [--map <mapping.json>] [--base-dir <dir>] [--source-ref <ref>] [--kind <kind>] [--sensitivity <level>] [--about <obj>]... [--include-secret] [--sync-embeddings] [--as-human]
-  meru-mind import jsonl <file.jsonl> --map <mapping.json> [--in <realm>] [--sync-embeddings] [--as-human]
+  meru-mind import md <file-or-dir> [--in <realm>] [--map <mapping.json>] [--base-dir <dir>] [--source-ref <ref>] [--kind <kind>] [--sensitivity <level>] [--about <obj>]... [--include-secret] [--sync-embeddings] [--dry-run] [--as-human]
+  meru-mind import jsonl <file.jsonl> --map <mapping.json> [--in <realm>] [--sync-embeddings] [--dry-run] [--as-human]
   meru-mind import verify --source <file|dir> [--in <realm>] [--map <mapping.json>] [--base-dir <dir>]
 Examples:
   meru-mind import md ./notes --in /ops
@@ -603,6 +606,7 @@ Examples:
 When to use: Initialize a store, take atomic VACUUM INTO backups, sync pending embeddings, rebuild derived indexes/drive, or export a read-only slice.
 Usage:
   meru-mind admin init [--org <name>] [--personal] [--policy open|tree]
+  meru-mind admin doctor
   meru-mind admin backup --out <file.sqlite>
   meru-mind admin sync-embeddings [--batch-size <n>] [--max-items <n>]
   meru-mind admin rebuild [--no-restore-drive]
@@ -1508,6 +1512,20 @@ async function main(): Promise<void> {
         output(res, formatGenericMarkdown("Initialized", res));
         return;
       }
+      if (sub === "doctor") {
+        assertAllowedFlags(flags, [], "admin doctor");
+        const ctx = resolveSessionContext({ engine, flags });
+        const treeRes = engine.sea.tree({
+          actor,
+          viewerRealmId: ctx.boundViewerRealmId,
+          depth: "all",
+          includeObjects: true,
+          scopeCeiling: ctx.boundScope,
+        });
+        const report = runRealmDoctor(treeRes);
+        output(report, formatDoctorMarkdown(report));
+        return;
+      }
       if (sub === "backup") {
         assertAllowedFlags(flags, ["out"], "admin backup");
         const outPath = requireFlag(flags, "out", "admin backup");
@@ -1966,36 +1984,121 @@ async function main(): Promise<void> {
 
     if (cmd === "entry") {
       if (sub === "move") {
-        assertAllowedFlags(flags, ["to", "dry-run"], "entry move");
-        const entryIds = positionals.slice(2).map((s) => s.trim()).filter(Boolean);
+        assertAllowedFlags(
+          flags,
+          ["to", "from", "ids-file", "dry-run"],
+          "entry move",
+        );
+        const idsFromPos = positionals.slice(2).map((s) => s.trim()).filter(Boolean);
+        const idsFile = flagStr(flags, "ids-file");
+        const idsFromFile: string[] = [];
+        if (idsFile) {
+          const raw =
+            idsFile === "-"
+              ? fs.readFileSync(0, "utf8")
+              : fs.readFileSync(idsFile, "utf8");
+          for (const line of raw.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith("#")) continue;
+            for (const tok of trimmed.split(/\s+/)) {
+              if (tok) idsFromFile.push(tok);
+            }
+          }
+        }
+        const entryIds = Array.from(new Set([...idsFromPos, ...idsFromFile]));
         if (entryIds.length === 0) {
           throw new MindError(
             "INVALID_INPUT",
-            "Missing <entryId>... for 'entry move'",
-            { try: "meru-mind entry move <entryId> --to /ops --as-human" },
+            "Missing <entryId>... or --ids-file <path|-> for 'entry move'",
+            {
+              try: "meru-mind entry move <entryId> --to /ops --as-human",
+            },
           );
         }
-        const orgId = resolveAdminOrgId(engine, orgFlag);
+        const ctx = resolveSessionContext({ engine, flags });
         const toRef = requireFlag(flags, "to", "entry move");
-        const targetRealmId = resolveAdminRealmId(engine, toRef, orgId);
-        const res = engine.ledger.moveEntries({
-          actor,
-          orgId,
-          entryIds,
-          targetRealmId,
-          dryRun: flagBool(flags, "dry-run"),
+        const fromRef = flagStr(flags, "from");
+        const dryRun = flagBool(flags, "dry-run");
+        const surface = new LocalMindSurface({
+          engine,
+          principal: {
+            tokenId: null,
+            orgId: ctx.org.id,
+            actor,
+            boundRealmId: ctx.boundViewerRealmId,
+            boundSource: ctx.boundSource,
+            authKind: "local",
+          },
+          ownsEngine: false,
         });
-        const mdLines = [
-          `# Entry Move${res.dryRun ? " (Dry Run)" : ""}: -> \`${res.targetRealmPath}\``,
-          `- Moved: ${res.moved.length}`,
-          `- Skipped (already in target): ${res.skippedAlreadyInTargetIds.length}`,
-          ...res.moved.map(
-            (m) =>
-              `- \`${m.id}\` (${m.entityType}): \`${m.fromRealmPath}\` -> \`${m.toRealmPath}\`${m.chainExpanded ? " _(chain-expanded)_" : ""}`,
-          ),
-        ];
-        output(res, mdLines.join("\n"));
-        return;
+        try {
+          const BATCH_SIZE = 250;
+          const allMoved: Array<{
+            id: string;
+            entityType: "record" | "seabed";
+            fromRealmId: string;
+            fromRealmPath: string;
+            toRealmId: string;
+            toRealmPath: string;
+            chainExpanded?: boolean;
+          }> = [];
+          const seenMovedIds = new Set<string>();
+          const seenSkippedIds = new Set<string>();
+          const allSkipped: string[] = [];
+          let targetRealmId = "";
+          let targetRealmPath = "";
+          let batches = 0;
+
+          for (let i = 0; i < entryIds.length; i += BATCH_SIZE) {
+            const chunk = entryIds.slice(i, i + BATCH_SIZE);
+            const part = await surface.move({
+              entryIds: chunk,
+              targetRealmRef: toRef,
+              expectedFromRealmRef: fromRef,
+              dryRun,
+            });
+            targetRealmId = part.targetRealmId;
+            targetRealmPath = part.targetRealmPath;
+            for (const item of part.moved) {
+              if (!seenMovedIds.has(item.id)) {
+                seenMovedIds.add(item.id);
+                allMoved.push(item);
+              }
+            }
+            for (const id of part.skippedAlreadyInTargetIds) {
+              if (!seenMovedIds.has(id) && !seenSkippedIds.has(id)) {
+                seenSkippedIds.add(id);
+                allSkipped.push(id);
+              }
+            }
+            batches += 1;
+          }
+
+          const merged = {
+            dryRun,
+            targetRealmId,
+            targetRealmPath,
+            moved: allMoved,
+            skippedAlreadyInTargetIds: allSkipped,
+            ...(batches > 1 ? { batches } : {}),
+          };
+          const mdLines = [
+            `# Entry Move${merged.dryRun ? " (Dry Run)" : ""}: -> \`${merged.targetRealmPath}\``,
+            `- Moved: ${merged.moved.length}${batches > 1 ? ` (${batches} batches)` : ""}`,
+            `- Skipped (already in target): ${merged.skippedAlreadyInTargetIds.length}`,
+            ...merged.moved.slice(0, 50).map(
+              (m) =>
+                `- \`${m.id}\` (${m.entityType}): \`${m.fromRealmPath}\` -> \`${m.toRealmPath}\`${m.chainExpanded ? " _(chain-expanded)_" : ""}`,
+            ),
+            ...(merged.moved.length > 50
+              ? [`... and ${merged.moved.length - 50} more`]
+              : []),
+          ];
+          output(merged, mdLines.join("\n"));
+          return;
+        } finally {
+          await surface.close();
+        }
       }
       throw new MindError(
         "UNKNOWN_COMMAND",
@@ -2503,6 +2606,67 @@ async function main(): Promise<void> {
     }
 
     if (cmd === "import") {
+      const resolveCliImportTarget = (opts: {
+        ctx: ReturnType<typeof resolveSessionContext>;
+        explicitIn?: string;
+        mapping?: ImportMappingConfig;
+        readOnly: boolean;
+      }): { targetRealmRef?: string; virtualDefaultRealmPath?: string } => {
+        if (opts.explicitIn?.trim()) {
+          return { targetRealmRef: opts.explicitIn.trim() };
+        }
+        if (opts.mapping?.defaultRealm?.trim()) {
+          return { targetRealmRef: opts.mapping.defaultRealm.trim() };
+        }
+        const isExplicitlyBound =
+          opts.ctx.boundSource === "MERU_MIND_VIEWER_REALM_ID";
+        if (
+          !isExplicitlyBound &&
+          opts.ctx.org.policy === "open" &&
+          workspaceMarkerError
+        ) {
+          throw workspaceMarkerError;
+        }
+        if (opts.readOnly) {
+          if (isExplicitlyBound) {
+            const bound = opts.ctx.realms.find(
+              (r) => r.id === opts.ctx.boundViewerRealmId,
+            );
+            return { targetRealmRef: bound?.path };
+          }
+          if (opts.ctx.org.policy === "open" && workspaceMarkerRef) {
+            return { targetRealmRef: workspaceMarkerRef };
+          }
+          if (opts.ctx.org.policy === "open") {
+            const existingInbox = opts.ctx.realms.find(
+              (r) => r.orgId === opts.ctx.org.id && r.path === "/inbox",
+            );
+            return existingInbox
+              ? { targetRealmRef: "/inbox" }
+              : { virtualDefaultRealmPath: "/inbox" };
+          }
+          throw new MindError(
+            "NOT_BOUND",
+            "Target realm could not be determined; pass --in <realm> or bind MERU_MIND_VIEWER_REALM_ID.",
+            { try: "MERU_MIND_VIEWER_REALM_ID=/team/project meru-mind import md ./notes" },
+          );
+        }
+        const routed = resolveWriteTargetRealm({
+          db: engine.db,
+          ledger: engine.ledger,
+          realms: opts.ctx.realms,
+          mounts: engine.db.listMounts(),
+          scope: opts.ctx.boundScope,
+          orgId: opts.ctx.org.id,
+          orgPolicy: opts.ctx.org.policy,
+          actor,
+          viewerRealmId: opts.ctx.boundViewerRealmId,
+          isExplicitlyBound,
+          workspaceMarkerRef,
+        });
+        return { targetRealmRef: routed.realm.path };
+      };
+
       if (sub === "md") {
         assertAllowedFlags(
           flags,
@@ -2517,6 +2681,7 @@ async function main(): Promise<void> {
             "about",
             "include-secret",
             "sync-embeddings",
+            "dry-run",
           ],
           "import md",
         );
@@ -2530,6 +2695,30 @@ async function main(): Promise<void> {
         }
         const mapPath = flagStr(flags, "map");
         const mapping = mapPath ? loadMappingFile(mapPath) : undefined;
+        const isDryRun = flagBool(flags, "dry-run");
+        const importTarget = resolveCliImportTarget({
+          ctx,
+          explicitIn: flagStr(flags, "in"),
+          mapping,
+          readOnly: isDryRun,
+        });
+        if (isDryRun) {
+          const preview = engine.importer.previewImport({
+            viewerRealmId: ctx.boundViewerRealmId,
+            sourcePath: third,
+            sourceType: "md",
+            mapping,
+            baseDir: flagStr(flags, "base-dir"),
+            targetRealmRef: importTarget.targetRealmRef,
+            virtualDefaultRealmPath: importTarget.virtualDefaultRealmPath,
+            skipSecret: !flagBool(flags, "include-secret"),
+          });
+          output(preview, formatImportDryRunMarkdown(preview));
+          if (!preview.valid) {
+            process.exitCode = 1;
+          }
+          return;
+        }
         const vis = createVisibilityHelpers({
           db: engine.db,
           realms: ctx.realms,
@@ -2549,7 +2738,7 @@ async function main(): Promise<void> {
         const res = await engine.importer.importMd({
           actor,
           viewerRealmId: ctx.boundViewerRealmId,
-          targetRealmRef: flagStr(flags, "in"),
+          targetRealmRef: importTarget.targetRealmRef,
           inputPath: third,
           baseDir: flagStr(flags, "base-dir"),
           sourceRef: flagStr(flags, "source-ref"),
@@ -2568,7 +2757,7 @@ async function main(): Promise<void> {
       if (sub === "jsonl") {
         assertAllowedFlags(
           flags,
-          ["in", "map", "sync-embeddings"],
+          ["in", "map", "sync-embeddings", "dry-run"],
           "import jsonl",
         );
         const ctx = resolveSessionContext({ engine, flags });
@@ -2582,10 +2771,32 @@ async function main(): Promise<void> {
         const mapping = loadMappingFile(
           requireFlag(flags, "map", "import jsonl"),
         );
+        const isDryRun = flagBool(flags, "dry-run");
+        const importTarget = resolveCliImportTarget({
+          ctx,
+          explicitIn: flagStr(flags, "in"),
+          mapping,
+          readOnly: isDryRun,
+        });
+        if (isDryRun) {
+          const preview = engine.importer.previewImport({
+            viewerRealmId: ctx.boundViewerRealmId,
+            sourcePath: third,
+            sourceType: "jsonl",
+            mapping,
+            targetRealmRef: importTarget.targetRealmRef,
+            virtualDefaultRealmPath: importTarget.virtualDefaultRealmPath,
+          });
+          output(preview, formatImportDryRunMarkdown(preview));
+          if (!preview.valid) {
+            process.exitCode = 1;
+          }
+          return;
+        }
         const res = await engine.importer.importJsonl({
           actor,
           viewerRealmId: ctx.boundViewerRealmId,
-          targetRealmRef: flagStr(flags, "in"),
+          targetRealmRef: importTarget.targetRealmRef,
           jsonlPath: third,
           mapping,
           syncEmbeddings: flagBool(flags, "sync-embeddings"),
@@ -2610,12 +2821,18 @@ async function main(): Promise<void> {
         }
         const mapPath = flagStr(flags, "map");
         const mapping = mapPath ? loadMappingFile(mapPath) : undefined;
+        const importTarget = resolveCliImportTarget({
+          ctx,
+          explicitIn: flagStr(flags, "in"),
+          mapping,
+          readOnly: true,
+        });
         const res = engine.importer.verifyImportConsistency({
           viewerRealmId: ctx.boundViewerRealmId,
           sourcePath,
           mapping,
           baseDir: flagStr(flags, "base-dir"),
-          targetRealmRef: flagStr(flags, "in"),
+          targetRealmRef: importTarget.targetRealmRef,
         });
         output(res, formatImportVerifyMarkdown(res));
         if (!res.passed) {

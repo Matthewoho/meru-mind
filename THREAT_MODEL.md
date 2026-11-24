@@ -5,6 +5,7 @@
 ## 1. Trust Boundaries & Tenancy
 
 1. **Single-Organization Server Instance**: Open-source `meru-mind serve` hosts **one organization per process and SQLite file**. Future managed multi-tenant deployments use **one tenant = one isolated SQLite file / Durable Object** — eliminating cross-tenant SQL injection or query-filter leaks by physical architecture.
+   - **Bound-Subtree Governance & Move Isolation (`v0.5.3`)**: Realm topology mutations (`createRealm`, `updateRealm` / `realm set`, `archiveRealm`, `unarchiveRealm`) require the target/parent realm to stay strictly inside the caller's bound realm subtree (sub-realm tokens cannot archive or alter ancestor/root realms even though ancestors are readable for rule inheritance). `surface.move` enforces source-entry visibility (opaque `NOT_FOUND` with zero existence oracle or invisible `actualRealmId` disclosure) and, in `tree` mode, constrains both source entries (including chain-expanded nodes) and target realm to the caller's bound subtree.
 2. **Server-Authoritative Identity (`Principal`)**:
    - Every token row in `tokens` stores **only a SHA-256 hash** (`token_hash`). Plaintext tokens (`mm_live_...`) are shown once at mint time and never persisted.
    - `actor_kind` (`"human" | "agent"`) is fixed in SQLite at token issuance. Remote clients **cannot** elevate privilege via headers, JSON fields, or `--as-human` (CLI rejects `--as-human` in remote mode).

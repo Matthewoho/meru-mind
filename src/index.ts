@@ -48,6 +48,7 @@ export type {
   SurfaceAddRuleInput,
   SurfaceRedactInput,
   SurfaceCreateRealmInput,
+  SurfaceUpdateRealmInput,
   SurfaceMountRealmInput,
   SurfaceCreateTokenInput,
   SurfaceCreateTokenResult,
@@ -168,9 +169,17 @@ export {
 } from "./adapters/local-drive.js";
 export {
   LedgerEngine,
+  DEFAULT_ROOT_REALM_SCOPE,
   computePayloadHash,
   isAllowedSupersedeKind,
 } from "./engine/ledger.js";
+export {
+  runRealmDoctor,
+  type DoctorFinding,
+  type DoctorFindingCode,
+  type DoctorReport,
+  type DoctorSeverity,
+} from "./engine/doctor.js";
 export {
   canonicalizeJson,
   sha256Bytes,
@@ -281,7 +290,9 @@ export {
   formatBriefMarkdown,
   formatCatMarkdown,
   formatChangesMarkdown,
+  formatDoctorMarkdown,
   formatGenericMarkdown,
+  formatImportDryRunMarkdown,
   formatImportJsonlMarkdown,
   formatImportMdMarkdown,
   formatImportVerifyMarkdown,

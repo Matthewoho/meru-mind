@@ -5,6 +5,7 @@ import type {
   SurfaceAddRuleInput,
   SurfaceChangesParams,
   SurfaceCreateRealmInput,
+  SurfaceUpdateRealmInput,
   SurfaceCreateTokenInput,
   SurfaceCreateTokenResult,
   SurfaceLsParams,
@@ -337,6 +338,10 @@ export class RemoteMindSurface implements MindSurface {
 
   async createRealm(params: SurfaceCreateRealmInput): Promise<Realm> {
     return this.request<Realm>("POST", "/v1/realms", { body: params });
+  }
+
+  async updateRealm(params: SurfaceUpdateRealmInput): Promise<Realm> {
+    return this.request<Realm>("POST", "/v1/realms/set", { body: params });
   }
 
   async mountRealm(params: SurfaceMountRealmInput): Promise<RealmMount> {

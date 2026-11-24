@@ -1,6 +1,6 @@
-import { assertAccess, resolveAccessScope } from "./policy.js";
+import { assertAccess, getDescendantIds, resolveAccessScope } from "./policy.js";
 import type { MindEngine } from "./index.js";
-import { resolveVisibleRealm } from "./engine/objects.js";
+import { OPAQUE_ENTRY_NOT_FOUND, resolveVisibleRealm } from "./engine/objects.js";
 import { assertNoAccidentalSecret } from "./engine/secret-guard.js";
 import {
   findRelatedActiveForEcho,
@@ -29,6 +29,7 @@ import type {
   SurfaceAddRuleInput,
   SurfaceChangesParams,
   SurfaceCreateRealmInput,
+  SurfaceUpdateRealmInput,
   SurfaceCreateTokenInput,
   SurfaceCreateTokenResult,
   SurfaceLsParams,
@@ -517,11 +518,32 @@ export class LocalMindSurface implements MindSurface {
     });
   }
 
+  private getBoundSubtreeRealmIds(realms: Realm[]): Set<string> {
+    return new Set<string>([
+      this.principal.boundRealmId,
+      ...getDescendantIds(realms, this.principal.boundRealmId),
+    ]);
+  }
+
+  private assertWithinBoundSubtree(
+    realms: Realm[],
+    targetRealm: Realm,
+    action: string,
+  ): void {
+    const allowed = this.getBoundSubtreeRealmIds(realms);
+    if (!allowed.has(targetRealm.id)) {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Cannot ${action} "${targetRealm.path}": realm is outside your bound subtree.`,
+      );
+    }
+  }
+
   async move(params: SurfaceMoveInput): Promise<MoveEntriesResult> {
     // Reversible governance verb: allowed for human actors via local, Bearer, AND browser Cookie!
     this.assertHuman(
       "move entries between realms",
-      `meru-mind move ${params.entryIds.join(" ")} --to ${params.targetRealmRef} --as-human`,
+      `meru-mind entry move ${params.entryIds.join(" ")} --to ${params.targetRealmRef} --as-human`,
     );
     const ctx = this.resolveScopeContext(false);
     const targetRealm = resolveVisibleRealm({
@@ -530,6 +552,16 @@ export class LocalMindSurface implements MindSurface {
       ref: params.targetRealmRef,
       scope: ctx.scope,
     });
+    if (ctx.org.policy === "tree") {
+      this.assertWithinBoundSubtree(ctx.realms, targetRealm, "move entries into");
+    }
+
+    const readableLedgerSet = new Set(ctx.scope.readableLedgerIds);
+    const readableSeabedSet = new Set(ctx.scope.readableSeabedIds);
+    const writableSourceRealmIds =
+      ctx.org.policy === "tree"
+        ? this.getBoundSubtreeRealmIds(ctx.realms)
+        : undefined;
 
     if (params.expectedFromRealmRef) {
       const expectedFrom = resolveVisibleRealm({
@@ -541,11 +573,17 @@ export class LocalMindSurface implements MindSurface {
       for (const id of params.entryIds) {
         const rec = this.engine.db.getRecord(id);
         const sea = rec ? null : this.engine.db.getSeabedEntry(id);
+        const entryOrgId = rec?.orgId ?? sea?.orgId ?? null;
         const curRealmId = rec?.realmId ?? sea?.realmId ?? null;
-        if (!curRealmId) {
-          throw new MindError("NOT_FOUND", `Entry not found: ${id}`);
+        const isReadable = rec
+          ? readableLedgerSet.has(rec.realmId)
+          : sea
+            ? readableSeabedSet.has(sea.realmId)
+            : false;
+        if (!curRealmId || entryOrgId !== ctx.org.id || !isReadable) {
+          throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
         }
-        // Idempotent success if already moved to targetRealm; CAS conflict if moved elsewhere
+        // Idempotent success if already moved to targetRealm; CAS conflict if moved elsewhere (within readable scope only)
         if (curRealmId !== expectedFrom.id && curRealmId !== targetRealm.id) {
           throw new MindError(
             "CONFLICT",
@@ -567,6 +605,9 @@ export class LocalMindSurface implements MindSurface {
       entryIds: params.entryIds,
       targetRealmId: targetRealm.id,
       dryRun: params.dryRun,
+      allowedSourceLedgerIds: readableLedgerSet,
+      allowedSourceSeabedIds: readableSeabedSet,
+      writableSourceRealmIds,
     });
   }
 
@@ -641,7 +682,7 @@ export class LocalMindSurface implements MindSurface {
   }
 
   async createRealm(params: SurfaceCreateRealmInput): Promise<Realm> {
-    const cliCmd = `meru-mind realm create --parent ${params.parentRef} --slug ${params.slug} --name ${JSON.stringify(params.name)} --as-human`;
+    const cliCmd = `meru-mind realm create --parent ${params.parentRef} --slug ${params.slug} --name ${JSON.stringify(params.name)} --scope "<scope>" --as-human`;
     this.assertNotWeakenedCookie("realm create", cliCmd);
     this.assertHuman("create realms", cliCmd);
     const ctx = this.resolveScopeContext(false);
@@ -651,6 +692,7 @@ export class LocalMindSurface implements MindSurface {
       ref: params.parentRef,
       scope: ctx.scope,
     });
+    this.assertWithinBoundSubtree(ctx.realms, parent, "create child realm under");
     return this.engine.ledger.createRealm({
       orgId: ctx.org.id,
       parentId: parent.id,
@@ -658,6 +700,27 @@ export class LocalMindSurface implements MindSurface {
       name: params.name,
       scope: params.scope,
       actor: this.principal.actor,
+    });
+  }
+
+  async updateRealm(params: SurfaceUpdateRealmInput): Promise<Realm> {
+    const cliCmd = `meru-mind realm set ${params.ref}${params.scope !== undefined ? ` --scope ${JSON.stringify(params.scope)}` : ""}${params.name !== undefined ? ` --name ${JSON.stringify(params.name)}` : ""} --as-human`;
+    this.assertNotWeakenedCookie("realm set", cliCmd);
+    this.assertHuman("update realm metadata", cliCmd);
+    const ctx = this.resolveScopeContext(false);
+    const target = resolveVisibleRealm({
+      realms: ctx.realms,
+      orgId: ctx.org.id,
+      ref: params.ref,
+      scope: ctx.scope,
+    });
+    this.assertWithinBoundSubtree(ctx.realms, target, "update realm");
+    return this.engine.ledger.updateRealm({
+      actor: this.principal.actor,
+      orgId: ctx.org.id,
+      realmId: target.id,
+      name: params.name,
+      scope: params.scope,
     });
   }
 
@@ -724,6 +787,7 @@ export class LocalMindSurface implements MindSurface {
       ref: params.ref,
       scope: ctx.scope,
     });
+    this.assertWithinBoundSubtree(ctx.realms, target, "archive realm");
     return this.engine.ledger.archiveRealm({
       actor: this.principal.actor,
       orgId: ctx.org.id,
@@ -742,6 +806,7 @@ export class LocalMindSurface implements MindSurface {
       ref: params.ref,
       scope: ctx.scope,
     });
+    this.assertWithinBoundSubtree(ctx.realms, target, "unarchive realm");
     return this.engine.ledger.unarchiveRealm({
       actor: this.principal.actor,
       orgId: ctx.org.id,

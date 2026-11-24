@@ -1,5 +1,7 @@
+import fs from "node:fs";
 import {
   formatChangesMarkdown,
+  formatDoctorMarkdown,
   formatGenericMarkdown,
   formatLsMarkdown,
   formatSearchMarkdown,
@@ -8,6 +10,7 @@ import {
   formatWhoamiMarkdown,
   MindError,
   RemoteMindSurface,
+  runRealmDoctor,
   type LsOnlyFilter,
   type MountScope,
   type OrgPolicy,
@@ -226,19 +229,81 @@ export async function runRemoteCliCommand(
     }
 
     if (cmd === "entry" && sub === "move") {
-      const entryIds = positionals.slice(2).filter(Boolean);
+      const idsFromPos = positionals.slice(2).map((s) => s.trim()).filter(Boolean);
+      const idsFile = str(flags, "ids-file");
+      const idsFromFile: string[] = [];
+      if (idsFile) {
+        const raw =
+          idsFile === "-"
+            ? fs.readFileSync(0, "utf8")
+            : fs.readFileSync(idsFile, "utf8");
+        for (const line of raw.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith("#")) continue;
+          for (const tok of trimmed.split(/\s+/)) {
+            if (tok) idsFromFile.push(tok);
+          }
+        }
+      }
+      const entryIds = Array.from(new Set([...idsFromPos, ...idsFromFile]));
       if (entryIds.length === 0) {
         throw new MindError(
           "INVALID_INPUT",
-          "entry move requires one or more <entryId> arguments",
+          "entry move requires one or more <entryId> arguments or --ids-file <path|->",
         );
       }
-      const res = await surface.move({
-        entryIds,
-        targetRealmRef: reqStr(flags, "to", "entry move"),
-        dryRun: bool(flags, "dry-run"),
-      });
-      output(res, formatGenericMarkdown("Moved Entries", res));
+      const targetRealmRef = reqStr(flags, "to", "entry move");
+      const expectedFromRealmRef = str(flags, "from");
+      const dryRun = bool(flags, "dry-run");
+      const BATCH_SIZE = 250;
+      const allMoved: Array<{
+        id: string;
+        entityType: "record" | "seabed";
+        fromRealmId: string;
+        fromRealmPath: string;
+        toRealmId: string;
+        toRealmPath: string;
+        chainExpanded?: boolean;
+      }> = [];
+      const seenMovedIds = new Set<string>();
+      const seenSkippedIds = new Set<string>();
+      const allSkipped: string[] = [];
+      let targetRealmId = "";
+      let targetRealmPath = "";
+      let batches = 0;
+      for (let i = 0; i < entryIds.length; i += BATCH_SIZE) {
+        const chunk = entryIds.slice(i, i + BATCH_SIZE);
+        const part = await surface.move({
+          entryIds: chunk,
+          targetRealmRef,
+          expectedFromRealmRef,
+          dryRun,
+        });
+        targetRealmId = part.targetRealmId;
+        targetRealmPath = part.targetRealmPath;
+        for (const item of part.moved) {
+          if (!seenMovedIds.has(item.id)) {
+            seenMovedIds.add(item.id);
+            allMoved.push(item);
+          }
+        }
+        for (const id of part.skippedAlreadyInTargetIds) {
+          if (!seenMovedIds.has(id) && !seenSkippedIds.has(id)) {
+            seenSkippedIds.add(id);
+            allSkipped.push(id);
+          }
+        }
+        batches += 1;
+      }
+      const merged = {
+        dryRun,
+        targetRealmId,
+        targetRealmPath,
+        moved: allMoved,
+        skippedAlreadyInTargetIds: allSkipped,
+        ...(batches > 1 ? { batches } : {}),
+      };
+      output(merged, formatGenericMarkdown("Moved Entries", merged));
       return;
     }
 
@@ -288,9 +353,23 @@ export async function runRemoteCliCommand(
           parentRef: str(flags, "parent") ?? "/",
           slug: reqStr(flags, "slug", "realm create"),
           name: reqStr(flags, "name", "realm create"),
-          scope: str(flags, "scope"),
+          scope: reqStr(flags, "scope", "realm create"),
         });
         output(res, formatGenericMarkdown("Realm Created", res));
+        return;
+      }
+      if (sub === "set") {
+        if (!third?.trim()) {
+          throw new MindError("INVALID_INPUT", "Missing <realmRef> for 'realm set'", {
+            try: 'meru-mind realm set /ops --scope "Include: ... Exclude: ..."',
+          });
+        }
+        const res = await surface.updateRealm({
+          ref: third.trim(),
+          name: str(flags, "name"),
+          scope: str(flags, "scope"),
+        });
+        output(res, formatGenericMarkdown("Realm Updated", res));
         return;
       }
       if (sub === "mount") {
@@ -458,6 +537,16 @@ export async function runRemoteCliCommand(
         output(res, formatGenericMarkdown("Resolved Work Items", res));
         return;
       }
+    }
+
+    if (cmd === "admin" && sub === "doctor") {
+      const treeRes = await surface.tree({
+        depth: "all",
+        includeObjects: true,
+      });
+      const report = runRealmDoctor(treeRes);
+      output(report, formatDoctorMarkdown(report));
+      return;
     }
 
     if (cmd === "admin" && sub === "backup") {

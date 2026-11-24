@@ -12,7 +12,7 @@ function loadPackageVersion(): string {
   } catch {
     // Fallback if package.json is unavailable in a custom bundle
   }
-  return "0.5.2";
+  return "0.5.3";
 }
 
 export const MERU_MIND_VERSION: string = loadPackageVersion();

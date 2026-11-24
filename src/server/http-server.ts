@@ -18,6 +18,7 @@ import { LocalMindSurface } from "../surface-local.js";
 import type {
   SurfaceAddRuleInput,
   SurfaceCreateRealmInput,
+  SurfaceUpdateRealmInput,
   SurfaceCreateTokenInput,
   SurfaceMountRealmInput,
   SurfaceMoveInput,
@@ -670,6 +671,13 @@ export async function startMindServer(
             if (method === "POST" && pathname === "/v1/realms") {
               const body = (await readJsonBody(req)) as unknown as SurfaceCreateRealmInput;
               const out = await surface.createRealm(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/realms/set") {
+              const body = (await readJsonBody(req)) as unknown as SurfaceUpdateRealmInput;
+              const out = await surface.updateRealm(body);
               sendJson(res, 200, out);
               return;
             }

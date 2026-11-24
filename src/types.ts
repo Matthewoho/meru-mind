@@ -1084,3 +1084,24 @@ export interface ImportConsistencyResult {
   activeSupersededMismatches: ImportConsistencyMismatch[];
   timestampMismatches: ImportConsistencyMismatch[];
 }
+
+export interface ImportDryRunUnresolvedRealm {
+  rawValue: string;
+  targetRef: string;
+  count: number;
+}
+
+export interface ImportDryRunResult {
+  dryRun: true;
+  sourceType: "md" | "jsonl";
+  totalItems: number;
+  plannedDefaultRealm: string;
+  defaultRealmCount: number;
+  undatedCount: number;
+  skippedSecret: number;
+  skippedRedacted: number;
+  realmDistribution: Record<string, number>;
+  unmatchedRealmValues: Record<string, number>;
+  unresolvedRealms: ImportDryRunUnresolvedRealm[];
+  valid: boolean;
+}

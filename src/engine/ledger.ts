@@ -53,6 +53,7 @@ import {
 } from "./content-hash.js";
 import {
   normalizeResourceTag,
+  OPAQUE_ENTRY_NOT_FOUND,
   OPAQUE_OBJECT_NOT_FOUND,
   resolveVisibleRealm,
 } from "./objects.js";
@@ -200,6 +201,9 @@ export function isAllowedSupersedeKind(
   return false;
 }
 
+export const DEFAULT_ROOT_REALM_SCOPE =
+  "Include: org-wide rules and decisions that bind every realm. Exclude: anything a child realm owns.";
+
 export class LedgerEngine {
   constructor(
     private readonly db: DbPort,
@@ -289,6 +293,7 @@ export class LedgerEngine {
       slug: "root",
       path: "/",
       name: `${name} Root`,
+      scope: DEFAULT_ROOT_REALM_SCOPE,
       archivedAt: null,
       createdAt: now,
     };
@@ -648,6 +653,11 @@ export class LedgerEngine {
     entryIds: string[];
     targetRealmId: string;
     dryRun?: boolean;
+    /** Optional caller visibility guard: entries outside these sets throw opaque NOT_FOUND */
+    allowedSourceLedgerIds?: ReadonlySet<string>;
+    allowedSourceSeabedIds?: ReadonlySet<string>;
+    /** Optional caller write-boundary guard (e.g. tree-mode bound subtree): readable-only ancestors/mounts throw ACCESS_DENIED */
+    writableSourceRealmIds?: ReadonlySet<string>;
   }): MoveEntriesResult {
     const MAX_MOVE_BATCH = 500;
     const actor = validateActor(params.actor);
@@ -725,10 +735,21 @@ export class LedgerEngine {
 
         const rec = this.db.getRecord(cur.id);
         if (rec) {
-          if (rec.orgId !== org.id) {
+          if (
+            rec.orgId !== org.id ||
+            (params.allowedSourceLedgerIds &&
+              !params.allowedSourceLedgerIds.has(rec.realmId))
+          ) {
+            throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+          }
+          if (
+            params.writableSourceRealmIds &&
+            !params.writableSourceRealmIds.has(rec.realmId)
+          ) {
+            const fromPath = realmsById.get(rec.realmId)?.path ?? rec.realmId;
             throw new MindError(
-              "NOT_FOUND",
-              `Entry not found in organization "${org.id}": ${cur.id}`,
+              "ACCESS_DENIED",
+              `Cannot move entry "${rec.id}" out of read-only realm "${fromPath}" (outside bound subtree).`,
             );
           }
           plannedById.set(rec.id, {
@@ -759,10 +780,21 @@ export class LedgerEngine {
 
         const sea = this.db.getSeabedEntry(cur.id);
         if (sea) {
-          if (sea.orgId !== org.id) {
+          if (
+            sea.orgId !== org.id ||
+            (params.allowedSourceSeabedIds &&
+              !params.allowedSourceSeabedIds.has(sea.realmId))
+          ) {
+            throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+          }
+          if (
+            params.writableSourceRealmIds &&
+            !params.writableSourceRealmIds.has(sea.realmId)
+          ) {
+            const fromPath = realmsById.get(sea.realmId)?.path ?? sea.realmId;
             throw new MindError(
-              "NOT_FOUND",
-              `Entry not found in organization "${org.id}": ${cur.id}`,
+              "ACCESS_DENIED",
+              `Cannot move entry "${sea.id}" out of read-only realm "${fromPath}" (outside bound subtree).`,
             );
           }
           if (sea.sourceRef && parseDriveSourceRef(sea.sourceRef)) {
@@ -788,7 +820,9 @@ export class LedgerEngine {
 
         throw new MindError(
           "NOT_FOUND",
-          `Entry not found in organization "${org.id}": ${cur.id}`,
+          params.allowedSourceLedgerIds
+            ? OPAQUE_ENTRY_NOT_FOUND
+            : `Entry not found in organization "${org.id}": ${cur.id}`,
         );
       }
 
