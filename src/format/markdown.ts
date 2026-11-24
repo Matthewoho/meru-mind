@@ -9,6 +9,7 @@ import type {
   BriefOutput,
   CatResult,
   ChangesResult,
+  ExportMdResult,
   ImportConsistencyResult,
   ImportDryRunResult,
   ImportJsonlResult,
@@ -1131,8 +1132,16 @@ export function formatSearchMarkdown(res: SearchResult): string {
 }
 
 export function formatImportDryRunMarkdown(res: ImportDryRunResult): string {
+  const statusLabel = res.valid
+    ? "READY"
+    : [
+        res.unresolvedRealms.length > 0 ? "UNRESOLVED REALMS" : "",
+        res.oversizedFiles.length > 0 ? "OVERSIZED FILES" : "",
+      ]
+        .filter(Boolean)
+        .join(" + ");
   const lines: string[] = [
-    `# Import Dry Run (${res.sourceType.toUpperCase()}) — ${res.valid ? "READY" : "UNRESOLVED REALMS"}`,
+    `# Import Dry Run (${res.sourceType.toUpperCase()}) — ${statusLabel}`,
     "",
     `- **Total items**: ${res.totalItems}`,
     `- **Planned default realm**: \`${res.plannedDefaultRealm}\` (${res.defaultRealmCount} fallback item(s))`,
@@ -1167,6 +1176,33 @@ export function formatImportDryRunMarkdown(res: ImportDryRunResult): string {
       );
     }
   }
+  if (res.oversizedFiles.length > 0) {
+    lines.push("", "## Oversized Files (Exceed Import Size Limit)");
+    for (const f of res.oversizedFiles) {
+      const mb = (f.sizeBytes / 1_048_576).toFixed(2);
+      const limMb = (f.limitBytes / 1_048_576).toFixed(2);
+      lines.push(`- \`${f.path}\` (${mb} MB > ${limMb} MB limit)`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function formatExportMdMarkdown(res: ExportMdResult): string {
+  const lines: string[] = [
+    `# One-Way Markdown Export${res.dryRun ? " (Dry Run)" : ""}`,
+    "",
+    `- **Org**: ${res.orgName} (\`${res.orgId}\`)`,
+    `- **Output Dir**: \`${res.outDir}\``,
+    `- **Exported**: ${res.exportedCount} active record(s)`,
+    `- **Skipped**: secret=${res.skippedSecret}, confidential=${res.skippedConfidential}, redacted=${res.skippedRedacted}`,
+  ];
+  if (res.manifestPath) {
+    lines.push(`- **Manifest**: \`${res.manifestPath}\``);
+  }
+  lines.push(
+    "",
+    "> One-way projection only: do not edit exported files expecting sync back into SQLite. If committed to Git, `redact` cannot purge historical Git commits.",
+  );
   return lines.join("\n");
 }
 

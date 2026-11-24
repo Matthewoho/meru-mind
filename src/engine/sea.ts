@@ -4766,13 +4766,14 @@ export class SeaEngine {
 
       const indexText = `${title}\n${distillation.narrativeMd}`.trim();
       if (indexText) {
+        // v0.5.5: pointer-only vec_pending row (syncEmbeddings hydrates text from canonical distillation)
         this.db.markVectorPending({
           itemId: distillation.id,
           sourceType: "distillation",
           orgId: targetRealm.orgId,
           realmId: distillation.realmId,
           status: distillation.status,
-          text: indexText,
+          text: "",
           queuedAt: now,
         });
       }
@@ -4816,19 +4817,82 @@ export class SeaEngine {
     let failed = 0;
     let failedOffset = 0;
 
+    const hydrateCanonicalEmbedText = (pending: {
+      itemId: string;
+      sourceType: "record" | "seabed" | "distillation";
+      text: string;
+    }): string | null => {
+      if (pending.text && pending.text.trim()) {
+        return pending.text;
+      }
+      if (pending.sourceType === "record") {
+        const rec = this.db.getRecord(pending.itemId);
+        if (
+          !rec ||
+          rec.redactedAt !== null ||
+          rec.sensitivity === "secret" ||
+          rec.status === "retracted"
+        ) {
+          return null;
+        }
+        const body =
+          typeof rec.payload.body === "string"
+            ? rec.payload.body
+            : typeof rec.payload.summary === "string"
+              ? rec.payload.summary
+              : JSON.stringify(rec.payload);
+        return `${rec.title}\n${body}`.trim() || null;
+      }
+      if (pending.sourceType === "seabed") {
+        const sea = this.db.getSeabedEntry(pending.itemId);
+        if (!sea || sea.redactedAt !== null || sea.sensitivity === "secret") {
+          return null;
+        }
+        return `${sea.kind}:${sea.topicId ?? sea.realmId}\n${sea.text}`.trim() || null;
+      }
+      const dist = this.db.getDistillation(pending.itemId);
+      if (!dist || (dist.status as string) === "retracted") {
+        return null;
+      }
+      return `${dist.layer}:${dist.periodKey}\n${dist.narrativeMd}`.trim() || null;
+    };
+
     while (processed < maxItems) {
       const limit = Math.min(batchSize, maxItems - processed);
       const batch = this.db.listPendingVectors(limit, failedOffset);
       if (batch.length === 0) break;
 
-      const texts = batch.map((item) => item.text);
+      const hydrated: Array<{ pending: (typeof batch)[number]; text: string }> = [];
+      const dropIds: string[] = [];
+      for (const item of batch) {
+        const text = hydrateCanonicalEmbedText(item);
+        if (!text) {
+          dropIds.push(item.itemId);
+        } else {
+          hydrated.push({ pending: item, text });
+        }
+      }
+      if (dropIds.length > 0) {
+        this.db.transaction(() => {
+          for (const id of dropIds) {
+            this.db.deletePendingVector(id);
+            processed += 1;
+            skipped += 1;
+          }
+        });
+      }
+      if (hydrated.length === 0) {
+        continue;
+      }
+
+      const texts = hydrated.map((h) => h.text);
       let vectors: Array<Float32Array | null>;
       if (typeof this.embedder.embedBatch === "function") {
         try {
           const out = await this.embedder.embedBatch(texts);
-          vectors = batch.map((_, idx) => out[idx] ?? null);
+          vectors = hydrated.map((_, idx) => out[idx] ?? null);
         } catch {
-          vectors = batch.map(() => null);
+          vectors = hydrated.map(() => null);
         }
       } else {
         vectors = await Promise.all(
@@ -4841,8 +4905,8 @@ export class SeaEngine {
       // 2) canonical row still exists, not redacted, not secret, not retracted
       // 3) use live status from canonical row when writing vec_items, then delete vec_pending
       this.db.transaction(() => {
-        for (let i = 0; i < batch.length; i += 1) {
-          const pending = batch[i]!;
+        for (let i = 0; i < hydrated.length; i += 1) {
+          const pending = hydrated[i]!.pending;
           const vec = vectors[i] ?? null;
           processed += 1;
 
@@ -4983,13 +5047,14 @@ export class SeaEngine {
         ftsIndexed += 1;
         const text = `${item.title}\n${item.body}`.trim();
         if (!text) return;
+        // v0.5.5: pointer-only vec_pending row (zero duplicate body storage)
         this.db.markVectorPending({
           itemId: item.itemId,
           sourceType: item.sourceType,
           orgId: item.orgId,
           realmId: item.realmId,
           status: item.status,
-          text,
+          text: "",
           queuedAt: now,
         });
       };

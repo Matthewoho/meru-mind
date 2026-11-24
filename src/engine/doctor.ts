@@ -3,6 +3,7 @@ import type {
   ObjectTreeNode,
   OrgPolicy,
   RealmTreeNode,
+  StorageBloatStats,
   TreeResult,
 } from "../types.js";
 
@@ -15,7 +16,8 @@ export type DoctorFindingCode =
   | "missing_scope"
   | "zero_rules_org"
   | "type_bucket_suspect"
-  | "oversized_leaf_realm";
+  | "oversized_leaf_realm"
+  | "storage_duplicate_body";
 
 export interface DoctorFinding {
   code: DoctorFindingCode;
@@ -61,7 +63,10 @@ function flattenObjectNodes(
  * Zero extra SQL queries, zero new REST endpoints, and zero risk of cross-realm visibility
  * leaks in `tree` mode.
  */
-export function runRealmDoctor(tree: TreeResult): DoctorReport {
+export function runRealmDoctor(
+  tree: TreeResult,
+  storageStats?: StorageBloatStats,
+): DoctorReport {
   const findings: DoctorFinding[] = [];
   let visibleActiveRealms = 0;
   let totalDirectConclusions = 0;
@@ -209,6 +214,23 @@ export function runRealmDoctor(tree: TreeResult): DoctorReport {
         totalDirectRules: 0,
       },
       try: 'meru-mind rule add --in / --title "<binding constraint>" --body "<rationale and rule>" --as-human',
+    });
+  }
+
+  // 8. Storage duplicate-body guard (local DB diagnostic when storageStats provided)
+  if (storageStats && storageStats.vecPendingTextBytes > 1_048_576) {
+    const mb = +(storageStats.vecPendingTextBytes / 1_048_576).toFixed(2);
+    findings.push({
+      code: "storage_duplicate_body",
+      severity: "warn",
+      realmPath: "/",
+      summary: `Secondary queue table "vec_pending" holds ${mb} MB of duplicated body text across ${storageStats.vecPendingCount} rows (canonical records payload is ${(storageStats.recordsPayloadBytes / 1_048_576).toFixed(2)} MB). Upgrade/re-open the database to run migration v11 and reclaim space.`,
+      metrics: {
+        vecPendingTextBytes: storageStats.vecPendingTextBytes,
+        vecPendingCount: storageStats.vecPendingCount,
+        recordsPayloadBytes: storageStats.recordsPayloadBytes,
+      },
+      try: "meru-mind admin rebuild",
     });
   }
 

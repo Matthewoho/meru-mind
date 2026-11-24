@@ -6,9 +6,11 @@ import {
   createMindEngine,
   discoverWorkspaceRealmMarker,
   ejectDefaultUiShell,
+  exportRecordsAsMarkdown,
   findRelatedActiveForEcho,
   formatChangesMarkdown,
   formatDoctorMarkdown,
+  formatExportMdMarkdown,
   formatGenericMarkdown,
   formatImportDryRunMarkdown,
   formatImportJsonlMarkdown,
@@ -91,6 +93,7 @@ const BOOLEAN_FLAGS = new Set([
   "personal",
   "as-human",
   "init-token",
+  "include-confidential",
   "demo",
   "history",
   "full",
@@ -611,6 +614,7 @@ Usage:
   meru-mind admin sync-embeddings [--batch-size <n>] [--max-items <n>]
   meru-mind admin rebuild [--no-restore-drive]
   meru-mind admin export-slice [--in <realm>] --out <dir>
+  meru-mind admin export-md <out-dir> [--in <realm>] [--include-confidential] [--dry-run]
 Examples:
   meru-mind admin init --org "Acme" --policy open
   meru-mind admin backup --out ./backups/mind-snapshot.sqlite
@@ -1522,7 +1526,7 @@ async function main(): Promise<void> {
           includeObjects: true,
           scopeCeiling: ctx.boundScope,
         });
-        const report = runRealmDoctor(treeRes);
+        const report = runRealmDoctor(treeRes, engine.db.getStorageBloatStats());
         output(report, formatDoctorMarkdown(report));
         return;
       }
@@ -1573,6 +1577,32 @@ async function main(): Promise<void> {
           outDir: requireFlag(flags, "out", "admin export-slice"),
         });
         output(res, formatGenericMarkdown("Slice Exported", res));
+        return;
+      }
+      if (sub === "export-md") {
+        assertAllowedFlags(
+          flags,
+          ["in", "out", "include-confidential", "dry-run"],
+          "admin export-md",
+        );
+        const ctx = resolveSessionContext({ engine, flags });
+        const outDir = flagStr(flags, "out") ?? third;
+        if (!outDir) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "Missing output directory for 'admin export-md <out-dir>'",
+            { try: "meru-mind admin export-md ./export-wiki --dry-run" },
+          );
+        }
+        const res = exportRecordsAsMarkdown({
+          db: engine.db,
+          viewerRealmId: ctx.boundViewerRealmId,
+          outDir,
+          targetRealmRef: flagStr(flags, "in"),
+          includeConfidential: flagBool(flags, "include-confidential"),
+          dryRun: flagBool(flags, "dry-run"),
+        });
+        output(res, formatExportMdMarkdown(res));
         return;
       }
       throw new MindError(

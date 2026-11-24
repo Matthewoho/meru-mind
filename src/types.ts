@@ -1107,6 +1107,12 @@ export interface ImportDryRunUnresolvedRealm {
   count: number;
 }
 
+export interface ImportDryRunOversizedFile {
+  path: string;
+  sizeBytes: number;
+  limitBytes: number;
+}
+
 export interface ImportDryRunResult {
   dryRun: true;
   sourceType: "md" | "jsonl";
@@ -1119,5 +1125,35 @@ export interface ImportDryRunResult {
   realmDistribution: Record<string, number>;
   unmatchedRealmValues: Record<string, number>;
   unresolvedRealms: ImportDryRunUnresolvedRealm[];
+  oversizedFiles: ImportDryRunOversizedFile[];
   valid: boolean;
+}
+
+export interface StorageBloatStats {
+  recordsCount: number;
+  recordsPayloadBytes: number;
+  vecPendingCount: number;
+  vecPendingTextBytes: number;
+}
+
+export interface ExportMdItemResult {
+  recordId: string;
+  realmPath: string;
+  relativePath: string;
+  bytes: number;
+}
+
+export interface ExportMdResult {
+  oneWayProjection: true;
+  dryRun: boolean;
+  outDir: string;
+  orgId: string;
+  orgName: string;
+  exportedCount: number;
+  skippedSecret: number;
+  skippedConfidential: number;
+  skippedRedacted: number;
+  includeConfidential: boolean;
+  manifestPath: string | null;
+  items: ExportMdItemResult[];
 }

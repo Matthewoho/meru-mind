@@ -350,7 +350,8 @@ export class SqliteDb implements DbPort {
 
   private initSchema(): void {
     this.assertMinSqliteVersion(3, 43);
-    this.maybeBackupBeforeMigration(10);
+    this.maybeBackupBeforeMigration(11);
+    let reclaimedVecPendingText = false;
     this.transaction(() => {
       const now = new Date().toISOString();
 
@@ -1272,10 +1273,33 @@ export class SqliteDb implements DbPort {
           .run(nowV10);
       }
 
+      // Migration v11: v0.5.5 thin pointer-only vec_pending (zero duplicate body text stored in queue)
+      if (!applied.has(11)) {
+        const nowV11 = new Date().toISOString();
+        const cleared = this.db
+          .prepare(`UPDATE vec_pending SET text = '' WHERE text != ''`)
+          .run();
+        if (Number(cleared.changes ?? 0) > 0) {
+          reclaimedVecPendingText = true;
+        }
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (11, 'v11_v055_vec_pending_thin', ?)`,
+          )
+          .run(nowV11);
+      }
+
       if (this.vecEnabled && !this.tableExists("vec_items")) {
         this.createVecItemsTable();
       }
     });
+    if (reclaimedVecPendingText && this.dbPath !== ":memory:") {
+      try {
+        this.db.exec(`VACUUM;`);
+      } catch {
+        // Non-fatal if another reader holds a lock during open; cleared rows still reuse freed pages
+      }
+    }
   }
 
   close(): void {
@@ -5404,5 +5428,24 @@ export class SqliteDb implements DbPort {
     if (this.vecEnabled) {
       this.db.exec(`DELETE FROM vec_items;`);
     }
+  }
+
+  getStorageBloatStats(): import("../types.js").StorageBloatStats {
+    const recRow = this.db
+      .prepare(
+        `SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(CAST(payload_json AS BLOB))), 0) AS bytes FROM records`,
+      )
+      .get() as { cnt?: number; bytes?: number } | undefined;
+    const vpRow = this.db
+      .prepare(
+        `SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) AS bytes FROM vec_pending`,
+      )
+      .get() as { cnt?: number; bytes?: number } | undefined;
+    return {
+      recordsCount: Number(recRow?.cnt ?? 0),
+      recordsPayloadBytes: Number(recRow?.bytes ?? 0),
+      vecPendingCount: Number(vpRow?.cnt ?? 0),
+      vecPendingTextBytes: Number(vpRow?.bytes ?? 0),
+    };
   }
 }

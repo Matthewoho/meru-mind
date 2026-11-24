@@ -609,6 +609,9 @@ export interface DbPort {
     limit: number;
   }): VectorMatch[];
   clearVectorIndex(): void;
+
+  // Storage hygiene diagnostics (v0.5.5)
+  getStorageBloatStats(): import("./types.js").StorageBloatStats;
 }
 
 /**

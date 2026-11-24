@@ -275,10 +275,12 @@ export {
 } from "./engine/objects.js";
 export {
   ImporterEngine,
+  MAX_IMPORT_MD_BYTES,
   parseMarkdownDocument,
   resolveMostPreciseDeclaredTimestamp,
   type ParsedMarkdownDoc,
 } from "./engine/importer.js";
+export { exportRecordsAsMarkdown } from "./engine/export-md.js";
 export {
   createVisibilityHelpers,
   parseDriveSourceRef,
@@ -309,6 +311,7 @@ export {
   formatCatMarkdown,
   formatChangesMarkdown,
   formatDoctorMarkdown,
+  formatExportMdMarkdown,
   formatGenericMarkdown,
   formatImportDryRunMarkdown,
   formatImportJsonlMarkdown,

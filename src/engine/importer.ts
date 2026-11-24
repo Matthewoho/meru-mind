@@ -12,6 +12,7 @@ import {
   type Actor,
   type ImportConsistencyMismatch,
   type ImportConsistencyResult,
+  type ImportDryRunOversizedFile,
   type ImportDryRunResult,
   type ImportDryRunUnresolvedRealm,
   type ImportJsonlResult,
@@ -36,6 +37,9 @@ import {
   resolveVisibleRealm,
 } from "./objects.js";
 import type { SeaEngine } from "./sea.js";
+
+/** Shared 2 MB limit aligned with remote HTTP JSON body cap (`http-server.ts`). */
+export const MAX_IMPORT_MD_BYTES = 2 * 1024 * 1024;
 
 const VALID_RECORD_KINDS = new Set<string>([
   "thing",
@@ -606,11 +610,14 @@ export class ImporterEngine {
     resourceTags?: string[];
     mapping?: ImportMappingConfig;
     syncEmbeddings?: boolean;
+    /** Maximum allowed bytes per Markdown file (default: 2 MB, aligned with remote write limit) */
+    maxFileBytes?: number;
   }): Promise<ImportMdResult> {
     const actor: Actor = params.actor ?? { id: "importer", kind: "agent" };
     const mapping = params.mapping;
     const filenameDateRe = validateMappingConfig(mapping);
     const skipSecret = params.skipSecret ?? mapping?.skipSecret ?? true;
+    const maxFileBytes = params.maxFileBytes ?? MAX_IMPORT_MD_BYTES;
 
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
@@ -689,6 +696,20 @@ export class ImporterEngine {
     let undatedCount = 0;
     let defaultRealmCount = 0;
     const nowIso = new Date().toISOString();
+
+    // Pre-check file sizes before reading or mutating SQLite (aligned with 2 MB remote write cap)
+    for (const filePath of files) {
+      const sizeBytes = fs.statSync(filePath).size;
+      if (sizeBytes > maxFileBytes) {
+        throw new MindError(
+          "INVALID_INPUT",
+          `Markdown file exceeds ${maxFileBytes} byte import limit (${sizeBytes} bytes): ${filePath}`,
+          {
+            try: "Run 'meru-mind import md <path> --dry-run' to list oversized files, or split/store raw attachments externally.",
+          },
+        );
+      }
+    }
 
     for (const filePath of files) {
       const rawContent = fs.readFileSync(filePath, "utf8");
@@ -1924,10 +1945,13 @@ export class ImporterEngine {
     /** Virtual fallback path (e.g. "/inbox") when default realm does not exist yet */
     virtualDefaultRealmPath?: string;
     skipSecret?: boolean;
+    /** Maximum allowed bytes per Markdown file (default: 2 MB) */
+    maxFileBytes?: number;
   }): ImportDryRunResult {
     const mapping = params.mapping;
     const filenameDateRe = validateMappingConfig(mapping);
     const skipSecret = params.skipSecret ?? mapping?.skipSecret ?? true;
+    const maxFileBytes = params.maxFileBytes ?? MAX_IMPORT_MD_BYTES;
 
     const realms = this.db.listRealms();
     const mounts = this.db.listMounts();
@@ -1981,6 +2005,7 @@ export class ImporterEngine {
     const realmDistribution: Record<string, number> = {};
     const unmatchedRealmValues: Record<string, number> = {};
     const unresolvedMap = new Map<string, ImportDryRunUnresolvedRealm>();
+    const oversizedFiles: ImportDryRunOversizedFile[] = [];
 
     const bump = (map: Record<string, number>, key: string) => {
       map[key] = (map[key] ?? 0) + 1;
@@ -2093,6 +2118,15 @@ export class ImporterEngine {
       const hasExplicitBaseDir = Boolean(params.baseDir?.trim());
       for (const filePath of files) {
         totalItems += 1;
+        const sizeBytes = fs.statSync(filePath).size;
+        if (sizeBytes > maxFileBytes) {
+          oversizedFiles.push({
+            path: path.relative(baseDir, filePath) || path.basename(filePath),
+            sizeBytes,
+            limitBytes: maxFileBytes,
+          });
+          continue;
+        }
         const rawContent = fs.readFileSync(filePath, "utf8");
         const sha = sha256Text(rawContent);
         const sourceRef = deriveDefaultSourceRef({
@@ -2156,7 +2190,8 @@ export class ImporterEngine {
       realmDistribution,
       unmatchedRealmValues,
       unresolvedRealms,
-      valid: unresolvedRealms.length === 0,
+      oversizedFiles,
+      valid: unresolvedRealms.length === 0 && oversizedFiles.length === 0,
     };
   }
 }

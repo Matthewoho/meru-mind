@@ -246,13 +246,15 @@ export class LedgerEngine {
     });
     const embedText = `${params.title}\n${params.body}`.trim();
     if (!embedText) return;
+    // v0.5.5: Store ID/metadata pointer only (text="") so vec_pending never duplicates record/seabed bodies.
+    // syncEmbeddings() hydrates live text on demand from the canonical row when vectors are enabled.
     this.db.markVectorPending({
       itemId: params.itemId,
       sourceType: params.sourceType,
       orgId: params.orgId,
       realmId: params.realmId,
       status: params.status,
-      text: embedText,
+      text: "",
       queuedAt: params.queuedAt,
     });
   }
