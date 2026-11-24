@@ -1,15 +1,13 @@
-# Meru Mind Studio UI Example (`--web-dir`)
+# Meru Mind Built-In Studio UI
 
-An optional zero-build Framed Sheet showcase UI built strictly on top of Meru Mind's server-hosted `/_meru/client.js` contract (`createMindClient`, `<meru-entry>`, `<meru-markdown>`, and `loadMarkdownTools`).
+As of `v0.5.7`, the Studio UI has been promoted to be Meru Mind's **single official built-in Web UI**, served directly at `/` and `/_meru/shell` on both local and team deployments without requiring `--web-dir`.
 
-- **Loopback-only by design (Guardrail #6)**: `--web-dir` is strictly restricted to loopback (`127.0.0.1` / `localhost` / `::1`). Team deployments always serve the built-in official shell (`/_meru/shell`).
-- **Strict CSP & Zero `innerHTML`**: Uses DOM construction + `<meru-markdown>` + sandboxed click-to-render static HTML preview.
-- **Bilingual & Theme-Aware**: Includes the Meru Mind Obsidian × Deep Sea Blue sub-logo (`12-F1`), Light/Dark Liquid Glass themes, and `English / 简体中文` switching in Settings.
-
-## Run Locally Against Demo Data
+- Canonical source lives in `src/ui/shell/` (bundled at build time into `src/server/ui-shell.generated.ts`).
+- To customize a local UI via loopback-only `--web-dir`, eject a working copy of the built-in official shell:
 
 ```bash
-meru-mind serve --demo --host 127.0.0.1 --port 3800 --web-dir ./examples/studio-ui
+meru-mind ui eject ./my-ui
+meru-mind serve --demo --host 127.0.0.1 --port 3800 --web-dir ./my-ui
 ```
 
-Open the printed 60-second single-use `Demo 60s Login URL` in your browser.
+See [docs/UI_BUILDER_SKILL.md](../../docs/UI_BUILDER_SKILL.md) for the `/_meru/client.js` contract and security guardrails.

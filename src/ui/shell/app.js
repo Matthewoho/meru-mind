@@ -1,10 +1,6 @@
-// Meru Mind Context Governance Studio
+// Meru Mind Official Built-In Studio UI (v0.5.7)
 // Built strictly on the server-hosted `/_meru/client.js` contract (zero direct /v1/* calls, zero innerHTML, strict CSP).
-import {
-  createMindClient,
-  applyHighlightRanges,
-  loadMarkdownTools,
-} from "/_meru/client.js";
+import { createMindClient, applyHighlightRanges, loadMarkdownTools } from "/_meru/client.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -48,6 +44,9 @@ const STUDIO_I18N = {
     htmlHide: "Show raw source",
     payload: "Structured Payload",
     activeHere: "Active here",
+    activeInChildren: "Active in child realms",
+    expandRealm: "Expand child realms",
+    collapseRealm: "Collapse child realms",
     inFlight: "In Flight",
     unkeyedBucket: "Unkeyed",
     collisionNote: "independent sessions working",
@@ -56,7 +55,7 @@ const STUDIO_I18N = {
     hereTag: "Here",
   },
   "zh-CN": {
-    realms: "领域目录",
+    realms: "识界",
     activeFocus: "当前在线",
     searchPrompt: "搜索当前可见记忆...",
     settings: "设置",
@@ -64,7 +63,7 @@ const STUDIO_I18N = {
     realtimeAuth: "实时同步与认证",
     shortcuts: "快捷键",
     language: "界面语言",
-    languageDesc: "在英文与简体中文之间切换 Studio 界面文案。",
+    languageDesc: "在英文与简体中文之间切换界面文案。",
     themeTitle: "外观主题",
     themeDesc: "极简双色浅色 / 深色液态玻璃主题。",
     md: "MD",
@@ -75,6 +74,9 @@ const STUDIO_I18N = {
     htmlHide: "查看源码",
     payload: "结构化 Payload",
     activeHere: "同域活跃",
+    activeInChildren: "子识界活跃",
+    expandRealm: "展开子识界",
+    collapseRealm: "折叠子识界",
     inFlight: "正在进行",
     unkeyedBucket: "未挂事",
     collisionNote: "个独立会话同时施工",
@@ -200,6 +202,8 @@ const ICONS = {
   logout: () => makeSvg(["M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4", "M16 17l5-5-5-5", "M21 12H9"], 14),
   work: () => makeSvg(["M6 3v12", "M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M18 9a9 9 0 0 1-9 9"], 13),
   collision: () => makeSvg(["M16 3h5v5", "M4 20L21 3", "M21 16v5h-5", "M15 15l6 6", "M4 4l5 5"], 13),
+  chevronRight: () => makeSvg(["M9 6l6 6-6 6"], 12),
+  chevronDown: () => makeSvg(["M6 9l6 6 6-6"], 12),
 };
 
 const app = document.getElementById("app");
@@ -213,6 +217,9 @@ const state = {
   inspectorView: "md",
   whoami: null,
   realms: [],
+  realmTree: [],
+  collapsedRealmIds: new Set(),
+  collapsedLoadedForOrgId: null,
   realmCounts: {}, // path -> { directRules, directConclusions, subtreeConclusions, directObjects, subtreeObjects, childRealmsCount }
   hasInboxRealm: false,
   activeRealmPath: "/",
@@ -309,6 +316,124 @@ function applyTheme(theme) {
   localStorage.setItem("meru-studio-theme", theme);
 }
 
+function getOrgId() {
+  return state.whoami?.org?.id || state.whoami?.organization?.id || "default";
+}
+
+function getOrgName() {
+  return state.whoami?.org?.name || state.whoami?.organization?.name || "Workspace";
+}
+
+function getOrgPolicy() {
+  return state.whoami?.org?.policy || state.whoami?.organization?.policy || null;
+}
+
+function collapsedStorageKey(orgId) {
+  return "meru-studio-collapsed-realms:" + String(orgId || "default");
+}
+
+function ensureCollapsedRealmsLoaded() {
+  const orgId = getOrgId();
+  if (state.collapsedLoadedForOrgId === orgId) return;
+  state.collapsedLoadedForOrgId = orgId;
+  const next = new Set();
+  try {
+    const raw = localStorage.getItem(collapsedStorageKey(orgId));
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        for (const id of parsed) {
+          if (typeof id === "string" && id.trim()) next.add(id);
+        }
+      }
+    }
+  } catch {
+    // ignore corrupt localStorage entry
+  }
+  state.collapsedRealmIds = next;
+}
+
+function persistCollapsedRealms() {
+  const orgId = getOrgId();
+  try {
+    localStorage.setItem(
+      collapsedStorageKey(orgId),
+      JSON.stringify(Array.from(state.collapsedRealmIds)),
+    );
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function toggleRealmCollapsed(realmId) {
+  if (!realmId) return;
+  ensureCollapsedRealmsLoaded();
+  if (state.collapsedRealmIds.has(realmId)) {
+    state.collapsedRealmIds.delete(realmId);
+  } else {
+    state.collapsedRealmIds.add(realmId);
+  }
+  persistCollapsedRealms();
+  render();
+}
+
+function getEffectiveRealmTree() {
+  if (Array.isArray(state.realmTree) && state.realmTree.length > 0) {
+    return state.realmTree;
+  }
+  const byId = new Map();
+  for (const r of state.realms || []) {
+    byId.set(r.id, { realm: r, counts: state.realmCounts[r.path] || {}, children: [] });
+  }
+  const roots = [];
+  for (const node of byId.values()) {
+    const pid = node.realm.parentId;
+    if (pid && byId.has(pid)) {
+      byId.get(pid).children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+  return roots;
+}
+
+function expandAncestorsForPath(targetPath) {
+  if (!targetPath) return;
+  ensureCollapsedRealmsLoaded();
+  const ancestors = [];
+  function walk(nodes, chain) {
+    for (const node of nodes || []) {
+      if (node.realm?.path === targetPath) {
+        for (const id of chain) ancestors.push(id);
+        return true;
+      }
+      if (Array.isArray(node.children) && node.children.length > 0) {
+        if (walk(node.children, [...chain, node.realm.id])) return true;
+      }
+    }
+    return false;
+  }
+  walk(getEffectiveRealmTree(), []);
+  let changed = false;
+  for (const id of ancestors) {
+    if (state.collapsedRealmIds.has(id)) {
+      state.collapsedRealmIds.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) persistCollapsedRealms();
+}
+
+function collectActiveDescendantPaths(node, activeSet, out = []) {
+  for (const child of node.children || []) {
+    if (child.realm?.path && activeSet.has(child.realm.path)) {
+      out.push(child.realm.path);
+    }
+    collectActiveDescendantPaths(child, activeSet, out);
+  }
+  return out;
+}
+
 function flattenRealmTreeCounts(nodes, out = {}) {
   if (!Array.isArray(nodes)) return out;
   for (const n of nodes) {
@@ -369,6 +494,7 @@ async function loadRealmEntries(realmPath, reset = true) {
 
 async function selectRealm(realmPath, preferredTab) {
   state.activeRealmPath = realmPath;
+  expandAncestorsForPath(realmPath);
   state.mobileNavOpen = false;
   state.popover = null;
   state.objectFilter = "";
@@ -452,12 +578,14 @@ async function selectEntryById(entryId, openInspector = true, fromObject = false
 }
 
 async function refreshAll() {
+  ensureCollapsedRealmsLoaded();
   const [treeRes, pulseRes] = await Promise.all([
     client.tree({ ref: "/", depth: "all", objects: false }),
     client.pulse.list().catch(() => ({ pulses: [] })),
   ]);
   state.realms = treeRes.realms || [];
-  state.realmCounts = flattenRealmTreeCounts(treeRes.realmTree || []);
+  state.realmTree = Array.isArray(treeRes.realmTree) ? treeRes.realmTree : [];
+  state.realmCounts = flattenRealmTreeCounts(state.realmTree);
   state.pulses = pulseRes.pulses || [];
   state.inFlight = Array.isArray(pulseRes.inFlight) ? pulseRes.inFlight : [];
   state.unkeyedCount = typeof pulseRes.unkeyedCount === "number" ? pulseRes.unkeyedCount : 0;
@@ -561,26 +689,57 @@ function buildSidebar() {
   realmLabel.textContent = st("realms");
   scroll.appendChild(realmLabel);
 
-  const realmPeerStatus = new Map();
+  ensureCollapsedRealmsLoaded();
+  const activeRealmSet = new Set();
   for (const p of state.pulses || []) {
     if (!p.active || p.sessionId === state.selfPulseSessionId) continue;
-    const prev = realmPeerStatus.get(p.realmPath);
-    const next = (p.state === "working" || p.online) ? "online" : "active";
-    if (!prev || next === "online") {
-      realmPeerStatus.set(p.realmPath, next);
-    }
+    if (p.realmPath) activeRealmSet.add(p.realmPath);
   }
 
-  for (const r of state.realms) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "realm-row" + (r.path === state.activeRealmPath ? " active" : "");
-    btn.dataset.realmPath = r.path;
-    const depth = r.path === "/inbox" ? 0 : pathDepth(r.path);
-    const indentCls = depth >= 3 ? " realm-indent-3" : (depth === 2 ? " realm-indent-2" : (depth === 1 ? " realm-indent-1" : ""));
+  function appendRealmTreeNode(node, depth) {
+    const r = node.realm;
+    if (!r) return;
+    const children = Array.isArray(node.children) ? node.children : [];
+    const hasChildren = children.length > 0;
+    const isCollapsed = hasChildren && state.collapsedRealmIds.has(r.id);
+    const effectiveDepth = r.path === "/inbox" ? 0 : Math.min(depth, 5);
+
+    const row = document.createElement("div");
+    row.className = "realm-row realm-depth-" + effectiveDepth + (r.path === state.activeRealmPath ? " active" : "");
+    row.dataset.realmPath = r.path;
+    row.dataset.realmId = r.id;
+
+    if (hasChildren) {
+      const chev = document.createElement("button");
+      chev.type = "button";
+      chev.className = "realm-chevron-btn";
+      chev.dataset.ui = "realm-chevron";
+      chev.dataset.realmId = r.id;
+      chev.dataset.realmPath = r.path;
+      chev.setAttribute("aria-expanded", String(!isCollapsed));
+      const chevLabel = (isCollapsed ? st("expandRealm") : st("collapseRealm")) + ": " + r.path;
+      chev.title = chevLabel;
+      chev.setAttribute("aria-label", chevLabel);
+      chev.appendChild(isCollapsed ? ICONS.chevronRight() : ICONS.chevronDown());
+      chev.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        toggleRealmCollapsed(r.id);
+      });
+      row.appendChild(chev);
+    } else {
+      const spacer = document.createElement("span");
+      spacer.className = "realm-chevron-spacer";
+      spacer.setAttribute("aria-hidden", "true");
+      row.appendChild(spacer);
+    }
+
+    const selectBtn = document.createElement("button");
+    selectBtn.type = "button";
+    selectBtn.className = "realm-select-btn";
+    selectBtn.dataset.realmPath = r.path;
 
     const left = document.createElement("span");
-    left.className = "realm-row-left" + indentCls;
+    left.className = "realm-row-left";
     const ico = document.createElement("span");
     ico.className = "realm-icon";
     ico.appendChild(r.path === "/inbox" ? ICONS.inbox() : ICONS.realm());
@@ -588,7 +747,7 @@ function buildSidebar() {
     name.className = "realm-label";
     if (r.path === "/") {
       name.textContent = "Root (/)";
-    } else if (depth >= 2) {
+    } else if (pathDepth(r.path) >= 2) {
       name.textContent = r.slug || r.path.split("/").pop();
     } else {
       name.textContent = r.path;
@@ -596,20 +755,28 @@ function buildSidebar() {
     name.title = r.name + " (" + r.path + ")";
     left.appendChild(ico);
     left.appendChild(name);
-    btn.appendChild(left);
+    selectBtn.appendChild(left);
 
     const rightMeta = document.createElement("span");
     rightMeta.className = "realm-row-right";
-    const peerTone = realmPeerStatus.get(r.path);
-    if (peerTone) {
+    const directActive = activeRealmSet.has(r.path);
+    const activeDescendants = isCollapsed
+      ? collectActiveDescendantPaths(node, activeRealmSet)
+      : [];
+    if (directActive || activeDescendants.length > 0) {
       const liveDot = document.createElement("span");
-      liveDot.className = "status-dot" + (peerTone === "online" ? "" : " active");
+      liveDot.className = "status-dot realm-live-dot";
       liveDot.dataset.ui = "realm-live-dot";
-      liveDot.title = st("activeHere");
+      if (!directActive && activeDescendants.length > 0) {
+        liveDot.dataset.inherited = "true";
+        liveDot.title = st("activeInChildren") + ": " + activeDescendants.join(", ");
+      } else {
+        liveDot.title = st("activeHere");
+      }
       rightMeta.appendChild(liveDot);
     }
 
-    const rc = state.realmCounts[r.path];
+    const rc = state.realmCounts[r.path] || node.counts;
     if (r.path === "/inbox" && state.inboxEntries.length > 0) {
       const cnt = document.createElement("span");
       cnt.className = "queue-count";
@@ -618,15 +785,30 @@ function buildSidebar() {
     } else if (rc && (rc.subtreeConclusions || rc.directConclusions)) {
       const cnt = document.createElement("span");
       cnt.className = "realm-count-muted";
-      cnt.textContent = fmtNum(r.path === "/" ? rc.subtreeConclusions : (rc.directConclusions || rc.subtreeConclusions));
+      cnt.textContent = fmtNum(
+        r.path === "/" || isCollapsed
+          ? (rc.subtreeConclusions || rc.directConclusions)
+          : (rc.directConclusions || rc.subtreeConclusions),
+      );
       rightMeta.appendChild(cnt);
     }
     if (rightMeta.childNodes.length > 0) {
-      btn.appendChild(rightMeta);
+      selectBtn.appendChild(rightMeta);
     }
 
-    btn.addEventListener("click", () => { void selectRealm(r.path); });
-    scroll.appendChild(btn);
+    selectBtn.addEventListener("click", () => { void selectRealm(r.path); });
+    row.appendChild(selectBtn);
+    scroll.appendChild(row);
+
+    if (hasChildren && !isCollapsed) {
+      for (const child of children) {
+        appendRealmTreeNode(child, effectiveDepth + 1);
+      }
+    }
+  }
+
+  for (const rootNode of getEffectiveRealmTree()) {
+    appendRealmTreeNode(rootNode, 0);
   }
 
   const inFlight = state.inFlight || [];
@@ -872,7 +1054,7 @@ function buildTopbar() {
 
   const crumb = document.createElement("span");
   crumb.className = "scope-crumb";
-  crumb.textContent = (state.whoami?.organization?.name || "Workspace") + " / " + (state.activeRealmPath === "/" ? "root" : state.activeRealmPath.slice(1));
+  crumb.textContent = getOrgName() + " / " + (state.activeRealmPath === "/" ? "root" : state.activeRealmPath.slice(1));
   left.appendChild(crumb);
 
   const searchBtn = document.createElement("button");
@@ -1443,7 +1625,7 @@ function buildWorkspace() {
         : {
             label: "Child Realms",
             value: childRealmsCount,
-            sub: state.whoami?.organization?.policy ? ("Policy: " + state.whoami.organization.policy) : "Scoped tree",
+            sub: getOrgPolicy() ? ("Policy: " + getOrgPolicy()) : "Scoped tree",
             tab: "overview",
             actionable: false,
           },

@@ -434,8 +434,9 @@ describe("v0.5.2 Security Hardening, Deployment P0s, Safe Markdown Vendor & Buil
     const forbiddenDomSinks = /\.innerHTML\b|\.outerHTML\b|insertAdjacentHTML\s*\(|document\.write\s*\(/;
     for (const relPath of [
       "src/server/ui-assets.ts",
+      "src/server/ui-shell.generated.ts",
       "src/server/markdown-renderer.ts",
-      "examples/studio-ui/app.js",
+      "src/ui/shell/app.js",
     ]) {
       const text = fs.readFileSync(path.resolve(relPath), "utf8");
       expect(text, `${relPath} must contain zero unsafe HTML sinks`).not.toMatch(

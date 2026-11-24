@@ -1,8 +1,8 @@
-# Meru Mind Custom UI Builder Skill (`v0.5.2`)
+# Meru Mind Custom UI Builder Skill (`v0.5.7`)
 
 Use this skill when crafting a bespoke local governance UI for a user's Meru Mind instance using `--web-dir`.
 
-> Reference showcase: see `examples/studio-ui/` for a zero-build Framed Sheet UI (`meru-mind serve --demo --host 127.0.0.1 --web-dir ./examples/studio-ui`).
+> Official built-in shell: the Studio UI (`src/ui/shell/`) is now Meru Mind's single built-in Web UI served directly at `/` and `/_meru/shell`. Run `meru-mind ui eject ./my-ui` to fork a local `--web-dir` copy.
 
 ## Quick Start (Zero-Build or Any Framework)
 

@@ -1,6 +1,6 @@
 {
   "name": "@meru-mind/core",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "description": "Scoped visibility (MindRealm) and layered memory & ledger engine (MindSea) for multi-agent teams.",
   "license": "MIT",
   "repository": {
@@ -50,7 +50,8 @@
   },
   "packageManager": "pnpm@11.5.1",
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node scripts/copy-vendor.mjs",
+    "ui:sync": "node scripts/generate-ui-assets.mjs",
+    "build": "node scripts/generate-ui-assets.mjs && node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node scripts/copy-vendor.mjs",
     "typecheck": "tsc --noEmit",
     "pretest": "pnpm build",
     "test": "vitest run",
