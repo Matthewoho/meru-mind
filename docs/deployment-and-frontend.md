@@ -61,7 +61,7 @@ Key operational guardrails:
    ```
    Snapshots land in `<MERU_MIND_HOME>/backups/` with SHA-256 verification and can be paired with [Litestream](https://litestream.io/) for continuous WAL replication to S3 / R2 / GCS.
 
-### Optional Standard OIDC SSO & Device-Code CLI Login (`v0.6.0`)
+### Optional Standard OIDC SSO, Roles, Editable Display Names & Device-Code CLI Login (`v0.6.0` / `v0.6.1`)
 
 Meru Mind supports standard OpenID Connect (PKCE + `nonce` + `(issuer, subject)` identity binding) with **zero IdP-specific adapters**:
 
@@ -73,13 +73,24 @@ Configure via 4 environment variables:
 - `MERU_OIDC_CLIENT_ID`
 - `MERU_OIDC_CLIENT_SECRET` (optional for public PKCE clients)
 - `MERU_MIND_PUBLIC_URL` (e.g. `https://mind.example.com`; register `https://mind.example.com/_meru/oidc/callback` as redirect URI)
-- Optional `MERU_OIDC_TRUST_ISSUER=true` for dedicated single-tenant IdPs (default `false`: invite-only).
+- Optional `MERU_OIDC_TRUST_ISSUER=true` for dedicated single-tenant IdPs (default `false`: invite-only). Auto-provisioned users under `MERU_OIDC_TRUST_ISSUER=true` are **always** created with `role: "member"` (never `"admin"`).
+
+Organization roles (`admin` vs `member`, `v0.6.1`):
+- **`member`** (default for invites and auto-provisioned SSO users): full everyday memory/ledger access within bound realm scope; can edit their own display name; receives `403` on organization admin endpoints (`/v1/tokens*`, `/v1/invites*`, `/v1/identities`, `/v1/actors/*`, `/v1/admin/backup`).
+- **`admin`** (root-realm human only): manages invites, tokens, actor roles, offboarding (`actor disable`), and online backups. Self-demotion and disabling/demoting the last active admin are blocked.
+- **Editable `displayName`**: authenticated users (Studio UI Profile Popover or `POST /v1/me/profile`) can customize their display name (sanitized, max 64 chars, empty resets to `null`) without mutating their stable `@actorId`.
 
 Team member lifecycle & CLI onboarding (works over SSH / headless servers):
 ```bash
-# 1. Admin creates a single-use invite link bound to an actorId (72h default TTL)
+# 1. Admin creates a single-use invite link bound to an actorId (72h default TTL; defaults to --role member)
 MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<admin-token> \
-  meru-mind invite create --actor-id alice --kind human
+  meru-mind invite create --actor-id alice --kind human --role member
+
+# Optional: invite a co-admin explicitly, or promote/demote an existing actor later
+MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<admin-token> \
+  meru-mind invite create --actor-id bob --kind human --role admin
+MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<admin-token> \
+  meru-mind actor set-role alice --role admin
 
 # 2. Teammate authenticates terminal via self-issued Device-Code flow (saves 90d token in ~/.config/meru-mind/credentials mode 0600)
 meru-mind login --url https://mind.example.com

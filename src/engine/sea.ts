@@ -3931,13 +3931,20 @@ export class SeaEngine {
           })()
         : undefined;
 
+    const actorRec = this.db.getActor(org.id, params.actor.id);
+    const enrichedActor: Actor = {
+      ...params.actor,
+      role: actorRec?.role ?? params.actor.role ?? "member",
+      ...(actorRec?.displayName ? { displayName: actorRec.displayName } : {}),
+    };
+
     return {
       org: {
         id: org.id,
         name: org.name,
         policy: org.policy,
       },
-      actor: params.actor,
+      actor: enrichedActor,
       bound: {
         realmId: sanitizedBound.id,
         realmPath: sanitizedBound.path,

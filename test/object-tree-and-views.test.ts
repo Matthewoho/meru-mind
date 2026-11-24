@@ -273,7 +273,7 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
           const rec = db.getRecord("rec_v2_legacy");
           const bySource = db.findActiveRecordBySourceRef("org_v2", "docs/legacy-note.md");
           const byExt = db.findRecordsByExternalRef("org_v2", "tracker:LEG-99");
-          if (migrations.join(",") !== "1,2,3,4,5,6,7,8,9,10,11,12") {
+          if (migrations.join(",") !== "1,2,3,4,5,6,7,8,9,10,11,12,13") {
             throw new Error("unexpected migrations: " + migrations.join(","));
           }
           if (!rec || rec.sourceRef !== "docs/legacy-note.md" || rec.externalRef !== "tracker:LEG-99") {

@@ -192,6 +192,9 @@ export function createUiRouteHandler(options: UiRouterOptions) {
         params.orgId,
       );
       const oidcEnabled = Boolean(options.oidcManager);
+      const actorRec = principal
+        ? engine.db.getActor(params.orgId, principal.actor.id)
+        : null;
       sendAsset(
         res,
         200,
@@ -200,7 +203,13 @@ export function createUiRouteHandler(options: UiRouterOptions) {
           principal
             ? {
                 authenticated: true,
-                actor: principal.actor,
+                actor: {
+                  ...principal.actor,
+                  role: actorRec?.role ?? "member",
+                  ...(actorRec?.displayName
+                    ? { displayName: actorRec.displayName }
+                    : {}),
+                },
                 oidcEnabled,
                 oidcLoginUrl: oidcEnabled ? "/_meru/oidc/login" : null,
               }

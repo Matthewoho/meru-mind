@@ -11,6 +11,7 @@ import {
   MindError,
   RemoteMindSurface,
   runRealmDoctor,
+  type ActorRole,
   type LsOnlyFilter,
   type MountScope,
   type OrgPolicy,
@@ -421,6 +422,7 @@ export async function runRemoteCliCommand(
           actorId: reqStr(flags, "actor-id", "token create"),
           actorKind: reqStr(flags, "kind", "token create") as "human" | "agent",
           actorFamily: str(flags, "family"),
+          actorRole: str(flags, "role") as ActorRole | undefined,
           boundRealmRef: str(flags, "in"),
           label: str(flags, "label"),
         });
@@ -552,6 +554,7 @@ export async function runRemoteCliCommand(
           body: JSON.stringify({
             actorId: reqStr(flags, "actor-id", "invite create"),
             actorKind: (str(flags, "kind") ?? "human") as "human" | "agent",
+            ...(str(flags, "role") ? { role: str(flags, "role") } : {}),
             boundRealmRef: str(flags, "in") ?? null,
             ttlHours: intFlag(flags, "ttl-hours"),
           }),
@@ -617,6 +620,42 @@ export async function runRemoteCliCommand(
 
     if (cmd === "actor") {
       const apiBase = baseUrl.replace(/\/+$/, "");
+      if (sub === "set-role") {
+        if (!third?.trim()) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "actor set-role requires <actorId> --role admin|member",
+          );
+        }
+        const role = reqStr(flags, "role", "actor set-role");
+        const resp = await fetch(`${apiBase}/v1/actors/role`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            actorId: third.trim(),
+            role,
+          }),
+        });
+        const payload = (await resp.json()) as Record<string, unknown>;
+        if (!resp.ok) {
+          throw new MindError(
+            resp.status === 401 || resp.status === 403
+              ? "ACCESS_DENIED"
+              : resp.status === 409
+                ? "CONFLICT"
+                : "INVALID_INPUT",
+            typeof payload.message === "string"
+              ? payload.message
+              : `Actor set-role failed (HTTP ${resp.status})`,
+          );
+        }
+        output(payload, formatGenericMarkdown("Actor Role Updated", payload));
+        return;
+      }
       if (sub === "disable") {
         if (!third?.trim()) {
           throw new MindError("INVALID_INPUT", "actor disable requires <actorId>");
@@ -636,7 +675,11 @@ export async function runRemoteCliCommand(
         const payload = (await resp.json()) as Record<string, unknown>;
         if (!resp.ok) {
           throw new MindError(
-            resp.status === 401 || resp.status === 403 ? "ACCESS_DENIED" : "INVALID_INPUT",
+            resp.status === 401 || resp.status === 403
+              ? "ACCESS_DENIED"
+              : resp.status === 409
+                ? "CONFLICT"
+                : "INVALID_INPUT",
             typeof payload.message === "string"
               ? payload.message
               : `Actor disable failed (HTTP ${resp.status})`,

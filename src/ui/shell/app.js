@@ -1,4 +1,4 @@
-// Meru Mind Official Built-In Studio UI (v0.6.0)
+// Meru Mind Official Built-In Studio UI (v0.6.1)
 // Built strictly on the server-hosted `/_meru/client.js` contract (zero direct /v1/* calls, zero innerHTML, strict CSP).
 import { createMindClient, applyHighlightRanges, loadMarkdownTools } from "/_meru/client.js";
 
@@ -76,6 +76,12 @@ const STUDIO_I18N = {
     nextEntry: "Next entry (J)",
     noInFlight: "No active keyed work right now.",
     noPresence: "No active sessions.",
+    displayNameLabel: "Display name",
+    displayNamePlaceholder: "Display name",
+    save: "Save",
+    saving: "Saving...",
+    displayNameSaved: "Display name updated",
+    signOut: "Sign out",
   },
   "zh-CN": {
     realms: "识界",
@@ -129,6 +135,12 @@ const STUDIO_I18N = {
     nextEntry: "下一条 (J)",
     noInFlight: "当前无挂事会话。",
     noPresence: "当前无活跃会话。",
+    displayNameLabel: "显示名称",
+    displayNamePlaceholder: "输入显示名称",
+    save: "保存",
+    saving: "保存中...",
+    displayNameSaved: "显示名称已更新",
+    signOut: "退出登录",
   },
 };
 
@@ -1548,17 +1560,24 @@ function buildSidebar() {
   profileBtn.className = "profile-trigger";
   profileBtn.dataset.ui = "profile-trigger";
   profileBtn.title = "Profile & session";
+  const myDisplayName = state.whoami.actor.displayName || state.whoami.actor.id;
   const avCircle = document.createElement("span");
   avCircle.className = "avatar-circle";
-  avCircle.textContent = String(state.whoami.actor.id || "U").slice(0, 1).toUpperCase();
+  avCircle.textContent = String(myDisplayName || "U").slice(0, 1).toUpperCase();
   const actorLabel = document.createElement("span");
   actorLabel.className = "actor-label";
-  actorLabel.textContent = state.whoami.actor.id;
+  actorLabel.textContent = myDisplayName;
   profileBtn.appendChild(avCircle);
   profileBtn.appendChild(actorLabel);
-  profileBtn.addEventListener("click", () => {
+  profileBtn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    if (state.popover && state.popover.kind === "profile") {
+      state.popover = null;
+      render();
+      return;
+    }
     const rect = profileBtn.getBoundingClientRect();
-    state.popover = { kind: "profile", x: rect.left, y: Math.max(16, rect.top - 130) };
+    state.popover = { kind: "profile", x: rect.left, y: Math.max(16, rect.top - 228) };
     render();
   });
 
@@ -2909,7 +2928,10 @@ function renderPopover() {
   const pop = document.createElement("div");
   pop.className = "floating-popover" + (isWideCard ? " wide" : "");
   const maxX = Math.max(12, window.innerWidth - (isWideCard ? 356 : 292));
-  const maxY = Math.max(12, window.innerHeight - (isWideCard ? 404 : 200));
+  const maxY = Math.max(
+    12,
+    window.innerHeight - (isWideCard ? 404 : state.popover.kind === "profile" ? 248 : 200),
+  );
   pop.style.left = Math.min(Math.max(12, state.popover.x), maxX) + "px";
   pop.style.top = Math.min(Math.max(12, state.popover.y), maxY) + "px";
   pop.addEventListener("click", (ev) => ev.stopPropagation());
@@ -3017,20 +3039,85 @@ function renderPopover() {
     head.className = "popover-head";
     const nm = document.createElement("div");
     nm.className = "popover-name";
-    nm.textContent = state.whoami.actor.id;
+    nm.textContent = state.whoami.actor.displayName || state.whoami.actor.id;
     const sub = document.createElement("div");
-    sub.className = "popover-sub";
-    sub.textContent = "Weakened Cookie Session · " + state.whoami.actor.kind;
+    sub.className = "popover-sub profile-meta-row";
+    const handleSpan = document.createElement("span");
+    handleSpan.textContent = "@" + state.whoami.actor.id;
+    const roleBadge = document.createElement("span");
+    roleBadge.className = "profile-role-badge" + (state.whoami.actor.role === "admin" ? " is-admin" : "");
+    roleBadge.textContent = state.whoami.actor.role === "admin" ? "admin" : "member";
+    const kindSpan = document.createElement("span");
+    kindSpan.textContent = "· " + state.whoami.actor.kind;
+    sub.appendChild(handleSpan);
+    sub.appendChild(roleBadge);
+    sub.appendChild(kindSpan);
     head.appendChild(nm);
     head.appendChild(sub);
     pop.appendChild(head);
+
+    const editForm = document.createElement("form");
+    editForm.className = "profile-edit-form";
+    const editLabel = document.createElement("label");
+    editLabel.className = "profile-edit-label";
+    editLabel.textContent = st("displayNameLabel");
+    const editRow = document.createElement("div");
+    editRow.className = "profile-edit-row";
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.className = "profile-name-input";
+    nameInput.maxLength = 64;
+    nameInput.autocomplete = "off";
+    nameInput.value = state.whoami.actor.displayName || "";
+    nameInput.placeholder = "@" + state.whoami.actor.id;
+    nameInput.setAttribute("aria-label", st("displayNameLabel"));
+    nameInput.dataset.ui = "profile-display-name-input";
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "submit";
+    saveBtn.className = "profile-save-btn";
+    saveBtn.dataset.ui = "profile-save-btn";
+    saveBtn.textContent = st("save");
+    editRow.appendChild(nameInput);
+    editRow.appendChild(saveBtn);
+    const errEl = document.createElement("div");
+    errEl.className = "profile-edit-error";
+    editForm.appendChild(editLabel);
+    editForm.appendChild(editRow);
+    editForm.appendChild(errEl);
+    editForm.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      errEl.textContent = "";
+      saveBtn.disabled = true;
+      saveBtn.textContent = st("saving");
+      try {
+        const nextRaw = nameInput.value.trim();
+        const res = await client.profile.updateDisplayName(nextRaw || null);
+        if (state.whoami && state.whoami.actor) {
+          if (res.displayName) {
+            state.whoami.actor.displayName = res.displayName;
+          } else {
+            delete state.whoami.actor.displayName;
+          }
+          if (res.role) {
+            state.whoami.actor.role = res.role;
+          }
+        }
+        showToast(st("displayNameSaved"));
+        render();
+      } catch (err) {
+        errEl.textContent = (err && err.message) ? String(err.message) : "Failed to save";
+        saveBtn.disabled = false;
+        saveBtn.textContent = st("save");
+      }
+    });
+    pop.appendChild(editForm);
 
     const signOut = document.createElement("button");
     signOut.type = "button";
     signOut.className = "menu-item danger";
     signOut.appendChild(ICONS.logout());
     const t = document.createElement("span");
-    t.textContent = "Sign out";
+    t.textContent = st("signOut");
     signOut.appendChild(t);
     signOut.addEventListener("click", async () => {
       state.popover = null;

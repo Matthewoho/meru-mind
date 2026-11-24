@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import net from "node:net";
 import * as oauth from "oauth4webapi";
 import type { DbPort } from "../ports.js";
 import {
   MindError,
+  type ActorRole,
   type InvitePublic,
   type InviteRecord,
   type OidcConfig,
@@ -15,6 +17,7 @@ import {
   DEFAULT_SSO_TOKEN_TTL_DAYS,
   hashAuthToken,
   MAX_TOKEN_TTL_DAYS,
+  sanitizeDisplayName,
 } from "./tokens.js";
 import { parseCookieHeader, type UiSessionManager } from "./ui-auth.js";
 import { isLoopbackHost } from "./ui-router.js";
@@ -27,6 +30,7 @@ export const DEVICE_HOST_TX_COOKIE_NAME = "__Host-meru_device_tx";
 export const INVITE_TX_COOKIE_NAME = "meru_invite_tx";
 export const INVITE_HOST_TX_COOKIE_NAME = "__Host-meru_invite_tx";
 export const INVITE_CODE_PREFIX = "mm_inv_";
+export const MAX_PENDING_DEVICE_CODES_GLOBAL = 2000;
 
 const OIDC_TX_TTL_MS = 10 * 60 * 1000;
 const DEVICE_CODE_TTL_MS = 10 * 60 * 1000;
@@ -35,7 +39,7 @@ const INVITE_CONFIRM_TX_TTL_MS = 5 * 60 * 1000;
 const DEVICE_MAX_AUTH_AGE_SECONDS = 90;
 const DISCOVERY_CACHE_TTL_MS = 60 * 60 * 1000;
 const IDP_FETCH_TIMEOUT_MS = 10_000;
-const MAX_PENDING_DEVICE_CODES_GLOBAL = 2000;
+const PRUNE_INTERVAL_MS = 60_000;
 const MAX_PENDING_DEVICE_PER_IP = 8;
 const MAX_DEVICE_CODE_MISSES_PER_TX = 5;
 const DEVICE_USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -108,6 +112,7 @@ interface PendingDeviceCode {
   userCode: string;
   orgId: string;
   remoteIp: string;
+  rateLimitKey: string;
   hostname: string;
   clientLabel: string;
   requestedKind: "human" | "agent";
@@ -175,6 +180,7 @@ export function toPublicInvite(rec: InviteRecord): InvitePublic {
     orgId: rec.orgId,
     actorId: rec.actorId,
     actorKind: rec.actorKind,
+    actorRole: rec.actorRole ?? "member",
     boundRealmId: rec.boundRealmId,
     createdBy: rec.createdBy,
     expiresAt: rec.expiresAt,
@@ -191,6 +197,7 @@ export function createInvite(params: {
   orgId: string;
   actorId: string;
   actorKind: "human" | "agent";
+  actorRole?: ActorRole;
   boundRealmRef?: string | null;
   createdBy: string;
   ttlHours?: number;
@@ -211,6 +218,19 @@ export function createInvite(params: {
     throw new MindError(
       "INVALID_INPUT",
       `Invite actorKind must be "human" or "agent"`,
+    );
+  }
+  const actorRole: ActorRole = params.actorRole ?? "member";
+  if (actorRole !== "admin" && actorRole !== "member") {
+    throw new MindError(
+      "INVALID_INPUT",
+      `Invite role must be "admin" or "member"`,
+    );
+  }
+  if (params.actorKind === "agent" && actorRole === "admin") {
+    throw new MindError(
+      "INVALID_INPUT",
+      'Agent invites cannot be granted the "admin" role',
     );
   }
   const org = params.db.getOrg(params.orgId);
@@ -250,6 +270,7 @@ export function createInvite(params: {
     codeHash: hashInviteCode(code),
     actorId,
     actorKind: params.actorKind,
+    actorRole,
     boundRealmId,
     createdBy: params.createdBy,
     expiresAt,
@@ -351,13 +372,71 @@ function isRequestSecure(req: IncomingMessage, publicUrl?: string | null): boole
   return Boolean((req.socket as { encrypted?: boolean })?.encrypted);
 }
 
+function expandIpv6Groups(ip: string): string[] | null {
+  let work = ip.toLowerCase();
+  const lastColon = work.lastIndexOf(":");
+  if (lastColon !== -1 && work.slice(lastColon + 1).includes(".")) {
+    const ipv4Part = work.slice(lastColon + 1);
+    const octets = ipv4Part.split(".").map((n) => Number.parseInt(n, 10));
+    if (
+      octets.length !== 4 ||
+      octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)
+    ) {
+      return null;
+    }
+    const hi = ((octets[0]! << 8) | octets[1]!).toString(16);
+    const lo = ((octets[2]! << 8) | octets[3]!).toString(16);
+    work = `${work.slice(0, lastColon)}:${hi}:${lo}`;
+  }
+  const halves = work.split("::");
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(":").filter(Boolean) : [];
+  const right =
+    halves.length === 2 && halves[1] ? halves[1].split(":").filter(Boolean) : [];
+  if (halves.length === 1) {
+    if (left.length !== 8) return null;
+    return left.map((g) => g.padStart(4, "0"));
+  }
+  const missing = 8 - (left.length + right.length);
+  if (missing < 1) return null;
+  return [
+    ...left,
+    ...Array.from({ length: missing }, () => "0"),
+    ...right,
+  ].map((g) => g.padStart(4, "0"));
+}
+
+/**
+ * R2-P1-4: Normalizes validated IPs for per-IP rate limiting.
+ * - IPv4 -> exact IPv4
+ * - IPv4-mapped IPv6 (`::ffff:a.b.c.d`) -> `a.b.c.d`
+ * - IPv6 -> `/64` prefix (`xxxx:xxxx:xxxx:xxxx::/64`) so rotating interface IDs share quota
+ */
+export function normalizeIpRateLimitKey(ip: string): string {
+  const trimmed = ip.trim();
+  const family = net.isIP(trimmed);
+  if (family === 4) return trimmed;
+  if (family === 6) {
+    const v4Mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(trimmed);
+    if (v4Mapped && net.isIP(v4Mapped[1]!) === 4) {
+      return v4Mapped[1]!;
+    }
+    const groups = expandIpv6Groups(trimmed);
+    if (groups) {
+      return `${groups.slice(0, 4).join(":")}::/64`;
+    }
+  }
+  return trimmed || "unknown";
+}
+
 function extractClientIp(req: IncomingMessage): string {
-  const realIp =
+  const rawRealIp =
     typeof req.headers["x-real-ip"] === "string"
       ? req.headers["x-real-ip"].trim()
       : "";
   const sockIp = req.socket?.remoteAddress?.trim() ?? "";
   // Only trust X-Real-IP when the direct TCP peer is loopback or RFC1918 reverse proxy (e.g. Caddy)
+  // AND the header value is a strictly valid IPv4/IPv6 address via net.isIP(...) (R2-P1-4)
   const peerIsProxy =
     sockIp === "127.0.0.1" ||
     sockIp === "::1" ||
@@ -368,10 +447,13 @@ function extractClientIp(req: IncomingMessage): string {
     sockIp.startsWith("::ffff:10.") ||
     sockIp.startsWith("::ffff:172.") ||
     sockIp.startsWith("::ffff:192.168.");
-  if (realIp && peerIsProxy) {
-    return realIp.slice(0, 64);
+  if (rawRealIp && peerIsProxy && net.isIP(rawRealIp) !== 0) {
+    return rawRealIp;
   }
-  return (sockIp || "unknown").slice(0, 64);
+  if (sockIp && net.isIP(sockIp) !== 0) {
+    return sockIp;
+  }
+  return "unknown";
 }
 
 function constantTimeEqualHex(a: string, b: string): boolean {
@@ -545,7 +627,7 @@ export class OidcManager {
   private readonly txAeadKey: Buffer;
   private cachedAs: oauth.AuthorizationServer | null = null;
   private cachedAsFetchedAtMs = 0;
-  /** Single-use replay table populated ONLY after valid AEAD callback verification */
+  /** Single-use replay table populated ONLY after IdP token verification succeeds (R2-P1-3) */
   private readonly usedOidcStates = new Map<string, number>();
   private readonly deviceCodesByHash = new Map<string, PendingDeviceCode>();
   private readonly deviceHashByUserCode = new Map<string, string>();
@@ -554,6 +636,8 @@ export class OidcManager {
     string,
     PendingInviteConfirmTx
   >();
+  private readonly pruneTimer: ReturnType<typeof setInterval>;
+  private lastDb: DbPort | undefined;
 
   constructor(config: OidcConfig) {
     let parsedIssuer: URL;
@@ -615,6 +699,15 @@ export class OidcManager {
     this.issuerUrl = new URL(this.config.issuer);
     this.allowHttpLoopback = isLoopbackHttp;
     this.txAeadKey = crypto.randomBytes(32);
+    // R2-P1-3: Periodic background pruning instead of O(N) scanning on every request
+    this.pruneTimer = setInterval(() => {
+      this.prune(this.lastDb);
+    }, PRUNE_INTERVAL_MS);
+    this.pruneTimer.unref();
+  }
+
+  close(): void {
+    clearInterval(this.pruneTimer);
   }
 
   private sealOidcPayload(payload: OidcCookiePayload): string {
@@ -765,14 +858,19 @@ export class OidcManager {
       throw new MindError("NOT_FOUND", `Organization not found: ${orgId}`);
     }
     if (preferredRealmId) {
+      // R2-P1-2: Fail closed when a non-null boundRealmId is missing or cross-org (NEVER fall back to root!)
       const realm = db.getRealm(preferredRealmId);
-      if (realm && realm.orgId === orgId) {
-        return { boundRealmId: realm.id, boundSource: "oidc-identity" };
+      if (!realm || realm.orgId !== orgId) {
+        throw new MindError(
+          "ACCESS_DENIED",
+          "Bound realm for this identity is missing or inaccessible.",
+        );
       }
+      return { boundRealmId: realm.id, boundSource: "oidc-identity" };
     }
-    const root = db.getRealmByPath(orgId, "/") ?? db.listRealms(orgId)[0];
+    const root = db.getRealmByPath(orgId, "/");
     if (!root) {
-      throw new MindError("NOT_FOUND", `No realms found in org ${orgId}`);
+      throw new MindError("ACCESS_DENIED", `Root realm "/" not found in org ${orgId}`);
     }
     return {
       boundRealmId: root.id,
@@ -885,6 +983,13 @@ export class OidcManager {
       extraClearCookies,
     } = params;
 
+    // Validate boundRealmId fail-closed for BOTH browser and device flows (R2-P1-2)
+    const { boundRealmId, boundSource } = this.resolveBoundRealmIdForOrg(
+      db,
+      orgId,
+      identity.boundRealmId,
+    );
+
     if (flow === "device") {
       if (typeof authTimeSec !== "number" || !Number.isFinite(authTimeSec)) {
         throw new MindError(
@@ -936,17 +1041,15 @@ export class OidcManager {
       return;
     }
 
-    const { boundRealmId, boundSource } = this.resolveBoundRealmIdForOrg(
-      db,
-      orgId,
-      identity.boundRealmId,
-    );
+    const actorRec = db.getActor(orgId, identity.actorId);
     const principal: Principal = {
       tokenId: null,
       orgId,
       actor: {
         id: identity.actorId,
         kind: identity.actorKind,
+        role: actorRec?.role ?? "member",
+        ...(actorRec?.displayName ? { displayName: actorRec.displayName } : {}),
       },
       boundRealmId,
       boundSource,
@@ -989,8 +1092,7 @@ export class OidcManager {
     const isSecure = isRequestSecure(req, this.config.publicUrl);
     const publicBase = this.resolvePublicBaseUrl(req, fallbackServerUrl);
     const redirectUri = `${publicBase}/_meru/oidc/callback`;
-
-    this.prune(db);
+    this.lastDb = db;
 
     // ---- 1. Start OIDC Authorization Code + PKCE Login (STATELESS AEAD cookie — zero server RAM!) ----
     if (pathname === "/_meru/oidc/login" && method === "GET") {
@@ -1122,12 +1224,19 @@ export class OidcManager {
         : undefined;
       const tx = sealedCookie ? this.openOidcPayload(sealedCookie) : null;
 
+      const nowMs = Date.now();
+      const usedExp = stateParam ? this.usedOidcStates.get(stateParam) : undefined;
+      if (usedExp !== undefined && usedExp <= nowMs) {
+        this.usedOidcStates.delete(stateParam);
+      }
+      const isReplayedState = usedExp !== undefined && usedExp > nowMs;
+
       if (
         !tx ||
         !stateParam ||
         !constantTimeEqualHex(tx.s, stateParam) ||
-        tx.e <= Date.now() ||
-        this.usedOidcStates.has(stateParam)
+        tx.e <= nowMs ||
+        isReplayedState
       ) {
         sendHtml(
           res,
@@ -1143,9 +1252,6 @@ export class OidcManager {
         );
         return true;
       }
-
-      // Single-use replay protection: record ONLY AFTER valid AEAD cookie verification!
-      this.usedOidcStates.set(stateParam, tx.e);
 
       try {
         const as = await this.getAuthorizationServer();
@@ -1180,6 +1286,16 @@ export class OidcManager {
             maxAge: tx.f === "device" ? DEVICE_MAX_AUTH_AGE_SECONDS : undefined,
           },
         );
+        // R2-P1-3: Record state ONLY AFTER IdP token exchange & ID token verification succeed
+        // so unauthenticated/failed callbacks NEVER allocate memory in usedOidcStates.
+        const postExp = this.usedOidcStates.get(stateParam);
+        if (postExp !== undefined && postExp > Date.now()) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "Sign-in session has already been used.",
+          );
+        }
+        this.usedOidcStates.set(stateParam, tx.e);
         const claims = oauth.getValidatedIdTokenClaims(tokenResult);
         if (!claims || typeof claims.sub !== "string" || !claims.sub.trim()) {
           throw new MindError(
@@ -1365,6 +1481,7 @@ export class OidcManager {
             <p class="muted">Confirm you want to link your SSO identity to this Meru Mind account.</p>
             <div class="meta">
               <div><span>Actor</span><span>${escapeHtml(preview.actorId)} (${escapeHtml(preview.actorKind)})</span></div>
+              <div><span>Role</span><span>${escapeHtml(preview.actorRole ?? "member")}</span></div>
               <div><span>Realm Scope</span><span>${escapeHtml(realmPath)}</span></div>
               <div><span>Invited By</span><span>${escapeHtml(preview.createdBy)}</span></div>
             </div>
@@ -1421,7 +1538,19 @@ export class OidcManager {
             createdAt: nowIso,
             updatedAt: nowIso,
           };
-          db.insertIdentity(created);
+          const sanitizedDn = sanitizeDisplayName(displayName);
+          // Security invariant: auto-provisioned users under trustIssuer=true ALWAYS receive role="member" (NEVER "admin")!
+          db.transaction(() => {
+            db.insertIdentity(created);
+            db.upsertActor({
+              orgId,
+              actorId: slug,
+              role: "member",
+              displayName: sanitizedDn,
+              createdBy: "oidc-auto-provision",
+              nowIso,
+            });
+          });
           this.issuePostAuthResponse({
             res,
             db,
@@ -1604,23 +1733,66 @@ export class OidcManager {
         return true;
       }
 
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
       const remoteIp = extractClientIp(req);
+      const rateLimitKey = normalizeIpRateLimitKey(remoteIp);
       let ipPendingCount = 0;
-      for (const entry of this.deviceCodesByHash.values()) {
-        if (entry.remoteIp === remoteIp && entry.status === "pending") {
-          ipPendingCount += 1;
+      let oldestPendingHash: string | null = null;
+      let oldestPendingUserCode: string | null = null;
+      for (const [k, entry] of this.deviceCodesByHash.entries()) {
+        if (entry.expiresAtMs <= nowMs) {
+          if (entry.status === "approved" && entry.mintedTokenId) {
+            try {
+              db.revokeToken(entry.orgId, entry.mintedTokenId, nowIso);
+            } catch {
+              // ignore best-effort cleanup
+            }
+          }
+          entry.mintedToken = null;
+          this.deviceCodesByHash.delete(k);
+          if (this.deviceHashByUserCode.get(entry.userCode) === k) {
+            this.deviceHashByUserCode.delete(entry.userCode);
+          }
+          continue;
+        }
+        if (entry.status === "pending") {
+          if (oldestPendingHash === null) {
+            oldestPendingHash = k;
+            oldestPendingUserCode = entry.userCode;
+          }
+          if (entry.rateLimitKey === rateLimitKey) {
+            ipPendingCount += 1;
+          }
         }
       }
-      if (
-        ipPendingCount >= MAX_PENDING_DEVICE_PER_IP ||
-        this.deviceCodesByHash.size >= MAX_PENDING_DEVICE_CODES_GLOBAL
-      ) {
+      if (ipPendingCount >= MAX_PENDING_DEVICE_PER_IP) {
         sendOidcJson(res, 429, {
           error: "invalid_input",
           message:
             "Too many pending device login sessions from this source; wait for existing codes to complete or expire.",
         });
         return true;
+      }
+      // R2-P1-4: Under global capacity pressure, evict the oldest pending entry (LRU) instead of rejecting new legitimate users!
+      if (this.deviceCodesByHash.size >= MAX_PENDING_DEVICE_CODES_GLOBAL) {
+        if (oldestPendingHash !== null) {
+          this.deviceCodesByHash.delete(oldestPendingHash);
+          if (
+            oldestPendingUserCode !== null &&
+            this.deviceHashByUserCode.get(oldestPendingUserCode) ===
+              oldestPendingHash
+          ) {
+            this.deviceHashByUserCode.delete(oldestPendingUserCode);
+          }
+        } else {
+          sendOidcJson(res, 429, {
+            error: "invalid_input",
+            message:
+              "Device login queue is temporarily full; retry in a few seconds.",
+          });
+          return true;
+        }
       }
 
       const body = await readFormOrJsonBody(req, { jsonOnly: true });
@@ -1646,12 +1818,12 @@ export class OidcManager {
       while (this.deviceHashByUserCode.has(userCode)) {
         userCode = formatUserCode();
       }
-      const nowMs = Date.now();
       this.deviceCodesByHash.set(deviceCodeHash, {
         deviceCodeHash,
         userCode,
         orgId,
         remoteIp,
+        rateLimitKey,
         hostname,
         clientLabel,
         requestedKind,
@@ -1662,7 +1834,7 @@ export class OidcManager {
         approvedActorKind: null,
         mintedExpiresAt: null,
         createdAtMs: nowMs,
-        createdAtIso: new Date(nowMs).toISOString(),
+        createdAtIso: nowIso,
         expiresAtMs: nowMs + DEVICE_CODE_TTL_MS,
       });
       this.deviceHashByUserCode.set(userCode, deviceCodeHash);
@@ -2016,6 +2188,24 @@ export class OidcManager {
           { "Set-Cookie": clearDeviceTx },
         );
         return true;
+      }
+
+      // R2-P1-2: Fail closed if boundRealmId was deleted or missing before minting a device token
+      if (freshTx.boundRealmId) {
+        const boundRealm = db.getRealm(freshTx.boundRealmId);
+        if (!boundRealm || boundRealm.orgId !== orgId) {
+          sendHtml(
+            res,
+            403,
+            renderMinimalPage(
+              "Forbidden",
+              "<h1>Bound realm missing</h1><p class='muted'>Bound realm for this identity is missing or inaccessible.</p>",
+            ),
+            MINIMAL_DEVICE_CSP,
+            { "Set-Cookie": clearDeviceTx },
+          );
+          return true;
+        }
       }
 
       const ttlDays = this.config.tokenTtlDays ?? DEFAULT_SSO_TOKEN_TTL_DAYS;

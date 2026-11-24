@@ -4,7 +4,7 @@
 
 [English README](./README.md) · [识界治理规范 (REALM_METHOD.md)](./docs/REALM_METHOD.md) · [架构设计 (ARCHITECTURE.md)](./ARCHITECTURE.md) · [安全威胁模型 (THREAT_MODEL.md)](./THREAT_MODEL.md) · [云端部署与可组合前端指南](./docs/deployment-and-frontend.md) · [自定义前端搭建 Skill](./docs/UI_BUILDER_SKILL.md)
 
-Meru Mind 是一个**零 Docker、单 SQLite、MIT 开源**的 TypeScript 引擎（`CLI` + `MCP Server` + `HTTP/WS 服务` + `可组合 Web 治理前端` + `SDK`），将 **空间与可见性（`MindRealm`）** 与 **时间与真相深度（`MindSea`）** 正交分离——让多个人类与编码 Agent 共享规矩、决策与排查证据，避免上下文爆炸、过期结论复活与跨分支泄密。
+Meru Mind 是一个**单 SQLite、MIT 开源**的 TypeScript 引擎（`CLI` + `MCP Server` + `HTTP/WS 服务` + `内置 Web 治理前端` + `SDK`）——**引擎本身零 Docker、零外部数据库即可直接运行**，云端团队部署另提供可选 Docker Compose 一键栈（内置 Caddy HTTPS + 可选 Pocket ID / Dex SSO）。它将 **空间与可见性（`MindRealm`）** 与 **时间与真相深度（`MindSea`）** 正交分离，让多个人类与编码 Agent 共享规矩、决策与排查证据，避免上下文爆炸、过期结论复活与跨分支泄密。
 
 ```mermaid
 flowchart LR
@@ -38,7 +38,7 @@ flowchart LR
 
 - **树状空间隔离与继承（`open | tree`）**：所有读写、检索、向量查询与只读切片导出均经过同一套纯函数策略引擎（`src/policy.ts`）。`tree` 模式下兄弟分支在 Top-K 之前即被 SQL/分区键物理排除；祖先规矩向下继承；跨分支访问必须经人类显式 `@mount`。
 - **单真相库，证据（`Seabed`）与定论（`Ledger`）分层**：在同一座 SQLite 真相库内，不可变原始证据（`seabed_entries` + `0o444` 内容寻址 `blobs/`）与水上定论（带原子 `supersedes` 取代链和合规级 `redact` 字节抹除的 `records`）严格分层；FTS5 与可选 `sqlite-vec` 等派生索引随时可用 `admin rebuild` 无损重建。
-- **零 Docker、确定性毫秒级召回**：直接构建于 Node.js 22+ 内置 `node:sqlite`（WAL + CJK 双字 FTS5 + 局部滑动窗口覆盖度），无外部数据库、无重中间件。
+- **引擎本身零 Docker、云端可选一键栈**：直接构建于 Node.js 22+ 内置 `node:sqlite`（WAL + CJK 双字 FTS5 + 局部滑动窗口覆盖度），无需 Docker、无需外部数据库即可在本地或裸机毫秒级运行；云端团队部署另提供可选 Docker Compose 一键栈（Caddy HTTPS + Pocket ID / Dex OIDC SSO）。
 - **极简 7 工具 MCP + 23 行 Skill**：引导 Agent 稳定执行 `whoami -> tree -> show <realm> -> search` 冷启动节奏，不浪费上下文预算。
 
 ---

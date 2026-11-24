@@ -48,6 +48,7 @@ import {
   type AccessScope,
   type Actor,
   type ActorKind,
+  type ActorRole,
   type DistillationLayer,
   type ImportMappingConfig,
   type LsOnlyFilter,
@@ -651,7 +652,7 @@ Examples:
   token: `Risk: high-risk-write (human-only)
 When to use: Issue, list, or revoke hashed authentication tokens for meru-mind serve.
 Usage:
-  meru-mind token create --actor-id <id> --kind human|agent [--in <realm>] [--family <model>] [--label <text>] [--as-human]
+  meru-mind token create --actor-id <id> --kind human|agent [--role member|admin] [--in <realm>] [--family <model>] [--label <text>] [--as-human]
   meru-mind token list [--all] [--as-human]
   meru-mind token revoke <tokenId> [--as-human]
 Examples:
@@ -666,23 +667,25 @@ Examples:
   meru-mind login --url https://mind.example.com
   meru-mind login --url https://mind.example.com --kind agent --label claude-code
 `,
-  invite: `Risk: high-risk-write (human-only)
+  invite: `Risk: high-risk-write (human-admin-only)
 When to use: Create, list, or revoke single-use OIDC onboarding invite codes bound to an actorId.
 Usage:
-  meru-mind invite create --actor-id <id> [--kind human|agent] [--in <realm>] [--ttl-hours <n>] [--as-human]
+  meru-mind invite create --actor-id <id> [--kind human|agent] [--role member|admin] [--in <realm>] [--ttl-hours <n>] [--as-human]
   meru-mind invite list [--as-human]
   meru-mind invite revoke <inviteId> [--as-human]
 Examples:
   meru-mind invite create --actor-id alice --kind human --as-human
-  MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<admin-token> meru-mind invite create --actor-id alice --kind human
+  MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<admin-token> meru-mind invite create --actor-id alice --role member
 `,
-  actor: `Risk: high-risk-write (human-only)
-When to use: List OIDC identities or immediately disable/enable an actor (revoking all tokens and browser sessions).
+  actor: `Risk: high-risk-write (human-admin-only)
+When to use: List actors & OIDC identities, change actor roles (admin|member), or immediately disable/enable an actor.
 Usage:
   meru-mind actor list [--as-human]
+  meru-mind actor set-role <actorId> --role admin|member [--as-human]
   meru-mind actor disable <actorId> [--reason <text>] [--as-human]
   meru-mind actor enable <actorId> [--as-human]
 Examples:
+  meru-mind actor set-role alice --role admin --as-human
   meru-mind actor disable alice --reason "offboarded" --as-human
 `,
   work: `Risk: read (list/ready/resolve) / high-risk-write (bind/unbind, human-only)
@@ -1813,18 +1816,46 @@ async function main(): Promise<void> {
       if (sub === "create") {
         assertAllowedFlags(
           flags,
-          ["actor-id", "kind", "in", "family", "label"],
+          ["actor-id", "kind", "role", "in", "family", "label"],
           "token create",
         );
+        const targetActorId = requireFlag(flags, "actor-id", "token create");
+        const targetKind = requireFlag(flags, "kind", "token create") as
+          | "human"
+          | "agent";
+        const boundRealmInput = flagStr(flags, "in");
+        const rawRole = flagStr(flags, "role");
+        if (
+          rawRole !== undefined &&
+          rawRole !== "admin" &&
+          rawRole !== "member"
+        ) {
+          throw new MindError(
+            "INVALID_INPUT",
+            `Flag --role must be "admin" or "member", got "${rawRole}"`,
+          );
+        }
+        const rootRealm = engine.db.getRealmByPath(orgId, "/");
+        const isRootInput =
+          !boundRealmInput?.trim() ||
+          boundRealmInput.trim() === "/" ||
+          (rootRealm !== null && boundRealmInput.trim() === rootRealm.id);
+        const existingActor = engine.db.getActor(orgId, targetActorId);
+        // Preserve local bootstrap behavior: local --as-human token create for a brand-new root-realm human
+        // defaults to admin unless --role is explicitly passed (never elevating an existing member silently).
+        const resolvedRole: ActorRole | undefined =
+          (rawRole as ActorRole | undefined) ??
+          (targetKind === "human" && isRootInput && !existingActor
+            ? "admin"
+            : undefined);
         const minted = createAuthToken({
           db: engine.db,
           orgId,
-          actorId: requireFlag(flags, "actor-id", "token create"),
-          actorKind: requireFlag(flags, "kind", "token create") as
-            | "human"
-            | "agent",
+          actorId: targetActorId,
+          actorKind: targetKind,
           actorFamily: flagStr(flags, "family"),
-          boundRealmId: flagStr(flags, "in"),
+          actorRole: resolvedRole,
+          boundRealmId: boundRealmInput,
           label: flagStr(flags, "label"),
           createdBy: actor.id,
         });
@@ -1880,14 +1911,22 @@ async function main(): Promise<void> {
       if (sub === "create") {
         assertAllowedFlags(
           flags,
-          ["actor-id", "kind", "in", "ttl-hours"],
+          ["actor-id", "kind", "role", "in", "ttl-hours"],
           "invite create",
         );
+        const rawRole = flagStr(flags, "role") ?? "member";
+        if (rawRole !== "admin" && rawRole !== "member") {
+          throw new MindError(
+            "INVALID_INPUT",
+            `Flag --role must be "admin" or "member", got "${rawRole}"`,
+          );
+        }
         const created = createInvite({
           db: engine.db,
           orgId,
           actorId: requireFlag(flags, "actor-id", "invite create"),
           actorKind: (flagStr(flags, "kind") ?? "human") as "human" | "agent",
+          actorRole: rawRole,
           boundRealmRef: flagStr(flags, "in") ?? null,
           createdBy: actor.id,
           ttlHours: parseIntFlag(flags, "ttl-hours", { min: 1 }),
@@ -1937,10 +1976,55 @@ async function main(): Promise<void> {
       if (sub === "list") {
         assertAllowedFlags(flags, [], "actor list");
         const res = {
+          actors: engine.db.listActors(orgId),
           identities: engine.db.listIdentities(orgId),
           disabledActors: engine.db.listDisabledActors(orgId),
         };
-        output(res, formatGenericMarkdown("SSO Identities & Disabled Actors", res));
+        output(res, formatGenericMarkdown("Actors, SSO Identities & Disabled Actors", res));
+        return;
+      }
+      if (sub === "set-role") {
+        assertAllowedFlags(flags, ["role"], "actor set-role");
+        if (!third?.trim()) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "actor set-role requires <actorId> --role admin|member",
+            {
+              try: "meru-mind actor set-role alice --role admin --as-human",
+            },
+          );
+        }
+        const targetActorId = third.trim();
+        const rawRole = requireFlag(flags, "role", "actor set-role");
+        if (rawRole !== "admin" && rawRole !== "member") {
+          throw new MindError(
+            "INVALID_INPUT",
+            `Flag --role must be "admin" or "member", got "${rawRole}"`,
+          );
+        }
+        const updated = engine.db.transaction(() => {
+          if (rawRole === "member") {
+            const existing = engine.db.getActor(orgId, targetActorId);
+            if (
+              existing?.role === "admin" &&
+              !engine.db.isActorDisabled(orgId, targetActorId) &&
+              engine.db.countActiveAdmins(orgId) <= 1
+            ) {
+              throw new MindError(
+                "CONFLICT",
+                "Cannot demote the last active organization administrator.",
+              );
+            }
+          }
+          return engine.db.setActorRole(orgId, targetActorId, rawRole);
+        });
+        const res = {
+          actorId: updated.actorId,
+          role: updated.role,
+          displayName: updated.displayName,
+          updatedAt: updated.updatedAt,
+        };
+        output(res, formatGenericMarkdown("Actor Role Updated", res));
         return;
       }
       if (sub === "disable") {
@@ -1950,15 +2034,29 @@ async function main(): Promise<void> {
             try: "meru-mind actor disable alice --as-human",
           });
         }
+        const targetActorId = third.trim();
         const disabledAt = new Date().toISOString();
-        const dbRes = engine.db.disableActor({
-          orgId,
-          actorId: third.trim(),
-          reason: flagStr(flags, "reason") ?? null,
-          disabledBy: actor.id,
-          disabledAt,
+        const dbRes = engine.db.transaction(() => {
+          const existing = engine.db.getActor(orgId, targetActorId);
+          if (
+            existing?.role === "admin" &&
+            !engine.db.isActorDisabled(orgId, targetActorId) &&
+            engine.db.countActiveAdmins(orgId) <= 1
+          ) {
+            throw new MindError(
+              "CONFLICT",
+              "Cannot disable the last active organization administrator.",
+            );
+          }
+          return engine.db.disableActor({
+            orgId,
+            actorId: targetActorId,
+            reason: flagStr(flags, "reason") ?? null,
+            disabledBy: actor.id,
+            disabledAt,
+          });
         });
-        const res = { actorId: third.trim(), disabled: true, disabledAt, ...dbRes };
+        const res = { actorId: targetActorId, disabled: true, disabledAt, ...dbRes };
         output(res, formatGenericMarkdown("Actor Disabled", res));
         return;
       }

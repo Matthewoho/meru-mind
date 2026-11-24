@@ -4,7 +4,7 @@
 
 [中文文档 (README.zh-CN.md)](./README.zh-CN.md) · [Realm Method](./docs/REALM_METHOD.md) · [Architecture](./ARCHITECTURE.md) · [Threat Model](./THREAT_MODEL.md) · [Cloud Deployment & Composable UI Guide](./docs/deployment-and-frontend.md) · [UI Builder Skill](./docs/UI_BUILDER_SKILL.md)
 
-Meru Mind is a zero-Docker, single-SQLite TypeScript engine (`CLI` + `MCP Server` + `HTTP/WS Server` + `Composable Web UI` + `SDK`) that separates **space & visibility (`MindRealm`)** from **time & truth depth (`MindSea`)** — so multiple humans and coding agents can share rules, decisions, and evidence without context flooding, stale-fact regressions, or cross-branch leakage.
+Meru Mind is a single-SQLite TypeScript engine (`CLI` + `MCP Server` + `HTTP/WS Server` + `Composable Web UI` + `SDK`) — **the engine itself runs zero-Docker with zero external databases** on Node.js 22+, with optional turnkey Docker Compose stacks provided for cloud team deployment. It separates **space & visibility (`MindRealm`)** from **time & truth depth (`MindSea`)** — so multiple humans and coding agents can share rules, decisions, and evidence without context flooding, stale-fact regressions, or cross-branch leakage.
 
 ```mermaid
 flowchart LR
@@ -38,7 +38,7 @@ flowchart LR
 
 - **Tree-scoped visibility (`open | tree`)**: Every read, search, vector KNN query, and slice export passes through one pure policy engine (`src/policy.ts`). In `tree` mode, sibling branches are excluded **before Top-K**; ancestor rules inherit downward; cross-branch reads require explicit `@mount`.
 - **Single truth store, layered into Evidence (`Seabed`) and Conclusions (`Ledger`)**: Inside one canonical SQLite store, immutable raw evidence (`seabed_entries` + `0o444` content-addressed `blobs/`) stays layered beneath structured conclusions (`records` with atomic `supersedes` chains and compliance-grade `redact`). All derived indexes (FTS5, optional `sqlite-vec`) can be destroyed and reconstructed via `admin rebuild`.
-- **Zero-Docker, deterministic speed**: Built directly on Node.js 22+ built-in `node:sqlite` (WAL + FTS5 + local-passage windowed coverage) with optional `sqlite-vec` embeddings.
+- **Zero-Docker engine, optional cloud stacks**: Built directly on Node.js 22+ built-in `node:sqlite` (WAL + FTS5 + local-passage windowed coverage) with optional `sqlite-vec` embeddings — no Docker or external DB required to run locally or bare-metal, plus optional Docker Compose stacks (Caddy HTTPS + Pocket ID / Dex SSO) for one-command cloud deployment.
 - **Minimal 7-tool MCP + 23-line Skill**: Agents follow a deterministic `whoami -> tree -> show <realm> -> search` rhythm without burning context budget.
 
 ---

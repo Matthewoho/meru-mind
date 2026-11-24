@@ -833,22 +833,34 @@ export class LocalMindSurface implements MindSurface {
   private assertOrgRootHuman(action: string, cliCmd: string): void {
     this.assertNotWeakenedCookie(action, cliCmd);
     this.assertHuman(action, cliCmd);
-    const root =
-      this.engine.db.getRealmByPath(this.principal.orgId, "/") ??
-      this.engine.db.listRealms(this.principal.orgId)[0];
-    if (root && this.principal.boundRealmId !== root.id) {
+    // R2-P1-2: Fail closed if root realm "/" is missing
+    const root = this.engine.db.getRealmByPath(this.principal.orgId, "/");
+    if (!root || this.principal.boundRealmId !== root.id) {
       throw new MindError(
         "ACCESS_DENIED",
         `Realm-scoped principals cannot ${action}; an organization root-realm human admin token is required.`,
         { try: cliCmd },
       );
     }
+    if (this.principal.authKind !== "local") {
+      const actorRec = this.engine.db.getActor(
+        this.principal.orgId,
+        this.principal.actor.id,
+      );
+      if (!actorRec || actorRec.role !== "admin") {
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Organization admin role is required to ${action} (actor "${this.principal.actor.id}" has role "${actorRec?.role ?? "member"}").`,
+          { try: cliCmd },
+        );
+      }
+    }
   }
 
   async createToken(
     params: SurfaceCreateTokenInput,
   ): Promise<SurfaceCreateTokenResult> {
-    const cliCmd = `meru-mind token create --actor ${params.actorId} --kind ${params.actorKind}${params.boundRealmRef ? ` --in ${params.boundRealmRef}` : ""}`;
+    const cliCmd = `meru-mind token create --actor-id ${params.actorId} --kind ${params.actorKind}${params.boundRealmRef ? ` --in ${params.boundRealmRef}` : ""}`;
     this.assertOrgRootHuman("create authentication tokens", cliCmd);
     return createAuthToken({
       db: this.engine.db,
@@ -856,6 +868,7 @@ export class LocalMindSurface implements MindSurface {
       actorId: params.actorId,
       actorKind: params.actorKind,
       actorFamily: params.actorFamily,
+      actorRole: params.actorRole,
       boundRealmId: params.boundRealmRef,
       label: params.label,
       createdBy: this.principal.actor.id,

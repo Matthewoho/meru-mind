@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type { DbPort } from "../ports.js";
 import {
   MindError,
+  type ActorRole,
   type AuthTokenPublic,
   type AuthTokenRecord,
   type Principal,
@@ -10,6 +11,31 @@ import {
 export const TOKEN_PREFIX = "mm_live_";
 export const DEFAULT_SSO_TOKEN_TTL_DAYS = 90;
 export const MAX_TOKEN_TTL_DAYS = 365;
+export const MAX_DISPLAY_NAME_CHARS = 64;
+
+const DISPLAY_NAME_STRIP_RE =
+  /[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g;
+
+/**
+ * Sanitizes a user-editable displayName:
+ * - Strips ASCII control chars and Unicode bidi override/isolate/mark characters
+ * - Trims leading/trailing whitespace
+ * - Caps at 64 Unicode codepoints
+ * - Normalizes empty string to null
+ */
+export function sanitizeDisplayName(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== "string") {
+    throw new MindError("INVALID_INPUT", "displayName must be a string or null");
+  }
+  const stripped = raw.replace(DISPLAY_NAME_STRIP_RE, "").trim();
+  if (!stripped) return null;
+  const capped = Array.from(stripped)
+    .slice(0, MAX_DISPLAY_NAME_CHARS)
+    .join("")
+    .trim();
+  return capped || null;
+}
 
 function isIsoExpired(expiresAt: string | null, nowMs: number): boolean {
   if (expiresAt === null) return false;
@@ -60,6 +86,7 @@ export interface CreateAuthTokenParams {
   actorId: string;
   actorKind: "human" | "agent";
   actorFamily?: string | null;
+  actorRole?: ActorRole;
   boundRealmId?: string | null;
   label?: string | null;
   createdBy: string;
@@ -86,10 +113,27 @@ export function createAuthToken(
       `Token actorKind must be "human" or "agent", got "${String(params.actorKind)}"`,
     );
   }
+  if (
+    params.actorRole !== undefined &&
+    params.actorRole !== "admin" &&
+    params.actorRole !== "member"
+  ) {
+    throw new MindError(
+      "INVALID_INPUT",
+      `Token actorRole must be "admin" or "member", got "${String(params.actorRole)}"`,
+    );
+  }
+  if (params.actorKind === "agent" && params.actorRole === "admin") {
+    throw new MindError(
+      "INVALID_INPUT",
+      'Agent tokens cannot be granted the "admin" organization role',
+    );
+  }
   const org = params.db.getOrg(params.orgId);
   if (!org) {
     throw new MindError("NOT_FOUND", `Organization not found: ${params.orgId}`);
   }
+  const rootRealm = params.db.getRealmByPath(params.orgId, "/");
   let boundRealmId = params.boundRealmId?.trim() || null;
   if (boundRealmId) {
     const realm = boundRealmId.startsWith("/")
@@ -103,9 +147,7 @@ export function createAuthToken(
     }
     boundRealmId = realm.id;
   } else if (org.policy === "tree") {
-    const root =
-      params.db.getRealmByPath(params.orgId, "/") ??
-      params.db.listRealms(params.orgId)[0];
+    const root = rootRealm ?? params.db.listRealms(params.orgId)[0];
     if (!root) {
       throw new MindError(
         "NOT_FOUND",
@@ -114,6 +156,8 @@ export function createAuthToken(
     }
     boundRealmId = root.id;
   }
+  const isRootBound =
+    boundRealmId === null || (rootRealm !== null && boundRealmId === rootRealm.id);
 
   const plaintext = generateAuthTokenPlaintext();
   const nowMs = Date.now();
@@ -147,7 +191,42 @@ export function createAuthToken(
     revokedAt: null,
     lastUsedAt: null,
   };
-  params.db.insertToken(fullRecord);
+  params.db.transaction(() => {
+    params.db.insertToken(fullRecord);
+    const isDeviceMint = params.createdBy.startsWith("oidc-device:");
+    const isBootstrap =
+      params.createdBy === "serve-init" ||
+      params.createdBy === "serve-bootstrap";
+    const existingActor = params.db.getActor(params.orgId, actorId);
+    if (!existingActor) {
+      const initialRole: ActorRole =
+        isDeviceMint || params.actorKind !== "human" || !isRootBound
+          ? "member"
+          : (params.actorRole ?? (isBootstrap ? "admin" : "member"));
+      params.db.upsertActor({
+        orgId: params.orgId,
+        actorId,
+        role: initialRole,
+        createdBy: params.createdBy,
+        nowIso: now,
+      });
+    } else if (
+      params.actorRole === "admin" &&
+      !isDeviceMint &&
+      params.actorKind === "human" &&
+      isRootBound
+    ) {
+      // Explicit admin role request only; NEVER silently elevate an existing "member" to "admin"
+      params.db.upsertActor({
+        orgId: params.orgId,
+        actorId,
+        role: "admin",
+        createdBy: params.createdBy,
+        nowIso: now,
+        overwriteRole: true,
+      });
+    }
+  });
   return {
     token: plaintext,
     record: toPublicToken(fullRecord),
@@ -242,11 +321,23 @@ export function resolvePrincipalFromToken(params: {
 
   let boundRealmId = tokenRec.boundRealmId;
   let boundSource = "token";
-  if (!boundRealmId) {
-    const root =
-      params.db.getRealmByPath(org.id, "/") ?? params.db.listRealms(org.id)[0];
+  if (boundRealmId) {
+    // R2-P1-2: Fail closed if an explicit boundRealmId is missing or belongs to another org (NEVER fall back to root!)
+    const realm = params.db.getRealm(boundRealmId);
+    if (!realm || realm.orgId !== org.id) {
+      throw new MindError(
+        "ACCESS_DENIED",
+        "Token bound realm is missing or inaccessible.",
+      );
+    }
+    boundRealmId = realm.id;
+  } else {
+    const root = params.db.getRealmByPath(org.id, "/");
     if (!root) {
-      throw new MindError("NOT_FOUND", `No realms in org ${org.id}`);
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Root realm "/" not found in org ${org.id}`,
+      );
     }
     boundRealmId = root.id;
     boundSource = org.policy === "open" ? "open-default:/" : "token-root:/";
@@ -259,6 +350,7 @@ export function resolvePrincipalFromToken(params: {
     params.db.touchTokenLastUsed(tokenRec.id, new Date(nowMs).toISOString());
   }
 
+  const actorRec = params.db.getActor(tokenRec.orgId, tokenRec.actorId);
   return {
     tokenId: tokenRec.id,
     orgId: tokenRec.orgId,
@@ -266,6 +358,8 @@ export function resolvePrincipalFromToken(params: {
       id: tokenRec.actorId,
       kind: tokenRec.actorKind,
       ...(tokenRec.actorFamily ? { family: tokenRec.actorFamily } : {}),
+      role: actorRec?.role ?? "member",
+      ...(actorRec?.displayName ? { displayName: actorRec.displayName } : {}),
     },
     boundRealmId,
     boundSource,
@@ -284,10 +378,20 @@ export function isPrincipalTokenActive(
   ) {
     return false;
   }
+  const boundRealm = db.getRealm(principal.boundRealmId);
+  if (!boundRealm || boundRealm.orgId !== principal.orgId) {
+    return false;
+  }
   if (!principal.tokenId) return true;
   const rec = db.getToken(principal.tokenId);
   if (!rec || rec.revokedAt !== null || rec.orgId !== principal.orgId) {
     return false;
+  }
+  if (rec.boundRealmId) {
+    const tokenRealm = db.getRealm(rec.boundRealmId);
+    if (!tokenRealm || tokenRealm.orgId !== principal.orgId) {
+      return false;
+    }
   }
   if (isIsoExpired(rec.expiresAt, nowMs)) {
     return false;

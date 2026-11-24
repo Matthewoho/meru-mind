@@ -1,5 +1,7 @@
 import type { WorkBindingRecord } from "./work/provider.js";
 import type {
+  ActorRecord,
+  ActorRole,
   AuthTokenRecord,
   ChangeAssetClass,
   ChangeCommittedEvent,
@@ -573,6 +575,32 @@ export interface DbPort {
   isActorDisabled(orgId: string, actorId: string): boolean;
   isActorIdClaimedInOrg(orgId: string, actorId: string): boolean;
   listDisabledActors(orgId: string): DisabledActorRecord[];
+
+  // Actors & Org Roles (Migration v13)
+  getActor(orgId: string, actorId: string): ActorRecord | null;
+  upsertActor(params: {
+    orgId: string;
+    actorId: string;
+    role: ActorRole;
+    displayName?: string | null;
+    createdBy?: string | null;
+    nowIso?: string;
+    overwriteRole?: boolean;
+  }): ActorRecord;
+  setActorRole(
+    orgId: string,
+    actorId: string,
+    role: ActorRole,
+    updatedAt?: string,
+  ): ActorRecord;
+  setActorDisplayName(
+    orgId: string,
+    actorId: string,
+    displayName: string | null,
+    updatedAt?: string,
+  ): ActorRecord;
+  listActors(orgId: string): ActorRecord[];
+  countActiveAdmins(orgId: string): number;
 
   // Outbox Consumer Cursors & Deliveries (Migration v9)
   upsertConsumerCursor(cursor: ConsumerCursor): void;

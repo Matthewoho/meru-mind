@@ -376,6 +376,10 @@ export function createMindClient(options = {}) {
       leave: (sessionId = undefined) =>
         apiRequest("DELETE", "/v1/pulse", { body: sessionId ? { sessionId } : {} }),
     },
+    profile: {
+      updateDisplayName: (displayName) =>
+        apiRequest("POST", "/v1/me/profile", { body: { displayName } }),
+    },
     logout: () => fetch((baseUrl || "") + "/_meru/logout", { method: "POST", credentials: "same-origin" }),
   };
 }

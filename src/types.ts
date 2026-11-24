@@ -54,11 +54,27 @@ export class MindError extends Error {
 
 export type ActorKind = "human" | "agent" | "system";
 
+export type ActorRole = "admin" | "member";
+
 export interface Actor {
   id: string;
   kind: ActorKind;
   /** Model family for agents (e.g., "claude", "gemini", "deepseek", "openai") */
   family?: string;
+  /** Organization role ("admin" | "member") */
+  role?: ActorRole;
+  /** Optional user-editable display name (does not change actorId) */
+  displayName?: string | null;
+}
+
+export interface ActorRecord {
+  orgId: string;
+  actorId: string;
+  role: ActorRole;
+  displayName: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export type OrgPolicy = "open" | "tree";
@@ -622,6 +638,7 @@ export interface InviteRecord {
   codeHash: string;
   actorId: string;
   actorKind: "human" | "agent";
+  actorRole?: ActorRole;
   boundRealmId: string | null;
   createdBy: string;
   expiresAt: string;
@@ -637,6 +654,7 @@ export interface InvitePublic {
   orgId: string;
   actorId: string;
   actorKind: "human" | "agent";
+  actorRole?: ActorRole;
   boundRealmId: string | null;
   createdBy: string;
   expiresAt: string;

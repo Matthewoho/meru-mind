@@ -35,6 +35,8 @@ import {
 } from "../work/provider.js";
 import {
   MindError,
+  type ActorRecord,
+  type ActorRole,
   type AuthTokenRecord,
   type ChangeAssetClass,
   type ChangeCommittedEvent,
@@ -1350,6 +1352,167 @@ export class SqliteDb implements DbPort {
             `INSERT INTO schema_migrations (version, name, applied_at) VALUES (12, 'v12_v060_oidc_identities_invites', ?)`,
           )
           .run(nowV12);
+      }
+
+      // Migration v13: v0.6.1 actors table (role: admin|member, display_name) + invites.actor_role
+      if (!applied.has(13)) {
+        const nowV13 = new Date().toISOString();
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS actors (
+            org_id TEXT NOT NULL REFERENCES orgs(id),
+            actor_id TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member')),
+            display_name TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (org_id, actor_id)
+          );
+          CREATE INDEX IF NOT EXISTS idx_actors_org_role
+            ON actors(org_id, role);
+        `);
+        this.ensureColumn("invites", "actor_role", "TEXT NOT NULL DEFAULT 'member'");
+
+        // Backfill existing org actors from tokens, identities, and disabled_actors:
+        // Any existing non-revoked root-realm human token actor or active root-realm human identity actor
+        // receives role='admin' (preserving backward compatibility for existing installs & tests);
+        // all other actors receive role='member'. Carry over display_name from identities when present.
+        const orgRows = this.db
+          .prepare(`SELECT id FROM orgs`)
+          .all() as Array<{ id: string }>;
+        const insertBackfill = this.db.prepare(
+          `INSERT OR IGNORE INTO actors
+           (org_id, actor_id, role, display_name, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'migration-v13', ?, ?)`,
+        );
+
+        for (const { id: backOrgId } of orgRows) {
+          const rootRow =
+            (this.db
+              .prepare(
+                `SELECT id FROM realms WHERE org_id = ? AND path = '/' LIMIT 1`,
+              )
+              .get(backOrgId) as { id?: string } | undefined) ??
+            (this.db
+              .prepare(
+                `SELECT id FROM realms WHERE org_id = ? ORDER BY created_at ASC LIMIT 1`,
+              )
+              .get(backOrgId) as { id?: string } | undefined);
+          const rootRealmId = rootRow?.id ?? null;
+
+          const actorMap = new Map<
+            string,
+            { role: ActorRole; displayName: string | null; createdAt: string }
+          >();
+
+          const tokenRows = this.db
+            .prepare(
+              `SELECT actor_id, actor_kind, bound_realm_id, revoked_at, created_at
+               FROM tokens WHERE org_id = ? ORDER BY created_at ASC`,
+            )
+            .all(backOrgId) as Array<{
+            actor_id: string;
+            actor_kind: string;
+            bound_realm_id: string | null;
+            revoked_at: string | null;
+            created_at: string;
+          }>;
+          for (const t of tokenRows) {
+            const norm = String(t.actor_id).trim().toLowerCase();
+            if (!norm) continue;
+            const isRootHumanActive =
+              t.actor_kind === "human" &&
+              t.revoked_at === null &&
+              (t.bound_realm_id === null ||
+                (rootRealmId !== null && t.bound_realm_id === rootRealmId));
+            const cur = actorMap.get(norm);
+            if (!cur) {
+              actorMap.set(norm, {
+                role: isRootHumanActive ? "admin" : "member",
+                displayName: null,
+                createdAt: String(t.created_at || nowV13),
+              });
+            } else if (isRootHumanActive) {
+              cur.role = "admin";
+            }
+          }
+
+          const identityRows = this.db
+            .prepare(
+              `SELECT actor_id, actor_kind, bound_realm_id, display_name, disabled_at, created_at
+               FROM identities WHERE org_id = ? ORDER BY updated_at DESC`,
+            )
+            .all(backOrgId) as Array<{
+            actor_id: string;
+            actor_kind: string;
+            bound_realm_id: string | null;
+            display_name: string | null;
+            disabled_at: string | null;
+            created_at: string;
+          }>;
+          for (const idRow of identityRows) {
+            const norm = String(idRow.actor_id).trim().toLowerCase();
+            if (!norm) continue;
+            const isRootHumanActive =
+              idRow.actor_kind === "human" &&
+              idRow.disabled_at === null &&
+              (idRow.bound_realm_id === null ||
+                (rootRealmId !== null && idRow.bound_realm_id === rootRealmId));
+            const rawDn =
+              typeof idRow.display_name === "string"
+                ? idRow.display_name
+                    .replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g, "")
+                    .trim()
+                    .slice(0, 64)
+                    .trim() || null
+                : null;
+            const cur = actorMap.get(norm);
+            if (!cur) {
+              actorMap.set(norm, {
+                role: isRootHumanActive ? "admin" : "member",
+                displayName: rawDn,
+                createdAt: String(idRow.created_at || nowV13),
+              });
+            } else {
+              if (isRootHumanActive) cur.role = "admin";
+              if (cur.displayName === null && rawDn !== null) {
+                cur.displayName = rawDn;
+              }
+            }
+          }
+
+          const disabledRows = this.db
+            .prepare(
+              `SELECT actor_id, disabled_at FROM disabled_actors WHERE org_id = ?`,
+            )
+            .all(backOrgId) as Array<{ actor_id: string; disabled_at: string }>;
+          for (const d of disabledRows) {
+            const norm = String(d.actor_id).trim().toLowerCase();
+            if (!norm || actorMap.has(norm)) continue;
+            actorMap.set(norm, {
+              role: "member",
+              displayName: null,
+              createdAt: String(d.disabled_at || nowV13),
+            });
+          }
+
+          for (const [normId, info] of actorMap.entries()) {
+            insertBackfill.run(
+              backOrgId,
+              normId,
+              info.role,
+              info.displayName,
+              info.createdAt,
+              nowV13,
+            );
+          }
+        }
+
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (13, 'v13_v061_actors_role_and_display_name', ?)`,
+          )
+          .run(nowV13);
       }
 
       if (this.vecEnabled && !this.tableExists("vec_items")) {
@@ -4729,6 +4892,7 @@ export class SqliteDb implements DbPort {
       codeHash: String(row.code_hash),
       actorId: String(row.actor_id),
       actorKind: String(row.actor_kind) as "human" | "agent",
+      actorRole: row.actor_role === "admin" ? "admin" : "member",
       boundRealmId: row.bound_realm_id ? String(row.bound_realm_id) : null,
       createdBy: String(row.created_by),
       expiresAt: String(row.expires_at),
@@ -4741,11 +4905,12 @@ export class SqliteDb implements DbPort {
   }
 
   insertInvite(invite: InviteRecord): void {
+    const actorRole: ActorRole = invite.actorRole === "admin" ? "admin" : "member";
     this.db
       .prepare(
         `INSERT INTO invites
-         (id, org_id, code_hash, actor_id, actor_kind, bound_realm_id, created_by, expires_at, used_at, used_by_issuer, used_by_subject, revoked_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, org_id, code_hash, actor_id, actor_kind, actor_role, bound_realm_id, created_by, expires_at, used_at, used_by_issuer, used_by_subject, revoked_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         invite.id,
@@ -4753,6 +4918,7 @@ export class SqliteDb implements DbPort {
         invite.codeHash,
         invite.actorId,
         invite.actorKind,
+        actorRole,
         invite.boundRealmId,
         invite.createdBy,
         invite.expiresAt,
@@ -4834,6 +5000,33 @@ export class SqliteDb implements DbPort {
         updatedAt: params.nowIso,
       };
       this.insertIdentity(identity);
+      const inviteRole: ActorRole =
+        invite.actorRole === "admin" && invite.actorKind === "human"
+          ? "admin"
+          : "member";
+      const sanitizedDn =
+        typeof params.displayName === "string"
+          ? Array.from(
+              params.displayName
+                .replace(
+                  /[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g,
+                  "",
+                )
+                .trim(),
+            )
+              .slice(0, 64)
+              .join("")
+              .trim() || null
+          : null;
+      this.upsertActor({
+        orgId: params.orgId,
+        actorId: invite.actorId,
+        role: inviteRole,
+        displayName: sanitizedDn,
+        createdBy: invite.createdBy,
+        nowIso: params.nowIso,
+        overwriteRole: inviteRole === "admin",
+      });
       return identity;
     });
   }
@@ -4957,7 +5150,9 @@ export class SqliteDb implements DbPort {
   isActorIdClaimedInOrg(orgId: string, actorId: string): boolean {
     const hit = this.db
       .prepare(
-        `SELECT 1 AS hit FROM identities WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)
+        `SELECT 1 AS hit FROM actors WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)
+         UNION ALL
+         SELECT 1 AS hit FROM identities WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)
          UNION ALL
          SELECT 1 AS hit FROM tokens WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)
          UNION ALL
@@ -4971,6 +5166,8 @@ export class SqliteDb implements DbPort {
          LIMIT 1`,
       )
       .get(
+        orgId,
+        actorId,
         orgId,
         actorId,
         orgId,
@@ -5000,6 +5197,256 @@ export class SqliteDb implements DbPort {
       disabledBy: String(r.disabled_by),
       disabledAt: String(r.disabled_at),
     }));
+  }
+
+  // ---- Actors & Org Roles (Migration v13) ----
+
+  private mapActor(row: Record<string, unknown>): ActorRecord {
+    return {
+      orgId: String(row.org_id),
+      actorId: String(row.actor_id),
+      role: row.role === "admin" ? "admin" : "member",
+      displayName: row.display_name ? String(row.display_name) : null,
+      createdBy: row.created_by ? String(row.created_by) : null,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  getActor(orgId: string, actorId: string): ActorRecord | null {
+    const normalized = actorId.trim();
+    if (!normalized) return null;
+    const row = this.db
+      .prepare(
+        `SELECT * FROM actors WHERE org_id = ? AND LOWER(actor_id) = LOWER(?) LIMIT 1`,
+      )
+      .get(orgId, normalized) as Record<string, unknown> | undefined;
+    return row ? this.mapActor(row) : null;
+  }
+
+  upsertActor(params: {
+    orgId: string;
+    actorId: string;
+    role: ActorRole;
+    displayName?: string | null;
+    createdBy?: string | null;
+    nowIso?: string;
+    overwriteRole?: boolean;
+  }): ActorRecord {
+    const normalized = params.actorId.trim().toLowerCase();
+    if (!normalized) {
+      throw new MindError("INVALID_INPUT", "actorId must not be empty");
+    }
+    const role: ActorRole = params.role === "admin" ? "admin" : "member";
+    const now = params.nowIso ?? new Date().toISOString();
+    return this.transaction(() => {
+      const existing = this.getActor(params.orgId, normalized);
+      if (existing) {
+        const nextRole = params.overwriteRole ? role : existing.role;
+        const nextDisplayName =
+          existing.displayName === null &&
+          params.displayName !== undefined &&
+          params.displayName !== null
+            ? params.displayName
+            : existing.displayName;
+        if (
+          nextRole !== existing.role ||
+          nextDisplayName !== existing.displayName
+        ) {
+          this.db
+            .prepare(
+              `UPDATE actors SET role = ?, display_name = ?, updated_at = ?
+               WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)`,
+            )
+            .run(nextRole, nextDisplayName, now, params.orgId, existing.actorId);
+          return {
+            ...existing,
+            role: nextRole,
+            displayName: nextDisplayName,
+            updatedAt: now,
+          };
+        }
+        return existing;
+      }
+      const displayName =
+        params.displayName !== undefined ? params.displayName : null;
+      const createdBy = params.createdBy ?? null;
+      this.db
+        .prepare(
+          `INSERT INTO actors (org_id, actor_id, role, display_name, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          params.orgId,
+          normalized,
+          role,
+          displayName,
+          createdBy,
+          now,
+          now,
+        );
+      return {
+        orgId: params.orgId,
+        actorId: normalized,
+        role,
+        displayName,
+        createdBy,
+        createdAt: now,
+        updatedAt: now,
+      };
+    });
+  }
+
+  setActorRole(
+    orgId: string,
+    actorId: string,
+    role: ActorRole,
+    updatedAt?: string,
+  ): ActorRecord {
+    const normalized = actorId.trim().toLowerCase();
+    if (!normalized) {
+      throw new MindError("INVALID_INPUT", "actorId must not be empty");
+    }
+    if (role !== "admin" && role !== "member") {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Actor role must be "admin" or "member", got "${String(role)}"`,
+      );
+    }
+    const now = updatedAt ?? new Date().toISOString();
+    return this.transaction(() => {
+      const existing = this.getActor(orgId, normalized);
+      if (existing) {
+        this.db
+          .prepare(
+            `UPDATE actors SET role = ?, updated_at = ?
+             WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)`,
+          )
+          .run(role, now, orgId, existing.actorId);
+        return {
+          ...existing,
+          role,
+          updatedAt: now,
+        };
+      }
+      const idRow = this.db
+        .prepare(
+          `SELECT display_name FROM identities
+           WHERE org_id = ? AND LOWER(actor_id) = LOWER(?) AND display_name IS NOT NULL
+           ORDER BY updated_at DESC LIMIT 1`,
+        )
+        .get(orgId, normalized) as { display_name?: string | null } | undefined;
+      const inheritedDn =
+        typeof idRow?.display_name === "string"
+          ? Array.from(
+              idRow.display_name
+                .replace(
+                  /[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g,
+                  "",
+                )
+                .trim(),
+            )
+              .slice(0, 64)
+              .join("")
+              .trim() || null
+          : null;
+      this.db
+        .prepare(
+          `INSERT INTO actors (org_id, actor_id, role, display_name, created_by, created_at, updated_at)
+           VALUES (?, ?, ?, ?, NULL, ?, ?)`,
+        )
+        .run(orgId, normalized, role, inheritedDn, now, now);
+      return {
+        orgId,
+        actorId: normalized,
+        role,
+        displayName: inheritedDn,
+        createdBy: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+    });
+  }
+
+  setActorDisplayName(
+    orgId: string,
+    actorId: string,
+    displayName: string | null,
+    updatedAt?: string,
+  ): ActorRecord {
+    const normalized = actorId.trim().toLowerCase();
+    if (!normalized) {
+      throw new MindError("INVALID_INPUT", "actorId must not be empty");
+    }
+    const now = updatedAt ?? new Date().toISOString();
+    return this.transaction(() => {
+      const existing = this.getActor(orgId, normalized);
+      if (existing) {
+        this.db
+          .prepare(
+            `UPDATE actors SET display_name = ?, updated_at = ?
+             WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)`,
+          )
+          .run(displayName, now, orgId, existing.actorId);
+        return {
+          ...existing,
+          displayName,
+          updatedAt: now,
+        };
+      }
+      this.db
+        .prepare(
+          `INSERT INTO actors (org_id, actor_id, role, display_name, created_by, created_at, updated_at)
+           VALUES (?, ?, 'member', ?, NULL, ?, ?)`,
+        )
+        .run(orgId, normalized, displayName, now, now);
+      return {
+        orgId,
+        actorId: normalized,
+        role: "member",
+        displayName,
+        createdBy: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+    });
+  }
+
+  listActors(orgId: string): ActorRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM actors WHERE org_id = ? ORDER BY role ASC, actor_id ASC`,
+      )
+      .all(orgId) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapActor(r));
+  }
+
+  countActiveAdmins(orgId: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS cnt
+         FROM actors a
+         WHERE a.org_id = ?
+           AND a.role = 'admin'
+           AND NOT EXISTS (
+             SELECT 1 FROM disabled_actors d
+             WHERE d.org_id = a.org_id AND LOWER(d.actor_id) = LOWER(a.actor_id)
+           )
+           AND NOT (
+             EXISTS (
+               SELECT 1 FROM identities i
+               WHERE i.org_id = a.org_id AND LOWER(i.actor_id) = LOWER(a.actor_id)
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM identities i2
+               WHERE i2.org_id = a.org_id
+                 AND LOWER(i2.actor_id) = LOWER(a.actor_id)
+                 AND i2.disabled_at IS NULL
+             )
+           )`,
+      )
+      .get(orgId) as { cnt?: number } | undefined;
+    return Number(row?.cnt ?? 0);
   }
 
   // ---- Outbox Consumer Cursors & Deliveries (Migration v9) ----

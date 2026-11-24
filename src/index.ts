@@ -70,6 +70,8 @@ export {
 export {
   TOKEN_PREFIX,
   DEFAULT_SSO_TOKEN_TTL_DAYS,
+  MAX_DISPLAY_NAME_CHARS,
+  sanitizeDisplayName,
   hashAuthToken,
   generateAuthTokenPlaintext,
   toPublicToken,
@@ -90,6 +92,8 @@ export {
   INVITE_TX_COOKIE_NAME,
   INVITE_HOST_TX_COOKIE_NAME,
   INVITE_CODE_PREFIX,
+  MAX_PENDING_DEVICE_CODES_GLOBAL,
+  normalizeIpRateLimitKey,
   loadOidcConfigFromEnv,
   sanitizeReturnTo,
   hashInviteCode,

@@ -760,6 +760,16 @@ describe("v0.6.0 Standard OIDC SSO, Single-Use Invites, Self-Issued Device-Code 
     expect(login.step3.status).toBe(200);
     const bobCookie = `${UI_SESSION_COOKIE_NAME}=${login.cookies[UI_SESSION_COOKIE_NAME]}`;
     const bobTok = srv.createToken({ actorId: "bob", actorKind: "human" });
+    // Promote bob to admin explicitly (v0.6.1: trustIssuer auto-provision creates member, not admin)
+    const promoteBob = await fetch(`${srv.url}/v1/actors/role`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${adminTok.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ actorId: "bob", role: "admin" }),
+    });
+    expect(promoteBob.status).toBe(200);
 
     // Bob creates an unused invite and a delegated agent token before being disabled (P1-2!)
     const bobInv = (await (

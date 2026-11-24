@@ -2,6 +2,7 @@ import type { RelatedActiveEcho } from "./engine/surface-write.js";
 import type { WorkBindingRecord } from "./work/provider.js";
 import type { SafeListReadyResult, SafeResolveResult } from "./work/registry.js";
 import type {
+  ActorRole,
   AuthTokenPublic,
   ChangeLogEntry,
   ChangesResult,
@@ -168,6 +169,7 @@ export interface SurfaceCreateTokenInput {
   actorId: string;
   actorKind: "human" | "agent";
   actorFamily?: string | null;
+  actorRole?: ActorRole;
   boundRealmRef?: string | null;
   label?: string | null;
 }

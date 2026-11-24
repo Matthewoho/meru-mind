@@ -29,6 +29,7 @@ import type {
 } from "../surface.js";
 import {
   MindError,
+  type ActorRole,
   type LsOnlyFilter,
   type OidcConfig,
   type OrgPolicy,
@@ -49,6 +50,7 @@ import { ChangeWakeBus } from "./pump.js";
 import {
   createAuthToken,
   resolvePrincipalFromToken,
+  sanitizeDisplayName,
   TokenTouchThrottle,
   type CreateAuthTokenResult,
 } from "./tokens.js";
@@ -175,6 +177,7 @@ export interface MindServerHandle {
     actorId: string;
     actorKind: "human" | "agent";
     actorFamily?: string | null;
+    actorRole?: ActorRole;
     boundRealmId?: string | null;
     label?: string | null;
     createdBy?: string;
@@ -322,6 +325,7 @@ export async function startMindServer(
   let engine: MindEngine | null = null;
   let unsubChangeLog: (() => void) | null = null;
   let detachWs: PumpWsHandle | null = null;
+  let oidcManager: OidcManager | null = null;
 
   try {
     engine = await createMindEngine({
@@ -370,7 +374,7 @@ export async function startMindServer(
     const uiSessions = new UiSessionManager();
     const resolvedOidcConfig =
       options.oidc === false ? null : (options.oidc ?? loadOidcConfigFromEnv());
-    const oidcManager = resolvedOidcConfig
+    oidcManager = resolvedOidcConfig
       ? new OidcManager(resolvedOidcConfig)
       : null;
     const serverUrlRef = { value: `http://${formatHostForUrl(host)}:${requestedPort}` };
@@ -627,6 +631,32 @@ export async function startMindServer(
               return;
             }
 
+            // ---- v0.6.1 Editable Profile Display Name (Bearer OR Cookie with CSRF check) ----
+            if (method === "POST" && pathname === "/v1/me/profile") {
+              const body = await readJsonBody(req);
+              if (
+                !("displayName" in body) ||
+                (body.displayName !== null && typeof body.displayName !== "string")
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  "displayName must be a string or null",
+                );
+              }
+              const sanitized = sanitizeDisplayName(body.displayName);
+              const updated = engine!.db.setActorDisplayName(
+                orgId,
+                principal.actor.id,
+                sanitized,
+              );
+              sendJson(res, 200, {
+                actorId: principal.actor.id,
+                displayName: updated.displayName,
+                role: updated.role,
+              });
+              return;
+            }
+
             if (method === "GET" && pathname === "/v1/tree") {
               const out = await surface.tree({
                 ref: sp.get("ref") ?? undefined,
@@ -857,28 +887,35 @@ export async function startMindServer(
               return;
             }
 
-            // ---- v0.6.0 Invitations, Identities & Actor Lifecycle (Root-Realm Human Bearer ONLY) ----
+            // ---- v0.6.0/v0.6.1 Invitations, Identities & Actor Lifecycle (Root-Realm Human Admin Bearer ONLY) ----
             const assertHumanBearerAdmin = (cliHint: string) => {
               if (principal.authKind === "cookie") {
                 throw new MindError(
                   "ACCESS_DENIED",
-                  "Browser Cookie sessions cannot manage invites or actor accounts; use a human Bearer token via CLI.",
+                  "Browser Cookie sessions cannot perform organization admin actions; use an admin Bearer token via CLI.",
                   { try: cliHint },
                 );
               }
               if (principal.actor.kind !== "human") {
                 throw new MindError(
                   "ACCESS_DENIED",
-                  "Only human principals can manage invites or actor accounts.",
+                  "Only human admin principals can perform organization admin actions.",
                 );
               }
-              const rootRealm =
-                engine!.db.getRealmByPath(orgId, "/") ??
-                engine!.db.listRealms(orgId)[0];
-              if (rootRealm && principal.boundRealmId !== rootRealm.id) {
+              // R2-P1-2: Fail closed if root realm "/" is missing
+              const rootRealm = engine!.db.getRealmByPath(orgId, "/");
+              if (!rootRealm || principal.boundRealmId !== rootRealm.id) {
                 throw new MindError(
                   "ACCESS_DENIED",
-                  "Realm-scoped humans cannot manage organization invites or actor accounts; an organization root-realm human admin token is required.",
+                  "Realm-scoped humans cannot perform organization admin actions; an organization root-realm human admin token is required.",
+                  { try: cliHint },
+                );
+              }
+              const actorRec = engine!.db.getActor(orgId, principal.actor.id);
+              if (!actorRec || actorRec.role !== "admin") {
+                throw new MindError(
+                  "ACCESS_DENIED",
+                  `Organization admin role is required (actor "${principal.actor.id}" has role "${actorRec?.role ?? "member"}").`,
                   { try: cliHint },
                 );
               }
@@ -898,9 +935,22 @@ export async function startMindServer(
               const body = (await readJsonBody(req)) as {
                 actorId?: string;
                 actorKind?: "human" | "agent";
+                role?: string;
+                actorRole?: string;
                 boundRealmRef?: string | null;
                 ttlHours?: number;
               };
+              const rawRole = body.role ?? body.actorRole;
+              if (
+                rawRole !== undefined &&
+                rawRole !== "admin" &&
+                rawRole !== "member"
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  `Invite role must be "admin" or "member"`,
+                );
+              }
               const publicBase = oidcManager
                 ? oidcManager.resolvePublicBaseUrl(req, serverUrlRef.value)
                 : serverUrlRef.value;
@@ -909,6 +959,7 @@ export async function startMindServer(
                 orgId,
                 actorId: String(body.actorId ?? ""),
                 actorKind: (body.actorKind ?? "human") as "human" | "agent",
+                actorRole: (rawRole ?? "member") as ActorRole,
                 boundRealmRef: body.boundRealmRef ?? null,
                 createdBy: principal.actor.id,
                 ttlHours: body.ttlHours,
@@ -937,8 +988,62 @@ export async function startMindServer(
             if (method === "GET" && pathname === "/v1/identities") {
               assertHumanBearerAdmin("meru-mind actor list");
               sendJson(res, 200, {
+                actors: engine!.db.listActors(orgId),
                 identities: engine!.db.listIdentities(orgId),
                 disabledActors: engine!.db.listDisabledActors(orgId),
+              });
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/actors/role") {
+              assertHumanBearerAdmin(
+                "meru-mind actor set-role <actorId> --role admin|member",
+              );
+              const body = (await readJsonBody(req)) as {
+                actorId?: string;
+                role?: string;
+              };
+              const targetActorId = String(body.actorId ?? "").trim();
+              if (!targetActorId) {
+                throw new MindError("INVALID_INPUT", "actorId is required");
+              }
+              const targetRole = body.role;
+              if (targetRole !== "admin" && targetRole !== "member") {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'role must be "admin" or "member"',
+                );
+              }
+              if (
+                targetRole === "member" &&
+                targetActorId.toLowerCase() === principal.actor.id.toLowerCase()
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  "Cannot demote your own active admin account.",
+                );
+              }
+              const updated = engine!.db.transaction(() => {
+                if (targetRole === "member") {
+                  const existing = engine!.db.getActor(orgId, targetActorId);
+                  if (
+                    existing?.role === "admin" &&
+                    !engine!.db.isActorDisabled(orgId, targetActorId) &&
+                    engine!.db.countActiveAdmins(orgId) <= 1
+                  ) {
+                    throw new MindError(
+                      "CONFLICT",
+                      "Cannot demote the last active organization administrator.",
+                    );
+                  }
+                }
+                return engine!.db.setActorRole(orgId, targetActorId, targetRole);
+              });
+              sendJson(res, 200, {
+                actorId: updated.actorId,
+                role: updated.role,
+                displayName: updated.displayName,
+                updatedAt: updated.updatedAt,
               });
               return;
             }
@@ -962,15 +1067,28 @@ export async function startMindServer(
                 );
               }
               const disabledAt = new Date().toISOString();
-              const dbRes = engine!.db.disableActor({
-                orgId,
-                actorId: targetActorId,
-                reason:
-                  typeof body.reason === "string" && body.reason.trim()
-                    ? body.reason.trim()
-                    : null,
-                disabledBy: principal.actor.id,
-                disabledAt,
+              const dbRes = engine!.db.transaction(() => {
+                const existing = engine!.db.getActor(orgId, targetActorId);
+                if (
+                  existing?.role === "admin" &&
+                  !engine!.db.isActorDisabled(orgId, targetActorId) &&
+                  engine!.db.countActiveAdmins(orgId) <= 1
+                ) {
+                  throw new MindError(
+                    "CONFLICT",
+                    "Cannot disable the last active organization administrator.",
+                  );
+                }
+                return engine!.db.disableActor({
+                  orgId,
+                  actorId: targetActorId,
+                  reason:
+                    typeof body.reason === "string" && body.reason.trim()
+                      ? body.reason.trim()
+                      : null,
+                  disabledBy: principal.actor.id,
+                  disabledAt,
+                });
               });
               const revokedSessions = uiSessions.revokeSessionsForActor(
                 orgId,
@@ -1037,21 +1155,9 @@ export async function startMindServer(
             }
 
             if (method === "POST" && pathname === "/v1/admin/backup") {
-              if (principal.authKind === "cookie") {
-                throw new MindError(
-                  "ACCESS_DENIED",
-                  "Browser Cookie sessions cannot create server backups; use a human Bearer token via CLI.",
-                  {
-                    try: "MERU_MIND_URL=<url> MERU_MIND_TOKEN=<token> meru-mind admin backup",
-                  },
-                );
-              }
-              if (principal.actor.kind !== "human") {
-                throw new MindError(
-                  "ACCESS_DENIED",
-                  "Only human principals can trigger server backups",
-                );
-              }
+              assertHumanBearerAdmin(
+                "MERU_MIND_URL=<url> MERU_MIND_TOKEN=<token> meru-mind admin backup",
+              );
               const body = (await readJsonBody(req)) as { name?: string };
               const rawName =
                 typeof body.name === "string" && body.name.trim()
@@ -1334,6 +1440,7 @@ export async function startMindServer(
         unsubChangeLog();
         unsubChangeLog = null;
       }
+      oidcManager?.close();
       try {
         pulseStore.saveSnapshot(pulseSnapshotPath);
       } catch {
@@ -1366,6 +1473,7 @@ export async function startMindServer(
           actorId: params.actorId,
           actorKind: params.actorKind,
           actorFamily: params.actorFamily,
+          actorRole: params.actorRole,
           boundRealmId: params.boundRealmId,
           label: params.label,
           createdBy: params.createdBy ?? "serve-bootstrap",
@@ -1385,6 +1493,7 @@ export async function startMindServer(
   } catch (err) {
     if (detachWs) detachWs();
     if (unsubChangeLog) unsubChangeLog();
+    oidcManager?.close();
     if (engine) {
       await engine.close().catch(() => {});
     }
