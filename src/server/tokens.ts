@@ -116,11 +116,54 @@ export function createAuthToken(
   };
 }
 
+export const DEFAULT_TOKEN_TOUCH_THROTTLE_MS = 60_000;
+const MAX_THROTTLE_ENTRIES = 2_000;
+
+/**
+ * In-memory throttle for `tokens.last_used_at` SQLite updates.
+ * Prevents high-frequency heartbeats or MCP bursts from turning read-only traffic
+ * into continuous SQLite writes (preserving WAL throughput & DO hibernation).
+ */
+export class TokenTouchThrottle {
+  private readonly lastTouchedMs = new Map<string, number>();
+
+  constructor(private readonly intervalMs = DEFAULT_TOKEN_TOUCH_THROTTLE_MS) {}
+
+  shouldTouch(tokenId: string, nowMs = Date.now()): boolean {
+    const prev = this.lastTouchedMs.get(tokenId);
+    if (prev !== undefined && nowMs - prev < this.intervalMs) {
+      return false;
+    }
+    if (this.lastTouchedMs.size >= MAX_THROTTLE_ENTRIES) {
+      let oldestKey: string | null = null;
+      let oldestMs = Infinity;
+      for (const [k, v] of this.lastTouchedMs.entries()) {
+        if (v < oldestMs) {
+          oldestMs = v;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey !== null) {
+        this.lastTouchedMs.delete(oldestKey);
+      }
+    }
+    this.lastTouchedMs.set(tokenId, nowMs);
+    return true;
+  }
+
+  clear(): void {
+    this.lastTouchedMs.clear();
+  }
+}
+
 export function resolvePrincipalFromToken(params: {
   db: DbPort;
   plaintextToken: string;
   expectedOrgId: string;
   authKind?: "bearer" | "cookie";
+  skipTouchLastUsed?: boolean;
+  touchThrottle?: TokenTouchThrottle;
+  nowMs?: number;
 }): Principal {
   const raw = params.plaintextToken.trim();
   if (!raw) {
@@ -152,7 +195,13 @@ export function resolvePrincipalFromToken(params: {
     boundSource = org.policy === "open" ? "open-default:/" : "token-root:/";
   }
 
-  params.db.touchTokenLastUsed(tokenRec.id, new Date().toISOString());
+  const nowMs = params.nowMs ?? Date.now();
+  if (
+    !params.skipTouchLastUsed &&
+    (!params.touchThrottle || params.touchThrottle.shouldTouch(tokenRec.id, nowMs))
+  ) {
+    params.db.touchTokenLastUsed(tokenRec.id, new Date(nowMs).toISOString());
+  }
 
   return {
     tokenId: tokenRec.id,

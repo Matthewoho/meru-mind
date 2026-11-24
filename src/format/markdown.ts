@@ -909,9 +909,35 @@ function formatEntryHeaderLines(res: CatResult): string[] {
   ];
 }
 
+function formatRelativeAge(ageSeconds: number): string {
+  if (ageSeconds < 60) return `${ageSeconds}s ago`;
+  const mins = Math.floor(ageSeconds / 60);
+  if (mins < 60) return `${mins}m ago`;
+  return `${Math.floor(mins / 60)}h ago`;
+}
+
 export function formatShowMarkdown(res: ShowResult): string {
   if (res.refType === "realm") {
-    return formatBriefMarkdown(res.brief);
+    const base = formatBriefMarkdown(res.brief);
+    if (!res.activePeers || res.activePeers.length === 0) {
+      return base;
+    }
+    const peerLines = [
+      "",
+      `## Active Peers (${res.activePeers.length})`,
+      ...res.activePeers.map((p) => {
+        const who = p.clientHint
+          ? `${p.actorId} (${p.actorKind}, client: ${p.clientHint})`
+          : `${p.actorId} (${p.actorKind})`;
+        const age = p.online ? "online" : `active ${formatRelativeAge(p.ageSeconds)}`;
+        const details = [
+          p.focus.length > 0 ? `focus: ${p.focus.join(", ")}` : "",
+          p.note ? `"${p.note}"` : "",
+        ].filter(Boolean);
+        return `- ${who} · ${age}${details.length > 0 ? ` · ${details.join(" · ")}` : ""}`;
+      }),
+    ];
+    return `${base}\n${peerLines.join("\n")}`;
   }
   if (res.refType === "object") {
     const c = res.card;

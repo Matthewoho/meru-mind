@@ -75,6 +75,8 @@ export {
   createAuthToken,
   resolvePrincipalFromToken,
   isPrincipalTokenActive,
+  TokenTouchThrottle,
+  DEFAULT_TOKEN_TOUCH_THROTTLE_MS,
   type CreateAuthTokenParams,
   type CreateAuthTokenResult,
 } from "./server/tokens.js";
@@ -94,7 +96,23 @@ export {
   type MindServerHandle,
 } from "./server/http-server.js";
 export { createSurfaceMcpServer } from "./server/mcp-http.js";
-export { MindPulseStore, type PulseEntry } from "./server/pulse.js";
+export {
+  MindPulseStore,
+  sanitizeClientHint,
+  MAX_FOCUS_REFS,
+  MAX_FOCUS_ITEM_CHARS,
+  MAX_NOTE_CHARS,
+  MAX_SESSION_TAG_CHARS,
+  MAX_CLIENT_HINT_CHARS,
+  MAX_SESSIONS_PER_PRINCIPAL,
+  MAX_TOTAL_SESSIONS,
+  type PulseEntry,
+  type PulseListResult,
+} from "./server/pulse.js";
+export {
+  withLivePulse,
+  type LivePulseSessionContext,
+} from "./server/live-pulse.js";
 export {
   UiSessionManager,
   UI_SESSION_COOKIE_NAME,

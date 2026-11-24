@@ -371,8 +371,10 @@ export function createMindClient(options = {}) {
     move: (input) => apiRequest("POST", "/v1/move", { body: input }),
     pulse: {
       list: () => apiRequest("GET", "/v1/pulse"),
-      setFocus: (focus, note = null, realmRef = undefined) =>
-        apiRequest("POST", "/v1/pulse", { body: { focus, note, realmRef } }),
+      setFocus: (focus, note = null, realmRef = undefined, clientHint = "browser") =>
+        apiRequest("POST", "/v1/pulse", { body: { focus, note, realmRef, clientHint } }),
+      leave: (sessionId = undefined) =>
+        apiRequest("DELETE", "/v1/pulse", { body: sessionId ? { sessionId } : {} }),
     },
     logout: () => fetch((baseUrl || "") + "/_meru/logout", { method: "POST", credentials: "same-origin" }),
   };
@@ -963,7 +965,17 @@ html, body {
   background: #10b981;
   flex-shrink: 0;
 }
+.pulse-dot.active { background: #3b82f6; }
 .pulse-dot.idle { background: #9ca3af; }
+.pulse-kind {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--meru-surface-2);
+  color: var(--meru-fg-muted);
+  border: 1px solid var(--meru-border);
+  flex-shrink: 0;
+}
 .pulse-name {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2345,17 +2357,36 @@ function render() {
     empty.textContent = "—";
     leftScroll.appendChild(empty);
   } else {
+    const formatAge = (sec) => {
+      if (typeof sec !== "number" || sec < 60) return (sec || 0) + "s";
+      const m = Math.floor(sec / 60);
+      return m < 60 ? (m + "m") : (Math.floor(m / 60) + "h");
+    };
     for (const p of state.pulses) {
       const row = document.createElement("div");
       row.className = "pulse-row";
       const dot = document.createElement("span");
-      dot.className = "pulse-dot" + (p.online ? "" : " idle");
+      dot.className = "pulse-dot" + (p.online ? "" : (p.active ? " active" : " idle"));
       const name = document.createElement("span");
       name.className = "pulse-name";
-      name.textContent = p.actorId + (p.focus?.length ? (" · " + p.focus[0]) : "");
-      name.title = p.note || p.realmPath;
+      const target = p.focus?.length ? p.focus[0] : p.realmPath;
+      name.textContent = p.actorId + (target ? (" · " + target) : "");
+      const metaParts = [
+        p.actorKind || "agent",
+        p.clientHint ? ("client: " + p.clientHint + " (self-reported)") : "",
+        p.online ? "online" : ("active " + formatAge(p.ageSeconds) + " ago"),
+        p.note || "",
+      ].filter(Boolean);
+      name.title = metaParts.join(" · ");
       row.appendChild(dot);
       row.appendChild(name);
+      if (p.actorKind === "agent") {
+        const badge = document.createElement("span");
+        badge.className = "pulse-kind";
+        badge.textContent = p.clientHint || "agent";
+        badge.title = p.clientHint ? "Agent (self-reported client)" : "Agent";
+        row.appendChild(badge);
+      }
       leftScroll.appendChild(row);
     }
   }
@@ -2390,6 +2421,7 @@ function render() {
   ));
   dockActions.appendChild(makeIconButton(ICONS.logout(), t("logoutHint"), async () => {
     client.pump.stop();
+    await client.pulse.leave().catch(() => {});
     await client.logout();
     state.whoami = null;
     state.settingsOpen = false;
@@ -2774,6 +2806,30 @@ client.pump.subscribe((snap) => {
         return selectEntryById(selectedId);
       }
     });
+  }
+});
+
+async function pulseKeepaliveTick() {
+  if (!state.whoami || document.visibilityState !== "visible") return;
+  try {
+    await client.pulse.setFocus([state.activeRealmPath], null, state.activeRealmPath, "browser").catch(() => {});
+    const pulseRes = await client.pulse.list().catch(() => null);
+    if (pulseRes?.pulses) {
+      state.pulses = pulseRes.pulses;
+      render();
+    }
+  } catch {
+    // quiet failure on background pulse tick
+  }
+}
+
+setInterval(() => {
+  void pulseKeepaliveTick();
+}, 40000);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    void pulseKeepaliveTick();
   }
 });
 

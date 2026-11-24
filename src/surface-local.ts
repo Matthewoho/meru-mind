@@ -408,22 +408,27 @@ export class LocalMindSurface implements MindSurface {
       orgPolicy: ctx.org.policy,
     });
 
-    // Cursor collision hints (v0.3): inspect same-realm changes by other actors since session lastReadSeq
+    // Collision hints (v0.3 + v0.5.4): look back to the EARLIER of `baselineSeq` or 10 minutes ago
+    // so stateless `/mcp` calls (baselineSeq=0) and one-shot CLI calls (fresh whoami cursor)
+    // both receive recent same-realm peer activity without requiring stateful server sessions.
+    const COLLISION_LOOKBACK_MS = 10 * 60_000;
     const baselineSeq =
       params.lastReadSeq !== undefined ? params.lastReadSeq : this.lastReadSeq;
-    let collisionHints: ChangeLogEntry[] = [];
-    if (baselineSeq > 0) {
-      const recent = this.engine.db.listChangeLog({
-        orgId: ctx.org.id,
-        realmIds: [routed.realm.id],
-        sinceSeq: baselineSeq,
-        limit: 20,
-        includeSecret: false,
-      });
-      collisionHints = recent.entries
-        .filter((e) => e.actorId !== this.principal.actor.id)
-        .slice(0, 10);
-    }
+    const lookbackIso = new Date(Date.now() - COLLISION_LOOKBACK_MS).toISOString();
+    const recent = this.engine.db.listChangeLog({
+      orgId: ctx.org.id,
+      realmIds: [routed.realm.id],
+      ...(baselineSeq > 0
+        ? { sinceSeq: baselineSeq, sinceCreatedAt: lookbackIso, combineSinceWithOr: true }
+        : { sinceCreatedAt: lookbackIso }),
+      order: "desc",
+      limit: 30,
+      includeSecret: false,
+    });
+    const collisionHints: ChangeLogEntry[] = recent.entries
+      .filter((e) => e.actorId !== this.principal.actor.id)
+      .slice(0, 10)
+      .reverse();
 
     const record = await writeEverydayConclusion({
       db: this.engine.db,

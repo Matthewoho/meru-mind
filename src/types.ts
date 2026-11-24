@@ -864,11 +864,27 @@ export interface ObjectCard {
   try: string;
 }
 
+export interface ActivePeerSummary {
+  sessionId: string;
+  actorId: string;
+  actorKind: "human" | "agent" | "system";
+  /** Self-reported client label (e.g. "claude-code", "codex"); never used for auth or identity */
+  clientHint: string | null;
+  realmPath: string;
+  focus: string[];
+  note: string | null;
+  lastSeenAt: string;
+  ageSeconds: number;
+  heartbeat: boolean;
+  online: boolean;
+}
+
 export type ShowResult =
   | {
       refType: "realm";
       ref: string;
       brief: BriefOutput;
+      activePeers?: ActivePeerSummary[];
     }
   | {
       refType: "object";

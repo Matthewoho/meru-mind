@@ -411,6 +411,9 @@ button, input, select, textarea {
   background: var(--meru-status-ok);
   flex-shrink: 0;
 }
+.status-dot.active {
+  background: #3b82f6;
+}
 .status-dot.idle {
   background: var(--meru-fg-muted);
   opacity: 0.55;

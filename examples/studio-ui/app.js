@@ -554,8 +554,14 @@ function buildSidebar() {
       nm.className = "member-name";
       nm.textContent = p.actorId;
       const dot = document.createElement("span");
-      dot.className = "status-dot" + (p.online ? "" : " idle");
-      dot.title = p.online ? "Online" : "Idle";
+      dot.className = "status-dot" + (p.online ? "" : (p.active ? " active" : " idle"));
+      const ageTxt = typeof p.ageSeconds === "number"
+        ? (p.ageSeconds < 60 ? p.ageSeconds + "s ago" : Math.floor(p.ageSeconds / 60) + "m ago")
+        : "";
+      const roleTxt = p.actorKind === "agent"
+        ? ("Agent" + (p.clientHint ? " (" + p.clientHint + ", self-reported)" : ""))
+        : "Human";
+      dot.title = [roleTxt, p.online ? "Online" : (p.active ? "Active " + ageTxt : "Idle"), p.realmPath || "/"].filter(Boolean).join(" · ");
       left.appendChild(av);
       left.appendChild(nm);
       left.appendChild(dot);
@@ -1536,7 +1542,14 @@ function renderPopover() {
     nm.textContent = p.actorId;
     const sub = document.createElement("div");
     sub.className = "popover-sub";
-    sub.textContent = (p.online ? "Online" : "Idle") + " · " + (p.realmPath || "/");
+    const ageStr = typeof p.ageSeconds === "number"
+      ? (p.ageSeconds < 60 ? p.ageSeconds + "s ago" : Math.floor(p.ageSeconds / 60) + "m ago")
+      : "";
+    const statusStr = p.online ? "Online" : (p.active ? "Active " + ageStr : "Idle");
+    const kindStr = p.actorKind === "agent"
+      ? ("agent" + (p.clientHint ? " · client: " + p.clientHint : ""))
+      : "human";
+    sub.textContent = [kindStr, statusStr, p.realmPath || "/"].join(" · ");
     head.appendChild(nm);
     head.appendChild(sub);
     pop.appendChild(head);
@@ -2070,6 +2083,30 @@ client.pump.subscribe((snap) => {
   }
   if (snap.lastFrames && snap.lastFrames.length > 0) {
     void refreshAll();
+  }
+});
+
+async function studioPulseKeepaliveTick() {
+  if (!state.whoami || document.visibilityState !== "visible") return;
+  try {
+    await client.pulse.setFocus([state.activeRealmPath], null, state.activeRealmPath, "browser").catch(() => {});
+    const pulseRes = await client.pulse.list().catch(() => null);
+    if (pulseRes?.pulses) {
+      state.pulses = pulseRes.pulses;
+      render();
+    }
+  } catch {
+    // quiet failure on background pulse tick
+  }
+}
+
+setInterval(() => {
+  void studioPulseKeepaliveTick();
+}, 40000);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    void studioPulseKeepaliveTick();
   }
 });
 

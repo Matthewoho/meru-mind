@@ -4233,6 +4233,9 @@ export class SqliteDb implements DbPort {
     orgId?: string;
     realmIds?: string[];
     sinceSeq?: number;
+    sinceCreatedAt?: string;
+    combineSinceWithOr?: boolean;
+    order?: "asc" | "desc";
     limit?: number;
     includeSecret?: boolean;
   }): { generation: number; entries: ChangeLogEntry[] } {
@@ -4250,9 +4253,22 @@ export class SqliteDb implements DbPort {
       where.push(`cl.realm_id IN (${placeholders(params.realmIds.length)})`);
       sqlParams.push(...params.realmIds);
     }
-    if (params?.sinceSeq !== undefined) {
-      where.push(`cl.seq > ?`);
-      sqlParams.push(params.sinceSeq);
+    if (
+      params?.combineSinceWithOr &&
+      params?.sinceSeq !== undefined &&
+      params?.sinceCreatedAt !== undefined
+    ) {
+      where.push(`(cl.seq > ? OR cl.created_at >= ?)`);
+      sqlParams.push(params.sinceSeq, params.sinceCreatedAt);
+    } else {
+      if (params?.sinceSeq !== undefined) {
+        where.push(`cl.seq > ?`);
+        sqlParams.push(params.sinceSeq);
+      }
+      if (params?.sinceCreatedAt !== undefined) {
+        where.push(`cl.created_at >= ?`);
+        sqlParams.push(params.sinceCreatedAt);
+      }
     }
     if (!params?.includeSecret) {
       where.push(`NOT (
@@ -4271,10 +4287,11 @@ export class SqliteDb implements DbPort {
       )`);
     }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const orderSql = params?.order === "desc" ? "DESC" : "ASC";
     const limit = params?.limit ?? 200;
     const rows = this.db
       .prepare(
-        `SELECT cl.* FROM change_log cl ${whereSql} ORDER BY cl.seq ASC LIMIT ?`,
+        `SELECT cl.* FROM change_log cl ${whereSql} ORDER BY cl.seq ${orderSql} LIMIT ?`,
       )
       .all(...sqlParams, limit) as Array<Record<string, unknown>>;
 

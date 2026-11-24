@@ -497,6 +497,9 @@ export interface DbPort {
     orgId?: string;
     realmIds?: string[];
     sinceSeq?: number;
+    sinceCreatedAt?: string;
+    combineSinceWithOr?: boolean;
+    order?: "asc" | "desc";
     limit?: number;
     includeSecret?: boolean;
   }): { generation: number; entries: ChangeLogEntry[] };

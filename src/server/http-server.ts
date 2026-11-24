@@ -16,6 +16,7 @@ import {
 import type { EmbedderPort } from "../ports.js";
 import { LocalMindSurface } from "../surface-local.js";
 import type {
+  MindSurface,
   SurfaceAddRuleInput,
   SurfaceCreateRealmInput,
   SurfaceUpdateRealmInput,
@@ -35,11 +36,13 @@ import {
 import { MERU_MIND_VERSION } from "../version.js";
 import { createSurfaceMcpServer } from "./mcp-http.js";
 import { seedDemoOrg, type DemoSeedSummary } from "./demo-seed.js";
-import { MindPulseStore } from "./pulse.js";
+import { withLivePulse } from "./live-pulse.js";
+import { MindPulseStore, sanitizeClientHint } from "./pulse.js";
 import { ChangeWakeBus } from "./pump.js";
 import {
   createAuthToken,
   resolvePrincipalFromToken,
+  TokenTouchThrottle,
   type CreateAuthTokenResult,
 } from "./tokens.js";
 import { UiSessionManager } from "./ui-auth.js";
@@ -129,7 +132,7 @@ export interface MindServerOptions {
       req: IncomingMessage,
       options?: { allowCookie?: boolean },
     ) => Principal;
-    createSurface: (principal: Principal, req: IncomingMessage) => LocalMindSurface;
+    createSurface: (principal: Principal, req: IncomingMessage) => MindSurface;
   }) => Promise<boolean>;
   /** Optional custom Cookie/session principal resolver (used by v0.4 HttpOnly Cookie auth) */
   cookieAuthenticator?: (req: IncomingMessage, orgId: string) => Principal | null;
@@ -338,6 +341,7 @@ export async function startMindServer(
     const workRegistry =
       options.workRegistry ?? WorkProviderRegistry.createDefault();
     const pulseStore = new MindPulseStore();
+    const touchThrottle = new TokenTouchThrottle();
     const uiSessions = new UiSessionManager();
     const builtInUiHandler = createUiRouteHandler({
       uiSessions,
@@ -359,7 +363,7 @@ export async function startMindServer(
 
     const authenticate = (
       req: IncomingMessage,
-      authOpts?: { allowCookie?: boolean },
+      authOpts?: { allowCookie?: boolean; skipTouchLastUsed?: boolean },
     ): Principal => {
       const bearer = extractBearerToken(req);
       if (bearer) {
@@ -368,6 +372,8 @@ export async function startMindServer(
           plaintextToken: bearer,
           expectedOrgId: orgId,
           authKind: "bearer",
+          skipTouchLastUsed: authOpts?.skipTouchLastUsed,
+          touchThrottle,
         });
       }
       if (authOpts?.allowCookie !== false) {
@@ -387,14 +393,39 @@ export async function startMindServer(
 
     const serverUrlRef = { value: `http://${formatHostForUrl(host)}:${requestedPort}` };
 
+    const extractPulseMeta = (
+      req: IncomingMessage,
+      workspaceHint: string | null,
+    ): { sessionTag: string; clientHint: string | null } => {
+      const rawClient = req.headers["x-meru-client"];
+      const clientHint = sanitizeClientHint(
+        typeof rawClient === "string" ? rawClient : null,
+      );
+      const rawSession = req.headers["x-meru-session-id"];
+      const headerSession =
+        typeof rawSession === "string" && rawSession.trim()
+          ? rawSession.trim()
+          : null;
+      if (headerSession) {
+        return { sessionTag: headerSession, clientHint };
+      }
+      if (clientHint || workspaceHint) {
+        const fallback = [clientHint ?? "client", workspaceHint ?? ""]
+          .filter(Boolean)
+          .join(":");
+        return { sessionTag: fallback.slice(0, 64), clientHint };
+      }
+      return { sessionTag: "default", clientHint };
+    };
+
     const createSurface = (
       principal: Principal,
       req: IncomingMessage,
-    ): LocalMindSurface => {
+    ): MindSurface => {
       const rawHint = req.headers["x-meru-workspace-hint"];
       const workspaceHint =
         typeof rawHint === "string" && rawHint.trim() ? rawHint.trim() : null;
-      return new LocalMindSurface({
+      const localSurface = new LocalMindSurface({
         engine: engine!,
         principal,
         wakeBus,
@@ -405,6 +436,14 @@ export async function startMindServer(
           localOnly: false,
         },
         ownsEngine: false,
+      });
+      const { sessionTag, clientHint } = extractPulseMeta(req, workspaceHint);
+      return withLivePulse(localSurface, {
+        db: engine!.db,
+        pulseStore,
+        principal,
+        sessionTag,
+        clientHint,
       });
     };
 
@@ -491,7 +530,11 @@ export async function startMindServer(
 
         // REST API under /v1/*
         if (pathname.startsWith("/v1/")) {
-          const principal = authenticate(req, { allowCookie: true });
+          const isPulseRoute = pathname === "/v1/pulse";
+          const principal = authenticate(req, {
+            allowCookie: true,
+            skipTouchLastUsed: isPulseRoute,
+          });
           actorId = principal.actor.id;
           // P0 #3: Enforce JSON Content-Type and same-Origin CSRF boundary on Cookie writes
           assertCookieCsrfAllowed({
@@ -822,11 +865,11 @@ export async function startMindServer(
             }
 
             if (method === "GET" && pathname === "/v1/pulse") {
-              const pulses = pulseStore.listVisible({
+              const out = pulseStore.listVisibleWithNow({
                 db: engine!.db,
                 principal,
               });
-              sendJson(res, 200, { pulses });
+              sendJson(res, 200, out);
               return;
             }
 
@@ -836,16 +879,44 @@ export async function startMindServer(
                 realmRef?: string;
                 focus?: string[];
                 note?: string | null;
+                clientHint?: string | null;
               };
+              const headerSession =
+                typeof req.headers["x-meru-session-id"] === "string" &&
+                req.headers["x-meru-session-id"].trim()
+                  ? req.headers["x-meru-session-id"].trim()
+                  : undefined;
+              const headerClient =
+                typeof req.headers["x-meru-client"] === "string"
+                  ? req.headers["x-meru-client"]
+                  : undefined;
               const pulse = pulseStore.declare({
                 db: engine!.db,
                 principal,
-                sessionId: body.sessionId,
+                sessionId: body.sessionId ?? headerSession,
                 realmRef: body.realmRef,
                 focus: body.focus,
                 note: body.note,
+                clientHint:
+                  body.clientHint !== undefined ? body.clientHint : headerClient,
               });
               sendJson(res, 200, pulse);
+              return;
+            }
+
+            if (method === "DELETE" && pathname === "/v1/pulse") {
+              const body = (await readJsonBody(req)) as { sessionId?: string };
+              const headerSession =
+                typeof req.headers["x-meru-session-id"] === "string" &&
+                req.headers["x-meru-session-id"].trim()
+                  ? req.headers["x-meru-session-id"].trim()
+                  : undefined;
+              const querySession = sp.get("sessionId") ?? undefined;
+              const out = pulseStore.removeForPrincipal({
+                principal,
+                sessionId: body.sessionId ?? querySession ?? headerSession,
+              });
+              sendJson(res, 200, out);
               return;
             }
 

@@ -9,7 +9,7 @@ Shared long-term memory, partitioned into realms (`/`, `/ops`, `/ops/cicd`). The
 
 ## Before you work
 1. Run `whoami`, then the `tree` call it names under Next. Tree prints each realm's scope; pick the realm your task belongs to.
-2. Run `show <that realm>` for its rules (inherited ones included), active decisions and recent entries. The rules bind you. If you are bound to `/`, still pick a sub-realm: the root brief covers only root's own entries.
+2. Run `show <that realm>` for its rules (inherited ones included), active decisions, recent entries, and `activePeers` (other humans/agents recently active here — coordinate before colliding). The rules bind you. If you are bound to `/`, still pick a sub-realm: the root brief covers only root's own entries.
 3. Run `search "<words>"` before asking the user or re-deriving something. Snippets are truncated; `show rec_…` gives the full entry.
 
 ## When you learn something durable
