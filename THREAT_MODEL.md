@@ -15,16 +15,18 @@
    - On a developer laptop where local coding agents run under the same OS user, any credential written to disk in the workspace or home directory is readable by those agents.
    - **Mitigation**: Keep human governance tokens out of project files and `.env` files. In `v0.4`, browser governance sessions use `HttpOnly; SameSite=Strict` cookies minted via 60-second single-use CLI codes (`meru-mind ui login`) and are restricted to **read + reversible actions only**.
 
-## 2. Weakened Browser Cookie Boundary (`v0.4` Composable UI)
+## 2. Weakened Browser Cookie Boundary (`v0.4+` Composable UI & `v0.5.2` Hardening)
 
-Because `v0.4` allows users/agents to author bespoke local UI shells via `--web-dir`, a malicious or buggy script running on the UI origin shares the browser cookie jar. Meru Mind enforces **6 hard guardrails**:
+Because `v0.4+` allows users/agents to author bespoke local UI shells via `--web-dir`, a malicious or buggy script running on the UI origin shares the browser cookie jar. Meru Mind enforces **8 hard guardrails**:
 
-1. **Weakened Cookie Capabilities**: Cookie sessions may only read visible scope and perform reversible actions (`write`, `move` / inbox triage, `pulse` focus). Irreversible or scope-widening mutations (`rule add`, `redact`, `realm mount/unmount/create/archive`, `org set-policy`, `token create/list/revoke`) strictly return `403` with a copyable CLI command requiring a Bearer token.
-2. **No Browser Login Form**: Long-lived tokens never enter DOM inputs; `meru-mind ui login` exchanges a 60s single-use code for an `HttpOnly; SameSite=Strict` cookie.
-3. **Strict Server CSP**: `default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`.
-4. **Reserved Prefixes**: `/_meru/*` and `/v1/*` can never be shadowed by custom `--web-dir` files.
-5. **No Service Workers**: Any request with `Service-Worker: script` returns `404`.
-6. **Loopback-Only `--web-dir`**: Custom UI directories are rejected at startup on non-loopback bind addresses in `v0.4`.
+1. **Weakened Cookie Capabilities**: Cookie sessions may only read visible scope and perform reversible actions (`write`, `move` / inbox triage, `pulse` focus). Irreversible or scope-widening mutations (`rule add`, `redact`, `realm mount/unmount/create/archive`, `org set-policy`, `token create/list/revoke`, `admin backup`) strictly return `403` with a copyable CLI command requiring a Bearer token.
+2. **No Browser Login Form & Top-Level Navigation Guard**: Long-lived tokens never enter DOM inputs; `meru-mind ui login` exchanges a 60s single-use code for an `HttpOnly; SameSite=Strict` cookie (`__Host-meru_session; Secure` whenever served over HTTPS / `X-Forwarded-Proto: https`). `GET /_meru/auth` rejects subresource fetches (`Sec-Fetch-Mode !== "navigate"` or `Sec-Fetch-Dest !== "document"`) with `403` before consuming the code.
+3. **Cookie Write CSRF Enforcement**: Every Cookie-authenticated mutating request (`POST`/`PUT`/`PATCH`/`DELETE` on `/v1/*`) must carry `Content-Type: application/json` and an allowed same-origin `Origin` header (and `POST /_meru/logout` enforces `Origin`). Bearer-authenticated CLI/MCP requests are unaffected.
+4. **Strict Server CSP**: `default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`.
+5. **Reserved Prefixes**: `/_meru/*` (including `/_meru/markdown.js` and SHA-256-verified vendored `/_meru/vendor/marked.esm.js`) and `/v1/*` can never be shadowed by custom `--web-dir` files.
+6. **No Service Workers**: Any request with `Service-Worker: script` returns `404`.
+7. **Loopback-Only `--web-dir`**: Custom UI directories are rejected at startup on non-loopback bind addresses.
+8. **Zero-`innerHTML` Markdown & Zero-Network Static HTML Preview (`v0.5.2`)**: `<meru-markdown>` tokenizes with pinned `marked.Lexer.lex()` and builds DOM strictly with `createElement`/`textContent` (raw HTML tokens remain literal text; external/same-origin images blocked). Click-to-render static HTML preview runs inside `<iframe sandbox="" referrerpolicy="no-referrer">` with a mandatory inner `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">` (0 scripts, 0 leaked requests, torn down immediately on entry switch or `redact`).
 
 ## 3. Secrets, Access Logs & `redact` Residual Checklist
 

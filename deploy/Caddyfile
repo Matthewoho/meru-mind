@@ -1,7 +1,12 @@
 {$MERU_DOMAIN:localhost} {
 	encode zstd gzip
 
-	# Pass real Origin and WebSocket upgrade headers directly to meru-mind serve
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+	}
+
+	# Pass real Host, Origin, and WebSocket upgrade headers directly to meru-mind serve
 	reverse_proxy meru-mind:3800 {
 		flush_interval -1
 		header_up Host {host}

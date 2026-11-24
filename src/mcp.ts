@@ -24,6 +24,7 @@ import {
   type Realm,
   type RealmMount,
 } from "./index.js";
+import { MERU_MIND_VERSION } from "./version.js";
 
 function okResult(data: unknown) {
   return {
@@ -269,7 +270,7 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
 
   const server = new McpServer({
     name: "meru-mind",
-    version: "0.2.0",
+    version: MERU_MIND_VERSION,
   });
 
   // ---- Strictly 7 Everyday Tools (1:1 Mirror of Everyday CLI Verbs) ----

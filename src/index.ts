@@ -97,6 +97,7 @@ export { MindPulseStore, type PulseEntry } from "./server/pulse.js";
 export {
   UiSessionManager,
   UI_SESSION_COOKIE_NAME,
+  UI_HOST_SESSION_COOKIE_NAME,
   parseCookieHeader,
 } from "./server/ui-auth.js";
 export {
@@ -108,10 +109,13 @@ export {
 } from "./server/ui-router.js";
 export {
   CLIENT_JS_SOURCE,
+  DEFAULT_FAVICON_SVG,
   DEFAULT_SHELL_HTML,
   DEFAULT_SHELL_CSS,
   DEFAULT_SHELL_JS,
 } from "./server/ui-assets.js";
+export { MARKDOWN_JS_SOURCE } from "./server/markdown-renderer.js";
+export { MERU_MIND_VERSION } from "./version.js";
 export { seedDemoOrg, type DemoSeedSummary } from "./server/demo-seed.js";
 export {
   attachPumpWebSocketServer,

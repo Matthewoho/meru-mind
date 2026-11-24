@@ -9,9 +9,10 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
 RUN pnpm install --frozen-lockfile
 
 COPY src ./src
+COPY scripts ./scripts
 COPY skills ./skills
 COPY docs ./docs
-RUN pnpm build
+RUN pnpm build && pnpm prune --prod
 
 FROM node:22-slim AS runtime
 

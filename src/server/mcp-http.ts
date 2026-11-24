@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { toSurfaceError } from "../format/errors.js";
 import type { MindSurface } from "../surface.js";
+import { MERU_MIND_VERSION } from "../version.js";
 
 function okResult(data: unknown) {
   return {
@@ -25,7 +26,7 @@ function errResult(err: unknown) {
 export function createSurfaceMcpServer(surface: MindSurface): McpServer {
   const server = new McpServer({
     name: "meru-mind",
-    version: "0.3.0",
+    version: MERU_MIND_VERSION,
   });
 
   server.tool(

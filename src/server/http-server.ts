@@ -1,8 +1,11 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
 import http, {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
+import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { toSurfaceError } from "../format/errors.js";
 import {
@@ -28,6 +31,7 @@ import {
   type OrgPolicy,
   type Principal,
 } from "../types.js";
+import { MERU_MIND_VERSION } from "../version.js";
 import { createSurfaceMcpServer } from "./mcp-http.js";
 import { seedDemoOrg, type DemoSeedSummary } from "./demo-seed.js";
 import { MindPulseStore } from "./pulse.js";
@@ -43,11 +47,47 @@ import {
   acquireServeWriterLock,
   type ServeWriterLockHandle,
 } from "./writer-lock.js";
-import { attachPumpWebSocketServer } from "./ws-pump.js";
+import { attachPumpWebSocketServer, isOriginAllowed } from "./ws-pump.js";
 import { WorkProviderRegistry } from "../work/registry.js";
 
-export const SERVER_VERSION = "0.5.0";
+export const SERVER_VERSION = MERU_MIND_VERSION;
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
+
+function assertCookieCsrfAllowed(params: {
+  req: IncomingMessage;
+  method: string;
+  principal: Principal;
+  allowedOrigins?: string[];
+}): void {
+  if (params.principal.authKind !== "cookie") return;
+  if (
+    params.method === "GET" ||
+    params.method === "HEAD" ||
+    params.method === "OPTIONS"
+  ) {
+    return;
+  }
+  const rawCt = params.req.headers["content-type"] ?? "";
+  const mediaType = rawCt.split(";")[0]?.trim().toLowerCase() ?? "";
+  if (mediaType !== "application/json") {
+    throw new MindError(
+      "ACCESS_DENIED",
+      "Cookie-authenticated write requests require Content-Type: application/json",
+    );
+  }
+  if (
+    !isOriginAllowed({
+      originHeader: params.req.headers.origin,
+      hostHeader: params.req.headers.host,
+      allowedOrigins: params.allowedOrigins,
+    })
+  ) {
+    throw new MindError(
+      "ACCESS_DENIED",
+      "Cross-origin or missing-Origin Cookie write rejected",
+    );
+  }
+}
 
 export interface AccessLogEntry {
   timestamp: string;
@@ -301,6 +341,7 @@ export async function startMindServer(
     const builtInUiHandler = createUiRouteHandler({
       uiSessions,
       webDir: resolvedWebDir,
+      allowedOrigins: options.allowedOrigins,
     });
 
     unsubChangeLog = engine.db.onChangeCommitted((events) =>
@@ -414,8 +455,20 @@ export async function startMindServer(
           return;
         }
 
-        // Streamable HTTP MCP endpoint (/mcp) — Bearer token auth only, strictly 7 tools
+        // Streamable HTTP MCP endpoint (/mcp) — Bearer token auth only, strictly 7 tools, POST only
         if (pathname === "/mcp") {
+          if (method !== "POST") {
+            sendJson(
+              res,
+              405,
+              {
+                error: "invalid_input",
+                message: "Streamable HTTP MCP endpoint accepts POST only",
+              },
+              { Allow: "POST" },
+            );
+            return;
+          }
           const principal = authenticate(req, { allowCookie: false });
           actorId = principal.actor.id;
           const surface = createSurface(principal, req);
@@ -425,8 +478,7 @@ export async function startMindServer(
           });
           await mcpServer.connect(transport);
           try {
-            const parsedBody =
-              method === "POST" ? await readJsonBody(req) : undefined;
+            const parsedBody = await readJsonBody(req);
             await transport.handleRequest(req, res, parsedBody);
           } finally {
             await transport.close();
@@ -440,6 +492,13 @@ export async function startMindServer(
         if (pathname.startsWith("/v1/")) {
           const principal = authenticate(req, { allowCookie: true });
           actorId = principal.actor.id;
+          // P0 #3: Enforce JSON Content-Type and same-Origin CSRF boundary on Cookie writes
+          assertCookieCsrfAllowed({
+            req,
+            method,
+            principal,
+            allowedOrigins: options.allowedOrigins,
+          });
           const surface = createSurface(principal, req);
           try {
             const sp = parsedUrl.searchParams;
@@ -677,9 +736,79 @@ export async function startMindServer(
 
             if (method === "POST" && pathname === "/v1/ui/login-code") {
               const minted = uiSessions.mintLoginCode(principal);
+              const authPath = `/_meru/auth?code=${encodeURIComponent(minted.code)}`;
+              const reqHost = req.headers.host?.trim();
+              const fwdProto =
+                typeof req.headers["x-forwarded-proto"] === "string"
+                  ? req.headers["x-forwarded-proto"].split(",")[0]?.trim().toLowerCase()
+                  : "";
+              const proto =
+                fwdProto === "https" || fwdProto === "http" ? fwdProto : "http";
+              const publicBase =
+                reqHost &&
+                !reqHost.startsWith("0.0.0.0") &&
+                !reqHost.startsWith("[::]")
+                  ? `${proto}://${reqHost}`
+                  : serverUrlRef.value;
               sendJson(res, 200, {
                 ...minted,
-                loginUrl: `${serverUrlRef.value}/_meru/auth?code=${encodeURIComponent(minted.code)}`,
+                path: authPath,
+                loginUrl: `${publicBase}${authPath}`,
+              });
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/admin/backup") {
+              if (principal.authKind === "cookie") {
+                throw new MindError(
+                  "ACCESS_DENIED",
+                  "Browser Cookie sessions cannot create server backups; use a human Bearer token via CLI.",
+                  {
+                    try: "MERU_MIND_URL=<url> MERU_MIND_TOKEN=<token> meru-mind admin backup",
+                  },
+                );
+              }
+              if (principal.actor.kind !== "human") {
+                throw new MindError(
+                  "ACCESS_DENIED",
+                  "Only human principals can trigger server backups",
+                );
+              }
+              const body = (await readJsonBody(req)) as { name?: string };
+              const rawName =
+                typeof body.name === "string" && body.name.trim()
+                  ? body.name.trim()
+                  : `mind-${new Date().toISOString().replace(/[:.]/g, "-")}.sqlite`;
+              if (
+                rawName.includes("/") ||
+                rawName.includes("\\") ||
+                rawName.includes("..") ||
+                !/^[A-Za-z0-9._-]+$/.test(rawName)
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  "Backup filename must match [A-Za-z0-9._-]+ without path separators",
+                );
+              }
+              const backupDir = path.join(path.resolve(homeDir), "backups");
+              fs.mkdirSync(backupDir, { recursive: true });
+              const filename = rawName.endsWith(".sqlite")
+                ? rawName
+                : `${rawName}.sqlite`;
+              const outPath = path.join(backupDir, filename);
+              engine!.db.vacuumInto(outPath);
+              const stat = fs.statSync(outPath);
+              const sha256 = crypto
+                .createHash("sha256")
+                .update(fs.readFileSync(outPath))
+                .digest("hex");
+              sendJson(res, 200, {
+                backedUp: true,
+                filename,
+                relativePath: `backups/${filename}`,
+                sizeBytes: stat.size,
+                sha256,
+                createdAt: new Date().toISOString(),
               });
               return;
             }

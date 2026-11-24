@@ -1,14 +1,17 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { MindError } from "../types.js";
 
 export const SERVE_LOCK_FILENAME = "mind.serve.lock";
+const ACTIVE_IN_PROCESS_LOCK_IDS = new Set<string>();
 
 export interface ServeLockInfo {
   pid: number;
   url: string;
   startedAt: string;
   orgId?: string;
+  instanceId?: string;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -23,7 +26,10 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-export function readLiveServeLock(homeDir: string): ServeLockInfo | null {
+export function readLiveServeLock(
+  homeDir: string,
+  options?: { ignoreSelfPid?: boolean },
+): ServeLockInfo | null {
   const lockPath = path.join(path.resolve(homeDir), SERVE_LOCK_FILENAME);
   if (!fs.existsSync(lockPath)) return null;
   try {
@@ -31,15 +37,33 @@ export function readLiveServeLock(homeDir: string): ServeLockInfo | null {
     const parsed = JSON.parse(raw) as Partial<ServeLockInfo>;
     if (
       typeof parsed.pid === "number" &&
-      typeof parsed.url === "string" &&
-      isProcessAlive(parsed.pid)
+      typeof parsed.url === "string"
     ) {
+      // P0 #1: In containers, Node always starts as PID 1. A leftover lock file
+      // with pid === process.pid whose instanceId is NOT active in this process
+      // is stale from a previous crashed container and must be reclaimed.
+      if (
+        options?.ignoreSelfPid &&
+        parsed.pid === process.pid &&
+        !(
+          typeof parsed.instanceId === "string" &&
+          ACTIVE_IN_PROCESS_LOCK_IDS.has(parsed.instanceId)
+        )
+      ) {
+        return null;
+      }
+      if (!isProcessAlive(parsed.pid)) {
+        return null;
+      }
       return {
         pid: parsed.pid,
         url: parsed.url,
         startedAt:
           typeof parsed.startedAt === "string" ? parsed.startedAt : "",
         ...(typeof parsed.orgId === "string" ? { orgId: parsed.orgId } : {}),
+        ...(typeof parsed.instanceId === "string"
+          ? { instanceId: parsed.instanceId }
+          : {}),
       };
     }
   } catch {
@@ -87,10 +111,12 @@ export function acquireServeWriterLock(params: {
   fs.mkdirSync(absHome, { recursive: true });
   const lockPath = path.join(absHome, SERVE_LOCK_FILENAME);
 
+  const instanceId = crypto.randomUUID();
   const info: ServeLockInfo = {
     pid: process.pid,
     url: params.url,
     startedAt: new Date().toISOString(),
+    instanceId,
     ...(params.orgId ? { orgId: params.orgId } : {}),
   };
   const payload = JSON.stringify(info, null, 2) + "\n";
@@ -103,14 +129,19 @@ export function acquireServeWriterLock(params: {
       } finally {
         fs.closeSync(fd);
       }
+      ACTIVE_IN_PROCESS_LOCK_IDS.add(instanceId);
       let released = false;
       const release = () => {
         if (released) return;
         released = true;
+        ACTIVE_IN_PROCESS_LOCK_IDS.delete(instanceId);
         try {
           const cur = fs.readFileSync(lockPath, "utf8");
           const parsed = JSON.parse(cur) as Partial<ServeLockInfo>;
-          if (parsed.pid === process.pid) {
+          if (
+            parsed.instanceId === instanceId ||
+            (!parsed.instanceId && parsed.pid === process.pid)
+          ) {
             fs.unlinkSync(lockPath);
           }
         } catch {
@@ -132,7 +163,7 @@ export function acquireServeWriterLock(params: {
     } catch (err) {
       const code = (err as NodeJS.ErrnoException)?.code;
       if (code !== "EEXIST") throw err;
-      const live = readLiveServeLock(absHome);
+      const live = readLiveServeLock(absHome, { ignoreSelfPid: true });
       if (live) {
         throw new MindError(
           "CONFLICT",

@@ -1004,21 +1004,25 @@ async function main(): Promise<void> {
       });
       const body = (await resp.json()) as {
         code?: string;
+        path?: string;
         loginUrl?: string;
         expiresAt?: string;
         message?: string;
       };
-      if (!resp.ok) {
+      if (!resp.ok || !body.code) {
         throw new MindError(
           resp.status === 401 || resp.status === 403 ? "ACCESS_DENIED" : "INVALID_INPUT",
           body.message ?? `Failed to mint login code (HTTP ${resp.status})`,
         );
       }
+      // P0 #2: Always assemble public loginUrl from the CLI's reachable targetUrl,
+      // never trusting an internal bind address (e.g., 0.0.0.0:3800 inside Docker).
+      const resolvedLoginUrl = `${targetUrl}/_meru/auth?code=${encodeURIComponent(body.code)}`;
       output(
-        body,
+        { ...body, loginUrl: resolvedLoginUrl },
         [
           "One-time browser login URL (valid 60s, single-use, HttpOnly Cookie):",
-          `  ${body.loginUrl}`,
+          `  ${resolvedLoginUrl}`,
         ].join("\n"),
       );
       return;

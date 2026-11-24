@@ -460,6 +460,39 @@ export async function runRemoteCliCommand(
       }
     }
 
+    if (cmd === "admin" && sub === "backup") {
+      const targetUrl = `${baseUrl.replace(/\/+$/, "")}/v1/admin/backup`;
+      const name = str(flags, "name");
+      const resp = await fetch(targetUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(name ? { name } : {}),
+      });
+      const text = await resp.text();
+      let payload: Record<string, unknown> = {};
+      if (text) {
+        try {
+          payload = JSON.parse(text) as Record<string, unknown>;
+        } catch {
+          payload = { message: text };
+        }
+      }
+      if (!resp.ok) {
+        throw new MindError(
+          resp.status === 401 || resp.status === 403 ? "ACCESS_DENIED" : "INVALID_INPUT",
+          typeof payload.message === "string"
+            ? payload.message
+            : `Remote backup failed (HTTP ${resp.status})`,
+        );
+      }
+      output(payload, formatGenericMarkdown("Online Server Backup Created", payload));
+      return;
+    }
+
     throw new MindError(
       "UNKNOWN_COMMAND",
       `Command "${positionals.join(" ")}" is not supported in remote HTTP mode`,

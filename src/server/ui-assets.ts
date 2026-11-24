@@ -1,14 +1,29 @@
 /**
- * Server-hosted 1.5-Layer Composable Frontend Assets (v0.4).
- * Zero external npm packages: `/_meru/client.js` and `/_meru/shell` are always version-locked to the running server.
+ * Server-hosted 1.5-Layer Composable Frontend Assets (v0.5.2).
+ * `/_meru/client.js` (0-dependency core + lazy <meru-markdown>) and `/_meru/shell`
+ * are always version-locked to the running server.
+ *
+ * Security invariant: zero raw HTML DOM injection sinks anywhere in this file.
  */
 
-export const CLIENT_JS_SOURCE = `// Meru Mind v0.4 Framework-Agnostic Composable Client (/_meru/client.js)
-// Zero dependencies. Works in vanilla HTML, React (useSyncExternalStore), Vue, Svelte, or Solid.
+export const CLIENT_JS_SOURCE = `// Meru Mind v0.5.2 Framework-Agnostic Composable Client (/_meru/client.js)
+// Zero runtime dependencies on initial load; <meru-markdown> lazy-loads /_meru/markdown.js on first mount.
 
 const WS_FAIL_THRESHOLD = 2;
 const WS_HANDSHAKE_TIMEOUT_MS = 5000;
 const WS_REPROBE_INTERVAL_MS = 5 * 60 * 1000;
+
+let markdownToolsPromise = null;
+
+/**
+ * Lazy-loads the safe token-AST Markdown & sandboxed Static HTML Preview module (/_meru/markdown.js).
+ */
+export function loadMarkdownTools() {
+  if (!markdownToolsPromise) {
+    markdownToolsPromise = import("/_meru/markdown.js");
+  }
+  return markdownToolsPromise;
+}
 
 function extractHighlightTerms(query) {
   if (!query || typeof query !== "string") return [];
@@ -58,7 +73,6 @@ export function computeHighlightRanges(text, query) {
 
 /**
  * Safely renders text + [start, end) highlight ranges using DocumentFragment + createTextNode only.
- * Zero innerHTML — 100% immune to stored XSS.
  */
 export function applyHighlightRanges(text, ranges) {
   const frag = document.createDocumentFragment();
@@ -223,11 +237,7 @@ export function createMindClient(options = {}) {
         settled = true;
         try { socket.close(); } catch {}
         wsFailures += 1;
-        if (wsFailures >= WS_FAIL_THRESHOLD) {
-          void runLongPollLoop();
-        } else {
-          void runLongPollLoop(); // 5s handshake timeout -> immediate Long-Poll fallback per Hard Condition #6
-        }
+        void runLongPollLoop();
       }
     }, WS_HANDSHAKE_TIMEOUT_MS);
 
@@ -378,14 +388,19 @@ const ENTRY_STYLES = \`
     color: var(--meru-fg, #14171f);
   }
   .card {
-    background: var(--meru-surface, rgba(255, 255, 255, 0.88));
+    background: var(--meru-surface, rgba(255, 255, 255, 0.92));
     border: 1px solid var(--meru-border, rgba(20, 23, 31, 0.1));
     border-radius: var(--meru-radius, 10px);
-    padding: 12px 14px;
-    transition: border-color 140ms ease, background 140ms ease;
+    padding: 11px 13px;
+    cursor: pointer;
+    transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
   }
   .card:hover {
     border-color: var(--meru-border-strong, rgba(20, 23, 31, 0.24));
+  }
+  .card.selected {
+    border-color: var(--meru-data-hue, #2e66b8);
+    box-shadow: 0 0 0 1px var(--meru-data-hue, #2e66b8);
   }
   .card.redacted {
     opacity: 0.72;
@@ -396,7 +411,7 @@ const ENTRY_STYLES = \`
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    margin-bottom: 6px;
+    margin-bottom: 5px;
   }
   .meta-left {
     display: flex;
@@ -405,7 +420,7 @@ const ENTRY_STYLES = \`
     min-width: 0;
   }
   .kind {
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 600;
     letter-spacing: 0.03em;
     text-transform: uppercase;
@@ -438,19 +453,22 @@ const ENTRY_STYLES = \`
     font-weight: 600;
     line-height: 1.4;
     margin: 0 0 4px 0;
-    cursor: pointer;
     word-break: break-word;
   }
   .body {
     font-size: 12.5px;
-    line-height: 1.55;
+    line-height: 1.52;
     color: var(--meru-fg-secondary, #3e4552);
     white-space: pre-wrap;
     word-break: break-word;
     margin: 0;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
   .footer {
-    margin-top: 8px;
+    margin-top: 7px;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -482,6 +500,7 @@ export class MeruEntryElement extends HTMLElement {
     super();
     this._entry = null;
     this._highlights = null;
+    this._selected = false;
     this.attachShadow({ mode: "open" });
   }
 
@@ -497,6 +516,16 @@ export class MeruEntryElement extends HTMLElement {
   set highlights(val) {
     this._highlights = val;
     this.render();
+  }
+
+  set selected(val) {
+    this._selected = Boolean(val);
+    const card = this.shadowRoot?.querySelector(".card");
+    if (card) card.classList.toggle("selected", this._selected);
+  }
+
+  get selected() {
+    return this._selected;
   }
 
   connectedCallback() {
@@ -517,8 +546,17 @@ export class MeruEntryElement extends HTMLElement {
 
     const isRedacted = Boolean(e.redactedAt) || e.status === "retracted";
     const card = document.createElement("article");
-    card.className = "card" + (isRedacted ? " redacted" : "");
+    card.className = "card" + (isRedacted ? " redacted" : "") + (this._selected ? " selected" : "");
     card.dataset.entryId = String(e.id || "");
+    card.addEventListener("click", () => {
+      const sel = typeof window !== "undefined" && window.getSelection ? window.getSelection() : null;
+      if (sel && String(sel).trim().length > 0) return;
+      this.dispatchEvent(new CustomEvent("meru-select", {
+        bubbles: true,
+        composed: true,
+        detail: { entry: e },
+      }));
+    });
 
     const top = document.createElement("div");
     top.className = "top";
@@ -557,13 +595,6 @@ export class MeruEntryElement extends HTMLElement {
     } else {
       title.textContent = String(e.title || e.id || "");
     }
-    title.addEventListener("click", () => {
-      this.dispatchEvent(new CustomEvent("meru-select", {
-        bubbles: true,
-        composed: true,
-        detail: { entry: e },
-      }));
-    });
     card.appendChild(title);
 
     const bodyText = isRedacted
@@ -597,23 +628,93 @@ export class MeruEntryElement extends HTMLElement {
 if (typeof customElements !== "undefined" && !customElements.get("meru-entry")) {
   customElements.define("meru-entry", MeruEntryElement);
 }
+
+// ---- Primitive 5: <meru-markdown> Thin Lazy-Loaded Token-AST Markdown Renderer ----
+export class MeruMarkdownElement extends HTMLElement {
+  constructor() {
+    super();
+    this._source = "";
+    this._labels = {};
+    this._renderToken = 0;
+    this.attachShadow({ mode: "open" });
+  }
+
+  set source(val) {
+    this._source = String(val ?? "");
+    this.render();
+  }
+
+  get source() {
+    return this._source;
+  }
+
+  set labels(val) {
+    this._labels = val && typeof val === "object" ? val : {};
+    if (this._source) this.render();
+  }
+
+  get labels() {
+    return this._labels;
+  }
+
+  connectedCallback() {
+    this.render();
+  }
+
+  render() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const token = ++this._renderToken;
+    const text = this._source;
+
+    // Immediate safe plain-text fallback while lazy module loads (zero blank flash)
+    while (root.firstChild) root.removeChild(root.firstChild);
+    const pre = document.createElement("pre");
+    pre.style.margin = "0";
+    pre.style.whiteSpace = "pre-wrap";
+    pre.style.wordBreak = "break-word";
+    pre.style.fontFamily = "var(--meru-font, -apple-system, BlinkMacSystemFont, sans-serif)";
+    pre.style.fontSize = "13px";
+    pre.style.lineHeight = "1.6";
+    pre.textContent = text;
+    root.appendChild(pre);
+
+    loadMarkdownTools()
+      .then((mod) => {
+        if (token !== this._renderToken) return;
+        mod.mountMarkdownIntoShadow(root, text, this._labels);
+      })
+      .catch(() => {
+        // Keep safe plain-text fallback on offline/load failure
+      });
+  }
+}
+
+if (typeof customElements !== "undefined" && !customElements.get("meru-markdown")) {
+  customElements.define("meru-markdown", MeruMarkdownElement);
+}
 `;
 
-export const DEFAULT_SHELL_CSS = `/* Meru Mind Official Default Shell — Monochromatic Two-Tone Liquid Glass */
+export const DEFAULT_SHELL_CSS = `/* Meru Mind Official Default Shell (v0.5.2) — Monochromatic Two-Tone + Deep Sea Sub-Logo */
 :root {
   --meru-canvas: #eaeef4;
-  --meru-panel: rgba(255, 255, 255, 0.88);
-  --meru-surface: rgba(255, 255, 255, 0.94);
+  --meru-panel: rgba(255, 255, 255, 0.9);
+  --meru-surface: rgba(255, 255, 255, 0.96);
   --meru-control: rgba(20, 23, 31, 0.055);
+  --meru-control-hover: rgba(20, 23, 31, 0.095);
   --meru-floating: rgba(255, 255, 255, 0.98);
   --meru-fg: #14171f;
   --meru-fg-secondary: #3e4552;
   --meru-fg-muted: #667080;
   --meru-accent: #14171f;
   --meru-accent-fg: #ffffff;
+  --meru-data-hue: #2e66b8;
+  --meru-logo-left: #1b3a6b;
+  --meru-logo-right: #2e66b8;
+  --meru-logo-top: #14171f;
   --meru-border: rgba(20, 23, 31, 0.09);
   --meru-border-strong: rgba(20, 23, 31, 0.22);
-  --meru-chip-bg: rgba(20, 23, 31, 0.07);
+  --meru-chip-bg: rgba(20, 23, 31, 0.068);
   --meru-radius: 10px;
   --meru-font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
   --meru-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
@@ -621,18 +722,23 @@ export const DEFAULT_SHELL_CSS = `/* Meru Mind Official Default Shell — Monoch
 
 :root[data-theme="dark"] {
   --meru-canvas: #090b0e;
-  --meru-panel: rgba(22, 26, 35, 0.86);
-  --meru-surface: rgba(28, 33, 44, 0.92);
-  --meru-control: rgba(255, 255, 255, 0.07);
+  --meru-panel: rgba(21, 25, 34, 0.9);
+  --meru-surface: rgba(27, 32, 43, 0.95);
+  --meru-control: rgba(255, 255, 255, 0.065);
+  --meru-control-hover: rgba(255, 255, 255, 0.11);
   --meru-floating: rgba(24, 29, 39, 0.98);
-  --meru-fg: #e8ecf4;
+  --meru-fg: #e8eef7;
   --meru-fg-secondary: #b6c0d0;
   --meru-fg-muted: #7f8b9f;
-  --meru-accent: #e8ecf4;
+  --meru-accent: #e8eef7;
   --meru-accent-fg: #090b0e;
-  --meru-border: rgba(232, 236, 244, 0.1);
-  --meru-border-strong: rgba(232, 236, 244, 0.24);
-  --meru-chip-bg: rgba(232, 236, 244, 0.1);
+  --meru-data-hue: #6ca3f2;
+  --meru-logo-left: #3b6cb7;
+  --meru-logo-right: #6ca3f2;
+  --meru-logo-top: #e8eef7;
+  --meru-border: rgba(232, 238, 247, 0.1);
+  --meru-border-strong: rgba(232, 238, 247, 0.24);
+  --meru-chip-bg: rgba(232, 238, 247, 0.1);
 }
 
 * { box-sizing: border-box; }
@@ -648,14 +754,18 @@ html, body {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 256px minmax(0, 1fr) 360px;
+  grid-template-columns: 256px minmax(0, 1fr) 432px;
   gap: 10px;
   height: 100vh;
   padding: 10px;
 }
 
-@media (max-width: 1024px) {
-  .app-shell { grid-template-columns: 220px minmax(0, 1fr); }
+@media (max-width: 1120px) {
+  .app-shell { grid-template-columns: 224px minmax(0, 1fr) 340px; }
+}
+
+@media (max-width: 880px) {
+  .app-shell { grid-template-columns: 210px minmax(0, 1fr); }
   .inspector-col { display: none; }
 }
 
@@ -668,6 +778,7 @@ html, body {
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+  position: relative;
 }
 
 .col-header {
@@ -675,8 +786,16 @@ html, body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 12px 14px;
+  padding: 11px 14px;
   border-bottom: 1px solid var(--meru-border);
+  flex-shrink: 0;
+  min-height: 48px;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   flex-shrink: 0;
 }
 
@@ -686,10 +805,20 @@ html, body {
   gap: 8px;
   min-width: 0;
 }
+.brand-logo {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  display: block;
+}
+.brand-logo .logo-left { fill: var(--meru-logo-left); }
+.brand-logo .logo-right { fill: var(--meru-logo-right); }
+.brand-logo .logo-top { fill: var(--meru-logo-top); }
 .brand-name {
   font-size: 14px;
   font-weight: 700;
-  letter-spacing: -0.015em;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
 }
 
 /* Dark textless WebSocket status lamp */
@@ -725,8 +854,12 @@ html, body {
   background: var(--meru-control);
   color: var(--meru-fg);
 }
+.icon-btn.active {
+  background: var(--meru-control-hover);
+  color: var(--meru-fg);
+}
 .icon-btn:focus-visible {
-  outline: 2px solid var(--meru-accent);
+  outline: 2px solid var(--meru-data-hue);
   outline-offset: 1px;
 }
 
@@ -741,12 +874,13 @@ html, body {
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.055em;
   color: var(--meru-fg-muted);
   margin: 14px 0 8px 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
 }
 .section-label:first-child { margin-top: 0; }
 
@@ -761,6 +895,7 @@ html, body {
   color: var(--meru-fg-secondary);
   border: 1px solid transparent;
   margin-bottom: 2px;
+  transition: background 110ms ease, color 110ms ease;
 }
 .realm-item:hover { background: var(--meru-control); color: var(--meru-fg); }
 .realm-item.active {
@@ -773,11 +908,44 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
 }
 .count-num {
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   opacity: 0.72;
+  flex-shrink: 0;
+}
+
+.obj-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  color: var(--meru-fg-secondary);
+  font-size: 12px;
+  margin-bottom: 2px;
+}
+.obj-item:hover { background: var(--meru-control); color: var(--meru-fg); }
+.obj-item.active {
+  background: var(--meru-control-hover);
+  color: var(--meru-fg);
+  font-weight: 600;
+}
+.obj-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.obj-kind {
+  font-family: var(--meru-mono);
+  font-size: 10.5px;
+  color: var(--meru-fg-muted);
+  flex-shrink: 0;
 }
 
 .pulse-row {
@@ -809,9 +977,10 @@ html, body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 10px 12px;
+  padding: 9px 12px;
   border-top: 1px solid var(--meru-border);
   flex-shrink: 0;
+  position: relative;
 }
 .actor-chip {
   display: flex;
@@ -845,6 +1014,111 @@ html, body {
   gap: 4px;
 }
 
+/* Compact Settings Popover */
+.settings-popover {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 52px;
+  background: var(--meru-floating);
+  border: 1px solid var(--meru-border-strong);
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.22);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--meru-fg-secondary);
+}
+.seg-group {
+  display: inline-flex;
+  background: var(--meru-control);
+  border-radius: 7px;
+  padding: 2px;
+  gap: 2px;
+}
+.seg-btn {
+  border: none;
+  background: transparent;
+  color: var(--meru-fg-secondary);
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 4px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.seg-btn.active {
+  background: var(--meru-surface);
+  color: var(--meru-fg);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+/* Center Header & Filters */
+.realm-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.realm-heading-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.filter-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+.filter-chip {
+  border: 1px solid var(--meru-border);
+  background: transparent;
+  color: var(--meru-fg-secondary);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 11.5px;
+  font-family: var(--meru-mono);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: background 110ms ease, border-color 110ms ease, color 110ms ease;
+}
+.filter-chip:hover {
+  background: var(--meru-control);
+  color: var(--meru-fg);
+}
+.filter-chip.active {
+  background: var(--meru-accent);
+  color: var(--meru-accent-fg);
+  border-color: var(--meru-accent);
+}
+.active-obj-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--meru-mono);
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--meru-control-hover);
+  color: var(--meru-fg);
+  border: none;
+  cursor: pointer;
+}
+
 .entry-stack {
   display: flex;
   flex-direction: column;
@@ -857,12 +1131,12 @@ html, body {
   justify-content: space-between;
   gap: 10px;
   padding: 8px 10px;
-  border-left: 2px solid var(--meru-accent);
+  border-left: 2px solid var(--meru-data-hue);
   background: var(--meru-control);
   border-radius: 0 8px 8px 0;
   cursor: pointer;
 }
-.rule-row:hover { border-left-width: 3px; }
+.rule-row:hover { border-left-width: 3px; background: var(--meru-control-hover); }
 .rule-title { font-size: 13px; font-weight: 500; word-break: break-word; }
 .rule-tag {
   font-size: 11px;
@@ -891,7 +1165,7 @@ html, body {
 }
 .action-pill {
   height: 28px;
-  padding: 0 10px;
+  padding: 0 11px;
   border-radius: 7px;
   border: 1px solid var(--meru-border-strong);
   background: var(--meru-accent);
@@ -904,6 +1178,119 @@ html, body {
   gap: 5px;
 }
 .action-pill:disabled { opacity: 0.5; cursor: not-allowed; }
+.small-btn {
+  height: 27px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 1px solid var(--meru-border-strong);
+  background: var(--meru-surface);
+  color: var(--meru-fg);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+.small-btn:hover { background: var(--meru-control); }
+
+.load-more-wrap {
+  margin-top: 12px;
+  display: flex;
+  justify-content: center;
+}
+
+/* Inspector */
+.inspector-title {
+  margin: 0 0 6px;
+  font-size: 15.5px;
+  font-weight: 650;
+  line-height: 1.38;
+  letter-spacing: -0.015em;
+  word-break: break-word;
+}
+.inspector-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  font-family: var(--meru-mono);
+  color: var(--meru-fg-muted);
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--meru-border);
+}
+.meta-pill {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--meru-chip-bg);
+  color: var(--meru-fg);
+}
+.raw-pre,
+.html-source-pre {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--meru-border);
+  background: var(--meru-surface);
+  font-family: var(--meru-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+.html-preview-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  background: var(--meru-control);
+  font-size: 12px;
+  color: var(--meru-fg-secondary);
+}
+.meru-html-sandbox-frame {
+  width: 100%;
+  min-height: 320px;
+  height: 44vh;
+  border: 1px solid var(--meru-border-strong);
+  border-radius: 8px;
+  background: #ffffff;
+}
+.payload-details {
+  margin-top: 12px;
+  border: 1px solid var(--meru-border);
+  border-radius: 8px;
+  background: var(--meru-control);
+  overflow: hidden;
+}
+.payload-details summary {
+  cursor: pointer;
+  padding: 7px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--meru-fg-secondary);
+  user-select: none;
+}
+.payload-details pre {
+  margin: 0;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--meru-border);
+  font-family: var(--meru-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
 
 .chain-rail {
   border-left: 1.5px solid var(--meru-border-strong);
@@ -911,7 +1298,7 @@ html, body {
   padding-left: 12px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 7px;
 }
 .chain-node {
   padding: 8px 10px;
@@ -919,50 +1306,59 @@ html, body {
   background: var(--meru-control);
   cursor: pointer;
 }
+.chain-node:hover { background: var(--meru-control-hover); }
 .chain-node.head {
   border: 1px solid var(--meru-border-strong);
 }
 
-.cli-box {
-  margin-top: 12px;
-  padding: 10px 12px;
+.cli-box-wrap {
+  margin-top: 8px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 10px;
   border-radius: 8px;
   background: var(--meru-control);
+}
+.cli-box {
   font-family: var(--meru-mono);
   font-size: 11.5px;
   color: var(--meru-fg-secondary);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+  flex: 1;
+  min-width: 0;
 }
 
 .empty-note {
   font-size: 12.5px;
   color: var(--meru-fg-muted);
-  padding: 12px 0;
+  padding: 10px 0;
 }
 
-/* Search Modal (Cmd+K) */
+/* Modals (Search Cmd+K & Quick Write) */
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(9, 11, 14, 0.42);
+  background: rgba(9, 11, 14, 0.44);
   display: none;
   align-items: flex-start;
   justify-content: center;
-  padding-top: 10vh;
+  padding-top: 9vh;
   z-index: 40;
 }
 .modal-backdrop.open { display: flex; }
 .modal-panel {
   width: min(640px, 92vw);
-  max-height: 76vh;
+  max-height: 78vh;
   background: var(--meru-floating);
   border: 1px solid var(--meru-border-strong);
   border-radius: 14px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.26);
 }
 .search-input {
   width: 100%;
@@ -974,6 +1370,50 @@ html, body {
   padding: 14px 16px;
   outline: none;
 }
+.write-form {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.write-row {
+  display: grid;
+  grid-template-columns: 1fr 140px;
+  gap: 8px;
+}
+.field-input,
+.field-select,
+.field-textarea {
+  width: 100%;
+  border: 1px solid var(--meru-border-strong);
+  background: var(--meru-surface);
+  color: var(--meru-fg);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: var(--meru-font);
+  font-size: 13px;
+  outline: none;
+}
+.field-input:focus,
+.field-select:focus,
+.field-textarea:focus {
+  border-color: var(--meru-data-hue);
+}
+.field-textarea {
+  min-height: 148px;
+  resize: vertical;
+  line-height: 1.5;
+  font-family: var(--meru-mono);
+  font-size: 12.5px;
+}
+.modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 4px;
+}
+
 .auth-screen {
   min-height: 100vh;
   display: flex;
@@ -1003,14 +1443,17 @@ html, body {
 .toast.show { display: block; }
 `;
 
-export const DEFAULT_FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#14171f" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18L9.5 6L14 14L17 9.5L21 18H3Z"/><path d="M3 21H21"/></svg>`;
+/**
+ * Meru Mind Sub-Logo (Option A: 12-F1 Obsidian x Deep Sea Blue, dark/light aware).
+ */
+export const DEFAULT_FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400"><style>.l{fill:#1B3A6B}.r{fill:#2E66B8}.t{fill:#14171F}@media(prefers-color-scheme:dark){.l{fill:#3B6CB7}.r{fill:#6CA3F2}.t{fill:#E8EEF7}}</style><polygon class="l" points="34,132 124,132 244,344 154,344"/><polygon class="r" points="366,132 276,132 200,266 244,344"/><polygon class="t" points="78,56 322,56 366,132 34,132"/></svg>`;
 
 export const DEFAULT_SHELL_HTML = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Meru Mind — Governance Console</title>
+  <title>Meru Mind</title>
   <link rel="icon" href="/_meru/favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/_meru/shell.css" />
 </head>
@@ -1022,32 +1465,159 @@ export const DEFAULT_SHELL_HTML = `<!doctype html>
 </html>
 `;
 
-export const DEFAULT_SHELL_JS = `// Meru Mind Official Default Shell (/_meru/shell.js)
+export const DEFAULT_SHELL_JS = `// Meru Mind Official Default Shell v0.5.2 (/_meru/shell.js)
 // Imports ONLY /_meru/client.js — ejectable via \`meru-mind ui eject <dir>\` as a reference template.
-import { createMindClient } from "/_meru/client.js";
+import { createMindClient, loadMarkdownTools } from "/_meru/client.js";
 
-const COPY = {
-  brand: "Meru Mind",
-  realms: "Realms",
-  pulse: "Active Focus",
-  rules: "Binding Rules",
-  inboxQueue: "Inbox Triage",
-  decisions: "Active Decisions",
-  findings: "Recent Findings",
-  inspector: "Inspector",
-  chain: "Supersede Chain",
-  searchPlaceholder: "Search visible memory...",
-  noEntries: "No entries in this section.",
-  noSelection: "Select an entry to inspect details and supersede history.",
-  moveLabel: "Move",
-  authTitle: "Sign in via CLI",
-  authDesc: "Browser sessions use a 60-second single-use CLI login code (HttpOnly Cookie; read and reversible triage only). Long-lived tokens never enter the browser.",
-  cliRestrictionNote: "Irreversible governance actions (redact, rules, mounts, tokens) require a CLI Bearer token.",
+const I18N = {
+  en: {
+    brand: "Meru Mind",
+    realms: "Realms",
+    objects: "Objects",
+    pulse: "Active Focus",
+    rules: "Binding Rules",
+    inboxQueue: "Inbox Triage",
+    entries: "Entries",
+    allKinds: "All",
+    loadMore: "Load more",
+    inspector: "Inspector",
+    chain: "Supersede Chain",
+    payload: "Structured Payload",
+    searchPlaceholder: "Search visible memory...",
+    searchHint: "Search (Cmd+K)",
+    refreshHint: "Refresh",
+    writeHint: "Write entry",
+    settingsHint: "Settings",
+    logoutHint: "Sign out",
+    copyHint: "Copy command",
+    copied: "Copied to clipboard",
+    themeLabel: "Theme",
+    light: "Light",
+    dark: "Dark",
+    langLabel: "Language",
+    realtimeLabel: "Realtime",
+    noEntries: "No entries here yet.",
+    noSelection: "Select an entry to inspect rendered Markdown and supersede history.",
+    moveLabel: "Move",
+    movedToast: "Moved {id} -> {target}",
+    writtenToast: "Saved entry in {realm}",
+    viewMd: "MD",
+    viewRaw: "Raw",
+    viewHtml: "HTML",
+    htmlNotice: "Static HTML preview (scripts & network disabled).",
+    htmlTooLarge: "HTML exceeds 1 MB static preview limit; showing escaped source.",
+    htmlRenderBtn: "Render static preview",
+    htmlHideBtn: "Show raw source",
+    largeMdWarning: "Large document (>256 KB) shown as plain text.",
+    renderAnyway: "Render Markdown",
+    writeTitle: "New Entry",
+    writeTitlePlaceholder: "Concise title...",
+    writeBodyPlaceholder: "Markdown body...",
+    cancel: "Cancel",
+    save: "Save",
+    authTitle: "Sign in via CLI",
+    authDesc: "Browser sessions use a 60-second single-use CLI login code (HttpOnly Cookie; read and reversible actions only). Long-lived tokens never enter the browser.",
+    cliRestrictionNote: "Irreversible governance actions (redact, rules, mounts, tokens) require a CLI Bearer token.",
+    clearFilter: "Clear filter",
+    inherited: "inherited",
+    local: "local",
+  },
+  "zh-CN": {
+    brand: "Meru Mind",
+    realms: "领域目录",
+    objects: "关联对象",
+    pulse: "当前在线",
+    rules: "生效规则",
+    inboxQueue: "收件箱分拣",
+    entries: "记忆条目",
+    allKinds: "全部",
+    loadMore: "加载更多",
+    inspector: "详情检查",
+    chain: "演进链条",
+    payload: "结构化 Payload",
+    searchPlaceholder: "搜索当前可见记忆...",
+    searchHint: "搜索 (Cmd+K)",
+    refreshHint: "刷新",
+    writeHint: "新建条目",
+    settingsHint: "设置",
+    logoutHint: "退出登录",
+    copyHint: "复制命令",
+    copied: "已复制到剪贴板",
+    themeLabel: "外观主题",
+    light: "浅色",
+    dark: "深色",
+    langLabel: "界面语言",
+    realtimeLabel: "实时同步",
+    noEntries: "当前目录下暂无条目。",
+    noSelection: "点选左侧或中间列表中的任意条目，在此查看 Markdown 渲染与演进链。",
+    moveLabel: "归档",
+    movedToast: "已移动 {id} -> {target}",
+    writtenToast: "已写入到 {realm}",
+    viewMd: "MD",
+    viewRaw: "原文",
+    viewHtml: "HTML",
+    htmlNotice: "静态 HTML 沙箱预览（脚本与外链请求已完全禁用）。",
+    htmlTooLarge: "HTML 超过 1 MB 静态预览上限，已降级为转义源码显示。",
+    htmlRenderBtn: "渲染静态预览",
+    htmlHideBtn: "查看源码",
+    largeMdWarning: "文档超过 256 KB，默认按纯文本显示以防卡顿。",
+    renderAnyway: "仍要渲染 Markdown",
+    writeTitle: "写入记忆条目",
+    writeTitlePlaceholder: "简短明确的标题...",
+    writeBodyPlaceholder: "支持标准 Markdown 正文...",
+    cancel: "取消",
+    save: "保存",
+    authTitle: "通过 CLI 登录",
+    authDesc: "浏览器会话仅使用 60 秒一次性 CLI 登录码换取 HttpOnly Cookie（仅限读取与可逆操作），长期 Token 绝不进入浏览器。",
+    cliRestrictionNote: "不可逆治理动作（redact、新增 rule、mount、签发 token）必须在 CLI 使用 Bearer Token 执行。",
+    clearFilter: "清除筛选",
+    inherited: "继承",
+    local: "本域",
+  },
 };
+
+function detectInitialLang() {
+  const saved = localStorage.getItem("meru-lang");
+  if (saved === "en" || saved === "zh-CN") return saved;
+  const nav = (navigator.language || "").toLowerCase();
+  return nav.startsWith("zh") ? "zh-CN" : "en";
+}
+
+function t(key, vars) {
+  const dict = I18N[state.lang] || I18N.en;
+  let out = dict[key] ?? I18N.en[key] ?? key;
+  if (vars) {
+    for (const [k, v] of Object.entries(vars)) {
+      out = out.replace("{" + k + "}", String(v));
+    }
+  }
+  return out;
+}
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
-function makeSvg(paths, size = 16) {
+function makeMeruSubLogo(size = 20) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("class", "brand-logo");
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.setAttribute("viewBox", "0 0 400 400");
+  svg.setAttribute("aria-hidden", "true");
+  const polys = [
+    ["logo-left", "34,132 124,132 244,344 154,344"],
+    ["logo-right", "366,132 276,132 200,266 244,344"],
+    ["logo-top", "78,56 322,56 366,132 34,132"],
+  ];
+  for (const [cls, pts] of polys) {
+    const p = document.createElementNS(SVG_NS, "polygon");
+    p.setAttribute("class", cls);
+    p.setAttribute("points", pts);
+    svg.appendChild(p);
+  }
+  return svg;
+}
+
+function makeSvg(paths, size = 15) {
   const svg = document.createElementNS(SVG_NS, "svg");
   svg.setAttribute("width", String(size));
   svg.setAttribute("height", String(size));
@@ -1066,13 +1636,18 @@ function makeSvg(paths, size = 16) {
 }
 
 const ICONS = {
-  logo: () => makeSvg(["M3 18L9.5 6L14 14L17 9.5L21 18H3Z", "M3 21H21"], 18),
+  logo: (size = 20) => makeMeruSubLogo(size),
   search: () => makeSvg(["M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z", "M21 21l-4.3-4.3"], 15),
   refresh: () => makeSvg(["M21 12a9 9 0 1 1-2.64-6.36", "M21 3v6h-6"], 15),
-  theme: () => makeSvg(["M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"], 15),
+  plus: () => makeSvg(["M12 5v14", "M5 12h14"], 15),
+  settings: () => makeSvg([
+    "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z",
+    "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z",
+  ], 15),
   logout: () => makeSvg(["M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4", "M16 17l5-5-5-5", "M21 12H9"], 15),
+  copy: () => makeSvg(["M9 9h10v10H9z", "M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"], 14),
   move: () => makeSvg(["M5 12h14", "M13 5l7 7-7 7"], 14),
-  close: () => makeSvg(["M18 6L6 18", "M6 6l12 12"], 15),
+  close: () => makeSvg(["M18 6L6 18", "M6 6l12 12"], 14),
 };
 
 function showToast(msg) {
@@ -1089,27 +1664,100 @@ document.documentElement.dataset.theme = savedTheme;
 
 const client = createMindClient();
 const app = document.getElementById("app");
+let activeHtmlPreview = null;
+
+function teardownHtmlPreview() {
+  if (activeHtmlPreview) {
+    try { activeHtmlPreview.teardown(); } catch {}
+    activeHtmlPreview = null;
+  }
+}
 
 let state = {
+  lang: detectInitialLang(),
+  theme: savedTheme,
+  settingsOpen: false,
   whoami: null,
   realms: [],
+  realmTreeRows: [],
   activeRealmPath: "/",
   brief: null,
+  realmObjects: [],
+  activeObjectFilter: null,
+  kindFilter: "",
+  entries: [],
+  entriesTotal: 0,
+  entriesNextCursor: null,
+  loadingMore: false,
   inboxEntries: [],
   pulses: [],
   selectedEntry: null,
   selectedChain: null,
+  inspectorView: "md", // md | raw | html
   searchOpen: false,
   searchQuery: "",
   searchResults: null,
+  writeOpen: false,
   pumpStatus: "disconnected",
 };
+
+document.documentElement.lang = state.lang;
 
 function clearEl(el) {
   while (el.firstChild) el.removeChild(el.firstChild);
 }
 
+function flattenRealmTree(nodes, depth = 0, out = []) {
+  for (const node of nodes || []) {
+    const c = node.counts || {};
+    const total =
+      (typeof c.subtreeConclusions === "number" ? c.subtreeConclusions : (c.directConclusions || 0)) +
+      (typeof c.subtreeRules === "number" ? c.subtreeRules : (c.directRules || 0));
+    out.push({
+      realm: node.realm,
+      depth,
+      count: total,
+      directCount: (c.directConclusions || 0) + (c.directRules || 0),
+    });
+    if (Array.isArray(node.children) && node.children.length > 0) {
+      flattenRealmTree(node.children, depth + 1, out);
+    }
+  }
+  return out;
+}
+
+function splitPayloadSection(text) {
+  const str = String(text ?? "");
+  const marker = "\\n## Payload\\n";
+  const idx = str.indexOf(marker);
+  if (idx === -1) return { main: str, payload: null };
+  return {
+    main: str.slice(0, idx).trimEnd(),
+    payload: str.slice(idx + marker.length).trim(),
+  };
+}
+
+function looksLikeHtmlDocument(text, sourceRef) {
+  if (typeof sourceRef === "string" && /\\.html?$/i.test(sourceRef.trim())) return true;
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return false;
+  return /^(?:<!doctype\\s+html|<html\\b|<head\\b|<body\\b|<div\\b|<section\\b|<article\\b|<main\\b|<table\\b|<style\\b)/i.test(trimmed);
+}
+
+function makeIconButton(iconNode, label, onClick, isActive = false, dataUi = "") {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "icon-btn" + (isActive ? " active" : "");
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  if (dataUi) btn.dataset.ui = dataUi;
+  btn.appendChild(iconNode);
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
 function renderAuthRequired() {
+  teardownHtmlPreview();
   clearEl(app);
   const wrap = document.createElement("main");
   wrap.className = "auth-screen";
@@ -1118,43 +1766,75 @@ function renderAuthRequired() {
 
   const brand = document.createElement("div");
   brand.className = "brand";
-  brand.appendChild(ICONS.logo());
+  brand.appendChild(ICONS.logo(24));
   const bn = document.createElement("span");
   bn.className = "brand-name";
-  bn.textContent = COPY.brand;
+  bn.textContent = t("brand");
   brand.appendChild(bn);
   card.appendChild(brand);
 
   const h = document.createElement("h2");
   h.style.margin = "16px 0 8px";
   h.style.fontSize = "17px";
-  h.textContent = COPY.authTitle;
+  h.textContent = t("authTitle");
   card.appendChild(h);
 
   const p = document.createElement("p");
   p.style.margin = "0 0 12px";
   p.style.color = "var(--meru-fg-secondary)";
   p.style.lineHeight = "1.55";
-  p.textContent = COPY.authDesc;
+  p.textContent = t("authDesc");
   card.appendChild(p);
 
+  const cmdWrap = document.createElement("div");
+  cmdWrap.className = "cli-box-wrap";
   const cmd = document.createElement("div");
   cmd.className = "cli-box";
   cmd.textContent = "meru-mind ui login --url " + window.location.origin;
-  card.appendChild(cmd);
+  cmdWrap.appendChild(cmd);
+  card.appendChild(cmdWrap);
 
   wrap.appendChild(card);
   app.appendChild(wrap);
 }
 
-async function selectRealm(realmPath) {
+async function fetchEntriesPage({ reset = true } = {}) {
+  const res = await client.ls({
+    ref: state.activeRealmPath,
+    only: "entries",
+    kind: state.kindFilter || undefined,
+    about: state.activeObjectFilter || undefined,
+    limit: 25,
+    cursor: reset ? undefined : (state.entriesNextCursor || undefined),
+  });
+  const items = Array.isArray(res?.items) ? res.items : [];
+  if (reset) {
+    state.entries = items;
+  } else {
+    state.entries = state.entries.concat(items);
+  }
+  state.entriesTotal = typeof res?.totalMatched === "number" ? res.totalMatched : state.entries.length;
+  state.entriesNextCursor = res?.nextCursor || null;
+}
+
+async function selectRealm(realmPath, opts = {}) {
+  const changed = realmPath !== state.activeRealmPath;
   state.activeRealmPath = realmPath;
-  const [showRes, lsRes] = await Promise.all([
+  if (changed && !opts.keepFilters) {
+    state.kindFilter = "";
+    state.activeObjectFilter = null;
+  }
+  const [showRes, objRes, inboxRes] = await Promise.all([
     client.brief(realmPath),
-    realmPath === "/inbox" ? client.ls({ ref: "/inbox", only: "entries", limit: 50 }) : Promise.resolve(null),
+    client.ls({ ref: realmPath, only: "objects", limit: 40 }).catch(() => ({ objects: [] })),
+    realmPath === "/inbox"
+      ? client.ls({ ref: "/inbox", only: "entries", limit: 50 }).catch(() => ({ items: [] }))
+      : Promise.resolve(null),
   ]);
   state.brief = showRes?.refType === "realm" ? showRes.brief : null;
-  if (lsRes) state.inboxEntries = lsRes.items || [];
+  state.realmObjects = Array.isArray(objRes?.objects) ? objRes.objects : [];
+  if (inboxRes) state.inboxEntries = inboxRes.items || [];
+  await fetchEntriesPage({ reset: true });
   await client.pulse.setFocus([realmPath], null, realmPath).catch(() => {});
   const pulseRes = await client.pulse.list().catch(() => null);
   if (pulseRes?.pulses) state.pulses = pulseRes.pulses;
@@ -1162,6 +1842,7 @@ async function selectRealm(realmPath) {
 }
 
 async function selectEntryById(entryId) {
+  teardownHtmlPreview();
   try {
     const [showRes, chainRes] = await Promise.all([
       client.show(entryId, { full: true }),
@@ -1176,6 +1857,7 @@ async function selectEntryById(entryId) {
           : { id: entryId, title: entryId, body: showRes.content };
       state.selectedEntry = flat;
       state.selectedChain = chainRes;
+      state.inspectorView = "md";
       render();
     }
   } catch (err) {
@@ -1189,6 +1871,9 @@ async function refreshAll() {
     client.pulse.list().catch(() => ({ pulses: [] })),
   ]);
   state.realms = treeRes.realms || [];
+  state.realmTreeRows = Array.isArray(treeRes.realmTree) && treeRes.realmTree.length > 0
+    ? flattenRealmTree(treeRes.realmTree)
+    : state.realms.map((r) => ({ realm: r, depth: 0, count: 0, directCount: 0 }));
   state.pulses = pulseRes.pulses || [];
   const hasInbox = state.realms.some((r) => r.path === "/inbox");
   if (hasInbox) {
@@ -1200,18 +1885,345 @@ async function refreshAll() {
   const targetPath = state.realms.some((r) => r.path === state.activeRealmPath)
     ? state.activeRealmPath
     : (state.realms[0]?.path || "/");
-  await selectRealm(targetPath);
+  await selectRealm(targetPath, { keepFilters: true });
 }
 
-function makeIconButton(iconNode, label, onClick) {
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = "icon-btn";
-  btn.title = label;
-  btn.setAttribute("aria-label", label);
-  btn.appendChild(iconNode);
-  btn.addEventListener("click", onClick);
-  return btn;
+function renderSettingsPopover(parentCol) {
+  if (!state.settingsOpen) return;
+  const pop = document.createElement("div");
+  pop.className = "settings-popover";
+  pop.dataset.ui = "settings-popover";
+
+  // Theme row
+  const themeRow = document.createElement("div");
+  themeRow.className = "setting-row";
+  const tl = document.createElement("span");
+  tl.textContent = t("themeLabel");
+  const tSeg = document.createElement("div");
+  tSeg.className = "seg-group";
+  for (const mode of ["light", "dark"]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "seg-btn" + (state.theme === mode ? " active" : "");
+    b.dataset.themeOption = mode;
+    b.textContent = t(mode);
+    b.addEventListener("click", () => {
+      state.theme = mode;
+      document.documentElement.dataset.theme = mode;
+      localStorage.setItem("meru-theme", mode);
+      render();
+    });
+    tSeg.appendChild(b);
+  }
+  themeRow.appendChild(tl);
+  themeRow.appendChild(tSeg);
+  pop.appendChild(themeRow);
+
+  // Language row
+  const langRow = document.createElement("div");
+  langRow.className = "setting-row";
+  const ll = document.createElement("span");
+  ll.textContent = t("langLabel");
+  const lSeg = document.createElement("div");
+  lSeg.className = "seg-group";
+  for (const [code, label] of [["en", "English"], ["zh-CN", "中文"]]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "seg-btn" + (state.lang === code ? " active" : "");
+    b.dataset.langOption = code;
+    b.textContent = label;
+    b.addEventListener("click", () => {
+      state.lang = code;
+      document.documentElement.lang = code;
+      localStorage.setItem("meru-lang", code);
+      render();
+    });
+    lSeg.appendChild(b);
+  }
+  langRow.appendChild(ll);
+  langRow.appendChild(lSeg);
+  pop.appendChild(langRow);
+
+  // Realtime row
+  const rtRow = document.createElement("div");
+  rtRow.className = "setting-row";
+  const rtl = document.createElement("span");
+  rtl.textContent = t("realtimeLabel");
+  const rtv = document.createElement("span");
+  rtv.style.fontFamily = "var(--meru-mono)";
+  rtv.style.fontSize = "11.5px";
+  rtv.textContent = state.pumpStatus;
+  rtRow.appendChild(rtl);
+  rtRow.appendChild(rtv);
+  pop.appendChild(rtRow);
+
+  parentCol.appendChild(pop);
+}
+
+function renderInspectorBody(rightScroll) {
+  teardownHtmlPreview();
+  const entry = state.selectedEntry;
+  if (!entry) {
+    const emp = document.createElement("div");
+    emp.className = "empty-note";
+    emp.textContent = t("noSelection");
+    rightScroll.appendChild(emp);
+    return;
+  }
+
+  const isRedacted = Boolean(entry.redactedAt) || entry.status === "retracted";
+
+  const titleEl = document.createElement("h3");
+  titleEl.className = "inspector-title";
+  titleEl.textContent = isRedacted ? "[REDACTED]" : String(entry.title || entry.id || "");
+  rightScroll.appendChild(titleEl);
+
+  const meta = document.createElement("div");
+  meta.className = "inspector-meta";
+  const kindPill = document.createElement("span");
+  kindPill.className = "meta-pill";
+  kindPill.textContent = String(entry.extKind || entry.kind || "entry");
+  meta.appendChild(kindPill);
+
+  const metaBits = [
+    entry.status && entry.status !== "active" ? entry.status : null,
+    entry.realmPath,
+    entry.authorId ? ("@" + entry.authorId) : null,
+    (entry.occurredAt || entry.createdAt) ? String(entry.occurredAt || entry.createdAt).slice(0, 16).replace("T", " ") : null,
+    entry.id,
+  ].filter(Boolean);
+  const metaText = document.createElement("span");
+  metaText.textContent = metaBits.join(" · ");
+  meta.appendChild(metaText);
+  rightScroll.appendChild(meta);
+
+  const rawBody = isRedacted
+    ? "[REDACTED — content permanently removed]"
+    : String(entry.body ?? entry.snippet ?? entry.text ?? "");
+  const split = isRedacted ? { main: rawBody, payload: null } : splitPayloadSection(rawBody);
+
+  if (isRedacted) {
+    const red = document.createElement("pre");
+    red.className = "raw-pre";
+    red.textContent = rawBody;
+    rightScroll.appendChild(red);
+  } else if (state.inspectorView === "raw") {
+    const pre = document.createElement("pre");
+    pre.className = "raw-pre";
+    pre.textContent = rawBody;
+    rightScroll.appendChild(pre);
+  } else if (state.inspectorView === "html") {
+    const htmlContainer = document.createElement("div");
+    htmlContainer.dataset.ui = "static-html-preview";
+    rightScroll.appendChild(htmlContainer);
+    const currentId = entry.id;
+    loadMarkdownTools()
+      .then((mod) => {
+        if (state.selectedEntry?.id !== currentId || state.inspectorView !== "html") return;
+        activeHtmlPreview = mod.mountStaticHtmlPreview(htmlContainer, split.main, {
+          notice: t("htmlNotice"),
+          tooLarge: t("htmlTooLarge"),
+          renderBtn: t("htmlRenderBtn"),
+          hideBtn: t("htmlHideBtn"),
+        });
+      })
+      .catch(() => {
+        const pre = document.createElement("pre");
+        pre.className = "raw-pre";
+        pre.textContent = split.main;
+        htmlContainer.appendChild(pre);
+      });
+  } else {
+    const mdEl = document.createElement("meru-markdown");
+    mdEl.labels = {
+      largeWarningText: t("largeMdWarning"),
+      renderAnywayLabel: t("renderAnyway"),
+    };
+    mdEl.source = split.main;
+    rightScroll.appendChild(mdEl);
+  }
+
+  if (!isRedacted && split.payload && state.inspectorView !== "raw") {
+    const details = document.createElement("details");
+    details.className = "payload-details";
+    const summary = document.createElement("summary");
+    summary.textContent = t("payload");
+    const pre = document.createElement("pre");
+    pre.textContent = split.payload;
+    details.appendChild(summary);
+    details.appendChild(pre);
+    rightScroll.appendChild(details);
+  }
+
+  if (state.selectedChain && state.selectedChain.nodes?.length > 1) {
+    const chHead = document.createElement("div");
+    chHead.className = "section-label";
+    chHead.textContent = t("chain") + " (" + state.selectedChain.nodes.length + ")";
+    rightScroll.appendChild(chHead);
+
+    const rail = document.createElement("div");
+    rail.className = "chain-rail";
+    for (const n of state.selectedChain.nodes) {
+      const node = document.createElement("div");
+      node.className = "chain-node" + (n.id === state.selectedChain.currentHeadId ? " head" : "");
+      const nt = document.createElement("div");
+      nt.style.fontWeight = "600";
+      nt.style.fontSize = "12.5px";
+      nt.textContent = n.title;
+      const nm = document.createElement("div");
+      nm.style.fontSize = "11px";
+      nm.style.fontFamily = "var(--meru-mono)";
+      nm.style.color = "var(--meru-fg-muted)";
+      nm.textContent = n.kind + " · " + n.status + " · " + n.id;
+      node.appendChild(nt);
+      node.appendChild(nm);
+      node.addEventListener("click", () => { void selectEntryById(n.id); });
+      rail.appendChild(node);
+    }
+    rightScroll.appendChild(rail);
+  }
+
+  const cliNote = document.createElement("div");
+  cliNote.className = "empty-note";
+  cliNote.style.marginTop = "12px";
+  cliNote.textContent = t("cliRestrictionNote");
+  rightScroll.appendChild(cliNote);
+
+  const cliCmd = "meru-mind redact " + entry.id + ' --reason "..."';
+  const cliWrap = document.createElement("div");
+  cliWrap.className = "cli-box-wrap";
+  const cliBox = document.createElement("div");
+  cliBox.className = "cli-box";
+  cliBox.textContent = cliCmd;
+  cliWrap.appendChild(cliBox);
+  cliWrap.appendChild(makeIconButton(ICONS.copy(), t("copyHint"), async () => {
+    try {
+      await navigator.clipboard.writeText(cliCmd);
+      showToast(t("copied"));
+    } catch {
+      showToast(cliCmd);
+    }
+  }));
+  rightScroll.appendChild(cliWrap);
+}
+
+function renderWriteModal() {
+  const modal = document.createElement("div");
+  modal.className = "modal-backdrop" + (state.writeOpen ? " open" : "");
+  modal.dataset.ui = "write-modal";
+  modal.addEventListener("click", (ev) => {
+    if (ev.target === modal) {
+      state.writeOpen = false;
+      render();
+    }
+  });
+  if (!state.writeOpen) return modal;
+
+  const panel = document.createElement("div");
+  panel.className = "modal-panel";
+
+  const head = document.createElement("div");
+  head.className = "col-header";
+  const heading = document.createElement("strong");
+  heading.textContent = t("writeTitle");
+  head.appendChild(heading);
+  head.appendChild(makeIconButton(ICONS.close(), t("cancel"), () => {
+    state.writeOpen = false;
+    render();
+  }));
+  panel.appendChild(head);
+
+  const form = document.createElement("form");
+  form.className = "write-form";
+
+  const row = document.createElement("div");
+  row.className = "write-row";
+
+  const realmSel = document.createElement("select");
+  realmSel.className = "field-select";
+  realmSel.name = "in";
+  for (const r of state.realms) {
+    const opt = document.createElement("option");
+    opt.value = r.path;
+    opt.textContent = r.path;
+    if (r.path === state.activeRealmPath) opt.selected = true;
+    realmSel.appendChild(opt);
+  }
+
+  const kindSel = document.createElement("select");
+  kindSel.className = "field-select";
+  kindSel.name = "kind";
+  for (const k of ["finding", "decision", "claim", "proposal", "verdict"]) {
+    const opt = document.createElement("option");
+    opt.value = k;
+    opt.textContent = k;
+    kindSel.appendChild(opt);
+  }
+  row.appendChild(realmSel);
+  row.appendChild(kindSel);
+  form.appendChild(row);
+
+  const titleInput = document.createElement("input");
+  titleInput.className = "field-input";
+  titleInput.id = "meru-write-title";
+  titleInput.type = "text";
+  titleInput.required = true;
+  titleInput.placeholder = t("writeTitlePlaceholder");
+  form.appendChild(titleInput);
+
+  const bodyArea = document.createElement("textarea");
+  bodyArea.className = "field-textarea";
+  bodyArea.required = true;
+  bodyArea.placeholder = t("writeBodyPlaceholder");
+  form.appendChild(bodyArea);
+
+  const footer = document.createElement("div");
+  footer.className = "modal-footer";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "small-btn";
+  cancelBtn.textContent = t("cancel");
+  cancelBtn.addEventListener("click", () => {
+    state.writeOpen = false;
+    render();
+  });
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "submit";
+  saveBtn.className = "action-pill";
+  saveBtn.textContent = t("save");
+  footer.appendChild(cancelBtn);
+  footer.appendChild(saveBtn);
+  form.appendChild(footer);
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const titleVal = titleInput.value.trim();
+    const bodyVal = bodyArea.value.trim();
+    if (!titleVal || !bodyVal) return;
+    saveBtn.disabled = true;
+    try {
+      const targetRealm = realmSel.value || state.activeRealmPath;
+      const wrote = await client.write({
+        in: targetRealm,
+        kind: kindSel.value,
+        title: titleVal,
+        body: bodyVal,
+      });
+      state.writeOpen = false;
+      showToast(t("writtenToast", { realm: targetRealm }));
+      await refreshAll();
+      if (wrote?.record?.id) {
+        await selectEntryById(wrote.record.id);
+      }
+    } catch (err) {
+      showToast(err?.message || "Write failed");
+      saveBtn.disabled = false;
+    }
+  });
+
+  panel.appendChild(form);
+  modal.appendChild(panel);
+  return modal;
 }
 
 function render() {
@@ -1220,11 +2232,12 @@ function render() {
     return;
   }
 
+  teardownHtmlPreview();
   clearEl(app);
   const shell = document.createElement("div");
   shell.className = "app-shell";
 
-  // ---- LEFT COLUMN: Brand + Realms + Pulse + Single-Row Utility Dock ----
+  // ---- LEFT COLUMN: Sub-Logo + Hierarchical Realms + Objects + Active Focus + Utility Dock ----
   const left = document.createElement("aside");
   left.className = "col";
 
@@ -1232,26 +2245,26 @@ function render() {
   leftHead.className = "col-header";
   const brand = document.createElement("div");
   brand.className = "brand";
-  brand.appendChild(ICONS.logo());
+  brand.appendChild(ICONS.logo(20));
   const bn = document.createElement("span");
   bn.className = "brand-name";
-  bn.textContent = COPY.brand;
+  bn.textContent = t("brand");
   brand.appendChild(bn);
 
   const lamp = document.createElement("span");
   lamp.className = "ws-lamp";
   lamp.dataset.ui = "ws-connection-status";
   lamp.dataset.status = state.pumpStatus;
-  lamp.title = "Realtime: " + state.pumpStatus;
+  lamp.title = t("realtimeLabel") + ": " + state.pumpStatus;
   brand.appendChild(lamp);
 
   leftHead.appendChild(brand);
-  leftHead.appendChild(makeIconButton(ICONS.search(), "Search (Cmd+K)", () => {
+  leftHead.appendChild(makeIconButton(ICONS.search(), t("searchHint"), () => {
     state.searchOpen = true;
     render();
     const inp = document.getElementById("meru-search-input");
     if (inp) inp.focus();
-  }));
+  }, false, "search-btn"));
   left.appendChild(leftHead);
 
   const leftScroll = document.createElement("div");
@@ -1259,30 +2272,71 @@ function render() {
 
   const rLabel = document.createElement("div");
   rLabel.className = "section-label";
-  rLabel.textContent = COPY.realms;
+  rLabel.textContent = t("realms");
   leftScroll.appendChild(rLabel);
 
-  for (const r of state.realms) {
+  for (const item of state.realmTreeRows) {
+    const r = item.realm;
     const row = document.createElement("div");
     row.className = "realm-item" + (r.path === state.activeRealmPath ? " active" : "");
     row.dataset.realmPath = r.path;
+    if (item.depth > 0) {
+      row.style.paddingLeft = (9 + Math.min(item.depth, 4) * 12) + "px";
+    }
     const pSpan = document.createElement("span");
     pSpan.className = "realm-path";
-    pSpan.textContent = r.path;
+    pSpan.textContent = item.depth === 0 ? r.path : ("/" + r.slug);
+    pSpan.title = r.path;
     row.appendChild(pSpan);
-    if (r.path === "/inbox" && state.inboxEntries.length > 0) {
+    const displayCount = r.path === "/inbox" ? state.inboxEntries.length : item.count;
+    if (displayCount > 0) {
       const cnt = document.createElement("span");
       cnt.className = "count-num";
-      cnt.textContent = String(state.inboxEntries.length);
+      cnt.textContent = String(displayCount);
       row.appendChild(cnt);
     }
     row.addEventListener("click", () => { void selectRealm(r.path); });
     leftScroll.appendChild(row);
   }
 
+  if (state.realmObjects.length > 0) {
+    const oLabel = document.createElement("div");
+    oLabel.className = "section-label";
+    const oTitle = document.createElement("span");
+    oTitle.textContent = t("objects");
+    const oCount = document.createElement("span");
+    oCount.className = "count-num";
+    oCount.textContent = String(state.realmObjects.length);
+    oLabel.appendChild(oTitle);
+    oLabel.appendChild(oCount);
+    leftScroll.appendChild(oLabel);
+
+    for (const obj of state.realmObjects) {
+      const oRow = document.createElement("div");
+      const isObjActive = state.activeObjectFilter === obj.ref;
+      oRow.className = "obj-item" + (isObjActive ? " active" : "");
+      oRow.dataset.objectRef = obj.ref;
+      const oname = document.createElement("span");
+      oname.className = "obj-name";
+      oname.textContent = obj.name;
+      oname.title = obj.ref;
+      const okind = document.createElement("span");
+      okind.className = "obj-kind";
+      okind.textContent = obj.kind;
+      oRow.appendChild(oname);
+      oRow.appendChild(okind);
+      oRow.addEventListener("click", async () => {
+        state.activeObjectFilter = isObjActive ? null : obj.ref;
+        await fetchEntriesPage({ reset: true });
+        render();
+      });
+      leftScroll.appendChild(oRow);
+    }
+  }
+
   const pLabel = document.createElement("div");
   pLabel.className = "section-label";
-  pLabel.textContent = COPY.pulse;
+  pLabel.textContent = t("pulse");
   leftScroll.appendChild(pLabel);
 
   if (state.pulses.length === 0) {
@@ -1307,6 +2361,8 @@ function render() {
   }
   left.appendChild(leftScroll);
 
+  renderSettingsPopover(left);
+
   const dock = document.createElement("div");
   dock.className = "utility-dock";
   const actorChip = document.createElement("div");
@@ -1322,32 +2378,58 @@ function render() {
 
   const dockActions = document.createElement("div");
   dockActions.className = "dock-actions";
-  dockActions.appendChild(makeIconButton(ICONS.theme(), "Toggle theme", () => {
-    const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
-    localStorage.setItem("meru-theme", next);
-  }));
-  dockActions.appendChild(makeIconButton(ICONS.logout(), "Sign out", async () => {
+  dockActions.appendChild(makeIconButton(
+    ICONS.settings(),
+    t("settingsHint"),
+    () => {
+      state.settingsOpen = !state.settingsOpen;
+      render();
+    },
+    state.settingsOpen,
+    "settings-btn",
+  ));
+  dockActions.appendChild(makeIconButton(ICONS.logout(), t("logoutHint"), async () => {
     client.pump.stop();
     await client.logout();
     state.whoami = null;
+    state.settingsOpen = false;
     render();
-  }));
+  }, false, "logout-btn"));
   dock.appendChild(actorChip);
   dock.appendChild(dockActions);
   left.appendChild(dock);
 
-  // ---- CENTER COLUMN: Realm L1 Brief (Untruncated Rules + Inbox Triage + Decisions/Findings) ----
+  // ---- CENTER COLUMN: Untruncated Rules + Inbox Triage + Generic Paginated Entries ----
   const center = document.createElement("main");
   center.className = "col";
 
   const centerHead = document.createElement("div");
   centerHead.className = "col-header";
   const headLeft = document.createElement("div");
+  headLeft.className = "realm-heading";
+
+  const headingRow = document.createElement("div");
+  headingRow.className = "realm-heading-row";
   const titleSpan = document.createElement("strong");
   titleSpan.style.fontFamily = "var(--meru-mono)";
   titleSpan.textContent = state.activeRealmPath;
-  headLeft.appendChild(titleSpan);
+  headingRow.appendChild(titleSpan);
+
+  if (state.activeObjectFilter) {
+    const objPill = document.createElement("button");
+    objPill.type = "button";
+    objPill.className = "active-obj-pill";
+    objPill.title = t("clearFilter");
+    objPill.textContent = state.activeObjectFilter + " ×";
+    objPill.addEventListener("click", async () => {
+      state.activeObjectFilter = null;
+      await fetchEntriesPage({ reset: true });
+      render();
+    });
+    headingRow.appendChild(objPill);
+  }
+  headLeft.appendChild(headingRow);
+
   if (state.brief?.realm?.scope) {
     const sc = document.createElement("div");
     sc.style.fontSize = "12px";
@@ -1356,31 +2438,38 @@ function render() {
     headLeft.appendChild(sc);
   }
   centerHead.appendChild(headLeft);
-  centerHead.appendChild(makeIconButton(ICONS.refresh(), "Refresh", () => { void refreshAll(); }));
+
+  const centerActions = document.createElement("div");
+  centerActions.className = "header-actions";
+  centerActions.appendChild(makeIconButton(ICONS.plus(), t("writeHint"), () => {
+    state.writeOpen = true;
+    render();
+    const inp = document.getElementById("meru-write-title");
+    if (inp) inp.focus();
+  }, false, "write-btn"));
+  centerActions.appendChild(makeIconButton(ICONS.refresh(), t("refreshHint"), () => {
+    void refreshAll();
+  }, false, "refresh-btn"));
+  centerHead.appendChild(centerActions);
   center.appendChild(centerHead);
 
   const centerScroll = document.createElement("div");
   centerScroll.className = "scroll-body";
 
-  // 1. Untruncated Binding Rules
+  // 1. Untruncated Binding Rules (shown whenever rules exist; preserves RULE-TAIL-SENTINEL invariant)
   const rules = state.brief?.middleMind?.rules?.items || [];
-  const rulesHead = document.createElement("div");
-  rulesHead.className = "section-label";
-  const rulesTitle = document.createElement("span");
-  rulesTitle.textContent = COPY.rules;
-  const rulesCount = document.createElement("span");
-  rulesCount.className = "count-num";
-  rulesCount.textContent = String(rules.length);
-  rulesHead.appendChild(rulesTitle);
-  rulesHead.appendChild(rulesCount);
-  centerScroll.appendChild(rulesHead);
+  if (rules.length > 0) {
+    const rulesHead = document.createElement("div");
+    rulesHead.className = "section-label";
+    const rulesTitle = document.createElement("span");
+    rulesTitle.textContent = t("rules");
+    const rulesCount = document.createElement("span");
+    rulesCount.className = "count-num";
+    rulesCount.textContent = String(rules.length);
+    rulesHead.appendChild(rulesTitle);
+    rulesHead.appendChild(rulesCount);
+    centerScroll.appendChild(rulesHead);
 
-  if (rules.length === 0) {
-    const emp = document.createElement("div");
-    emp.className = "empty-note";
-    emp.textContent = COPY.noEntries;
-    centerScroll.appendChild(emp);
-  } else {
     const ruleStack = document.createElement("div");
     ruleStack.className = "entry-stack";
     ruleStack.dataset.section = "rules";
@@ -1393,7 +2482,7 @@ function render() {
       rt.textContent = rule.title;
       const rtag = document.createElement("span");
       rtag.className = "rule-tag";
-      rtag.textContent = rule.inherited ? "inherited" : "local";
+      rtag.textContent = rule.inherited ? t("inherited") : t("local");
       rRow.appendChild(rt);
       rRow.appendChild(rtag);
       rRow.addEventListener("click", () => { void selectEntryById(rule.id); });
@@ -1402,35 +2491,85 @@ function render() {
     centerScroll.appendChild(ruleStack);
   }
 
-  // 2. Inbox Triage Queue (when viewing /inbox)
-  if (state.activeRealmPath === "/inbox") {
-    const inboxHead = document.createElement("div");
-    inboxHead.className = "section-label";
-    inboxHead.textContent = COPY.inboxQueue + " (" + state.inboxEntries.length + ")";
-    centerScroll.appendChild(inboxHead);
+  // 2. Unified Paginated Entries List (with inline CAS Triage controls when viewing /inbox)
+  const isInboxView = state.activeRealmPath === "/inbox";
+  const triageTargets = isInboxView ? state.realms.filter((r) => r.path !== "/inbox") : [];
 
-    const targets = state.realms.filter((r) => r.path !== "/inbox");
-    const stack = document.createElement("div");
-    stack.className = "entry-stack";
-    stack.dataset.section = "inbox-triage";
+  const entriesHead = document.createElement("div");
+  entriesHead.className = "section-label";
+  const eTitle = document.createElement("span");
+  eTitle.textContent = isInboxView ? t("inboxQueue") : t("entries");
+  const eCount = document.createElement("span");
+  eCount.className = "count-num";
+  eCount.textContent = String(state.entriesTotal);
+  entriesHead.appendChild(eTitle);
+  entriesHead.appendChild(eCount);
+  centerScroll.appendChild(entriesHead);
 
-    for (const item of state.inboxEntries) {
+  const hist = state.brief?.kindHistogram || {};
+  const histKinds = Object.entries(hist)
+    .filter(([, n]) => typeof n === "number" && n > 0)
+    .sort((a, b) => b[1] - a[1]);
+
+  if (histKinds.length > 0) {
+    const fBar = document.createElement("div");
+    fBar.className = "filter-bar";
+    const allBtn = document.createElement("button");
+    allBtn.type = "button";
+    allBtn.className = "filter-chip" + (state.kindFilter === "" ? " active" : "");
+    allBtn.textContent = t("allKinds");
+    allBtn.addEventListener("click", async () => {
+      if (state.kindFilter === "") return;
+      state.kindFilter = "";
+      await fetchEntriesPage({ reset: true });
+      render();
+    });
+    fBar.appendChild(allBtn);
+
+    for (const [kindName, count] of histKinds) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "filter-chip" + (state.kindFilter === kindName ? " active" : "");
+      chip.dataset.kindFilter = kindName;
+      chip.textContent = kindName + " " + count;
+      chip.addEventListener("click", async () => {
+        state.kindFilter = state.kindFilter === kindName ? "" : kindName;
+        await fetchEntriesPage({ reset: true });
+        render();
+      });
+      fBar.appendChild(chip);
+    }
+    centerScroll.appendChild(fBar);
+  }
+
+  const entryStack = document.createElement("div");
+  entryStack.className = "entry-stack";
+  entryStack.dataset.section = isInboxView ? "inbox-triage" : "entries";
+
+  if (state.entries.length === 0) {
+    const emp = document.createElement("div");
+    emp.className = "empty-note";
+    emp.textContent = t("noEntries");
+    entryStack.appendChild(emp);
+  } else {
+    for (const item of state.entries) {
       const box = document.createElement("div");
       const el = document.createElement("meru-entry");
       el.entry = item;
+      el.selected = state.selectedEntry?.id === item.id;
       el.addEventListener("meru-select", () => { void selectEntryById(item.id); });
       box.appendChild(el);
 
-      if (targets.length > 0) {
+      if (isInboxView && triageTargets.length > 0) {
         const bar = document.createElement("div");
         bar.className = "triage-bar";
         const sel = document.createElement("select");
         sel.className = "triage-select";
         sel.setAttribute("aria-label", "Destination realm for " + item.id);
-        for (const t of targets) {
+        for (const tgt of triageTargets) {
           const opt = document.createElement("option");
-          opt.value = t.path;
-          opt.textContent = t.path;
+          opt.value = tgt.path;
+          opt.textContent = tgt.path;
           sel.appendChild(opt);
         }
         const btn = document.createElement("button");
@@ -1439,13 +2578,13 @@ function render() {
         btn.dataset.triageEntry = item.id;
         btn.appendChild(ICONS.move());
         const span = document.createElement("span");
-        span.textContent = COPY.moveLabel;
+        span.textContent = t("moveLabel");
         btn.appendChild(span);
         btn.addEventListener("click", async () => {
           btn.disabled = true;
           try {
             await client.inbox.triage(item.id, sel.value, { expectedFromRealmRef: "/inbox" });
-            showToast("Moved " + item.id + " -> " + sel.value);
+            showToast(t("movedToast", { id: item.id, target: sel.value }));
             await refreshAll();
           } catch (err) {
             showToast(err?.message || "Triage failed");
@@ -1456,116 +2595,74 @@ function render() {
         bar.appendChild(btn);
         box.appendChild(bar);
       }
-      stack.appendChild(box);
+
+      entryStack.appendChild(box);
     }
-    centerScroll.appendChild(stack);
+  }
+  centerScroll.appendChild(entryStack);
+
+  if (state.entriesNextCursor) {
+    const moreWrap = document.createElement("div");
+    moreWrap.className = "load-more-wrap";
+    const moreBtn = document.createElement("button");
+    moreBtn.type = "button";
+    moreBtn.className = "small-btn";
+    moreBtn.dataset.ui = "load-more-entries";
+    moreBtn.disabled = state.loadingMore;
+    moreBtn.textContent = t("loadMore");
+    moreBtn.addEventListener("click", async () => {
+      state.loadingMore = true;
+      moreBtn.disabled = true;
+      try {
+        await fetchEntriesPage({ reset: false });
+      } finally {
+        state.loadingMore = false;
+        render();
+      }
+    });
+    moreWrap.appendChild(moreBtn);
+    centerScroll.appendChild(moreWrap);
   }
 
-  // 3. Active Decisions & Recent Findings (rendered via sanitized <meru-entry>)
-  const decisions = state.brief?.upperLedger?.activeDecisions?.items || [];
-  const findings = state.brief?.upperLedger?.recentFindings?.items || [];
-
-  const decHead = document.createElement("div");
-  decHead.className = "section-label";
-  decHead.textContent = COPY.decisions + " (" + decisions.length + ")";
-  centerScroll.appendChild(decHead);
-  const decStack = document.createElement("div");
-  decStack.className = "entry-stack";
-  for (const d of decisions) {
-    const el = document.createElement("meru-entry");
-    el.entry = { ...d, realmPath: state.activeRealmPath };
-    el.addEventListener("meru-select", () => { void selectEntryById(d.id); });
-    decStack.appendChild(el);
-  }
-  if (decisions.length === 0) {
-    const emp = document.createElement("div");
-    emp.className = "empty-note";
-    emp.textContent = COPY.noEntries;
-    decStack.appendChild(emp);
-  }
-  centerScroll.appendChild(decStack);
-
-  const findHead = document.createElement("div");
-  findHead.className = "section-label";
-  findHead.textContent = COPY.findings + " (" + findings.length + ")";
-  centerScroll.appendChild(findHead);
-  const findStack = document.createElement("div");
-  findStack.className = "entry-stack";
-  for (const f of findings) {
-    const el = document.createElement("meru-entry");
-    el.entry = { ...f, realmPath: state.activeRealmPath };
-    el.addEventListener("meru-select", () => { void selectEntryById(f.id); });
-    findStack.appendChild(el);
-  }
-  if (findings.length === 0) {
-    const emp = document.createElement("div");
-    emp.className = "empty-note";
-    emp.textContent = COPY.noEntries;
-    findStack.appendChild(emp);
-  }
-  centerScroll.appendChild(findStack);
   center.appendChild(centerScroll);
 
-  // ---- RIGHT COLUMN: Inspector + Supersede Chain + CLI Governance Boundary ----
+  // ---- RIGHT COLUMN: Inspector (<meru-markdown> + Raw + Click-to-Render Static HTML + Chain + CLI) ----
   const right = document.createElement("aside");
   right.className = "col inspector-col";
   const rightHead = document.createElement("div");
   rightHead.className = "col-header";
   const rTitle = document.createElement("strong");
-  rTitle.textContent = COPY.inspector;
+  rTitle.textContent = t("inspector");
   rightHead.appendChild(rTitle);
+
+  if (state.selectedEntry && !state.selectedEntry.redactedAt && state.selectedEntry.status !== "retracted") {
+    const bodyForDetect = splitPayloadSection(state.selectedEntry.body ?? state.selectedEntry.snippet ?? "").main;
+    const isHtmlCandidate = looksLikeHtmlDocument(bodyForDetect, state.selectedEntry.sourceRef);
+    const modeSeg = document.createElement("div");
+    modeSeg.className = "seg-group";
+    const modes = isHtmlCandidate
+      ? [["md", t("viewMd")], ["raw", t("viewRaw")], ["html", t("viewHtml")]]
+      : [["md", t("viewMd")], ["raw", t("viewRaw")]];
+    for (const [mKey, mLabel] of modes) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "seg-btn" + (state.inspectorView === mKey ? " active" : "");
+      b.dataset.inspectorMode = mKey;
+      b.textContent = mLabel;
+      b.addEventListener("click", () => {
+        if (state.inspectorView === mKey) return;
+        state.inspectorView = mKey;
+        render();
+      });
+      modeSeg.appendChild(b);
+    }
+    rightHead.appendChild(modeSeg);
+  }
   right.appendChild(rightHead);
 
   const rightScroll = document.createElement("div");
   rightScroll.className = "scroll-body";
-  if (!state.selectedEntry) {
-    const emp = document.createElement("div");
-    emp.className = "empty-note";
-    emp.textContent = COPY.noSelection;
-    rightScroll.appendChild(emp);
-  } else {
-    const entryEl = document.createElement("meru-entry");
-    entryEl.entry = state.selectedEntry;
-    rightScroll.appendChild(entryEl);
-
-    if (state.selectedChain && state.selectedChain.nodes?.length > 1) {
-      const chHead = document.createElement("div");
-      chHead.className = "section-label";
-      chHead.textContent = COPY.chain + " (" + state.selectedChain.nodes.length + ")";
-      rightScroll.appendChild(chHead);
-
-      const rail = document.createElement("div");
-      rail.className = "chain-rail";
-      for (const n of state.selectedChain.nodes) {
-        const node = document.createElement("div");
-        node.className = "chain-node" + (n.id === state.selectedChain.currentHeadId ? " head" : "");
-        const nt = document.createElement("div");
-        nt.style.fontWeight = "600";
-        nt.style.fontSize = "12.5px";
-        nt.textContent = n.title;
-        const nm = document.createElement("div");
-        nm.style.fontSize = "11px";
-        nm.style.fontFamily = "var(--meru-mono)";
-        nm.style.color = "var(--meru-fg-muted)";
-        nm.textContent = n.kind + " · " + n.status + " · " + n.id;
-        node.appendChild(nt);
-        node.appendChild(nm);
-        node.addEventListener("click", () => { void selectEntryById(n.id); });
-        rail.appendChild(node);
-      }
-      rightScroll.appendChild(rail);
-    }
-
-    const cliNote = document.createElement("div");
-    cliNote.className = "empty-note";
-    cliNote.textContent = COPY.cliRestrictionNote;
-    rightScroll.appendChild(cliNote);
-
-    const cliBox = document.createElement("div");
-    cliBox.className = "cli-box";
-    cliBox.textContent = "meru-mind redact " + state.selectedEntry.id + ' --reason "..."';
-    rightScroll.appendChild(cliBox);
-  }
+  renderInspectorBody(rightScroll);
   right.appendChild(rightScroll);
 
   shell.appendChild(left);
@@ -1589,7 +2686,7 @@ function render() {
   inp.id = "meru-search-input";
   inp.className = "search-input";
   inp.type = "search";
-  inp.placeholder = COPY.searchPlaceholder;
+  inp.placeholder = t("searchPlaceholder");
   inp.value = state.searchQuery;
   inp.addEventListener("keydown", async (ev) => {
     if (ev.key === "Escape") {
@@ -1630,17 +2727,26 @@ function render() {
   panel.appendChild(resScroll);
   modal.appendChild(panel);
   app.appendChild(modal);
+
+  // ---- Quick Write Modal ----
+  app.appendChild(renderWriteModal());
 }
 
 window.addEventListener("keydown", (ev) => {
   if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
     ev.preventDefault();
     state.searchOpen = !state.searchOpen;
+    state.writeOpen = false;
     render();
     if (state.searchOpen) {
       const inp = document.getElementById("meru-search-input");
       if (inp) inp.focus();
     }
+  } else if (ev.key === "Escape" && (state.searchOpen || state.writeOpen || state.settingsOpen)) {
+    state.searchOpen = false;
+    state.writeOpen = false;
+    state.settingsOpen = false;
+    render();
   }
 });
 
@@ -1648,6 +2754,7 @@ client.pump.subscribe((snap) => {
   const prevStatus = state.pumpStatus;
   state.pumpStatus = snap.status;
   if (snap.status === "auth-required") {
+    teardownHtmlPreview();
     state.whoami = null;
     render();
     return;
@@ -1655,12 +2762,18 @@ client.pump.subscribe((snap) => {
   const lamp = document.querySelector('[data-ui="ws-connection-status"]');
   if (lamp) {
     lamp.dataset.status = snap.status;
-    lamp.title = "Realtime: " + snap.status;
+    lamp.title = t("realtimeLabel") + ": " + snap.status;
   } else if (prevStatus !== snap.status) {
     render();
   }
   if (snap.lastFrames && snap.lastFrames.length > 0) {
-    void refreshAll();
+    const selectedId = state.selectedEntry?.id;
+    const touchedSelected = selectedId && snap.lastFrames.some((f) => f.entityId === selectedId);
+    void refreshAll().then(() => {
+      if (touchedSelected) {
+        return selectEntryById(selectedId);
+      }
+    });
   }
 });
 

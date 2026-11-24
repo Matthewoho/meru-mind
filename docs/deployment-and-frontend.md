@@ -38,8 +38,28 @@ Internet (HTTPS / WSS)
 ```
 
 Key operational guardrails:
-1. **Secrets stay in environment variables** (`MERU_MIND_ORIGIN`, `LINEAR_API_KEY`, etc.) — never stored in SQLite tables or `work_bindings.config_json`.
-2. **Disaster recovery**: Built-in scheduled `VACUUM INTO` atomic snapshots (restore drill verified in CI), optionally paired with [Litestream](https://litestream.io/) for continuous WAL replication to S3 / R2 / GCS.
+1. **Safe one-shot first-token bootstrap (NEVER leave `--init-token` in `docker-compose.yml` logs)**:
+   ```bash
+   # Before starting the long-running server, mint the first human admin token in a one-shot container
+   docker compose -f deploy/docker-compose.yml run --rm meru-mind \
+     node /app/dist/cli.js token create --actor-id admin --kind human --as-human
+   # Then start the persistent server + Caddy HTTPS proxy
+   MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
+   ```
+   Mint teammate tokens and 60-second browser login links remotely with your saved admin token:
+   ```bash
+   MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<admin-token> \
+     meru-mind token create --actor-id teammate --kind human
+   MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<your-token> \
+     meru-mind ui login
+   ```
+2. **Secrets stay in environment variables** (`MERU_MIND_ORIGIN`, `LINEAR_API_KEY`, etc.) — never stored in SQLite tables or `work_bindings.config_json`.
+3. **Online disaster-recovery backups (no downtime required)**: Trigger an atomic `VACUUM INTO` snapshot over the live server with a human Bearer token:
+   ```bash
+   MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<admin-token> \
+     meru-mind admin backup
+   ```
+   Snapshots land in `<MERU_MIND_HOME>/backups/` with SHA-256 verification and can be paired with [Litestream](https://litestream.io/) for continuous WAL replication to S3 / R2 / GCS.
 
 ### Track 2 (Future Managed Cloud / SaaS Edition): Cloudflare Workers + Durable Objects
 

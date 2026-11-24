@@ -1,9 +1,30 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
+
+function httpGetNoRedirect(
+  urlStr: string,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.get(urlStr, { headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+      res.on("end", () =>
+        resolve({
+          status: res.statusCode ?? 0,
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString("utf8"),
+        }),
+      );
+    });
+    req.on("error", reject);
+  });
+}
 import { afterEach, describe, expect, it } from "vitest";
 import {
   CLIENT_JS_SOURCE,
@@ -234,15 +255,22 @@ describe("v0.4 1.5-Layer Composable Web Governance UI, 7-Condition Pump WS & In-
     const { code, loginUrl } = (await mintResp.json()) as { code: string; loginUrl: string };
     expect(code).toMatch(/^mm_code_/);
 
-    const authResp = await fetch(loginUrl, { redirect: "manual" });
+    const authResp = await httpGetNoRedirect(loginUrl, {
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Dest": "document",
+    });
     expect(authResp.status).toBe(302);
-    const setCookie = authResp.headers.get("set-cookie") ?? "";
+    const setCookieHeader = authResp.headers["set-cookie"];
+    const setCookie = Array.isArray(setCookieHeader) ? (setCookieHeader[0] ?? "") : (setCookieHeader ?? "");
     expect(setCookie).toContain("HttpOnly");
     expect(setCookie).toContain("SameSite=Strict");
     const cookiePair = setCookie.split(";")[0]!;
 
     // Replaying the same single-use code MUST fail with 401/403
-    const replayResp = await fetch(loginUrl, { redirect: "manual" });
+    const replayResp = await httpGetNoRedirect(loginUrl, {
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Dest": "document",
+    });
     expect([401, 403]).toContain(replayResp.status);
 
     // Guardrail #1: Weakened Cookie allows read + reversible inbox triage, blocks redact/rule/mount/token with 403 + CLI cmd
@@ -252,10 +280,14 @@ describe("v0.4 1.5-Layer Composable Web Governance UI, 7-Condition Pump WS & In-
     expect(whoJson.actor.id).toBe("matthew");
     expect(whoJson.write.canRedact).toBe(false);
 
-    // Reversible triage move from /inbox -> /ops SUCCEEDS with Cookie
+    // Reversible triage move from /inbox -> /ops SUCCEEDS with Cookie (requires same-origin Origin header per v0.5.2 CSRF guardrail)
     const triageResp = await fetch(`${srv.url}/v1/move`, {
       method: "POST",
-      headers: { Cookie: cookiePair, "Content-Type": "application/json" },
+      headers: {
+        Cookie: cookiePair,
+        Origin: srv.url,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
         entryIds: [srv.demoSeed!.inboxEntryId],
         targetRealmRef: "/ops",
@@ -274,7 +306,11 @@ describe("v0.4 1.5-Layer Composable Web Governance UI, 7-Condition Pump WS & In-
     ] as const) {
       const r = await fetch(`${srv.url}${ep}`, {
         method: "POST",
-        headers: { Cookie: cookiePair, "Content-Type": "application/json" },
+        headers: {
+          Cookie: cookiePair,
+          Origin: srv.url,
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify(payload),
       });
       expect(r.status).toBe(403);
@@ -312,8 +348,13 @@ describe("v0.4 1.5-Layer Composable Web Governance UI, 7-Condition Pump WS & In-
       headers: { Authorization: `Bearer ${humanTok.token}` },
     });
     const { loginUrl } = (await mint.json()) as { loginUrl: string };
-    const authRes = await fetch(loginUrl, { redirect: "manual" });
-    const cookiePair = (authRes.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const authRes = await httpGetNoRedirect(loginUrl, {
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Dest": "document",
+    });
+    const rawSetCookie = authRes.headers["set-cookie"];
+    const setCookieStr = Array.isArray(rawSetCookie) ? (rawSetCookie[0] ?? "") : (rawSetCookie ?? "");
+    const cookiePair = setCookieStr.split(";")[0]!;
 
     // Condition #1: ?token=... in WS URL MUST be rejected (400)
     const badUrl = await rawWsConnect({

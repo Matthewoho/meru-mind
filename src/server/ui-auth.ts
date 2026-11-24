@@ -5,6 +5,7 @@ import { MindError, type Principal } from "../types.js";
 import { isPrincipalTokenActive } from "./tokens.js";
 
 export const UI_SESSION_COOKIE_NAME = "meru_session";
+export const UI_HOST_SESSION_COOKIE_NAME = "__Host-meru_session";
 const LOGIN_CODE_TTL_MS = 60_000;
 const COOKIE_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
@@ -146,7 +147,7 @@ export class UiSessionManager {
   ): Principal | null {
     this.prune(nowMs);
     const cookies = parseCookieHeader(req.headers.cookie);
-    const sid = cookies[UI_SESSION_COOKIE_NAME];
+    const sid = cookies[UI_HOST_SESSION_COOKIE_NAME] ?? cookies[UI_SESSION_COOKIE_NAME];
     if (!sid) return null;
     const sess = this.sessions.get(sid);
     if (!sess || sess.expiresAtMs <= nowMs) {
@@ -165,10 +166,10 @@ export class UiSessionManager {
 
   revokeSessionFromRequest(req: IncomingMessage): void {
     const cookies = parseCookieHeader(req.headers.cookie);
-    const sid = cookies[UI_SESSION_COOKIE_NAME];
-    if (sid) {
-      this.sessions.delete(sid);
-    }
+    const hostSid = cookies[UI_HOST_SESSION_COOKIE_NAME];
+    const plainSid = cookies[UI_SESSION_COOKIE_NAME];
+    if (hostSid) this.sessions.delete(hostSid);
+    if (plainSid) this.sessions.delete(plainSid);
   }
 
   buildSetCookieHeader(
@@ -176,8 +177,9 @@ export class UiSessionManager {
     maxAgeSeconds: number,
     isSecure: boolean,
   ): string {
+    const cookieName = isSecure ? UI_HOST_SESSION_COOKIE_NAME : UI_SESSION_COOKIE_NAME;
     const parts = [
-      `${UI_SESSION_COOKIE_NAME}=${encodeURIComponent(sessionId)}`,
+      `${cookieName}=${encodeURIComponent(sessionId)}`,
       "HttpOnly",
       "SameSite=Strict",
       "Path=/",
@@ -185,6 +187,18 @@ export class UiSessionManager {
     ];
     if (isSecure) parts.push("Secure");
     return parts.join("; ");
+  }
+
+  buildClearCookieHeaders(isSecure = false): string[] {
+    const headers = [
+      `${UI_SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`,
+    ];
+    if (isSecure) {
+      headers.push(
+        `${UI_HOST_SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure`,
+      );
+    }
+    return headers;
   }
 
   buildClearCookieHeader(): string {

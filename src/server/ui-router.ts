@@ -1,8 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { MindEngine } from "../index.js";
 import { MindError, type Principal } from "../types.js";
+import { MARKDOWN_JS_SOURCE } from "./markdown-renderer.js";
 import {
   CLIENT_JS_SOURCE,
   DEFAULT_FAVICON_SVG,
@@ -11,6 +13,27 @@ import {
   DEFAULT_SHELL_JS,
 } from "./ui-assets.js";
 import type { UiSessionManager } from "./ui-auth.js";
+import { isOriginAllowed } from "./ws-pump.js";
+
+let cachedMarkedVendorSource: string | null = null;
+
+function loadMarkedVendorSource(): string {
+  if (cachedMarkedVendorSource !== null) return cachedMarkedVendorSource;
+  const candidates = [
+    fileURLToPath(new URL("../vendor/marked.esm.js", import.meta.url)),
+    fileURLToPath(new URL("../../dist/vendor/marked.esm.js", import.meta.url)),
+  ];
+  for (const filePath of candidates) {
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      cachedMarkedVendorSource = fs.readFileSync(filePath, "utf8");
+      return cachedMarkedVendorSource;
+    }
+  }
+  throw new MindError(
+    "NOT_FOUND",
+    "Vendored marked.esm.js not found in dist/vendor/marked.esm.js. Run 'pnpm build' first.",
+  );
+}
 
 /**
  * Guardrail #3: Strict server-enforced CSP for all UI shells (default and custom --web-dir).
@@ -92,6 +115,7 @@ function isRequestSecure(req: IncomingMessage): boolean {
 export interface UiRouterOptions {
   uiSessions: UiSessionManager;
   webDir: string | null;
+  allowedOrigins?: string[];
 }
 
 /**
@@ -134,6 +158,14 @@ export function createUiRouteHandler(options: UiRouterOptions) {
       sendAsset(res, 200, "application/javascript; charset=utf-8", CLIENT_JS_SOURCE);
       return true;
     }
+    if (pathname === "/_meru/markdown.js" && method === "GET") {
+      sendAsset(res, 200, "application/javascript; charset=utf-8", MARKDOWN_JS_SOURCE);
+      return true;
+    }
+    if (pathname === "/_meru/vendor/marked.esm.js" && method === "GET") {
+      sendAsset(res, 200, "application/javascript; charset=utf-8", loadMarkedVendorSource());
+      return true;
+    }
     if ((pathname === "/_meru/shell" || pathname === "/_meru/shell/") && method === "GET") {
       sendAsset(res, 200, "text/html; charset=utf-8", DEFAULT_SHELL_HTML);
       return true;
@@ -169,6 +201,26 @@ export function createUiRouteHandler(options: UiRouterOptions) {
       return true;
     }
     if (pathname === "/_meru/auth" && method === "GET") {
+      const fetchMode =
+        typeof req.headers["sec-fetch-mode"] === "string"
+          ? req.headers["sec-fetch-mode"].trim().toLowerCase()
+          : "";
+      const fetchDest =
+        typeof req.headers["sec-fetch-dest"] === "string"
+          ? req.headers["sec-fetch-dest"].trim().toLowerCase()
+          : "";
+      if (
+        (fetchMode && fetchMode !== "navigate") ||
+        (fetchDest && fetchDest !== "document")
+      ) {
+        sendAsset(
+          res,
+          403,
+          "text/plain; charset=utf-8",
+          "Login code exchange requires top-level browser document navigation.",
+        );
+        return true;
+      }
       const code = url.searchParams.get("code") ?? "";
       const exchanged = options.uiSessions.exchangeLoginCode(code, engine.db);
       const setCookie = options.uiSessions.buildSetCookieHeader(
@@ -186,10 +238,29 @@ export function createUiRouteHandler(options: UiRouterOptions) {
       return true;
     }
     if (pathname === "/_meru/logout" && method === "POST") {
+      if (
+        (req.headers.origin !== undefined || req.headers.cookie !== undefined) &&
+        !isOriginAllowed({
+          originHeader: req.headers.origin,
+          hostHeader: req.headers.host,
+          allowedOrigins: options.allowedOrigins,
+        })
+      ) {
+        sendAsset(
+          res,
+          403,
+          "application/json; charset=utf-8",
+          JSON.stringify({
+            error: "forbidden",
+            message: "Cross-origin or missing-Origin logout rejected",
+          }),
+        );
+        return true;
+      }
       options.uiSessions.revokeSessionFromRequest(req);
       res.writeHead(200, {
         "Content-Type": "application/json; charset=utf-8",
-        "Set-Cookie": options.uiSessions.buildClearCookieHeader(),
+        "Set-Cookie": options.uiSessions.buildClearCookieHeaders(isRequestSecure(req)),
         "Cache-Control": "no-store",
       });
       res.end(JSON.stringify({ ok: true }));
