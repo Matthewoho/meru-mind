@@ -1,4 +1,4 @@
-// Meru Mind Official Built-In Studio UI (v0.5.7)
+// Meru Mind Official Built-In Studio UI (v0.5.8)
 // Built strictly on the server-hosted `/_meru/client.js` contract (zero direct /v1/* calls, zero innerHTML, strict CSP).
 import { createMindClient, applyHighlightRanges, loadMarkdownTools } from "/_meru/client.js";
 
@@ -48,11 +48,32 @@ const STUDIO_I18N = {
     expandRealm: "Expand child realms",
     collapseRealm: "Collapse child realms",
     inFlight: "In Flight",
+    people: "People",
+    presence: "Presence",
     unkeyedBucket: "Unkeyed",
     collisionNote: "independent sessions working",
     sessionsPlural: "sessions",
     sessionSingle: "session",
     hereTag: "Here",
+    loadMoreSessions: "Load more",
+    properties: "Properties",
+    realmProperties: "Realm",
+    objectProperties: "Object",
+    openDocument: "Open full document",
+    linkedRefs: "Linked Objects & Tags",
+    supersedeChain: "Supersede History",
+    activePeers: "Active Peers",
+    actions: "Actions",
+    copyId: "Copy ID",
+    copyLink: "Copy link",
+    cliMoveCmd: "Copy CLI move command",
+    cliRedactCmd: "Copy CLI redact command",
+    cliRequiresBearer: "Irreversible or cross-realm governance requires a CLI Bearer token:",
+    backToList: "Back to list",
+    prevEntry: "Previous entry (K)",
+    nextEntry: "Next entry (J)",
+    noInFlight: "No active keyed work right now.",
+    noPresence: "No active sessions.",
   },
   "zh-CN": {
     realms: "识界",
@@ -77,12 +98,33 @@ const STUDIO_I18N = {
     activeInChildren: "子识界活跃",
     expandRealm: "展开子识界",
     collapseRealm: "折叠子识界",
-    inFlight: "正在进行",
+    inFlight: "按事",
+    people: "按身份",
+    presence: "当前在线",
     unkeyedBucket: "未挂事",
     collisionNote: "个独立会话同时施工",
     sessionsPlural: "个会话",
     sessionSingle: "个会话",
     hereTag: "当前域",
+    loadMoreSessions: "加载更多",
+    properties: "属性",
+    realmProperties: "识界属性",
+    objectProperties: "对象属性",
+    openDocument: "在中间展开全文",
+    linkedRefs: "关联对象与标签",
+    supersedeChain: "演进链",
+    activePeers: "同域活跃会话",
+    actions: "操作",
+    copyId: "复制 ID",
+    copyLink: "复制文档链接",
+    cliMoveCmd: "复制 CLI 移动命令",
+    cliRedactCmd: "复制 CLI 销毁命令",
+    cliRequiresBearer: "不可逆治理动作需在终端使用 CLI Bearer Token 执行：",
+    backToList: "返回列表",
+    prevEntry: "上一条 (K)",
+    nextEntry: "下一条 (J)",
+    noInFlight: "当前无挂事会话。",
+    noPresence: "当前无活跃会话。",
   },
 };
 
@@ -204,6 +246,10 @@ const ICONS = {
   collision: () => makeSvg(["M16 3h5v5", "M4 20L21 3", "M21 16v5h-5", "M15 15l6 6", "M4 4l5 5"], 13),
   chevronRight: () => makeSvg(["M9 6l6 6-6 6"], 12),
   chevronDown: () => makeSvg(["M6 9l6 6 6-6"], 12),
+  chevronUp: () => makeSvg(["M18 15l-6-6-6 6"], 14),
+  link: () => makeSvg(["M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71", "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"], 14),
+  terminal: () => makeSvg(["M4 17l6-6-6-6", "M12 19h8"], 14),
+  bookOpen: () => makeSvg(["M2 4h6a4 4 0 0 1 4 4v12a3 3 0 0 0-3-3H2z", "M22 4h-6a4 4 0 0 0-4 4v12a3 3 0 0 1 3-3h7z"], 14),
 };
 
 const app = document.getElementById("app");
@@ -212,9 +258,11 @@ const client = createMindClient();
 const savedTheme = localStorage.getItem("meru-studio-theme") || "light";
 document.documentElement.dataset.theme = savedTheme;
 
+const ACTOR_SESSION_PAGE_SIZE = 5;
+
 const state = {
   lang: detectStudioLang(),
-  inspectorView: "md",
+  readerView: "md", // md | raw | html
   whoami: null,
   realms: [],
   realmTree: [],
@@ -236,10 +284,23 @@ const state = {
   inFlight: [],
   unkeyedCount: 0,
   selfPulseSessionId: null,
-  selectedEntry: null,
+  presenceCollapsed: false,
+  presenceMode: "people", // "in-flight" | "people"
+  presenceModeUserSet: false,
+  collapsedActorIds: new Set(),
+  actorVisibleCounts: new Map(), // actorId -> visible session count
+  presenceHovered: false,
+  pendingPulsePatch: null,
+  presenceScrollTop: 0,
+  openEntry: null, // entry opened full-width in Center Document Reader
+  focusedEntryId: null, // list row focused via J/K (or matching openEntry)
+  focusedEntry: null, // entry shown in Right Properties Rail
   selectedChain: null,
   selectedObject: null,
   previousObject: null,
+  railCliCommand: null, // { label, cmd } shown ONLY on explicit action or 403
+  savedListScrollTop: 0,
+  restoreListScrollPending: false,
   inspectorOpen: window.innerWidth > 1120,
   mobileNavOpen: false,
   pumpStatus: "disconnected",
@@ -468,6 +529,106 @@ function collectOverviewConclusions(brief, fallbackEntries) {
   return list;
 }
 
+/* ==================== URL as Single Source of Truth ==================== */
+
+function isReservedShellPath(pathname) {
+  return pathname === "/_meru/shell" || pathname === "/_meru/shell/";
+}
+
+function normalizeRealmPathname(rawPath) {
+  if (!rawPath || rawPath === "/" || rawPath === "/index.html") return "/";
+  const trimmed = rawPath.replace(/\/+$/, "");
+  return trimmed.startsWith("/") ? trimmed : "/" + trimmed;
+}
+
+function parseUrlState() {
+  const loc = window.location;
+  const sp = new URLSearchParams(loc.search);
+  const onShell = isReservedShellPath(loc.pathname);
+  const realmPath = onShell
+    ? normalizeRealmPathname(sp.get("realm") || "/")
+    : normalizeRealmPathname(loc.pathname);
+  const rawTab = sp.get("tab") || "";
+  const validTabs = new Set(["overview", "conclusions", "objects", "rules", "inbox"]);
+  const tab = validTabs.has(rawTab) ? rawTab : null;
+  const entryId = sp.get("entry") || null;
+  const objectRef = sp.get("object") || null;
+  const rawView = sp.get("view") || "";
+  const view = (rawView === "md" || rawView === "raw" || rawView === "html") ? rawView : null;
+  return { realmPath, tab, entryId, objectRef, view };
+}
+
+function buildUrlFromState() {
+  const onShell = isReservedShellPath(window.location.pathname);
+  const basePath = onShell ? "/_meru/shell" : (state.activeRealmPath || "/");
+  const sp = new URLSearchParams();
+  if (onShell && state.activeRealmPath && state.activeRealmPath !== "/") {
+    sp.set("realm", state.activeRealmPath);
+  }
+  const defaultTab = state.activeRealmPath === "/inbox" ? "inbox" : "overview";
+  if (state.activeTab && state.activeTab !== defaultTab) {
+    sp.set("tab", state.activeTab);
+  }
+  if (state.openEntry?.id) {
+    sp.set("entry", state.openEntry.id);
+    if (state.readerView && state.readerView !== "md") {
+      sp.set("view", state.readerView);
+    }
+  } else if (state.selectedObject?.ref) {
+    sp.set("object", state.selectedObject.ref);
+  }
+  const qs = sp.toString();
+  return qs ? (basePath + "?" + qs) : basePath;
+}
+
+function syncUrlFromState(replace = false) {
+  try {
+    const nextUrl = buildUrlFromState();
+    const currentUrl = window.location.pathname + window.location.search;
+    if (nextUrl === currentUrl) return;
+    if (replace) {
+      window.history.replaceState({ meru: true }, "", nextUrl);
+    } else {
+      window.history.pushState({ meru: true }, "", nextUrl);
+    }
+  } catch {
+    // ignore history API errors in restricted contexts
+  }
+}
+
+function getVisibleListEntries() {
+  if (state.activeTab === "overview") {
+    const conclusions = collectOverviewConclusions(state.brief, state.realmEntries);
+    const rules = state.brief?.middleMind?.rules?.items || [];
+    return [...conclusions, ...rules];
+  }
+  if (state.activeTab === "conclusions") {
+    return state.realmEntries.filter((x) => x.kind !== "rule");
+  }
+  if (state.activeTab === "rules") {
+    return state.brief?.middleMind?.rules?.items || [];
+  }
+  if (state.activeTab === "inbox") {
+    return state.inboxEntries || [];
+  }
+  return [];
+}
+
+function applyPulsePayload(pulseRes, deferIfHovered = false) {
+  if (!pulseRes || !Array.isArray(pulseRes.pulses)) return;
+  if (deferIfHovered && state.presenceHovered) {
+    state.pendingPulsePatch = pulseRes;
+    return;
+  }
+  state.pendingPulsePatch = null;
+  state.pulses = pulseRes.pulses;
+  state.inFlight = Array.isArray(pulseRes.inFlight) ? pulseRes.inFlight : [];
+  state.unkeyedCount = typeof pulseRes.unkeyedCount === "number" ? pulseRes.unkeyedCount : 0;
+  if (!state.presenceModeUserSet) {
+    state.presenceMode = state.inFlight.length > 0 ? "in-flight" : "people";
+  }
+}
+
 /* ==================== Data Loading ==================== */
 
 async function loadRealmEntries(realmPath, reset = true) {
@@ -492,12 +653,26 @@ async function loadRealmEntries(realmPath, reset = true) {
   state.realmEntriesHasMore = Boolean(state.realmEntriesCursor);
 }
 
-async function selectRealm(realmPath, preferredTab) {
+async function selectRealm(realmPath, preferredTab, opts = {}) {
+  const prevRealm = state.activeRealmPath;
   state.activeRealmPath = realmPath;
   expandAncestorsForPath(realmPath);
   state.mobileNavOpen = false;
   state.popover = null;
   state.objectFilter = "";
+  if (!opts.keepReader) {
+    teardownStudioHtmlPreview();
+    state.openEntry = null;
+    state.railCliCommand = null;
+    if (prevRealm !== realmPath) {
+      state.focusedEntryId = null;
+      state.focusedEntry = null;
+      state.selectedChain = null;
+      state.selectedObject = null;
+      state.previousObject = null;
+      state.savedListScrollTop = 0;
+    }
+  }
   if (preferredTab) {
     state.activeTab = preferredTab;
   } else if (realmPath === "/inbox") {
@@ -524,22 +699,28 @@ async function selectRealm(realmPath, preferredTab) {
   if (selfPulse?.sessionId) state.selfPulseSessionId = selfPulse.sessionId;
   const pulseRes = await client.pulse.list().catch(() => null);
   if (pulseRes?.pulses) {
-    state.pulses = pulseRes.pulses;
-    state.inFlight = Array.isArray(pulseRes.inFlight) ? pulseRes.inFlight : [];
-    state.unkeyedCount = typeof pulseRes.unkeyedCount === "number" ? pulseRes.unkeyedCount : 0;
+    applyPulsePayload(pulseRes, false);
+  }
+  if (!opts.skipUrlSync) {
+    syncUrlFromState(Boolean(opts.replaceUrl));
   }
   render();
 }
 
-async function selectObjectByRef(objRef, openInspector = true) {
+async function selectObjectByRef(objRef, openInspector = true, opts = {}) {
   try {
     const res = await client.show(objRef);
     if (res?.refType === "object" && res.card) {
+      teardownStudioHtmlPreview();
       state.selectedObject = res.card;
       state.previousObject = null;
-      state.selectedEntry = null;
+      state.openEntry = null;
+      state.focusedEntryId = null;
+      state.focusedEntry = null;
       state.selectedChain = null;
+      state.railCliCommand = null;
       if (openInspector) state.inspectorOpen = true;
+      if (!opts.skipUrlSync) syncUrlFromState(Boolean(opts.replaceUrl));
       render();
     }
   } catch (err) {
@@ -547,37 +728,108 @@ async function selectObjectByRef(objRef, openInspector = true) {
   }
 }
 
-async function selectEntryById(entryId, openInspector = true, fromObject = false) {
+async function fetchFlatEntry(entryId) {
+  const [showRes, chainRes] = await Promise.all([
+    client.show(entryId, { full: true }),
+    entryId.startsWith("rec_") ? client.chain(entryId).catch(() => null) : Promise.resolve(null),
+  ]);
+  if (showRes?.refType !== "entry") return null;
+  const e = showRes.entry;
+  const flat = e.kind === "record"
+    ? { ...e.record, realmPath: e.realmPath, body: showRes.content }
+    : e.kind === "seabed"
+      ? { ...e.seabed, realmPath: e.realmPath, title: e.seabed.kind + ":" + e.seabed.id, body: showRes.content }
+      : { id: entryId, title: entryId, body: showRes.content };
+  return { flat, chainRes };
+}
+
+function pickInitialReaderView(flat, requestedView) {
+  const rawBody = String(flat?.body || flat?.snippet || "");
+  const payloadIdx = rawBody.indexOf("\n## Payload\n");
+  const mainBody = payloadIdx >= 0 ? rawBody.slice(0, payloadIdx).trim() : rawBody;
+  const isHtmlDoc = looksLikeHtmlDoc(mainBody, flat?.sourceRef);
+  if (requestedView === "raw") return "raw";
+  if (requestedView === "html" && isHtmlDoc) return "html";
+  if (requestedView === "md") return "md";
+  return isHtmlDoc ? "html" : "md";
+}
+
+async function openEntryInCenter(entryId, opts = {}) {
   try {
-    const [showRes, chainRes] = await Promise.all([
-      client.show(entryId, { full: true }),
-      entryId.startsWith("rec_") ? client.chain(entryId).catch(() => null) : Promise.resolve(null),
-    ]);
-    if (showRes?.refType === "entry") {
-      const e = showRes.entry;
-      const flat = e.kind === "record"
-        ? { ...e.record, realmPath: e.realmPath, body: showRes.content }
-        : e.kind === "seabed"
-          ? { ...e.seabed, realmPath: e.realmPath, title: e.seabed.kind + ":" + e.seabed.id, body: showRes.content }
-          : { id: entryId, title: entryId, body: showRes.content };
-      if (fromObject && state.selectedObject) {
-        state.previousObject = state.selectedObject;
-      } else if (!fromObject) {
-        state.previousObject = null;
-      }
-      state.selectedObject = null;
-      state.selectedEntry = flat;
-      state.selectedChain = chainRes;
-      state.inspectorView = "md";
-      if (openInspector) state.inspectorOpen = true;
-      render();
+    if (!state.openEntry) {
+      const wsScroll = document.querySelector(".workspace-scroll");
+      if (wsScroll) state.savedListScrollTop = wsScroll.scrollTop;
     }
+    const fetched = await fetchFlatEntry(entryId);
+    if (!fetched) return;
+    const { flat, chainRes } = fetched;
+    if (opts.fromObject && state.selectedObject) {
+      state.previousObject = state.selectedObject;
+    } else if (!opts.fromObject) {
+      state.previousObject = null;
+    }
+    state.selectedObject = null;
+    state.openEntry = flat;
+    state.focusedEntryId = flat.id;
+    state.focusedEntry = flat;
+    state.selectedChain = chainRes;
+    state.railCliCommand = null;
+    state.readerView = pickInitialReaderView(flat, opts.requestedView || null);
+    if (flat.realmPath && state.realms.some((r) => r.path === flat.realmPath)) {
+      expandAncestorsForPath(flat.realmPath);
+    }
+    if (!opts.skipUrlSync) {
+      syncUrlFromState(Boolean(opts.replaceUrl));
+    }
+    render();
   } catch (err) {
     showToast(err?.message || "Failed to load entry");
   }
 }
 
-async function refreshAll() {
+function closeReaderToList(opts = {}) {
+  if (!state.openEntry) return;
+  teardownStudioHtmlPreview();
+  state.openEntry = null;
+  state.railCliCommand = null;
+  state.restoreListScrollPending = true;
+  if (!opts.skipUrlSync) {
+    syncUrlFromState(Boolean(opts.replaceUrl));
+  }
+  render();
+}
+
+async function focusEntryInList(entryId, summaryHint = null) {
+  state.focusedEntryId = entryId;
+  state.selectedObject = null;
+  state.railCliCommand = null;
+  if (summaryHint) {
+    state.focusedEntry = summaryHint;
+  }
+  render();
+  // Scroll focused card/row smoothly into view
+  requestAnimationFrame(() => {
+    const rowEl = document.querySelector('[data-list-entry-id="' + CSS.escape(entryId) + '"]');
+    if (rowEl && typeof rowEl.scrollIntoView === "function") {
+      rowEl.scrollIntoView({ block: "nearest" });
+    }
+  });
+  try {
+    const fetched = await fetchFlatEntry(entryId);
+    if (!fetched || state.focusedEntryId !== entryId) return;
+    state.focusedEntry = fetched.flat;
+    state.selectedChain = fetched.chainRes;
+    render();
+  } catch {
+    // keep summary hint if full fetch fails quietly
+  }
+}
+
+async function selectEntryById(entryId, _openInspector = true, fromObject = false) {
+  await openEntryInCenter(entryId, { fromObject });
+}
+
+async function refreshAll(opts = {}) {
   ensureCollapsedRealmsLoaded();
   const [treeRes, pulseRes] = await Promise.all([
     client.tree({ ref: "/", depth: "all", objects: false }),
@@ -586,9 +838,7 @@ async function refreshAll() {
   state.realms = treeRes.realms || [];
   state.realmTree = Array.isArray(treeRes.realmTree) ? treeRes.realmTree : [];
   state.realmCounts = flattenRealmTreeCounts(state.realmTree);
-  state.pulses = pulseRes.pulses || [];
-  state.inFlight = Array.isArray(pulseRes.inFlight) ? pulseRes.inFlight : [];
-  state.unkeyedCount = typeof pulseRes.unkeyedCount === "number" ? pulseRes.unkeyedCount : 0;
+  applyPulsePayload(pulseRes, false);
   state.hasInboxRealm = state.realms.some((r) => r.path === "/inbox");
   if (state.hasInboxRealm) {
     const lsInbox = await client.ls({ ref: "/inbox", only: "entries", limit: 50 }).catch(() => ({ items: [] }));
@@ -596,18 +846,15 @@ async function refreshAll() {
   } else {
     state.inboxEntries = [];
   }
-  const targetPath = state.realms.some((r) => r.path === state.activeRealmPath)
-    ? state.activeRealmPath
+  const desiredRealm = opts.realmPath || state.activeRealmPath;
+  const targetPath = state.realms.some((r) => r.path === desiredRealm)
+    ? desiredRealm
     : (state.realms[0]?.path || "/");
-  await selectRealm(targetPath, state.activeTab);
-
-  // Auto-select first real conclusion or rule so Inspector starts populated on desktop
-  if (!state.selectedEntry && !state.selectedObject && state.inspectorOpen) {
-    const overviewItems = collectOverviewConclusions(state.brief, state.realmEntries);
-    const firstRule = state.brief?.middleMind?.rules?.items?.[0];
-    const firstId = overviewItems[0]?.id || firstRule?.id;
-    if (firstId) await selectEntryById(firstId, false);
-  }
+  await selectRealm(targetPath, opts.tab || state.activeTab, {
+    keepReader: Boolean(opts.keepReader ?? state.openEntry),
+    skipUrlSync: Boolean(opts.skipUrlSync),
+    replaceUrl: Boolean(opts.replaceUrl),
+  });
 }
 
 /* ==================== Component Builders ==================== */
@@ -682,7 +929,7 @@ function buildSidebar() {
   aside.appendChild(brandBar);
 
   const scroll = document.createElement("div");
-  scroll.className = "sidebar-scroll";
+  scroll.className = "sidebar-scroll sidebar-realms-scroll";
 
   const realmLabel = document.createElement("div");
   realmLabel.className = "nav-group-label";
@@ -811,196 +1058,378 @@ function buildSidebar() {
     appendRealmTreeNode(rootNode, 0);
   }
 
+  aside.appendChild(scroll);
+
+  // Unified Presence Pane (collapsible section, capped at 40% height, independent scroll, hover-frozen)
   const inFlight = state.inFlight || [];
   const unkeyedPulses = (state.pulses || []).filter((p) => !p.keys || p.keys.length === 0);
+  const actorGroups = groupPulsesByActor(state.pulses);
 
-  const focusLabel = document.createElement("div");
-  focusLabel.className = "nav-group-label";
-  focusLabel.textContent = inFlight.length > 0 ? st("inFlight") : st("activeFocus");
-  scroll.appendChild(focusLabel);
+  const presencePane = document.createElement("section");
+  presencePane.className = "presence-pane" + (state.presenceCollapsed ? " collapsed" : "");
+  presencePane.dataset.ui = "presence-pane";
+  presencePane.addEventListener("mouseenter", () => {
+    state.presenceHovered = true;
+  });
+  presencePane.addEventListener("mouseleave", () => {
+    state.presenceHovered = false;
+    if (state.pendingPulsePatch) {
+      const pending = state.pendingPulsePatch;
+      applyPulsePayload(pending, false);
+      render();
+    }
+  });
 
-  if (inFlight.length > 0) {
-    for (const w of inFlight.slice(0, 8)) {
-      const row = document.createElement("div");
-      row.className = "member-row work-flight-row" + (w.hasCollision ? " has-collision" : "");
-      row.dataset.workKey = w.key;
-      row.tabIndex = 0;
+  const presenceHeader = document.createElement("div");
+  presenceHeader.className = "presence-header";
 
-      const left = document.createElement("div");
-      left.className = "member-left";
-      const av = document.createElement("span");
-      av.className = "member-avatar" + (w.hasCollision ? " collision" : "");
-      av.appendChild(w.hasCollision ? ICONS.collision() : ICONS.work());
-      const nm = document.createElement("span");
-      nm.className = "member-name";
-      nm.textContent = w.label;
-      const anyOnline = w.participants.some((p) => p.online || p.state === "working");
-      const anyActive = w.participants.some((p) => p.active);
-      const dot = document.createElement("span");
-      dot.className = "status-dot" + (w.hasCollision ? " collision" : (anyOnline ? "" : (anyActive ? " active" : " idle")));
-      const tip = [
-        w.key,
-        w.hasCollision ? (w.workingRoots + " " + st("collisionNote")) : (w.participants.length + " " + (w.participants.length === 1 ? st("sessionSingle") : st("sessionsPlural"))),
-        w.realms.join(", "),
-      ].filter(Boolean).join(" · ");
-      row.title = tip;
-      dot.title = tip;
-      left.appendChild(av);
-      left.appendChild(nm);
-      left.appendChild(dot);
+  const toggleSectionBtn = document.createElement("button");
+  toggleSectionBtn.type = "button";
+  toggleSectionBtn.className = "presence-collapse-btn";
+  toggleSectionBtn.dataset.ui = "presence-section-toggle";
+  toggleSectionBtn.setAttribute("aria-expanded", String(!state.presenceCollapsed));
+  toggleSectionBtn.appendChild(state.presenceCollapsed ? ICONS.chevronRight() : ICONS.chevronDown());
+  const pLbl = document.createElement("span");
+  pLbl.textContent = st("presence");
+  toggleSectionBtn.appendChild(pLbl);
+  if (state.pulses.length > 0) {
+    const totalCnt = document.createElement("span");
+    totalCnt.className = "realm-count-muted";
+    totalCnt.textContent = String(state.pulses.length);
+    toggleSectionBtn.appendChild(totalCnt);
+  }
+  toggleSectionBtn.addEventListener("click", () => {
+    state.presenceCollapsed = !state.presenceCollapsed;
+    render();
+  });
+  presenceHeader.appendChild(toggleSectionBtn);
 
-      const rightWrap = document.createElement("div");
-      rightWrap.className = "member-right";
-      if (w.participants.length > 1) {
-        const cnt = document.createElement("span");
-        cnt.className = "realm-count-muted";
-        cnt.textContent = String(w.participants.length);
-        rightWrap.appendChild(cnt);
+  if (!state.presenceCollapsed) {
+    const seg = document.createElement("div");
+    seg.className = "presence-seg";
+    seg.dataset.ui = "presence-mode-switch";
+    for (const [mKey, mLbl] of [["in-flight", st("inFlight")], ["people", st("people")]]) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "presence-seg-btn" + (state.presenceMode === mKey ? " active" : "");
+      b.dataset.presenceMode = mKey;
+      b.textContent = mLbl;
+      b.addEventListener("click", () => {
+        if (state.presenceMode === mKey) return;
+        state.presenceMode = mKey;
+        state.presenceModeUserSet = true;
+        state.presenceScrollTop = 0;
+        render();
+      });
+      seg.appendChild(b);
+    }
+    presenceHeader.appendChild(seg);
+  }
+  presencePane.appendChild(presenceHeader);
+
+  if (!state.presenceCollapsed) {
+    const pScroll = document.createElement("div");
+    pScroll.className = "presence-scroll";
+    pScroll.dataset.ui = "presence-scroll";
+
+    if (state.presenceMode === "in-flight") {
+      if (inFlight.length === 0 && unkeyedPulses.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "presence-empty";
+        empty.textContent = st("noInFlight");
+        pScroll.appendChild(empty);
+      } else {
+        for (const w of inFlight.slice(0, 12)) {
+          const row = document.createElement("div");
+          row.className = "member-row work-flight-row" + (w.hasCollision ? " has-collision" : "");
+          row.dataset.workKey = w.key;
+          row.tabIndex = 0;
+
+          const left = document.createElement("div");
+          left.className = "member-left";
+          const av = document.createElement("span");
+          av.className = "member-avatar" + (w.hasCollision ? " collision" : "");
+          av.appendChild(w.hasCollision ? ICONS.collision() : ICONS.work());
+          const nm = document.createElement("span");
+          nm.className = "member-name";
+          nm.textContent = w.label;
+          const anyOnline = w.participants.some((p) => p.online || p.state === "working");
+          const anyActive = w.participants.some((p) => p.active);
+          const dot = document.createElement("span");
+          dot.className = "status-dot" + (w.hasCollision ? " collision" : (anyOnline ? "" : (anyActive ? " active" : " idle")));
+          const tip = [
+            w.key,
+            w.hasCollision ? (w.workingRoots + " " + st("collisionNote")) : (w.participants.length + " " + (w.participants.length === 1 ? st("sessionSingle") : st("sessionsPlural"))),
+            w.realms.join(", "),
+          ].filter(Boolean).join(" · ");
+          row.title = tip;
+          dot.title = tip;
+          left.appendChild(av);
+          left.appendChild(nm);
+          left.appendChild(dot);
+
+          const rightWrap = document.createElement("div");
+          rightWrap.className = "member-right";
+          if (w.participants.length > 1) {
+            const cnt = document.createElement("span");
+            cnt.className = "realm-count-muted";
+            cnt.textContent = String(w.participants.length);
+            rightWrap.appendChild(cnt);
+          }
+          const dotsBtn = document.createElement("button");
+          dotsBtn.type = "button";
+          dotsBtn.className = "row-dots-btn";
+          dotsBtn.title = "Inspect in-flight work";
+          dotsBtn.setAttribute("aria-label", "Inspect " + w.label);
+          dotsBtn.appendChild(ICONS.dots());
+          dotsBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            const rect = dotsBtn.getBoundingClientRect();
+            state.popover = { kind: "work-card", x: rect.right + 6, y: rect.top, work: w };
+            render();
+          });
+          rightWrap.appendChild(dotsBtn);
+
+          row.appendChild(left);
+          row.appendChild(rightWrap);
+          row.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            const rect = row.getBoundingClientRect();
+            state.popover = { kind: "work-card", x: rect.right + 8, y: rect.top, work: w };
+            render();
+          });
+          row.addEventListener("contextmenu", (ev) => {
+            ev.preventDefault();
+            state.popover = { kind: "work-card", x: ev.clientX, y: ev.clientY, work: w };
+            render();
+          });
+          pScroll.appendChild(row);
+        }
+
+        if (unkeyedPulses.length > 0) {
+          const unkeyedRow = document.createElement("div");
+          unkeyedRow.className = "member-row unkeyed-bucket-row";
+          unkeyedRow.dataset.ui = "unkeyed-bucket";
+          unkeyedRow.tabIndex = 0;
+
+          const left = document.createElement("div");
+          left.className = "member-left";
+          const av = document.createElement("span");
+          av.className = "member-avatar";
+          av.appendChild(ICONS.user());
+          const nm = document.createElement("span");
+          nm.className = "member-name";
+          nm.textContent = st("unkeyedBucket");
+          const anyOnline = unkeyedPulses.some((p) => p.online);
+          const dot = document.createElement("span");
+          dot.className = "status-dot" + (anyOnline ? "" : " active");
+          left.appendChild(av);
+          left.appendChild(nm);
+          left.appendChild(dot);
+
+          const cnt = document.createElement("span");
+          cnt.className = "realm-count-muted";
+          cnt.textContent = String(unkeyedPulses.length);
+
+          unkeyedRow.appendChild(left);
+          unkeyedRow.appendChild(cnt);
+          const bucketGroup = {
+            actorId: st("unkeyedBucket"),
+            actorKind: "unkeyed",
+            online: anyOnline,
+            active: true,
+            sessions: unkeyedPulses,
+          };
+          unkeyedRow.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            const rect = unkeyedRow.getBoundingClientRect();
+            state.popover = { kind: "member-card", x: rect.right + 8, y: rect.top, group: bucketGroup };
+            render();
+          });
+          pScroll.appendChild(unkeyedRow);
+        }
       }
-      const dotsBtn = document.createElement("button");
-      dotsBtn.type = "button";
-      dotsBtn.className = "row-dots-btn";
-      dotsBtn.title = "Inspect in-flight work";
-      dotsBtn.setAttribute("aria-label", "Inspect " + w.label);
-      dotsBtn.appendChild(ICONS.dots());
-      dotsBtn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const rect = dotsBtn.getBoundingClientRect();
-        state.popover = { kind: "work-card", x: rect.right + 6, y: rect.top, work: w };
-        render();
-      });
-      rightWrap.appendChild(dotsBtn);
-
-      row.appendChild(left);
-      row.appendChild(rightWrap);
-      row.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const rect = row.getBoundingClientRect();
-        state.popover = { kind: "work-card", x: rect.right + 8, y: rect.top, work: w };
-        render();
-      });
-      row.addEventListener("contextmenu", (ev) => {
-        ev.preventDefault();
-        state.popover = { kind: "work-card", x: ev.clientX, y: ev.clientY, work: w };
-        render();
-      });
-      scroll.appendChild(row);
-    }
-
-    if (unkeyedPulses.length > 0) {
-      const unkeyedRow = document.createElement("div");
-      unkeyedRow.className = "member-row unkeyed-bucket-row";
-      unkeyedRow.dataset.ui = "unkeyed-bucket";
-      unkeyedRow.tabIndex = 0;
-
-      const left = document.createElement("div");
-      left.className = "member-left";
-      const av = document.createElement("span");
-      av.className = "member-avatar";
-      av.appendChild(ICONS.user());
-      const nm = document.createElement("span");
-      nm.className = "member-name";
-      nm.textContent = st("unkeyedBucket");
-      const anyOnline = unkeyedPulses.some((p) => p.online);
-      const dot = document.createElement("span");
-      dot.className = "status-dot" + (anyOnline ? "" : " active");
-      left.appendChild(av);
-      left.appendChild(nm);
-      left.appendChild(dot);
-
-      const cnt = document.createElement("span");
-      cnt.className = "realm-count-muted";
-      cnt.textContent = String(unkeyedPulses.length);
-
-      unkeyedRow.appendChild(left);
-      unkeyedRow.appendChild(cnt);
-      const bucketGroup = {
-        actorId: st("unkeyedBucket"),
-        actorKind: "unkeyed",
-        online: anyOnline,
-        active: true,
-        sessions: unkeyedPulses,
-      };
-      unkeyedRow.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const rect = unkeyedRow.getBoundingClientRect();
-        state.popover = { kind: "member-card", x: rect.right + 8, y: rect.top, group: bucketGroup };
-        render();
-      });
-      scroll.appendChild(unkeyedRow);
-    }
-  } else {
-    const actorGroups = groupPulsesByActor(state.pulses);
-    if (actorGroups.length === 0) {
-      const dash = document.createElement("div");
-      dash.className = "nav-group-label";
-      dash.textContent = "-";
-      scroll.appendChild(dash);
     } else {
-      for (const g of actorGroups) {
-        const row = document.createElement("div");
-        row.className = "member-row";
-        row.dataset.actorId = g.actorId;
-        row.tabIndex = 0;
+      // People mode (按身份): collapsible per actor, DEFAULT EXPANDED, paginated incremental scroll loading
+      if (actorGroups.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "presence-empty";
+        empty.textContent = st("noPresence");
+        pScroll.appendChild(empty);
+      } else {
+        const expandableActorsWithMore = [];
+        for (const g of actorGroups) {
+          const isActorCollapsed = state.collapsedActorIds.has(g.actorId);
+          const visibleLimit = state.actorVisibleCounts.get(g.actorId) || ACTOR_SESSION_PAGE_SIZE;
 
-        const left = document.createElement("div");
-        left.className = "member-left";
-        const av = document.createElement("span");
-        av.className = "member-avatar";
-        av.appendChild(ICONS.user());
-        const nm = document.createElement("span");
-        nm.className = "member-name";
-        nm.textContent = g.actorId;
-        const dot = document.createElement("span");
-        dot.className = "status-dot" + (g.online ? "" : (g.active ? " active" : " idle"));
-        const sessionSummary = g.sessions
-          .map((s) => {
-            const client = s.clientHint || s.actorKind || "session";
-            const detail = s.activity || s.note || s.realmPath || "/";
-            return client + " (" + detail + ")";
-          })
-          .join(", ");
-        const countLabel = g.sessions.length + " " + (g.sessions.length === 1 ? st("sessionSingle") : st("sessionsPlural"));
-        const tip = [g.actorId, g.actorKind, countLabel, sessionSummary].filter(Boolean).join(" · ");
-        dot.title = tip;
-        row.title = tip;
-        left.appendChild(av);
-        left.appendChild(nm);
-        left.appendChild(dot);
+          const groupEl = document.createElement("div");
+          groupEl.className = "presence-actor-group";
+          groupEl.dataset.actorGroup = g.actorId;
 
-        const dotsBtn = document.createElement("button");
-        dotsBtn.type = "button";
-        dotsBtn.className = "row-dots-btn";
-        dotsBtn.title = "Member actions";
-        dotsBtn.setAttribute("aria-label", "Actions for " + g.actorId);
-        dotsBtn.appendChild(ICONS.dots());
-        dotsBtn.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          const rect = dotsBtn.getBoundingClientRect();
-          state.popover = { kind: "member-menu", x: rect.right + 6, y: rect.top, group: g, pulse: g.sessions[0] };
-          render();
-        });
+          const row = document.createElement("div");
+          row.className = "member-row presence-actor-row";
+          row.dataset.actorId = g.actorId;
+          row.tabIndex = 0;
 
-        row.appendChild(left);
-        row.appendChild(dotsBtn);
+          const left = document.createElement("div");
+          left.className = "member-left";
 
-        row.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          const rect = row.getBoundingClientRect();
-          state.popover = { kind: "member-card", x: rect.right + 8, y: rect.top, group: g, pulse: g.sessions[0] };
-          render();
-        });
-        row.addEventListener("contextmenu", (ev) => {
-          ev.preventDefault();
-          state.popover = { kind: "member-menu", x: ev.clientX, y: ev.clientY, group: g, pulse: g.sessions[0] };
-          render();
-        });
-        scroll.appendChild(row);
+          const chev = document.createElement("button");
+          chev.type = "button";
+          chev.className = "realm-chevron-btn";
+          chev.dataset.ui = "actor-chevron";
+          chev.dataset.actorId = g.actorId;
+          chev.setAttribute("aria-expanded", String(!isActorCollapsed));
+          chev.title = (isActorCollapsed ? "Expand " : "Collapse ") + g.actorId;
+          chev.setAttribute("aria-label", chev.title);
+          chev.appendChild(isActorCollapsed ? ICONS.chevronRight() : ICONS.chevronDown());
+          chev.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            state.presenceScrollTop = pScroll.scrollTop;
+            if (state.collapsedActorIds.has(g.actorId)) {
+              state.collapsedActorIds.delete(g.actorId);
+            } else {
+              state.collapsedActorIds.add(g.actorId);
+            }
+            render();
+          });
+
+          const av = document.createElement("span");
+          av.className = "member-avatar";
+          av.appendChild(ICONS.user());
+          const nm = document.createElement("span");
+          nm.className = "member-name";
+          nm.textContent = g.actorId;
+          const dot = document.createElement("span");
+          dot.className = "status-dot" + (g.online ? "" : (g.active ? " active" : " idle"));
+          const countLabel = g.sessions.length + " " + (g.sessions.length === 1 ? st("sessionSingle") : st("sessionsPlural"));
+          const tip = [g.actorId, g.actorKind, countLabel].filter(Boolean).join(" · ");
+          dot.title = tip;
+          row.title = tip;
+          left.appendChild(chev);
+          left.appendChild(av);
+          left.appendChild(nm);
+          left.appendChild(dot);
+
+          const rightWrap = document.createElement("div");
+          rightWrap.className = "member-right";
+          if (g.sessions.length > 1) {
+            const cnt = document.createElement("span");
+            cnt.className = "realm-count-muted";
+            cnt.textContent = String(g.sessions.length);
+            rightWrap.appendChild(cnt);
+          }
+          const dotsBtn = document.createElement("button");
+          dotsBtn.type = "button";
+          dotsBtn.className = "row-dots-btn";
+          dotsBtn.title = "Member actions";
+          dotsBtn.setAttribute("aria-label", "Actions for " + g.actorId);
+          dotsBtn.appendChild(ICONS.dots());
+          dotsBtn.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            const rect = dotsBtn.getBoundingClientRect();
+            state.popover = { kind: "member-menu", x: rect.right + 6, y: rect.top, group: g, pulse: g.sessions[0] };
+            render();
+          });
+          rightWrap.appendChild(dotsBtn);
+
+          row.appendChild(left);
+          row.appendChild(rightWrap);
+
+          row.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            const rect = row.getBoundingClientRect();
+            state.popover = { kind: "member-card", x: rect.right + 8, y: rect.top, group: g, pulse: g.sessions[0] };
+            render();
+          });
+          row.addEventListener("contextmenu", (ev) => {
+            ev.preventDefault();
+            state.popover = { kind: "member-menu", x: ev.clientX, y: ev.clientY, group: g, pulse: g.sessions[0] };
+            render();
+          });
+          groupEl.appendChild(row);
+
+          if (!isActorCollapsed) {
+            const sessList = document.createElement("div");
+            sessList.className = "presence-actor-sessions";
+            sessList.dataset.actorSessions = g.actorId;
+            const visibleSessions = g.sessions.slice(0, visibleLimit);
+            for (const s of visibleSessions) {
+              const sBtn = document.createElement("button");
+              sBtn.type = "button";
+              sBtn.className = "presence-session-row";
+              sBtn.dataset.sessionId = s.sessionId;
+              const sDot = document.createElement("span");
+              sDot.className = "status-dot" + (s.state === "working" || s.online ? "" : (s.state === "turn_ended" ? " paused" : (s.active ? " active" : " idle")));
+              const sLabel = document.createElement("span");
+              sLabel.className = "presence-session-label";
+              sLabel.textContent = (s.clientHint || s.actorKind || "session") + " " + shortSessionHandle(s.sessionId);
+              const sDetail = document.createElement("span");
+              sDetail.className = "presence-session-detail";
+              sDetail.textContent = s.activity || s.note || s.realmPath || "/";
+              sBtn.title = [sLabel.textContent, s.realmPath || "/", s.activity || s.note || ""].filter(Boolean).join(" · ");
+              sBtn.appendChild(sDot);
+              sBtn.appendChild(sLabel);
+              sBtn.appendChild(sDetail);
+              sBtn.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                const rect = sBtn.getBoundingClientRect();
+                state.popover = { kind: "member-card", x: rect.right + 8, y: rect.top, group: g, pulse: s };
+                render();
+              });
+              sessList.appendChild(sBtn);
+            }
+
+            const remaining = g.sessions.length - visibleSessions.length;
+            if (remaining > 0) {
+              expandableActorsWithMore.push(g.actorId);
+              const moreBtn = document.createElement("button");
+              moreBtn.type = "button";
+              moreBtn.className = "presence-load-more-btn";
+              moreBtn.dataset.ui = "presence-load-more";
+              moreBtn.dataset.actorId = g.actorId;
+              moreBtn.textContent = st("loadMoreSessions") + " (+" + remaining + ")";
+              moreBtn.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                state.presenceScrollTop = pScroll.scrollTop;
+                state.actorVisibleCounts.set(g.actorId, visibleLimit + ACTOR_SESSION_PAGE_SIZE);
+                render();
+              });
+              sessList.appendChild(moreBtn);
+            }
+            groupEl.appendChild(sessList);
+          }
+
+          pScroll.appendChild(groupEl);
+        }
+
+        if (expandableActorsWithMore.length > 0) {
+          let scrollLoadTriggered = false;
+          pScroll.addEventListener("scroll", () => {
+            state.presenceScrollTop = pScroll.scrollTop;
+            if (scrollLoadTriggered) return;
+            const nearBottom = pScroll.scrollTop + pScroll.clientHeight >= pScroll.scrollHeight - 24;
+            if (nearBottom) {
+              scrollLoadTriggered = true;
+              const nextActor = expandableActorsWithMore[0];
+              const cur = state.actorVisibleCounts.get(nextActor) || ACTOR_SESSION_PAGE_SIZE;
+              state.actorVisibleCounts.set(nextActor, cur + ACTOR_SESSION_PAGE_SIZE);
+              render();
+            }
+          });
+        }
       }
+    }
+
+    presencePane.appendChild(pScroll);
+    if (state.presenceScrollTop > 0) {
+      requestAnimationFrame(() => {
+        pScroll.scrollTop = state.presenceScrollTop;
+      });
     }
   }
 
-  aside.appendChild(scroll);
+  aside.appendChild(presencePane);
 
   const dock = document.createElement("div");
   dock.className = "utility-dock";
@@ -1131,8 +1560,10 @@ function buildRulesSection(rules) {
   rules.forEach((rule, idx) => {
     const row = document.createElement("button");
     row.type = "button";
-    row.className = "rule-row" + (state.selectedEntry?.id === rule.id ? " selected" : "");
+    const isFocused = state.focusedEntryId === rule.id;
+    row.className = "rule-row" + (isFocused ? " selected" : "");
     row.dataset.ruleId = rule.id;
+    row.dataset.listEntryId = rule.id;
 
     const num = document.createElement("span");
     num.className = "rule-idx";
@@ -1392,8 +1823,10 @@ function buildRecentConclusionsSection(items, opts = {}) {
   stack.className = "entry-stack";
   for (const item of items) {
     const el = document.createElement("meru-entry");
+    el.dataset.listEntryId = item.id;
     el.entry = { ...item, realmPath: item.realmPath || state.activeRealmPath };
-    el.addEventListener("meru-select", () => { void selectEntryById(item.id, true); });
+    el.selected = state.focusedEntryId === item.id;
+    el.addEventListener("meru-select", () => { void openEntryInCenter(item.id); });
     stack.appendChild(el);
   }
   sec.appendChild(stack);
@@ -1438,7 +1871,201 @@ function buildRecentConclusionsSection(items, opts = {}) {
   return sec;
 }
 
+function buildDocumentReader() {
+  const main = document.createElement("main");
+  main.className = "workspace-col doc-reader-col";
+  main.dataset.ui = "center-doc-reader";
+
+  const e = state.openEntry;
+  const isRedacted = Boolean(e.redactedAt) || e.status === "retracted";
+  const rawBody = isRedacted
+    ? "[REDACTED: content permanently removed]"
+    : String(e.body || e.snippet || "No body text.");
+  const payloadSplitIdx = !isRedacted ? rawBody.indexOf("\n## Payload\n") : -1;
+  const mainBodyText = payloadSplitIdx >= 0 ? rawBody.slice(0, payloadSplitIdx).trim() : rawBody;
+  const rawPayloadText = payloadSplitIdx >= 0 ? rawBody.slice(payloadSplitIdx + "\n## Payload\n".length).trim() : "";
+  const isHtmlDoc = !isRedacted && looksLikeHtmlDoc(mainBodyText, e.sourceRef);
+
+  const visibleEntries = getVisibleListEntries();
+  const currentIdx = visibleEntries.findIndex((item) => item.id === e.id);
+  const prevItem = currentIdx > 0 ? visibleEntries[currentIdx - 1] : null;
+  const nextItem = currentIdx >= 0 && currentIdx < visibleEntries.length - 1 ? visibleEntries[currentIdx + 1] : null;
+
+  const toolbar = document.createElement("div");
+  toolbar.className = "reader-toolbar";
+
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "reader-back-btn";
+  backBtn.dataset.ui = "reader-back";
+  backBtn.title = st("backToList") + " (Esc)";
+  backBtn.appendChild(ICONS.arrowLeft());
+  const backLbl = document.createElement("span");
+  backLbl.textContent = state.previousObject
+    ? state.previousObject.ref
+    : (e.realmPath || state.activeRealmPath || "/");
+  backBtn.appendChild(backLbl);
+  backBtn.addEventListener("click", () => {
+    if (state.previousObject) {
+      const obj = state.previousObject;
+      state.previousObject = null;
+      teardownStudioHtmlPreview();
+      state.openEntry = null;
+      state.selectedObject = obj;
+      syncUrlFromState(false);
+      render();
+    } else {
+      closeReaderToList();
+    }
+  });
+  toolbar.appendChild(backBtn);
+
+  const rightControls = document.createElement("div");
+  rightControls.className = "reader-toolbar-right";
+
+  if (!isRedacted) {
+    const seg = document.createElement("div");
+    seg.className = "studio-seg reader-view-seg";
+    seg.dataset.ui = "reader-view-switch";
+    // Show ONLY views that actually apply to this document (never show HTML tab on plain MD!)
+    const modes = isHtmlDoc
+      ? [["html", st("html")], ["md", st("md")], ["raw", st("raw")]]
+      : [["md", st("md")], ["raw", st("raw")]];
+    const effectiveView = (state.readerView === "html" && !isHtmlDoc) ? "md" : state.readerView;
+    for (const [mKey, mLbl] of modes) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "studio-seg-btn" + (effectiveView === mKey ? " active" : "");
+      b.dataset.readerView = mKey;
+      b.textContent = mLbl;
+      b.addEventListener("click", () => {
+        if (state.readerView === mKey) return;
+        state.readerView = mKey;
+        syncUrlFromState(true);
+        render();
+      });
+      seg.appendChild(b);
+    }
+    rightControls.appendChild(seg);
+  }
+
+  const navGroup = document.createElement("div");
+  navGroup.className = "reader-nav-group";
+  const prevBtn = makeIconBtn(ICONS.chevronUp(), st("prevEntry"), () => {
+    if (prevItem) void openEntryInCenter(prevItem.id);
+  });
+  prevBtn.dataset.ui = "reader-prev";
+  prevBtn.disabled = !prevItem;
+  const nextBtn = makeIconBtn(ICONS.chevronDown(), st("nextEntry"), () => {
+    if (nextItem) void openEntryInCenter(nextItem.id);
+  });
+  nextBtn.dataset.ui = "reader-next";
+  nextBtn.disabled = !nextItem;
+  navGroup.appendChild(prevBtn);
+  navGroup.appendChild(nextBtn);
+  rightControls.appendChild(navGroup);
+
+  toolbar.appendChild(rightControls);
+  main.appendChild(toolbar);
+
+  const scroll = document.createElement("div");
+  scroll.className = "reader-scroll";
+
+  const canvas = document.createElement("article");
+  canvas.className = "reader-canvas";
+  canvas.dataset.entryId = e.id;
+
+  const h1 = document.createElement("h1");
+  h1.className = "reader-doc-title";
+  h1.textContent = isRedacted ? "[REDACTED]" : String(e.title || e.id);
+  canvas.appendChild(h1);
+
+  const submeta = document.createElement("div");
+  submeta.className = "reader-doc-submeta";
+  const kindBadge = document.createElement("span");
+  kindBadge.className = "reader-kind-pill";
+  kindBadge.textContent = String(e.extKind || e.kind || "entry");
+  submeta.appendChild(kindBadge);
+  if (e.status && e.status !== "active" && e.status !== "evidence") {
+    const stSpan = document.createElement("span");
+    stSpan.textContent = String(e.status);
+    submeta.appendChild(stSpan);
+  }
+  if (e.authorId) {
+    const authSpan = document.createElement("span");
+    authSpan.textContent = "@" + e.authorId;
+    submeta.appendChild(authSpan);
+  }
+  const tsSpan = document.createElement("span");
+  tsSpan.textContent = formatStamp(e.occurredAt || e.createdAt);
+  submeta.appendChild(tsSpan);
+  canvas.appendChild(submeta);
+
+  const bodyWrap = document.createElement("div");
+  bodyWrap.className = "reader-doc-body";
+
+  teardownStudioHtmlPreview();
+  if (isRedacted) {
+    const body = document.createElement("p");
+    body.className = "inspector-body redacted";
+    body.textContent = mainBodyText;
+    bodyWrap.appendChild(body);
+  } else {
+    const effectiveView = (state.readerView === "html" && !isHtmlDoc) ? "md" : state.readerView;
+    if (effectiveView === "raw") {
+      const pre = document.createElement("pre");
+      pre.className = "reader-raw-pre";
+      pre.textContent = mainBodyText;
+      bodyWrap.appendChild(pre);
+    } else if (effectiveView === "html") {
+      const htmlBox = document.createElement("div");
+      htmlBox.className = "reader-html-box";
+      bodyWrap.appendChild(htmlBox);
+      const currentId = e.id;
+      loadMarkdownTools().then((mod) => {
+        if (state.openEntry?.id !== currentId || state.readerView !== "html") return;
+        activeStudioHtmlPreview = mod.mountStaticHtmlPreview(htmlBox, mainBodyText, {
+          notice: st("htmlNotice"),
+          renderBtn: st("htmlRender"),
+          hideBtn: st("htmlHide"),
+        });
+      }).catch(() => {
+        const pre = document.createElement("pre");
+        pre.className = "html-source-pre";
+        pre.textContent = mainBodyText;
+        htmlBox.appendChild(pre);
+      });
+    } else {
+      const mdEl = document.createElement("meru-markdown");
+      mdEl.className = "reader-markdown";
+      mdEl.source = mainBodyText;
+      bodyWrap.appendChild(mdEl);
+    }
+  }
+  canvas.appendChild(bodyWrap);
+
+  if (rawPayloadText) {
+    const det = document.createElement("details");
+    det.className = "payload-details";
+    const sum = document.createElement("summary");
+    sum.textContent = st("payload");
+    const pre = document.createElement("pre");
+    pre.className = "payload-pre";
+    pre.textContent = rawPayloadText.replace(/^```json\n?|\n?```$/g, "");
+    det.appendChild(sum);
+    det.appendChild(pre);
+    canvas.appendChild(det);
+  }
+
+  scroll.appendChild(canvas);
+  main.appendChild(scroll);
+  return main;
+}
+
 function buildWorkspace() {
+  if (state.openEntry) {
+    return buildDocumentReader();
+  }
   const main = document.createElement("main");
   main.className = "workspace-col";
 
@@ -1578,6 +2205,7 @@ function buildWorkspace() {
     }
     btn.addEventListener("click", () => {
       state.activeTab = t.id;
+      syncUrlFromState(true);
       render();
     });
     tabs.appendChild(btn);
@@ -1697,28 +2325,92 @@ function buildWorkspace() {
   }
 
   main.appendChild(scroll);
+  if (state.restoreListScrollPending) {
+    state.restoreListScrollPending = false;
+    const savedTop = state.savedListScrollTop;
+    requestAnimationFrame(() => {
+      scroll.scrollTop = savedTop;
+    });
+  }
   return main;
+}
+
+function buildPropList(rows) {
+  const list = document.createElement("dl");
+  list.className = "prop-list";
+  for (const row of rows) {
+    if (!row || row.value === undefined || row.value === null || row.value === "") continue;
+    const item = document.createElement("div");
+    item.className = "prop-row";
+    const dt = document.createElement("dt");
+    dt.className = "prop-label";
+    dt.textContent = row.label;
+    const dd = document.createElement("dd");
+    dd.className = "prop-value" + (row.mono ? " mono" : "");
+    if (typeof row.onClick === "function") {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "prop-value-btn" + (row.mono ? " mono" : "");
+      btn.textContent = String(row.value);
+      btn.title = row.title || String(row.value);
+      btn.addEventListener("click", row.onClick);
+      dd.appendChild(btn);
+    } else {
+      dd.textContent = String(row.value);
+      dd.title = row.title || String(row.value);
+    }
+    item.appendChild(dt);
+    item.appendChild(dd);
+    list.appendChild(item);
+  }
+  return list;
 }
 
 function buildInspector() {
   const aside = document.createElement("aside");
   aside.className = "inspector-col";
+  aside.dataset.ui = "properties-rail";
+
+  const focusEntry = state.openEntry || state.focusedEntry;
 
   const head = document.createElement("div");
   head.className = "inspector-head";
   const heading = document.createElement("span");
   heading.className = "inspector-heading";
-  heading.textContent = state.selectedObject ? "Object Card" : "Inspector";
+  heading.textContent = state.selectedObject
+    ? st("objectProperties")
+    : (focusEntry ? st("properties") : st("realmProperties"));
   head.appendChild(heading);
-  head.appendChild(makeIconBtn(ICONS.close(), "Close inspector", () => {
+
+  const headActions = document.createElement("div");
+  headActions.className = "inspector-head-actions";
+  if (focusEntry || state.selectedObject) {
+    const actionsBtn = makeIconBtn(ICONS.dots(), st("actions"), (ev) => {
+      ev.stopPropagation();
+      const rect = actionsBtn.getBoundingClientRect();
+      state.popover = {
+        kind: "rail-actions",
+        x: Math.max(12, rect.right - 220),
+        y: rect.bottom + 6,
+        entry: focusEntry || null,
+        object: state.selectedObject || null,
+      };
+      render();
+    });
+    actionsBtn.dataset.ui = "rail-actions-trigger";
+    headActions.appendChild(actionsBtn);
+  }
+  headActions.appendChild(makeIconBtn(ICONS.close(), "Close properties ([)", () => {
     state.inspectorOpen = false;
     render();
   }));
+  head.appendChild(headActions);
   aside.appendChild(head);
 
   const scroll = document.createElement("div");
   scroll.className = "inspector-scroll";
 
+  // Mode 1: Object focus
   if (state.selectedObject) {
     const card = state.selectedObject;
     const title = document.createElement("h3");
@@ -1726,241 +2418,290 @@ function buildInspector() {
     title.textContent = card.name || card.ref;
     scroll.appendChild(title);
 
-    const metaGrid = document.createElement("div");
-    metaGrid.className = "inspector-meta-grid";
-    for (const [k, v] of [
-      ["Ref", card.ref || "-"],
-      ["Kind", card.kind || "-"],
-      ["Realm", card.realmPath || "-"],
-      ["Linked", fmtNum(card.counts?.total ?? card.recentEntries?.length ?? 0) + " entries"],
-    ]) {
-      const ke = document.createElement("span");
-      ke.className = "meta-key";
-      ke.textContent = k;
-      const ve = document.createElement("span");
-      ve.className = "meta-val";
-      ve.textContent = String(v);
-      metaGrid.appendChild(ke);
-      metaGrid.appendChild(ve);
-    }
-    scroll.appendChild(metaGrid);
+    scroll.appendChild(buildPropList([
+      { label: "Ref", value: card.ref, mono: true, onClick: () => copyText(card.ref, "Copied " + card.ref) },
+      { label: "Kind", value: card.kind },
+      {
+        label: "Realm",
+        value: card.realmPath,
+        mono: true,
+        onClick: card.realmPath ? () => { void selectRealm(card.realmPath); } : null,
+      },
+      { label: "Linked", value: fmtNum(card.counts?.total ?? card.recentEntries?.length ?? 0) },
+    ]));
 
-    const listLabel = document.createElement("div");
-    listLabel.className = "chain-block-label";
-    listLabel.textContent = "Recent Linked Context (" + (card.recentEntries?.length || 0) + ")";
-    scroll.appendChild(listLabel);
+    if (Array.isArray(card.recentEntries) && card.recentEntries.length > 0) {
+      const sec = document.createElement("div");
+      sec.className = "rail-section";
+      const lbl = document.createElement("div");
+      lbl.className = "rail-section-head";
+      lbl.textContent = "Linked Context (" + card.recentEntries.length + ")";
+      sec.appendChild(lbl);
 
-    const list = document.createElement("div");
-    list.className = "object-entries-list";
-    for (const item of card.recentEntries || []) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "object-entry-mini";
-      const t = document.createElement("div");
-      t.className = "object-entry-mini-title";
-      t.textContent = item.title || item.id;
-      const m = document.createElement("div");
-      m.className = "object-entry-mini-meta";
-      m.textContent = (item.extKind || item.kind || "entry") + " · " + formatStamp(item.occurredAt || item.createdAt);
-      btn.appendChild(t);
-      btn.appendChild(m);
-      btn.addEventListener("click", () => { void selectEntryById(item.id, true, true); });
-      list.appendChild(btn);
+      const list = document.createElement("div");
+      list.className = "object-entries-list";
+      for (const item of card.recentEntries) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "object-entry-mini";
+        const t = document.createElement("div");
+        t.className = "object-entry-mini-title";
+        t.textContent = item.title || item.id;
+        const m = document.createElement("div");
+        m.className = "object-entry-mini-meta";
+        m.textContent = (item.extKind || item.kind || "entry") + " · " + formatStamp(item.occurredAt || item.createdAt);
+        btn.appendChild(t);
+        btn.appendChild(m);
+        btn.addEventListener("click", () => { void openEntryInCenter(item.id, { fromObject: true }); });
+        list.appendChild(btn);
+      }
+      sec.appendChild(list);
+      scroll.appendChild(sec);
     }
-    scroll.appendChild(list);
+
     aside.appendChild(scroll);
     return aside;
   }
 
-  if (!state.selectedEntry) {
-    const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.textContent = "Select any conclusion, object, or rule to inspect full content and supersede history.";
-    scroll.appendChild(empty);
-    aside.appendChild(scroll);
-    return aside;
-  }
+  // Mode 2: Entry focus (either open full-width in Center Reader or focused via J/K in List)
+  if (focusEntry) {
+    const e = focusEntry;
+    const isRedacted = Boolean(e.redactedAt) || e.status === "retracted";
 
-  if (state.previousObject) {
-    const back = document.createElement("button");
-    back.type = "button";
-    back.className = "inspector-back-btn";
-    back.appendChild(ICONS.arrowLeft());
-    const bt = document.createElement("span");
-    bt.textContent = "Back to " + state.previousObject.ref;
-    back.appendChild(bt);
-    back.addEventListener("click", () => {
-      state.selectedObject = state.previousObject;
-      state.previousObject = null;
-      state.selectedEntry = null;
-      state.selectedChain = null;
-      render();
-    });
-    scroll.appendChild(back);
-  }
+    // When NOT yet open in Center Reader, show compact title + 2-line excerpt + Open button
+    if (!state.openEntry) {
+      const title = document.createElement("h3");
+      title.className = "inspector-title";
+      title.textContent = isRedacted ? "[REDACTED]" : String(e.title || e.id);
+      scroll.appendChild(title);
 
-  const e = state.selectedEntry;
-  const isRedacted = Boolean(e.redactedAt) || e.status === "retracted";
+      const snippet = isRedacted ? "" : String(e.snippet || e.body || "").trim();
+      if (snippet) {
+        const ex = document.createElement("p");
+        ex.className = "rail-focus-excerpt";
+        ex.textContent = snippet.slice(0, 220);
+        scroll.appendChild(ex);
+      }
 
-  const title = document.createElement("h3");
-  title.className = "inspector-title";
-  title.textContent = isRedacted ? "[REDACTED]" : String(e.title || e.id);
-  scroll.appendChild(title);
-
-  const metaGrid = document.createElement("div");
-  metaGrid.className = "inspector-meta-grid";
-  const rows = [
-    ["ID", e.id || "-"],
-    ["Kind", e.extKind || e.kind || "entry"],
-    ["Status", e.status || "active"],
-    ["Realm", e.realmPath || state.activeRealmPath],
-    ["Author", e.authorId ? ("@" + e.authorId) : "-"],
-    ["Recorded", formatStamp(e.occurredAt || e.createdAt)],
-  ];
-  if (e.sourceRef) rows.push(["Source", e.sourceRef]);
-  for (const [k, v] of rows) {
-    const ke = document.createElement("span");
-    ke.className = "meta-key";
-    ke.textContent = k;
-    const ve = document.createElement("span");
-    ve.className = "meta-val";
-    ve.textContent = String(v);
-    metaGrid.appendChild(ke);
-    metaGrid.appendChild(ve);
-  }
-  scroll.appendChild(metaGrid);
-
-  const rawBody = isRedacted
-    ? "[REDACTED: content permanently removed]"
-    : String(e.body || e.snippet || "No body text.");
-  const payloadSplitIdx = !isRedacted ? rawBody.indexOf("\n## Payload\n") : -1;
-  const mainBodyText = payloadSplitIdx >= 0 ? rawBody.slice(0, payloadSplitIdx).trim() : rawBody;
-  const rawPayloadText = payloadSplitIdx >= 0 ? rawBody.slice(payloadSplitIdx + "\n## Payload\n".length).trim() : "";
-
-  teardownStudioHtmlPreview();
-  if (isRedacted) {
-    const body = document.createElement("p");
-    body.className = "inspector-body redacted";
-    body.textContent = mainBodyText;
-    scroll.appendChild(body);
-  } else {
-    const isHtmlDoc = looksLikeHtmlDoc(mainBodyText, e.sourceRef);
-    const seg = document.createElement("div");
-    seg.className = "studio-seg";
-    const modes = isHtmlDoc
-      ? [["md", st("md")], ["raw", st("raw")], ["html", st("html")]]
-      : [["md", st("md")], ["raw", st("raw")]];
-    for (const [mKey, mLbl] of modes) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "studio-seg-btn" + (state.inspectorView === mKey ? " active" : "");
-      b.textContent = mLbl;
-      b.addEventListener("click", () => {
-        if (state.inspectorView === mKey) return;
-        state.inspectorView = mKey;
-        render();
-      });
-      seg.appendChild(b);
+      const openBtn = document.createElement("button");
+      openBtn.type = "button";
+      openBtn.className = "meru-btn rail-open-btn";
+      openBtn.dataset.ui = "rail-open-doc";
+      openBtn.appendChild(ICONS.bookOpen());
+      const lbl = document.createElement("span");
+      lbl.textContent = st("openDocument");
+      openBtn.appendChild(lbl);
+      openBtn.addEventListener("click", () => { void openEntryInCenter(e.id); });
+      scroll.appendChild(openBtn);
     }
-    scroll.appendChild(seg);
 
-    if (state.inspectorView === "raw") {
-      const body = document.createElement("p");
-      body.className = "inspector-body";
-      body.textContent = mainBodyText;
-      scroll.appendChild(body);
-    } else if (state.inspectorView === "html") {
-      const htmlBox = document.createElement("div");
-      scroll.appendChild(htmlBox);
-      const currentId = e.id;
-      loadMarkdownTools().then((mod) => {
-        if (state.selectedEntry?.id !== currentId || state.inspectorView !== "html") return;
-        activeStudioHtmlPreview = mod.mountStaticHtmlPreview(htmlBox, mainBodyText, {
-          notice: st("htmlNotice"),
-          renderBtn: st("htmlRender"),
-          hideBtn: st("htmlHide"),
+    // Flat single-line properties (zero card-in-card, zero duplicate document body!)
+    scroll.appendChild(buildPropList([
+      { label: "ID", value: e.id, mono: true, onClick: () => copyText(e.id, "Copied " + e.id) },
+      { label: "Kind", value: e.extKind || e.kind || "entry" },
+      { label: "Status", value: e.status || "active" },
+      {
+        label: "Realm",
+        value: e.realmPath || state.activeRealmPath,
+        mono: true,
+        onClick: () => { void selectRealm(e.realmPath || state.activeRealmPath); },
+      },
+      { label: "Author", value: e.authorId ? ("@" + e.authorId) : null, mono: true },
+      { label: "Recorded", value: formatStamp(e.occurredAt || e.createdAt), mono: true },
+      { label: "Source", value: e.sourceRef || null, mono: true },
+    ]));
+
+    // Linked Objects & Resource Tags — COMPLETELY HIDDEN when empty
+    const linkedRefs = [
+      ...(Array.isArray(e.objectIds) ? e.objectIds : []),
+      ...(Array.isArray(e.refs) ? e.refs : []),
+      ...(Array.isArray(e.resourceTags) ? e.resourceTags.map((t) => "#" + t) : []),
+    ].filter(Boolean);
+    const uniqueRefs = Array.from(new Set(linkedRefs));
+    if (uniqueRefs.length > 0) {
+      const sec = document.createElement("div");
+      sec.className = "rail-section";
+      const lbl = document.createElement("div");
+      lbl.className = "rail-section-head";
+      lbl.textContent = st("linkedRefs");
+      sec.appendChild(lbl);
+
+      const chipWrap = document.createElement("div");
+      chipWrap.className = "rail-chip-wrap";
+      for (const ref of uniqueRefs) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "rail-ref-chip";
+        chip.textContent = ref;
+        chip.addEventListener("click", () => {
+          if (ref.startsWith("#")) {
+            void copyText(ref, "Copied " + ref);
+          } else {
+            void selectObjectByRef(ref, true);
+          }
         });
-      }).catch(() => {
-        const pre = document.createElement("pre");
-        pre.className = "html-source-pre";
-        pre.textContent = mainBodyText;
-        htmlBox.appendChild(pre);
-      });
-    } else {
-      const mdEl = document.createElement("meru-markdown");
-      mdEl.source = mainBodyText;
-      scroll.appendChild(mdEl);
+        chipWrap.appendChild(chip);
+      }
+      sec.appendChild(chipWrap);
+      scroll.appendChild(sec);
     }
-  }
 
-  if (rawPayloadText) {
-    const det = document.createElement("details");
-    det.className = "payload-details";
-    const sum = document.createElement("summary");
-    sum.textContent = st("payload");
-    const pre = document.createElement("pre");
-    pre.className = "payload-pre";
-    pre.textContent = rawPayloadText.replace(/^```json\n?|\n?```$/g, "");
-    det.appendChild(sum);
-    det.appendChild(pre);
-    scroll.appendChild(det);
-  }
+    // Supersede Provenance — COMPLETELY HIDDEN if <= 1 revision
+    if (state.selectedChain && Array.isArray(state.selectedChain.nodes) && state.selectedChain.nodes.length > 1) {
+      const sec = document.createElement("div");
+      sec.className = "rail-section";
 
-  if (state.selectedChain && Array.isArray(state.selectedChain.nodes) && state.selectedChain.nodes.length > 1) {
-    const chBlock = document.createElement("div");
-    chBlock.className = "chain-block";
+      const chLabel = document.createElement("div");
+      chLabel.className = "rail-section-head";
+      const cLeft = document.createElement("span");
+      cLeft.textContent = st("supersedeChain");
+      const cRight = document.createElement("span");
+      cRight.textContent = String(state.selectedChain.nodes.length);
+      chLabel.appendChild(cLeft);
+      chLabel.appendChild(cRight);
+      sec.appendChild(chLabel);
 
-    const chLabel = document.createElement("div");
-    chLabel.className = "chain-block-label";
-    const cLeft = document.createElement("span");
-    cLeft.textContent = "Supersede Provenance";
-    const cRight = document.createElement("span");
-    cRight.textContent = state.selectedChain.nodes.length + " revisions";
-    chLabel.appendChild(cLeft);
-    chLabel.appendChild(cRight);
-    chBlock.appendChild(chLabel);
-
-    const rail = document.createElement("div");
-    rail.className = "chain-rail";
-    for (const n of state.selectedChain.nodes) {
-      const node = document.createElement("button");
-      node.type = "button";
-      const isHead = n.id === state.selectedChain.currentHeadId;
-      const isCurr = n.id === e.id;
-      node.className = "chain-node" + (isHead ? " head" : "") + (isCurr ? " current" : "");
-      const nt = document.createElement("div");
-      nt.className = "chain-node-title";
-      nt.textContent = n.title;
-      const nm = document.createElement("div");
-      nm.className = "chain-node-meta";
-      nm.textContent = (isHead ? "head · " : "") + n.kind + " · " + n.status + " · " + n.id.slice(0, 12);
-      node.appendChild(nt);
-      node.appendChild(nm);
-      node.addEventListener("click", () => { void selectEntryById(n.id, true); });
-      rail.appendChild(node);
+      const rail = document.createElement("div");
+      rail.className = "chain-rail";
+      for (const n of state.selectedChain.nodes) {
+        const node = document.createElement("button");
+        node.type = "button";
+        const isHead = n.id === state.selectedChain.currentHeadId;
+        const isCurr = n.id === e.id;
+        node.className = "chain-node" + (isHead ? " head" : "") + (isCurr ? " current" : "");
+        const nt = document.createElement("div");
+        nt.className = "chain-node-title";
+        nt.textContent = n.title;
+        const nm = document.createElement("div");
+        nm.className = "chain-node-meta";
+        nm.textContent = (isHead ? "head · " : "") + n.kind + " · " + n.status + " · " + n.id.slice(0, 12);
+        node.appendChild(nt);
+        node.appendChild(nm);
+        node.addEventListener("click", () => { void openEntryInCenter(n.id); });
+        rail.appendChild(node);
+      }
+      sec.appendChild(rail);
+      scroll.appendChild(sec);
     }
-    chBlock.appendChild(rail);
-    scroll.appendChild(chBlock);
+
+    // Active Peers touching this realm/entry — COMPLETELY HIDDEN if 0 peers
+    const entryRealm = e.realmPath || state.activeRealmPath;
+    const relevantPeers = (state.pulses || []).filter(
+      (p) =>
+        p.active &&
+        p.sessionId !== state.selfPulseSessionId &&
+        (p.realmPath === entryRealm || (Array.isArray(p.focus) && p.focus.includes(e.id))),
+    );
+    if (relevantPeers.length > 0) {
+      const sec = document.createElement("div");
+      sec.className = "rail-section";
+      const lbl = document.createElement("div");
+      lbl.className = "rail-section-head";
+      lbl.textContent = st("activePeers");
+      sec.appendChild(lbl);
+      const list = document.createElement("div");
+      list.className = "rail-peer-list";
+      for (const peer of relevantPeers.slice(0, 5)) {
+        const pRow = document.createElement("div");
+        pRow.className = "rail-peer-row";
+        const dot = document.createElement("span");
+        dot.className = "status-dot realm-live-dot";
+        const who = document.createElement("span");
+        who.className = "rail-peer-who";
+        who.textContent = peer.clientHint ? (peer.actorId + " · " + peer.clientHint) : peer.actorId;
+        const act = document.createElement("span");
+        act.className = "rail-peer-act";
+        act.textContent = peer.activity || peer.note || (peer.online ? "now" : formatPulseAge(peer.ageSeconds));
+        pRow.appendChild(dot);
+        pRow.appendChild(who);
+        pRow.appendChild(act);
+        list.appendChild(pRow);
+      }
+      sec.appendChild(list);
+      scroll.appendChild(sec);
+    }
+
+    // Contextual CLI Governance Command Box — SHOWN ONLY when explicitly requested from ⋯ menu or on 403
+    if (state.railCliCommand) {
+      const cliBlock = document.createElement("div");
+      cliBlock.className = "rail-section rail-cli-box";
+      cliBlock.dataset.ui = "rail-cli-box";
+      const top = document.createElement("div");
+      top.className = "rail-section-head";
+      const lbl = document.createElement("span");
+      lbl.textContent = state.railCliCommand.label || "CLI";
+      top.appendChild(lbl);
+      top.appendChild(makeIconBtn(ICONS.close(), "Dismiss", () => {
+        state.railCliCommand = null;
+        render();
+      }));
+      cliBlock.appendChild(top);
+
+      const note = document.createElement("p");
+      note.className = "cli-boundary-note";
+      note.textContent = st("cliRequiresBearer");
+      cliBlock.appendChild(note);
+
+      const cmdRow = document.createElement("div");
+      cmdRow.className = "cli-cmd-row";
+      const cmdCode = document.createElement("code");
+      cmdCode.className = "cli-cmd-text";
+      cmdCode.textContent = state.railCliCommand.cmd;
+      cmdCode.title = state.railCliCommand.cmd;
+      cmdRow.appendChild(cmdCode);
+      cmdRow.appendChild(makeIconBtn(ICONS.copy(), "Copy CLI command", () => copyText(state.railCliCommand.cmd)));
+      cliBlock.appendChild(cmdRow);
+      scroll.appendChild(cliBlock);
+    }
+
+    aside.appendChild(scroll);
+    return aside;
   }
 
-  const cliBlock = document.createElement("div");
-  cliBlock.className = "cli-boundary";
-  const note = document.createElement("p");
-  note.className = "cli-boundary-note";
-  note.textContent = "Irreversible governance actions (redact, rule edits, mounts, tokens) require a CLI Bearer token:";
-  cliBlock.appendChild(note);
+  // Mode 3: No specific entry/object focused -> show active Realm properties
+  const activeRealmObj = state.realms.find((r) => r.path === state.activeRealmPath);
+  const rc = state.realmCounts[state.activeRealmPath] || {};
+  const rulesCount = state.brief?.middleMind?.rules?.items?.length || 0;
+  scroll.appendChild(buildPropList([
+    { label: "Path", value: state.activeRealmPath, mono: true },
+    { label: "Name", value: realmDisplayName(activeRealmObj) },
+    { label: "Conclusions", value: fmtNum(rc.subtreeConclusions ?? rc.directConclusions ?? 0), mono: true },
+    { label: "Objects", value: fmtNum(rc.subtreeObjects ?? state.realmObjects.length), mono: true },
+    { label: "Rules", value: fmtNum(rulesCount), mono: true },
+    { label: "Policy", value: getOrgPolicy(), mono: true },
+  ]));
 
-  const redactCmd = "meru-mind redact " + e.id + ' --reason "compliance"';
-  const cmdRow = document.createElement("div");
-  cmdRow.className = "cli-cmd-row";
-  const cmdCode = document.createElement("code");
-  cmdCode.className = "cli-cmd-text";
-  cmdCode.textContent = redactCmd;
-  cmdCode.title = redactCmd;
-  cmdRow.appendChild(cmdCode);
-  cmdRow.appendChild(makeIconBtn(ICONS.copy(), "Copy CLI redact command", () => copyText(redactCmd)));
-  cliBlock.appendChild(cmdRow);
-  scroll.appendChild(cliBlock);
+  const realmPeers = (state.pulses || []).filter(
+    (p) => p.active && p.sessionId !== state.selfPulseSessionId && p.realmPath === state.activeRealmPath,
+  );
+  if (realmPeers.length > 0) {
+    const sec = document.createElement("div");
+    sec.className = "rail-section";
+    const lbl = document.createElement("div");
+    lbl.className = "rail-section-head";
+    lbl.textContent = st("activePeers");
+    sec.appendChild(lbl);
+    const list = document.createElement("div");
+    list.className = "rail-peer-list";
+    for (const peer of realmPeers.slice(0, 6)) {
+      const pRow = document.createElement("div");
+      pRow.className = "rail-peer-row";
+      const dot = document.createElement("span");
+      dot.className = "status-dot realm-live-dot";
+      const who = document.createElement("span");
+      who.className = "rail-peer-who";
+      who.textContent = peer.clientHint ? (peer.actorId + " · " + peer.clientHint) : peer.actorId;
+      const act = document.createElement("span");
+      act.className = "rail-peer-act";
+      act.textContent = peer.activity || peer.note || (peer.online ? "now" : formatPulseAge(peer.ageSeconds));
+      pRow.appendChild(dot);
+      pRow.appendChild(who);
+      pRow.appendChild(act);
+      list.appendChild(pRow);
+    }
+    sec.appendChild(list);
+    scroll.appendChild(sec);
+  }
 
   aside.appendChild(scroll);
   return aside;
@@ -2095,6 +2836,58 @@ function renderPopover() {
       }
     }
     pop.appendChild(list);
+    return pop;
+  }
+
+  if (state.popover.kind === "rail-actions") {
+    const entry = state.popover.entry;
+    const obj = state.popover.object;
+    const addAction = (iconEl, label, onClick, isDanger = false) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "menu-item" + (isDanger ? " danger" : "");
+      b.appendChild(iconEl);
+      const sp = document.createElement("span");
+      sp.textContent = label;
+      b.appendChild(sp);
+      b.addEventListener("click", () => {
+        state.popover = null;
+        onClick();
+      });
+      pop.appendChild(b);
+    };
+
+    if (entry) {
+      addAction(ICONS.copy(), st("copyId"), () => {
+        render();
+        void copyText(entry.id, "Copied " + entry.id);
+      });
+      addAction(ICONS.link(), st("copyLink"), () => {
+        const u = new URL(window.location.href);
+        const targetRealm = entry.realmPath || state.activeRealmPath || "/";
+        u.pathname = targetRealm;
+        u.search = "?entry=" + encodeURIComponent(entry.id);
+        render();
+        void copyText(u.toString(), "Copied document link");
+      });
+      const moveCmd = "meru-mind entry move " + entry.id + " --to /target-realm";
+      addAction(ICONS.terminal(), st("cliMoveCmd"), () => {
+        state.railCliCommand = { label: "CLI Move", cmd: moveCmd };
+        render();
+        void copyText(moveCmd, "Copied CLI move command");
+      });
+      const redactCmd = "meru-mind redact " + entry.id + ' --reason "compliance"';
+      addAction(ICONS.terminal(), st("cliRedactCmd"), () => {
+        state.railCliCommand = { label: "CLI Redact", cmd: redactCmd };
+        render();
+        void copyText(redactCmd, "Copied CLI redact command");
+      }, true);
+    } else if (obj) {
+      addAction(ICONS.copy(), "Copy Ref", () => {
+        render();
+        void copyText(obj.ref, "Copied " + obj.ref);
+      });
+    }
     return pop;
   }
 
@@ -2549,9 +3342,12 @@ function renderModal() {
     } else {
       for (const [k, desc] of [
         ["⌘K / Ctrl+K", "Open global visible-memory search"],
+        ["J / K", "Focus next / previous entry (or step in document reader)"],
+        ["Enter", "Open focused entry full-width in center reader"],
+        ["Esc", "Return from document reader to list / close dialogs"],
         ["N", "Open new entry drawer in active realm"],
         ["R", "Refresh current realm snapshot"],
-        ["[", "Toggle right inspector column"],
+        ["[", "Toggle right properties rail"],
         ["⌘,", "Open settings"],
       ]) {
         const keycap = document.createElement("span");
@@ -2642,13 +3438,41 @@ window.addEventListener("keydown", (ev) => {
       state.modal = null;
       state.popover = null;
       render();
+    } else if (state.openEntry) {
+      closeReaderToList();
     }
     return;
   }
   if (inInput || state.modal) return;
-  if (ev.key.toLowerCase() === "r") {
+  const lowKey = ev.key.toLowerCase();
+  if (lowKey === "j" || lowKey === "k") {
+    const list = getVisibleListEntries();
+    if (list.length === 0) return;
+    ev.preventDefault();
+    const curId = state.openEntry?.id || state.focusedEntryId;
+    const idx = curId ? list.findIndex((x) => x.id === curId) : -1;
+    let nextIdx;
+    if (lowKey === "j") {
+      nextIdx = idx < 0 ? 0 : Math.min(list.length - 1, idx + 1);
+    } else {
+      nextIdx = idx < 0 ? list.length - 1 : Math.max(0, idx - 1);
+    }
+    const target = list[nextIdx];
+    if (!target || target.id === curId) return;
+    if (state.openEntry) {
+      void openEntryInCenter(target.id);
+    } else {
+      void focusEntryInList(target.id, target);
+    }
+  } else if (ev.key === "Enter" && !state.openEntry && state.focusedEntryId) {
+    // Only trigger when not clicking an interactive button/link directly
+    if (tag !== "button" && tag !== "a") {
+      ev.preventDefault();
+      void openEntryInCenter(state.focusedEntryId);
+    }
+  } else if (lowKey === "r") {
     void refreshAll();
-  } else if (ev.key.toLowerCase() === "n") {
+  } else if (lowKey === "n") {
     ev.preventDefault();
     state.writeError = null;
     state.modal = "write";
@@ -2658,6 +3482,39 @@ window.addEventListener("keydown", (ev) => {
     render();
   }
 });
+
+window.addEventListener("popstate", () => {
+  if (!state.whoami) return;
+  void applyUrlStateFromLocation();
+});
+
+async function applyUrlStateFromLocation() {
+  const parsed = parseUrlState();
+  const targetRealm = state.realms.some((r) => r.path === parsed.realmPath)
+    ? parsed.realmPath
+    : (state.realms[0]?.path || "/");
+  if (targetRealm !== state.activeRealmPath || (parsed.tab && parsed.tab !== state.activeTab)) {
+    await selectRealm(targetRealm, parsed.tab || undefined, {
+      keepReader: Boolean(parsed.entryId),
+      skipUrlSync: true,
+    });
+  }
+  if (parsed.entryId) {
+    if (state.openEntry?.id !== parsed.entryId || (parsed.view && parsed.view !== state.readerView)) {
+      await openEntryInCenter(parsed.entryId, {
+        requestedView: parsed.view,
+        skipUrlSync: true,
+      });
+    }
+  } else if (parsed.objectRef) {
+    await selectObjectByRef(parsed.objectRef, true, { skipUrlSync: true });
+  } else if (state.openEntry) {
+    closeReaderToList({ skipUrlSync: true });
+  } else if (state.selectedObject) {
+    state.selectedObject = null;
+    render();
+  }
+}
 
 client.pump.subscribe((snap) => {
   const prevStatus = state.pumpStatus;
@@ -2677,7 +3534,7 @@ client.pump.subscribe((snap) => {
     render();
   }
   if (snap.lastFrames && snap.lastFrames.length > 0) {
-    void refreshAll();
+    void refreshAll({ keepReader: Boolean(state.openEntry), skipUrlSync: true });
   }
 });
 
@@ -2688,10 +3545,10 @@ async function studioPulseKeepaliveTick() {
     if (selfPulse?.sessionId) state.selfPulseSessionId = selfPulse.sessionId;
     const pulseRes = await client.pulse.list().catch(() => null);
     if (pulseRes?.pulses) {
-      state.pulses = pulseRes.pulses;
-      state.inFlight = Array.isArray(pulseRes.inFlight) ? pulseRes.inFlight : [];
-      state.unkeyedCount = typeof pulseRes.unkeyedCount === "number" ? pulseRes.unkeyedCount : 0;
-      render();
+      applyPulsePayload(pulseRes, true);
+      if (!state.presenceHovered) {
+        render();
+      }
     }
   } catch {
     // quiet failure on background pulse tick
@@ -2718,7 +3575,23 @@ async function boot() {
       return;
     }
     state.whoami = await client.whoami();
-    await refreshAll();
+    const initialUrl = parseUrlState();
+    await refreshAll({
+      realmPath: initialUrl.realmPath,
+      tab: initialUrl.tab || undefined,
+      keepReader: Boolean(initialUrl.entryId),
+      skipUrlSync: true,
+    });
+    if (initialUrl.entryId) {
+      await openEntryInCenter(initialUrl.entryId, {
+        requestedView: initialUrl.view,
+        replaceUrl: true,
+      });
+    } else if (initialUrl.objectRef) {
+      await selectObjectByRef(initialUrl.objectRef, true, { replaceUrl: true });
+    } else {
+      syncUrlFromState(true);
+    }
     client.pump.start(state.whoami.latestSeq || 0);
   } catch {
     state.whoami = null;

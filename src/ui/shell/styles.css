@@ -51,9 +51,9 @@
   --meru-font: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", sans-serif;
   --meru-mono: "IBM Plex Mono", "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
-  --meru-sidebar-w: 236px;
+  --meru-sidebar-w: 244px;
   --meru-topbar-h: 48px;
-  --meru-inspector-w: 380px;
+  --meru-inspector-w: 320px;
   --meru-gutter: 16px;
 }
 
@@ -215,6 +215,32 @@ button, input, select, textarea {
   font-size: 12px;
   color: var(--meru-fg-secondary);
 }
+.small-btn {
+  appearance: none;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: var(--meru-radius-sm);
+  border: 1px solid var(--meru-border-strong);
+  background: var(--meru-surface);
+  color: var(--meru-fg);
+  font-size: var(--meru-fs-xs);
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 110ms ease, border-color 110ms ease, color 110ms ease;
+}
+.small-btn:hover {
+  background: var(--meru-surface-hover);
+}
+.small-btn:focus-visible {
+  outline: 2px solid var(--meru-data-hue);
+  outline-offset: 1px;
+}
 .html-source-pre {
   margin: 0;
   padding: 10px 12px;
@@ -228,10 +254,10 @@ button, input, select, textarea {
 }
 .meru-html-sandbox-frame {
   width: 100%;
-  min-height: 300px;
-  height: 40vh;
+  min-height: 480px;
+  height: 62vh;
   border: 1px solid var(--meru-border-strong);
-  border-radius: 8px;
+  border-radius: 10px;
   background: #ffffff;
 }
 
@@ -259,10 +285,154 @@ button, input, select, textarea {
 .ws-lamp[data-status="auth-required"] { background: var(--meru-status-err); }
 
 .sidebar-scroll {
-  flex: 1;
+  flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding: 8px 2px 12px;
+  padding: 6px 2px 8px;
+}
+
+/* Unified Presence Pane: collapsible, capped at 40% of sidebar height, independent scroll */
+.presence-pane {
+  flex: 0 1 auto;
+  max-height: 40%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-top: 1px solid var(--meru-rule);
+  padding-top: 8px;
+  margin-top: 4px;
+}
+.presence-pane.collapsed {
+  flex: 0 0 auto;
+}
+
+.presence-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0 4px 6px;
+  flex-shrink: 0;
+}
+
+.presence-collapse-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: transparent;
+  padding: 2px 4px;
+  border-radius: 5px;
+  font-size: var(--meru-fs-xs);
+  font-weight: 500;
+  color: var(--meru-fg-muted);
+  cursor: pointer;
+}
+.presence-collapse-btn:hover {
+  background: var(--meru-surface-hover);
+  color: var(--meru-fg);
+}
+
+.presence-seg {
+  display: inline-flex;
+  background: var(--meru-surface-control);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.presence-seg-btn {
+  border: none;
+  background: transparent;
+  color: var(--meru-fg-muted);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.presence-seg-btn.active {
+  background: var(--meru-surface);
+  color: var(--meru-fg);
+  font-weight: 600;
+}
+
+.presence-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 2px 4px;
+}
+
+.presence-empty {
+  padding: 6px 8px;
+  font-size: var(--meru-fs-xs);
+  color: var(--meru-fg-muted);
+}
+
+.presence-actor-group {
+  margin-bottom: 4px;
+}
+
+.presence-actor-sessions {
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 1px;
+}
+
+.presence-session-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 26px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--meru-fg-secondary);
+  font-size: 11.5px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 100ms ease, color 100ms ease;
+}
+.presence-session-row:hover {
+  background: var(--meru-surface-hover);
+  color: var(--meru-fg);
+}
+.presence-session-label {
+  font-family: var(--meru-mono);
+  font-size: 11px;
+  color: var(--meru-fg-secondary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.presence-session-detail {
+  color: var(--meru-fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.presence-load-more-btn {
+  align-self: flex-start;
+  margin: 2px 0 4px 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--meru-border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--meru-fg-muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 100ms ease, color 100ms ease;
+}
+.presence-load-more-btn:hover {
+  background: var(--meru-surface-hover);
+  color: var(--meru-fg);
 }
 
 .nav-group-label {
@@ -1307,6 +1477,290 @@ button, input, select, textarea {
   word-break: break-word;
 }
 
+/* ==================== Center Full Document Reader (v0.5.8 Linear Style) ==================== */
+
+.reader-toolbar {
+  height: 52px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--meru-rule);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.reader-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px 0 6px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--meru-fg-secondary);
+  font-size: var(--meru-fs-sm);
+  font-family: var(--meru-mono);
+  cursor: pointer;
+  min-width: 0;
+  max-width: 55%;
+  transition: background 110ms ease, color 110ms ease;
+}
+.reader-back-btn span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.reader-back-btn:hover {
+  background: var(--meru-surface-hover);
+  color: var(--meru-fg);
+}
+
+.reader-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.reader-view-seg {
+  margin-bottom: 0;
+}
+
+.reader-nav-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.reader-nav-group .meru-icon-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.reader-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.reader-canvas {
+  max-width: 72ch;
+  margin: 0 auto;
+  padding: 28px 32px 64px;
+}
+
+.reader-doc-title {
+  margin: 0 0 10px;
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.025em;
+  color: var(--meru-fg);
+  word-break: break-word;
+}
+
+.reader-doc-submeta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: var(--meru-fs-xs);
+  color: var(--meru-fg-muted);
+  font-family: var(--meru-mono);
+  padding-bottom: 18px;
+  margin-bottom: 22px;
+  border-bottom: 1px solid var(--meru-rule);
+}
+
+.reader-kind-pill {
+  font-family: var(--meru-font);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--meru-chip-bg);
+  color: var(--meru-fg);
+}
+
+.reader-doc-body {
+  margin-bottom: 24px;
+}
+
+.reader-markdown {
+  --meru-md-font-size: 14.5px;
+  --meru-md-line-height: 1.74;
+  --meru-md-h1-size: 20px;
+  --meru-md-h2-size: 17px;
+  --meru-md-h3-size: 15px;
+}
+
+.reader-raw-pre {
+  margin: 0;
+  padding: 16px 18px;
+  border-radius: var(--meru-radius);
+  border: 1px solid var(--meru-rule);
+  background: var(--meru-surface-subtle);
+  font-family: var(--meru-mono);
+  font-size: 12.5px;
+  line-height: 1.62;
+  color: var(--meru-fg-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ==================== Linear Right Properties & Actions Rail ==================== */
+
+.inspector-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.prop-list {
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.prop-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: var(--meru-fs-xs);
+}
+
+.prop-label {
+  color: var(--meru-fg-muted);
+  margin: 0;
+}
+
+.prop-value {
+  margin: 0;
+  color: var(--meru-fg);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.prop-value.mono {
+  font-family: var(--meru-mono);
+  font-size: 11.5px;
+  color: var(--meru-fg-secondary);
+}
+
+.prop-value-btn {
+  border: none;
+  background: transparent;
+  padding: 1px 4px;
+  margin: -1px -4px;
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.prop-value-btn:hover {
+  background: var(--meru-surface-hover);
+  color: var(--meru-fg);
+}
+
+.rail-focus-excerpt {
+  margin: 0 0 12px;
+  font-size: var(--meru-fs-xs);
+  line-height: 1.55;
+  color: var(--meru-fg-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.rail-open-btn {
+  width: 100%;
+  margin-bottom: 14px;
+}
+
+.rail-section {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--meru-rule);
+}
+
+.rail-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--meru-fs-xs);
+  font-weight: 500;
+  color: var(--meru-fg-muted);
+  margin-bottom: 10px;
+}
+
+.rail-chip-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.rail-ref-chip {
+  border: 1px solid var(--meru-border);
+  background: var(--meru-surface);
+  color: var(--meru-fg-secondary);
+  font-family: var(--meru-mono);
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rail-ref-chip:hover {
+  border-color: var(--meru-border-strong);
+  color: var(--meru-fg);
+}
+
+.rail-peer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rail-peer-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--meru-fs-xs);
+}
+
+.rail-peer-who {
+  color: var(--meru-fg);
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.rail-peer-act {
+  color: var(--meru-fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
 /* ==================== Right Inspector Column ==================== */
 
 .inspector-col {
@@ -2026,6 +2480,15 @@ mark.meru-hl {
   }
   .workspace-scroll {
     padding: 16px;
+  }
+  .reader-toolbar {
+    padding: 0 12px;
+  }
+  .reader-canvas {
+    padding: 20px 16px 48px;
+  }
+  .reader-doc-title {
+    font-size: 20px;
   }
   .ledger-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));

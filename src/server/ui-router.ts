@@ -303,8 +303,18 @@ export function createUiRouteHandler(options: UiRouterOptions) {
       }
     }
 
-    // Default fallback: built-in official shell at `/`
-    if (pathname === "/" || pathname === "/index.html") {
+    // Default fallback: built-in official shell at `/` and SPA deep-link routes (`/<realm>?entry=...`)
+    // Never shadows `/_meru/*`, `/v1/*`, `/mcp`, or missing static asset extensions.
+    const STATIC_ASSET_EXT_RE =
+      /\.(?:js|mjs|cjs|css|map|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|eot|json|xml|txt)$/i;
+    if (
+      pathname === "/" ||
+      pathname === "/index.html" ||
+      (!pathname.startsWith("/_meru/") &&
+        !pathname.startsWith("/v1/") &&
+        pathname !== "/mcp" &&
+        !STATIC_ASSET_EXT_RE.test(pathname))
+    ) {
       sendAsset(res, 200, "text/html; charset=utf-8", DEFAULT_SHELL_HTML);
       return true;
     }

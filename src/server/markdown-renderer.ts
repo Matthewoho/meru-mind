@@ -310,8 +310,8 @@ export const MARKDOWN_SHADOW_STYLES = \`
   :host {
     display: block;
     font-family: var(--meru-font, -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif);
-    font-size: 13px;
-    line-height: 1.62;
+    font-size: var(--meru-md-font-size, 13.5px);
+    line-height: var(--meru-md-line-height, 1.68);
     color: var(--meru-fg-secondary, #3f4756);
     word-break: break-word;
   }
@@ -321,13 +321,13 @@ export const MARKDOWN_SHADOW_STYLES = \`
     color: var(--meru-fg, #14171f);
     font-weight: 600;
     line-height: 1.32;
-    margin: 1.1em 0 0.45em;
+    margin: 1.25em 0 0.5em;
     letter-spacing: -0.015em;
   }
-  h1 { font-size: 16px; border-bottom: 1px solid var(--meru-border, rgba(20, 23, 31, 0.1)); padding-bottom: 5px; }
-  h2 { font-size: 14.5px; }
-  h3 { font-size: 13.5px; }
-  h4, h5, h6 { font-size: 13px; }
+  h1 { font-size: var(--meru-md-h1-size, 18px); border-bottom: 1px solid var(--meru-border, rgba(20, 23, 31, 0.1)); padding-bottom: 6px; }
+  h2 { font-size: var(--meru-md-h2-size, 15.5px); }
+  h3 { font-size: var(--meru-md-h3-size, 14px); }
+  h4, h5, h6 { font-size: var(--meru-md-font-size, 13.5px); }
   p { margin: 0.55em 0; }
   ul, ol { margin: 0.5em 0; padding-left: 1.4em; }
   li { margin: 0.25em 0; }

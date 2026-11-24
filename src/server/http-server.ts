@@ -118,6 +118,13 @@ export interface MindServerOptions {
   demo?: boolean;
   /** Optional custom WorkProviderRegistry (defaults to official Linear + GitHub static registry) */
   workRegistry?: WorkProviderRegistry;
+  /**
+   * Emit a stateless random UUID `Mcp-Session-Id` response header on `POST /mcp` JSON-RPC `initialize`
+   * requests that omit `Mcp-Session-Id`, allowing multi-connection clients to separate MindPulse sessions
+   * automatically without server-side session state or 404s. Defaults to true unless disabled here or via
+   * `MERU_MIND_MCP_SESSION_HEADER=false`.
+   */
+  mcpSessionHeader?: boolean;
   /** Custom access logger (pass false to disable stderr logging in tests) */
   accessLog?: ((entry: AccessLogEntry) => void) | false;
   /** Optional custom request hook invoked for non-/v1, non-/mcp paths (used by v0.4 Web UI shell) */
@@ -395,9 +402,16 @@ export async function startMindServer(
 
     const serverUrlRef = { value: `http://${formatHostForUrl(host)}:${requestedPort}` };
 
+    const enableMcpSessionHeader =
+      options.mcpSessionHeader ??
+      !["false", "0", "off", "no"].includes(
+        (process.env.MERU_MIND_MCP_SESSION_HEADER ?? "").trim().toLowerCase(),
+      );
+
     const extractPulseMeta = (
       req: IncomingMessage,
       workspaceHint: string | null,
+      fallbackSessionId?: string | null,
     ): {
       sessionTag: string;
       parentSessionTag: string | null;
@@ -413,7 +427,9 @@ export async function startMindServer(
           ? rawParent.trim()
           : null;
       const rawSession =
-        req.headers["x-meru-session-id"] ?? req.headers["mcp-session-id"];
+        req.headers["x-meru-session-id"] ??
+        req.headers["mcp-session-id"] ??
+        fallbackSessionId;
       const headerSession =
         typeof rawSession === "string" && rawSession.trim()
           ? rawSession.trim()
@@ -437,6 +453,7 @@ export async function startMindServer(
     const createSurface = (
       principal: Principal,
       req: IncomingMessage,
+      surfaceOpts?: { fallbackSessionId?: string | null },
     ): MindSurface => {
       const rawHint = req.headers["x-meru-workspace-hint"];
       const workspaceHint =
@@ -456,6 +473,7 @@ export async function startMindServer(
       const { sessionTag, parentSessionTag, clientHint } = extractPulseMeta(
         req,
         workspaceHint,
+        surfaceOpts?.fallbackSessionId,
       );
       return withLivePulse(localSurface, {
         db: engine!.db,
@@ -531,14 +549,26 @@ export async function startMindServer(
           }
           const principal = authenticate(req, { allowCookie: false });
           actorId = principal.actor.id;
-          const surface = createSurface(principal, req);
+          const parsedBody = await readJsonBody(req);
+          const incomingMcpSession =
+            typeof req.headers["mcp-session-id"] === "string"
+              ? req.headers["mcp-session-id"].trim()
+              : "";
+          const isInitializeCall = parsedBody.method === "initialize";
+          let issuedMcpSessionId: string | null = null;
+          if (enableMcpSessionHeader && isInitializeCall && !incomingMcpSession) {
+            issuedMcpSessionId = crypto.randomUUID();
+            res.setHeader("Mcp-Session-Id", issuedMcpSessionId);
+          }
+          const surface = createSurface(principal, req, {
+            fallbackSessionId: issuedMcpSessionId,
+          });
           const mcpServer = createSurfaceMcpServer(surface);
           const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: undefined,
           });
           await mcpServer.connect(transport);
           try {
-            const parsedBody = await readJsonBody(req);
             await transport.handleRequest(req, res, parsedBody);
           } finally {
             await transport.close();
