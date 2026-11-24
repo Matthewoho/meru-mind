@@ -64,6 +64,8 @@ export interface RemoteMindSurfaceOptions {
   workspaceHint?: string | null;
   /** Optional client session tag for MindPulse (`X-Meru-Session-Id`); defaults to `MERU_MIND_SESSION_ID` env */
   sessionId?: string | null;
+  /** Optional same-principal parent session tag for MindPulse collaborator tree (`X-Meru-Parent-Session-Id`); defaults to `MERU_MIND_PARENT_SESSION_ID` env */
+  parentSessionId?: string | null;
   /** Optional self-reported client hint for MindPulse (`X-Meru-Client`); defaults to `MERU_MIND_CLIENT` env */
   clientHint?: string | null;
   fetchImpl?: typeof fetch;
@@ -80,6 +82,7 @@ export class RemoteMindSurface implements MindSurface {
   private readonly token: string;
   private readonly workspaceHint: string | null;
   private readonly sessionId: string | null;
+  private readonly parentSessionId: string | null;
   private readonly clientHint: string | null;
   private readonly fetchImpl: typeof fetch;
   private lastReadSeq = 0;
@@ -95,6 +98,10 @@ export class RemoteMindSurface implements MindSurface {
       options.sessionId !== undefined
         ? options.sessionId
         : (process.env.MERU_MIND_SESSION_ID?.trim() || null);
+    this.parentSessionId =
+      options.parentSessionId !== undefined
+        ? options.parentSessionId
+        : (process.env.MERU_MIND_PARENT_SESSION_ID?.trim() || null);
     this.clientHint =
       options.clientHint !== undefined
         ? options.clientHint
@@ -165,6 +172,9 @@ export class RemoteMindSurface implements MindSurface {
         : {}),
       ...(this.sessionId
         ? { "X-Meru-Session-Id": this.sessionId }
+        : {}),
+      ...(this.parentSessionId
+        ? { "X-Meru-Parent-Session-Id": this.parentSessionId }
         : {}),
       ...(this.clientHint
         ? { "X-Meru-Client": this.clientHint }

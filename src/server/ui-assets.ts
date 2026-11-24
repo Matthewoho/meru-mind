@@ -2369,13 +2369,14 @@ function render() {
       dot.className = "pulse-dot" + (p.online ? "" : (p.active ? " active" : " idle"));
       const name = document.createElement("span");
       name.className = "pulse-name";
-      const target = p.focus?.length ? p.focus[0] : p.realmPath;
+      const target = (p.keys && p.keys.length > 0) ? p.keys[0] : (p.focus?.length ? p.focus[0] : p.realmPath);
       const clientLabel = p.clientHint ? (" · " + p.clientHint) : "";
       name.textContent = p.actorId + clientLabel + (target ? (" · " + target) : "");
       const metaParts = [
         p.actorKind || "agent",
         p.clientHint ? ("client: " + p.clientHint + " (self-reported)") : "",
-        p.online ? "online" : ("active " + formatAge(p.ageSeconds) + " ago"),
+        p.state || (p.online ? "online" : ("active " + formatAge(p.ageSeconds) + " ago")),
+        p.source ? ("source=" + p.source) : "",
         p.activity || "",
         p.note || "",
       ].filter(Boolean);

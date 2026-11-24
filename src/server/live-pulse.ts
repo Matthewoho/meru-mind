@@ -1,20 +1,23 @@
 import type { DbPort } from "../ports.js";
 import type { MindSurface } from "../surface.js";
-import type { Principal, ShowResult } from "../types.js";
+import type { Principal, PulseMode, ShowResult } from "../types.js";
 import type { MindPulseStore } from "./pulse.js";
+import { extractDeterministicKeysFromText } from "./pulse-keys.js";
 
 export interface LivePulseSessionContext {
   db: DbPort;
   pulseStore: MindPulseStore;
   principal: Principal;
   sessionTag: string;
+  parentSessionTag?: string | null;
   clientHint: string | null;
 }
 
 /**
  * Wraps a `MindSurface` at the single `http-server.ts:createSurface` seam so BOTH
- * REST (`/v1/*`) and Streamable HTTP MCP (`/mcp`) get passive MindPulse observation
- * and `show <realm>` `activePeers` without JSON-RPC sniffing or mutating `LocalMindSurface`.
+ * REST (`/v1/*`) and Streamable HTTP MCP (`/mcp`) get passive MindPulse observation,
+ * deterministic key extraction, and `show <realm|object>` `activePeers` without
+ * JSON-RPC sniffing or mutating `LocalMindSurface`.
  *
  * Structural guarantees:
  * - `write()` observes strictly AFTER commit and NEVER reads `pulseStore` (Invariant #2).
@@ -29,16 +32,21 @@ export function withLivePulse(
     realmId?: string | null;
     realmRef?: string | null;
     activity?: string | null;
+    keys?: string[];
+    mode?: PulseMode;
   }): void => {
     try {
       ctx.pulseStore.observe({
         db: ctx.db,
         principal: ctx.principal,
         sessionTag: ctx.sessionTag,
+        parentSessionTag: ctx.parentSessionTag ?? null,
         clientHint: ctx.clientHint,
         realmId: opts?.realmId ?? null,
         realmRef: opts?.realmRef ?? null,
         activity: opts?.activity ?? null,
+        keys: opts?.keys,
+        mode: opts?.mode,
       });
     } catch {
       // Never allow ephemeral telemetry failures to disrupt committed reads/writes
@@ -93,22 +101,36 @@ export function withLivePulse(
         return out;
       }
       if (out.refType === "object") {
+        const objKey = `${out.card.kind}:${out.card.name}`;
         safeObserve({
           realmId: out.card.object?.realmId ?? null,
-          activity: out.card.object
-            ? `inspecting ${out.card.kind}:${out.card.name}`
-            : null,
+          activity: out.card.object ? `inspecting ${objKey}` : null,
+          keys: out.card.object ? [objKey] : undefined,
         });
+        try {
+          const activePeers = ctx.pulseStore.listActivePeersForTarget({
+            db: ctx.db,
+            principal: ctx.principal,
+            targetKey: objKey,
+            excludeSessionTag: ctx.sessionTag,
+            limit: 5,
+          });
+          if (activePeers.length > 0) {
+            return { ...out, activePeers };
+          }
+        } catch {
+          // Swallow peer-lookup errors; return canonical object card cleanly
+        }
         return out;
       }
       if (out.refType === "entry") {
         const entry = out.entry;
         if (entry.kind === "record") {
+          const safe = isPublicOrInternal(entry.record.sensitivity);
           safeObserve({
             realmId: entry.record.realmId,
-            activity: isPublicOrInternal(entry.record.sensitivity)
-              ? `reading "${entry.record.title}"`
-              : null,
+            activity: safe ? `reading "${entry.record.title}"` : null,
+            keys: safe ? extractDeterministicKeysFromText(entry.record.title) : undefined,
           });
         } else if (entry.kind === "seabed") {
           safeObserve({
@@ -132,6 +154,7 @@ export function withLivePulse(
         safeObserve({
           realmId: out.file.realmId,
           activity: `reading file:${baseName}`,
+          keys: [`file:${baseName}`],
         });
         return out;
       }
@@ -145,6 +168,7 @@ export function withLivePulse(
         safeObserve({
           realmRef: params.in.trim(),
           activity: `searching "${params.query}"`,
+          keys: extractDeterministicKeysFromText(params.query),
         });
       } else {
         safeObserve();
@@ -158,11 +182,20 @@ export function withLivePulse(
     async write(params) {
       const out = await inner.write(params);
       // Strictly post-commit and write-only into pulseStore (never calls listVisible)
+      const safe = isPublicOrInternal(out.record.sensitivity);
+      const writeKeys = safe
+        ? [
+            ...(params.about ?? []),
+            ...extractDeterministicKeysFromText(out.record.title),
+          ]
+        : [];
       safeObserve({
         realmId: out.record.realmId,
-        activity: isPublicOrInternal(out.record.sensitivity)
+        activity: safe
           ? `wrote ${out.record.kind}: "${out.record.title}"`
           : "wrote entry",
+        keys: writeKeys.length > 0 ? writeKeys : undefined,
+        mode: "working",
       });
       return out;
     },
@@ -174,6 +207,7 @@ export function withLivePulse(
         activity: isPublicOrInternal(out.sensitivity)
           ? `added raw (${out.kind})`
           : "added raw entry",
+        mode: "working",
       });
       return out;
     },

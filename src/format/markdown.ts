@@ -917,31 +917,68 @@ function formatRelativeAge(ageSeconds: number): string {
   return `${Math.floor(mins / 60)}h ago`;
 }
 
+function formatActivePeersBlock(activePeers?: ShowResult extends never ? never : Array<{
+  sessionId: string;
+  actorId: string;
+  actorKind: string;
+  clientHint: string | null;
+  realmPath: string;
+  focus: string[];
+  keys?: string[];
+  matchedKeys?: string[];
+  note: string | null;
+  activity?: string | null;
+  mode?: string;
+  state?: string;
+  source?: string;
+  ageSeconds: number;
+  online: boolean;
+}>): string[] {
+  if (!activePeers || activePeers.length === 0) return [];
+  return [
+    "",
+    `## Active Peers (${activePeers.length})`,
+    ...activePeers.map((p) => {
+      const handle = `#${p.sessionId.replace(/^ps_/, "").slice(0, 4)}`;
+      const clientPart = p.clientHint
+        ? `${p.actorKind}, ${p.clientHint} ${handle}`
+        : `${p.actorKind} ${handle}`;
+      const who = `${p.actorId} (${clientPart})`;
+      const status =
+        p.state === "turn_ended"
+          ? `turn-ended ${formatRelativeAge(p.ageSeconds)}`
+          : p.state === "silent"
+            ? `silent ${formatRelativeAge(p.ageSeconds)}`
+            : p.online
+              ? p.mode === "working"
+                ? "working"
+                : "online"
+              : `active ${formatRelativeAge(p.ageSeconds)}`;
+      const extraFocus = p.focus.filter((f) => f && f !== p.realmPath);
+      const keysLabel =
+        p.matchedKeys && p.matchedKeys.length > 0
+          ? `keys: ${p.matchedKeys.join(", ")}`
+          : p.keys && p.keys.length > 0
+            ? `keys: ${p.keys.slice(0, 3).join(", ")}`
+            : "";
+      const sourceLabel = p.source ? `source=${p.source}` : "";
+      const details = [
+        sourceLabel,
+        keysLabel,
+        p.activity ? p.activity : "",
+        !keysLabel && extraFocus.length > 0 ? `focus: ${extraFocus.join(", ")}` : "",
+        p.note ? `"${p.note}"` : "",
+      ].filter(Boolean);
+      return `- ${who} · ${status}${details.length > 0 ? ` · ${details.join(" · ")}` : ""}`;
+    }),
+  ];
+}
+
 export function formatShowMarkdown(res: ShowResult): string {
   if (res.refType === "realm") {
     const base = formatBriefMarkdown(res.brief);
-    if (!res.activePeers || res.activePeers.length === 0) {
-      return base;
-    }
-    const peerLines = [
-      "",
-      `## Active Peers (${res.activePeers.length})`,
-      ...res.activePeers.map((p) => {
-        const handle = `#${p.sessionId.replace(/^ps_/, "").slice(0, 4)}`;
-        const clientPart = p.clientHint
-          ? `${p.actorKind}, ${p.clientHint} ${handle}`
-          : `${p.actorKind} ${handle}`;
-        const who = `${p.actorId} (${clientPart})`;
-        const age = p.online ? "online" : `active ${formatRelativeAge(p.ageSeconds)}`;
-        const extraFocus = p.focus.filter((f) => f && f !== p.realmPath);
-        const details = [
-          p.activity ? p.activity : "",
-          extraFocus.length > 0 ? `focus: ${extraFocus.join(", ")}` : "",
-          p.note ? `"${p.note}"` : "",
-        ].filter(Boolean);
-        return `- ${who} · ${age}${details.length > 0 ? ` · ${details.join(" · ")}` : ""}`;
-      }),
-    ];
+    const peerLines = formatActivePeersBlock(res.activePeers);
+    if (peerLines.length === 0) return base;
     return `${base}\n${peerLines.join("\n")}`;
   }
   if (res.refType === "object") {
@@ -978,6 +1015,10 @@ export function formatShowMarkdown(res: ShowResult): string {
       for (const item of c.recentEntries) {
         lines.push(formatLsEntryLine(item));
       }
+    }
+    const peerLines = formatActivePeersBlock(res.activePeers);
+    if (peerLines.length > 0) {
+      lines.push(...peerLines);
     }
     lines.push("", `Next: \`${c.try}\``);
     return lines.join("\n");

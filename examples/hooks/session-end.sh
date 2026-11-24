@@ -41,7 +41,9 @@ DEFAULT_SESSION="${PARSED_SESSION:-${REPO_NAME}${GIT_BRANCH:+@${GIT_BRANCH}}}"
 SESSION_ID="$(printf '%s' "${MERU_MIND_SESSION_ID:-$DEFAULT_SESSION}" | tr -cd 'A-Za-z0-9._:@/-' | cut -c1-64)"
 
 SAFE_KEY="$(printf '%s' "$SESSION_ID" | tr -cd 'A-Za-z0-9._-' | cut -c1-48)"
-rm -f "${TMPDIR:-/tmp}/meru-mind-pulse-${SAFE_KEY:-default}.stamp" >/dev/null 2>&1 || true
+rm -f "${TMPDIR:-/tmp}/meru-mind-pulse-${SAFE_KEY:-default}.stamp" \
+      "${TMPDIR:-/tmp}/meru-mind-pulse-${SAFE_KEY:-default}.json" \
+      "${TMPDIR:-/tmp}/meru-mind-seen-${SAFE_KEY:-default}.json" >/dev/null 2>&1 || true
 
 PAYLOAD="$(printf '{"sessionId":"%s"}' "$SESSION_ID")"
 

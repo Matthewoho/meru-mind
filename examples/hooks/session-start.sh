@@ -78,8 +78,24 @@ export MERU_MIND_SESSION_ID="${SESSION_ID:-default}"
 
 if [[ -n "${MERU_MIND_URL:-}" && -n "${MERU_MIND_TOKEN:-}" ]] && command -v node >/dev/null 2>&1; then
   PAYLOAD="$(
-    SESSION_ID="$MERU_MIND_SESSION_ID" CLIENT_HINT="$CLIENT_HINT" REALM_PATH="$REALM_PATH" AUTO_NOTE="$AUTO_NOTE" \
-      node -e 'process.stdout.write(JSON.stringify({ sessionId: process.env.SESSION_ID, clientHint: process.env.CLIENT_HINT, realmRef: process.env.REALM_PATH, focus: [process.env.REALM_PATH], note: (process.env.AUTO_NOTE || "").slice(0, 140) || null }));'
+    SESSION_ID="$MERU_MIND_SESSION_ID" PARENT_ID="${MERU_MIND_PARENT_SESSION_ID:-}" CLIENT_HINT="$CLIENT_HINT" REALM_PATH="$REALM_PATH" AUTO_NOTE="$AUTO_NOTE" REPO_NAME="$REPO_NAME" GIT_BRANCH="$GIT_BRANCH" \
+      node -e '
+        const keys = [];
+        if (process.env.REPO_NAME && process.env.GIT_BRANCH && !["main","master","HEAD","develop","dev"].includes(process.env.GIT_BRANCH)) {
+          keys.push(`${process.env.REPO_NAME}@${process.env.GIT_BRANCH}`);
+        }
+        const body = {
+          sessionId: process.env.SESSION_ID,
+          ...(process.env.PARENT_ID ? { parentSessionId: process.env.PARENT_ID } : {}),
+          clientHint: process.env.CLIENT_HINT,
+          realmRef: process.env.REALM_PATH,
+          focus: [process.env.REALM_PATH],
+          keys,
+          note: (process.env.AUTO_NOTE || "").slice(0, 140) || null,
+          source: "hook",
+        };
+        process.stdout.write(JSON.stringify(body));
+      '
   )"
   curl -fsS -m 3 -X POST "${MERU_MIND_URL%/}/v1/pulse" \
     -H "Authorization: Bearer ${MERU_MIND_TOKEN}" \

@@ -48,6 +48,9 @@ const STUDIO_I18N = {
     htmlHide: "Show raw source",
     payload: "Structured Payload",
     activeHere: "Active here",
+    inFlight: "In Flight",
+    unkeyedBucket: "Unkeyed",
+    collisionNote: "independent sessions working",
     sessionsPlural: "sessions",
     sessionSingle: "session",
     hereTag: "Here",
@@ -72,6 +75,9 @@ const STUDIO_I18N = {
     htmlHide: "查看源码",
     payload: "结构化 Payload",
     activeHere: "同域活跃",
+    inFlight: "正在进行",
+    unkeyedBucket: "未挂事",
+    collisionNote: "个独立会话同时施工",
     sessionsPlural: "个会话",
     sessionSingle: "个会话",
     hereTag: "当前域",
@@ -192,6 +198,8 @@ const ICONS = {
   close: () => makeSvg(["M18 6L6 18", "M6 6l12 12"], 15),
   menu: () => makeSvg(["M4 7h16", "M4 12h16", "M4 17h16"], 16),
   logout: () => makeSvg(["M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4", "M16 17l5-5-5-5", "M21 12H9"], 14),
+  work: () => makeSvg(["M6 3v12", "M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M18 9a9 9 0 0 1-9 9"], 13),
+  collision: () => makeSvg(["M16 3h5v5", "M4 20L21 3", "M21 16v5h-5", "M15 15l6 6", "M4 4l5 5"], 13),
 };
 
 const app = document.getElementById("app");
@@ -218,6 +226,8 @@ const state = {
   showLedgerHistory: false,
   inboxEntries: [],
   pulses: [],
+  inFlight: [],
+  unkeyedCount: 0,
   selfPulseSessionId: null,
   selectedEntry: null,
   selectedChain: null,
@@ -387,7 +397,11 @@ async function selectRealm(realmPath, preferredTab) {
   const selfPulse = await client.pulse.setFocus([realmPath], null, realmPath, "browser").catch(() => null);
   if (selfPulse?.sessionId) state.selfPulseSessionId = selfPulse.sessionId;
   const pulseRes = await client.pulse.list().catch(() => null);
-  if (pulseRes?.pulses) state.pulses = pulseRes.pulses;
+  if (pulseRes?.pulses) {
+    state.pulses = pulseRes.pulses;
+    state.inFlight = Array.isArray(pulseRes.inFlight) ? pulseRes.inFlight : [];
+    state.unkeyedCount = typeof pulseRes.unkeyedCount === "number" ? pulseRes.unkeyedCount : 0;
+  }
   render();
 }
 
@@ -445,6 +459,8 @@ async function refreshAll() {
   state.realms = treeRes.realms || [];
   state.realmCounts = flattenRealmTreeCounts(treeRes.realmTree || []);
   state.pulses = pulseRes.pulses || [];
+  state.inFlight = Array.isArray(pulseRes.inFlight) ? pulseRes.inFlight : [];
+  state.unkeyedCount = typeof pulseRes.unkeyedCount === "number" ? pulseRes.unkeyedCount : 0;
   state.hasInboxRealm = state.realms.some((r) => r.path === "/inbox");
   if (state.hasInboxRealm) {
     const lsInbox = await client.ls({ ref: "/inbox", only: "entries", limit: 50 }).catch(() => ({ items: [] }));
@@ -545,6 +561,16 @@ function buildSidebar() {
   realmLabel.textContent = st("realms");
   scroll.appendChild(realmLabel);
 
+  const realmPeerStatus = new Map();
+  for (const p of state.pulses || []) {
+    if (!p.active || p.sessionId === state.selfPulseSessionId) continue;
+    const prev = realmPeerStatus.get(p.realmPath);
+    const next = (p.state === "working" || p.online) ? "online" : "active";
+    if (!prev || next === "online") {
+      realmPeerStatus.set(p.realmPath, next);
+    }
+  }
+
   for (const r of state.realms) {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -572,40 +598,118 @@ function buildSidebar() {
     left.appendChild(name);
     btn.appendChild(left);
 
+    const rightMeta = document.createElement("span");
+    rightMeta.className = "realm-row-right";
+    const peerTone = realmPeerStatus.get(r.path);
+    if (peerTone) {
+      const liveDot = document.createElement("span");
+      liveDot.className = "status-dot" + (peerTone === "online" ? "" : " active");
+      liveDot.dataset.ui = "realm-live-dot";
+      liveDot.title = st("activeHere");
+      rightMeta.appendChild(liveDot);
+    }
+
     const rc = state.realmCounts[r.path];
     if (r.path === "/inbox" && state.inboxEntries.length > 0) {
       const cnt = document.createElement("span");
       cnt.className = "queue-count";
       cnt.textContent = String(state.inboxEntries.length);
-      btn.appendChild(cnt);
+      rightMeta.appendChild(cnt);
     } else if (rc && (rc.subtreeConclusions || rc.directConclusions)) {
       const cnt = document.createElement("span");
       cnt.className = "realm-count-muted";
       cnt.textContent = fmtNum(r.path === "/" ? rc.subtreeConclusions : (rc.directConclusions || rc.subtreeConclusions));
-      btn.appendChild(cnt);
+      rightMeta.appendChild(cnt);
+    }
+    if (rightMeta.childNodes.length > 0) {
+      btn.appendChild(rightMeta);
     }
 
     btn.addEventListener("click", () => { void selectRealm(r.path); });
     scroll.appendChild(btn);
   }
 
+  const inFlight = state.inFlight || [];
+  const unkeyedPulses = (state.pulses || []).filter((p) => !p.keys || p.keys.length === 0);
+
   const focusLabel = document.createElement("div");
   focusLabel.className = "nav-group-label";
-  focusLabel.textContent = st("activeFocus");
+  focusLabel.textContent = inFlight.length > 0 ? st("inFlight") : st("activeFocus");
   scroll.appendChild(focusLabel);
 
-  const actorGroups = groupPulsesByActor(state.pulses);
-  if (actorGroups.length === 0) {
-    const dash = document.createElement("div");
-    dash.className = "nav-group-label";
-    dash.textContent = "-";
-    scroll.appendChild(dash);
-  } else {
-    for (const g of actorGroups) {
+  if (inFlight.length > 0) {
+    for (const w of inFlight.slice(0, 8)) {
       const row = document.createElement("div");
-      row.className = "member-row";
-      row.dataset.actorId = g.actorId;
+      row.className = "member-row work-flight-row" + (w.hasCollision ? " has-collision" : "");
+      row.dataset.workKey = w.key;
       row.tabIndex = 0;
+
+      const left = document.createElement("div");
+      left.className = "member-left";
+      const av = document.createElement("span");
+      av.className = "member-avatar" + (w.hasCollision ? " collision" : "");
+      av.appendChild(w.hasCollision ? ICONS.collision() : ICONS.work());
+      const nm = document.createElement("span");
+      nm.className = "member-name";
+      nm.textContent = w.label;
+      const anyOnline = w.participants.some((p) => p.online || p.state === "working");
+      const anyActive = w.participants.some((p) => p.active);
+      const dot = document.createElement("span");
+      dot.className = "status-dot" + (w.hasCollision ? " collision" : (anyOnline ? "" : (anyActive ? " active" : " idle")));
+      const tip = [
+        w.key,
+        w.hasCollision ? (w.workingRoots + " " + st("collisionNote")) : (w.participants.length + " " + (w.participants.length === 1 ? st("sessionSingle") : st("sessionsPlural"))),
+        w.realms.join(", "),
+      ].filter(Boolean).join(" · ");
+      row.title = tip;
+      dot.title = tip;
+      left.appendChild(av);
+      left.appendChild(nm);
+      left.appendChild(dot);
+
+      const rightWrap = document.createElement("div");
+      rightWrap.className = "member-right";
+      if (w.participants.length > 1) {
+        const cnt = document.createElement("span");
+        cnt.className = "realm-count-muted";
+        cnt.textContent = String(w.participants.length);
+        rightWrap.appendChild(cnt);
+      }
+      const dotsBtn = document.createElement("button");
+      dotsBtn.type = "button";
+      dotsBtn.className = "row-dots-btn";
+      dotsBtn.title = "Inspect in-flight work";
+      dotsBtn.setAttribute("aria-label", "Inspect " + w.label);
+      dotsBtn.appendChild(ICONS.dots());
+      dotsBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const rect = dotsBtn.getBoundingClientRect();
+        state.popover = { kind: "work-card", x: rect.right + 6, y: rect.top, work: w };
+        render();
+      });
+      rightWrap.appendChild(dotsBtn);
+
+      row.appendChild(left);
+      row.appendChild(rightWrap);
+      row.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const rect = row.getBoundingClientRect();
+        state.popover = { kind: "work-card", x: rect.right + 8, y: rect.top, work: w };
+        render();
+      });
+      row.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        state.popover = { kind: "work-card", x: ev.clientX, y: ev.clientY, work: w };
+        render();
+      });
+      scroll.appendChild(row);
+    }
+
+    if (unkeyedPulses.length > 0) {
+      const unkeyedRow = document.createElement("div");
+      unkeyedRow.className = "member-row unkeyed-bucket-row";
+      unkeyedRow.dataset.ui = "unkeyed-bucket";
+      unkeyedRow.tabIndex = 0;
 
       const left = document.createElement("div");
       left.className = "member-left";
@@ -614,51 +718,103 @@ function buildSidebar() {
       av.appendChild(ICONS.user());
       const nm = document.createElement("span");
       nm.className = "member-name";
-      nm.textContent = g.actorId;
+      nm.textContent = st("unkeyedBucket");
+      const anyOnline = unkeyedPulses.some((p) => p.online);
       const dot = document.createElement("span");
-      dot.className = "status-dot" + (g.online ? "" : (g.active ? " active" : " idle"));
-      const sessionSummary = g.sessions
-        .map((s) => {
-          const client = s.clientHint || s.actorKind || "session";
-          const detail = s.activity || s.note || s.realmPath || "/";
-          return client + " (" + detail + ")";
-        })
-        .join(", ");
-      const countLabel = g.sessions.length + " " + (g.sessions.length === 1 ? st("sessionSingle") : st("sessionsPlural"));
-      const tip = [g.actorId, g.actorKind, countLabel, sessionSummary].filter(Boolean).join(" · ");
-      dot.title = tip;
-      row.title = tip;
+      dot.className = "status-dot" + (anyOnline ? "" : " active");
       left.appendChild(av);
       left.appendChild(nm);
       left.appendChild(dot);
 
-      const dotsBtn = document.createElement("button");
-      dotsBtn.type = "button";
-      dotsBtn.className = "row-dots-btn";
-      dotsBtn.title = "Member actions";
-      dotsBtn.setAttribute("aria-label", "Actions for " + g.actorId);
-      dotsBtn.appendChild(ICONS.dots());
-      dotsBtn.addEventListener("click", (ev) => {
+      const cnt = document.createElement("span");
+      cnt.className = "realm-count-muted";
+      cnt.textContent = String(unkeyedPulses.length);
+
+      unkeyedRow.appendChild(left);
+      unkeyedRow.appendChild(cnt);
+      const bucketGroup = {
+        actorId: st("unkeyedBucket"),
+        actorKind: "unkeyed",
+        online: anyOnline,
+        active: true,
+        sessions: unkeyedPulses,
+      };
+      unkeyedRow.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        const rect = dotsBtn.getBoundingClientRect();
-        state.popover = { kind: "member-menu", x: rect.right + 6, y: rect.top, group: g, pulse: g.sessions[0] };
+        const rect = unkeyedRow.getBoundingClientRect();
+        state.popover = { kind: "member-card", x: rect.right + 8, y: rect.top, group: bucketGroup };
         render();
       });
+      scroll.appendChild(unkeyedRow);
+    }
+  } else {
+    const actorGroups = groupPulsesByActor(state.pulses);
+    if (actorGroups.length === 0) {
+      const dash = document.createElement("div");
+      dash.className = "nav-group-label";
+      dash.textContent = "-";
+      scroll.appendChild(dash);
+    } else {
+      for (const g of actorGroups) {
+        const row = document.createElement("div");
+        row.className = "member-row";
+        row.dataset.actorId = g.actorId;
+        row.tabIndex = 0;
 
-      row.appendChild(left);
-      row.appendChild(dotsBtn);
+        const left = document.createElement("div");
+        left.className = "member-left";
+        const av = document.createElement("span");
+        av.className = "member-avatar";
+        av.appendChild(ICONS.user());
+        const nm = document.createElement("span");
+        nm.className = "member-name";
+        nm.textContent = g.actorId;
+        const dot = document.createElement("span");
+        dot.className = "status-dot" + (g.online ? "" : (g.active ? " active" : " idle"));
+        const sessionSummary = g.sessions
+          .map((s) => {
+            const client = s.clientHint || s.actorKind || "session";
+            const detail = s.activity || s.note || s.realmPath || "/";
+            return client + " (" + detail + ")";
+          })
+          .join(", ");
+        const countLabel = g.sessions.length + " " + (g.sessions.length === 1 ? st("sessionSingle") : st("sessionsPlural"));
+        const tip = [g.actorId, g.actorKind, countLabel, sessionSummary].filter(Boolean).join(" · ");
+        dot.title = tip;
+        row.title = tip;
+        left.appendChild(av);
+        left.appendChild(nm);
+        left.appendChild(dot);
 
-      row.addEventListener("click", () => {
-        const rect = row.getBoundingClientRect();
-        state.popover = { kind: "member-card", x: rect.right + 8, y: rect.top, group: g, pulse: g.sessions[0] };
-        render();
-      });
-      row.addEventListener("contextmenu", (ev) => {
-        ev.preventDefault();
-        state.popover = { kind: "member-menu", x: ev.clientX, y: ev.clientY, group: g, pulse: g.sessions[0] };
-        render();
-      });
-      scroll.appendChild(row);
+        const dotsBtn = document.createElement("button");
+        dotsBtn.type = "button";
+        dotsBtn.className = "row-dots-btn";
+        dotsBtn.title = "Member actions";
+        dotsBtn.setAttribute("aria-label", "Actions for " + g.actorId);
+        dotsBtn.appendChild(ICONS.dots());
+        dotsBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const rect = dotsBtn.getBoundingClientRect();
+          state.popover = { kind: "member-menu", x: rect.right + 6, y: rect.top, group: g, pulse: g.sessions[0] };
+          render();
+        });
+
+        row.appendChild(left);
+        row.appendChild(dotsBtn);
+
+        row.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const rect = row.getBoundingClientRect();
+          state.popover = { kind: "member-card", x: rect.right + 8, y: rect.top, group: g, pulse: g.sessions[0] };
+          render();
+        });
+        row.addEventListener("contextmenu", (ev) => {
+          ev.preventDefault();
+          state.popover = { kind: "member-menu", x: ev.clientX, y: ev.clientY, group: g, pulse: g.sessions[0] };
+          render();
+        });
+        scroll.appendChild(row);
+      }
     }
   }
 
@@ -1630,16 +1786,135 @@ function buildInspector() {
 
 /* ==================== Popovers & Modals ==================== */
 
+function formatSessionStateBadge(s) {
+  if (s.state === "turn_ended") return "Turn ended " + formatPulseAge(s.ageSeconds) + " ago";
+  if (s.state === "silent") return "Silent " + formatPulseAge(s.ageSeconds) + " ago";
+  if (s.state === "working" || (s.online && s.mode === "working")) return "Working";
+  if (s.online) return "Online";
+  if (s.active) return "Active " + formatPulseAge(s.ageSeconds) + " ago";
+  return "Quiet " + formatPulseAge(s.ageSeconds) + " ago";
+}
+
+function buildPopoverSessionItem(s, opts = {}) {
+  const item = document.createElement("div");
+  item.className = "popover-session-item" + (opts.isChild ? " is-child" : "");
+
+  const topRow = document.createElement("div");
+  topRow.className = "popover-session-top";
+  const leftMeta = document.createElement("span");
+  leftMeta.className = "popover-session-client";
+  const sDot = document.createElement("span");
+  sDot.className = "status-dot" + (
+    s.state === "working" || s.online ? "" : (s.state === "turn_ended" ? " paused" : (s.active ? " active" : " idle"))
+  );
+  const clientText = document.createElement("span");
+  const whoPrefix = opts.showActor ? (s.actorId + " · ") : "";
+  clientText.textContent = whoPrefix + (s.clientHint || s.actorKind || "session") + " " + shortSessionHandle(s.sessionId);
+  leftMeta.appendChild(sDot);
+  leftMeta.appendChild(clientText);
+
+  const ageMeta = document.createElement("span");
+  ageMeta.className = "popover-session-age";
+  ageMeta.textContent = formatSessionStateBadge(s);
+  topRow.appendChild(leftMeta);
+  topRow.appendChild(ageMeta);
+  item.appendChild(topRow);
+
+  if (s.source || s.mode) {
+    const prov = document.createElement("div");
+    prov.className = "popover-session-meta";
+    prov.textContent = [s.mode, s.source ? ("source=" + s.source) : ""].filter(Boolean).join(" · ");
+    item.appendChild(prov);
+  }
+
+  if (s.activity) {
+    const actEl = document.createElement("div");
+    actEl.className = "popover-session-activity";
+    actEl.textContent = s.activity;
+    item.appendChild(actEl);
+  }
+
+  if (s.note) {
+    const noteEl = document.createElement("div");
+    noteEl.className = "popover-session-note";
+    noteEl.textContent = s.note;
+    item.appendChild(noteEl);
+  }
+
+  const targetRealm = s.realmPath || (s.focus && s.focus[0]) || "/";
+  const realmBtn = document.createElement("button");
+  realmBtn.type = "button";
+  realmBtn.className = "popover-session-realm";
+  realmBtn.appendChild(ICONS.arrowRight());
+  const rSpan = document.createElement("span");
+  rSpan.textContent = targetRealm === state.activeRealmPath
+    ? (targetRealm + " · " + st("hereTag"))
+    : targetRealm;
+  realmBtn.appendChild(rSpan);
+  realmBtn.addEventListener("click", () => {
+    state.popover = null;
+    void selectRealm(targetRealm);
+  });
+  item.appendChild(realmBtn);
+  return item;
+}
+
 function renderPopover() {
   if (!state.popover) return null;
-  const isMemberCard = state.popover.kind === "member-card";
+  const isWideCard = state.popover.kind === "member-card" || state.popover.kind === "work-card";
   const pop = document.createElement("div");
-  pop.className = "floating-popover" + (isMemberCard ? " wide" : "");
-  const maxX = Math.max(12, window.innerWidth - (isMemberCard ? 356 : 292));
-  const maxY = Math.max(12, window.innerHeight - (isMemberCard ? 320 : 200));
+  pop.className = "floating-popover" + (isWideCard ? " wide" : "");
+  const maxX = Math.max(12, window.innerWidth - (isWideCard ? 356 : 292));
+  const maxY = Math.max(12, window.innerHeight - (isWideCard ? 404 : 200));
   pop.style.left = Math.min(Math.max(12, state.popover.x), maxX) + "px";
   pop.style.top = Math.min(Math.max(12, state.popover.y), maxY) + "px";
   pop.addEventListener("click", (ev) => ev.stopPropagation());
+
+  if (state.popover.kind === "work-card" && state.popover.work) {
+    const w = state.popover.work;
+    const head = document.createElement("div");
+    head.className = "popover-head";
+    const nm = document.createElement("div");
+    nm.className = "popover-name";
+    nm.textContent = w.label;
+    const sub = document.createElement("div");
+    sub.className = "popover-sub" + (w.hasCollision ? " collision" : "");
+    sub.textContent = w.hasCollision
+      ? (w.key + " · " + w.workingRoots + " " + st("collisionNote"))
+      : (w.key + " · " + w.participants.length + " " + (w.participants.length === 1 ? st("sessionSingle") : st("sessionsPlural")));
+    head.appendChild(nm);
+    head.appendChild(sub);
+    pop.appendChild(head);
+
+    // Order participants as parent -> children tree (pure read-only projection)
+    const byId = new Map(w.participants.map((p) => [p.sessionId, p]));
+    const childrenByParent = new Map();
+    const roots = [];
+    for (const p of w.participants) {
+      if (p.parentSessionId && byId.has(p.parentSessionId)) {
+        let arr = childrenByParent.get(p.parentSessionId);
+        if (!arr) {
+          arr = [];
+          childrenByParent.set(p.parentSessionId, arr);
+        }
+        arr.push(p);
+      } else {
+        roots.push(p);
+      }
+    }
+
+    const list = document.createElement("div");
+    list.className = "popover-session-list";
+    for (const r of roots) {
+      list.appendChild(buildPopoverSessionItem(r, { showActor: true, isChild: false }));
+      const kids = childrenByParent.get(r.sessionId) || [];
+      for (const k of kids) {
+        list.appendChild(buildPopoverSessionItem(k, { showActor: true, isChild: true }));
+      }
+    }
+    pop.appendChild(list);
+    return pop;
+  }
 
   if (state.popover.kind === "profile") {
     const head = document.createElement("div");
@@ -1697,60 +1972,7 @@ function renderPopover() {
     const list = document.createElement("div");
     list.className = "popover-session-list";
     for (const s of group.sessions) {
-      const item = document.createElement("div");
-      item.className = "popover-session-item";
-
-      const topRow = document.createElement("div");
-      topRow.className = "popover-session-top";
-      const leftMeta = document.createElement("span");
-      leftMeta.className = "popover-session-client";
-      const sDot = document.createElement("span");
-      sDot.className = "status-dot" + (s.online ? "" : (s.active ? " active" : " idle"));
-      const clientText = document.createElement("span");
-      clientText.textContent = (s.clientHint || s.actorKind || "session") + " " + shortSessionHandle(s.sessionId);
-      leftMeta.appendChild(sDot);
-      leftMeta.appendChild(clientText);
-
-      const ageMeta = document.createElement("span");
-      ageMeta.className = "popover-session-age";
-      ageMeta.textContent = s.online
-        ? "Online"
-        : (s.active ? ("Active " + formatPulseAge(s.ageSeconds) + " ago") : ("Idle " + formatPulseAge(s.ageSeconds) + " ago"));
-      topRow.appendChild(leftMeta);
-      topRow.appendChild(ageMeta);
-      item.appendChild(topRow);
-
-      if (s.activity) {
-        const actEl = document.createElement("div");
-        actEl.className = "popover-session-activity";
-        actEl.textContent = s.activity;
-        item.appendChild(actEl);
-      }
-
-      if (s.note) {
-        const noteEl = document.createElement("div");
-        noteEl.className = "popover-session-note";
-        noteEl.textContent = s.note;
-        item.appendChild(noteEl);
-      }
-
-      const targetRealm = s.realmPath || (s.focus && s.focus[0]) || "/";
-      const realmBtn = document.createElement("button");
-      realmBtn.type = "button";
-      realmBtn.className = "popover-session-realm";
-      realmBtn.appendChild(ICONS.arrowRight());
-      const rSpan = document.createElement("span");
-      rSpan.textContent = targetRealm === state.activeRealmPath
-        ? (targetRealm + " · " + st("hereTag"))
-        : targetRealm;
-      realmBtn.appendChild(rSpan);
-      realmBtn.addEventListener("click", () => {
-        state.popover = null;
-        void selectRealm(targetRealm);
-      });
-      item.appendChild(realmBtn);
-
-      list.appendChild(item);
+      list.appendChild(buildPopoverSessionItem(s, { showActor: group.actorKind === "unkeyed", isChild: Boolean(s.parentSessionId) }));
     }
     pop.appendChild(list);
     return pop;
@@ -2285,6 +2507,8 @@ async function studioPulseKeepaliveTick() {
     const pulseRes = await client.pulse.list().catch(() => null);
     if (pulseRes?.pulses) {
       state.pulses = pulseRes.pulses;
+      state.inFlight = Array.isArray(pulseRes.inFlight) ? pulseRes.inFlight : [];
+      state.unkeyedCount = typeof pulseRes.unkeyedCount === "number" ? pulseRes.unkeyedCount : 0;
       render();
     }
   } catch {

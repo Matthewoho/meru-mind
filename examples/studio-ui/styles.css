@@ -385,6 +385,34 @@ button, input, select, textarea {
   min-width: 0;
 }
 
+.member-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.realm-row-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.member-avatar.collision {
+  color: #b6554e;
+  border-color: rgba(182, 85, 78, 0.45);
+  background: rgba(182, 85, 78, 0.1);
+}
+
+.status-dot.collision {
+  background: #d97706;
+}
+.status-dot.paused {
+  background: #d97706;
+  opacity: 0.8;
+}
+
 .member-avatar {
   width: 20px;
   height: 20px;
@@ -1484,6 +1512,20 @@ button, input, select, textarea {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+.popover-session-item.is-child {
+  margin-left: 14px;
+  padding-left: 10px;
+  border-left: 1.5px solid var(--meru-border-strong);
+  border-top-style: dashed;
+}
+.popover-session-meta {
+  font-family: var(--meru-mono);
+  font-size: 11px;
+  color: var(--meru-fg-muted);
+}
+.popover-sub.collision {
+  color: #b6554e;
 }
 .popover-session-item:first-child {
   border-top: none;

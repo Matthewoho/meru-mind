@@ -864,17 +864,35 @@ export interface ObjectCard {
   try: string;
 }
 
+export type PulseMode = "observing" | "working";
+export type PulseSource = "observed" | "hook" | "host" | "declared";
+export type PulseEventKind = "turn_start" | "heartbeat" | "turn_end" | "session_end";
+export type PulseSessionState = "working" | "turn_ended" | "silent" | "active" | "quiet";
+
 export interface ActivePeerSummary {
   sessionId: string;
+  /** Optional sanitized explicit session tag for host routing (e.g. orchestrator peer routing), never contains tokens */
+  sessionTag?: string | null;
+  /** Same-principal parent external sessionId, if spawned as a sub-session */
+  parentSessionId?: string | null;
+  /** Root session ID of the collaborator tree (same root = collaborator, distinct root = potential collision) */
+  rootSessionId?: string;
   actorId: string;
   actorKind: "human" | "agent" | "system";
   /** Self-reported client label (e.g. "claude-code", "codex"); never used for auth or identity */
   clientHint: string | null;
   realmPath: string;
   focus: string[];
+  /** Deterministic normalized work/target keys (`work:linear:ENG-42`, `service:auth`, `branch:repo@fix/x`, `file:a.ts`) */
+  keys?: string[];
+  /** Keys matched against the caller's query/handshake */
+  matchedKeys?: string[];
   note: string | null;
   /** Server-observed latest safe action in this realm (e.g. `wrote decision: "..."`, `inspecting service:auth`) */
   activity?: string | null;
+  mode?: PulseMode;
+  state?: PulseSessionState;
+  source?: PulseSource;
   lastSeenAt: string;
   ageSeconds: number;
   heartbeat: boolean;
@@ -892,6 +910,7 @@ export type ShowResult =
       refType: "object";
       ref: string;
       card: ObjectCard;
+      activePeers?: ActivePeerSummary[];
     }
   | {
       refType: "entry";

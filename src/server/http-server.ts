@@ -341,6 +341,8 @@ export async function startMindServer(
     const workRegistry =
       options.workRegistry ?? WorkProviderRegistry.createDefault();
     const pulseStore = new MindPulseStore();
+    const pulseSnapshotPath = path.join(homeDir, "pulse-snapshot.json");
+    pulseStore.loadSnapshot(pulseSnapshotPath);
     const touchThrottle = new TokenTouchThrottle();
     const uiSessions = new UiSessionManager();
     const builtInUiHandler = createUiRouteHandler({
@@ -396,11 +398,20 @@ export async function startMindServer(
     const extractPulseMeta = (
       req: IncomingMessage,
       workspaceHint: string | null,
-    ): { sessionTag: string; clientHint: string | null } => {
+    ): {
+      sessionTag: string;
+      parentSessionTag: string | null;
+      clientHint: string | null;
+    } => {
       const rawClient = req.headers["x-meru-client"];
       const clientHint = sanitizeClientHint(
         typeof rawClient === "string" ? rawClient : null,
       );
+      const rawParent = req.headers["x-meru-parent-session-id"];
+      const parentSessionTag =
+        typeof rawParent === "string" && rawParent.trim()
+          ? rawParent.trim()
+          : null;
       const rawSession =
         req.headers["x-meru-session-id"] ?? req.headers["mcp-session-id"];
       const headerSession =
@@ -408,15 +419,19 @@ export async function startMindServer(
           ? rawSession.trim()
           : null;
       if (headerSession) {
-        return { sessionTag: headerSession, clientHint };
+        return { sessionTag: headerSession, parentSessionTag, clientHint };
       }
       if (clientHint || workspaceHint) {
         const fallback = [clientHint ?? "client", workspaceHint ?? ""]
           .filter(Boolean)
           .join(":");
-        return { sessionTag: fallback.slice(0, 64), clientHint };
+        return {
+          sessionTag: fallback.slice(0, 64),
+          parentSessionTag,
+          clientHint,
+        };
       }
-      return { sessionTag: "default", clientHint };
+      return { sessionTag: "default", parentSessionTag, clientHint };
     };
 
     const createSurface = (
@@ -438,12 +453,16 @@ export async function startMindServer(
         },
         ownsEngine: false,
       });
-      const { sessionTag, clientHint } = extractPulseMeta(req, workspaceHint);
+      const { sessionTag, parentSessionTag, clientHint } = extractPulseMeta(
+        req,
+        workspaceHint,
+      );
       return withLivePulse(localSurface, {
         db: engine!.db,
         pulseStore,
         principal,
         sessionTag,
+        parentSessionTag,
         clientHint,
       });
     };
@@ -866,9 +885,33 @@ export async function startMindServer(
             }
 
             if (method === "GET" && pathname === "/v1/pulse") {
+              const rawMatches = [
+                ...sp.getAll("match"),
+                ...sp.getAll("key"),
+                ...sp.getAll("focus"),
+              ]
+                .flatMap((v) => v.split(","))
+                .map((v) => v.trim())
+                .filter(Boolean);
+              const realmRef = sp.get("realm") ?? undefined;
+              const rawMode = sp.get("mode");
+              const modeFilter =
+                rawMode === "observing" || rawMode === "working"
+                  ? rawMode
+                  : undefined;
+              const headerSession =
+                typeof req.headers["x-meru-session-id"] === "string" &&
+                req.headers["x-meru-session-id"].trim()
+                  ? req.headers["x-meru-session-id"].trim()
+                  : undefined;
+              const excludeSelf = sp.get("excludeSelf") === "true" || sp.get("excludeSelf") === "1";
               const out = pulseStore.listVisibleWithNow({
                 db: engine!.db,
                 principal,
+                matchKeys: rawMatches.length > 0 ? rawMatches : undefined,
+                realmRef,
+                modeFilter,
+                excludeSessionTag: excludeSelf ? headerSession : undefined,
               });
               sendJson(res, 200, out);
               return;
@@ -877,29 +920,57 @@ export async function startMindServer(
             if (method === "POST" && pathname === "/v1/pulse") {
               const body = (await readJsonBody(req)) as {
                 sessionId?: string;
+                parentSessionId?: string | null;
                 realmRef?: string;
                 focus?: string[];
+                keys?: string[];
                 note?: string | null;
                 clientHint?: string | null;
+                mode?: string;
+                source?: string;
+                event?: string;
               };
               const headerSession =
                 typeof req.headers["x-meru-session-id"] === "string" &&
                 req.headers["x-meru-session-id"].trim()
                   ? req.headers["x-meru-session-id"].trim()
                   : undefined;
+              const headerParent =
+                typeof req.headers["x-meru-parent-session-id"] === "string" &&
+                req.headers["x-meru-parent-session-id"].trim()
+                  ? req.headers["x-meru-parent-session-id"].trim()
+                  : undefined;
               const headerClient =
                 typeof req.headers["x-meru-client"] === "string"
                   ? req.headers["x-meru-client"]
                   : undefined;
+
+              if (body.event === "session_end") {
+                const out = pulseStore.removeForPrincipal({
+                  principal,
+                  sessionId: body.sessionId ?? headerSession,
+                });
+                sendJson(res, 200, out);
+                return;
+              }
+
               const pulse = pulseStore.declare({
                 db: engine!.db,
                 principal,
                 sessionId: body.sessionId ?? headerSession,
+                parentSessionId:
+                  body.parentSessionId !== undefined
+                    ? body.parentSessionId
+                    : headerParent,
                 realmRef: body.realmRef,
                 focus: body.focus,
+                keys: body.keys,
                 note: body.note,
                 clientHint:
                   body.clientHint !== undefined ? body.clientHint : headerClient,
+                mode: body.mode,
+                source: body.source,
+                event: body.event,
               });
               sendJson(res, 200, pulse);
               return;
@@ -1055,6 +1126,11 @@ export async function startMindServer(
       if (unsubChangeLog) {
         unsubChangeLog();
         unsubChangeLog = null;
+      }
+      try {
+        pulseStore.saveSnapshot(pulseSnapshotPath);
+      } catch {
+        // Disposable shutdown telemetry snapshot — never block server close
       }
       if (engine) {
         await engine.close();
