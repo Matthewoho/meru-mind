@@ -1,0 +1,106 @@
+# Meru Mind Team Server + Dex OIDC Broker (Google Workspace / GitHub SSO) + Caddy HTTPS
+# Mount your Dex config at ./dex-config.yaml (defining issuer https://${OIDC_DOMAIN}/dex,
+# staticClients with redirectURI https://${MERU_DOMAIN}/_meru/oidc/callback, and connectors).
+# Dex v2.46.0+ is pinned so OIDC max_age / auth_time required by `meru-mind login` works natively.
+#
+# SECURITY WARNING: Keep MERU_OIDC_TRUST_ISSUER=false (invite-only) whenever Dex uses public
+# connectors (Google, GitHub). Only set true if Dex restricts authentication strictly to your
+# company domain/org AND you intend for every authenticated user to auto-join.
+#
+# Usage:
+#   MERU_DOMAIN=mind.example.com \
+#   OIDC_DOMAIN=auth.example.com \
+#   MERU_OIDC_CLIENT_ID=meru-mind \
+#   MERU_OIDC_CLIENT_SECRET=<shared-secret> \
+#   docker compose -f deploy/docker-compose.oidc-dex.yml up -d
+
+services:
+  meru-mind:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      MERU_MIND_HOME: /var/lib/meru-mind
+      MERU_MIND_PUBLIC_URL: https://${MERU_DOMAIN}
+      MERU_OIDC_ISSUER: https://${OIDC_DOMAIN}/dex
+      MERU_OIDC_CLIENT_ID: ${MERU_OIDC_CLIENT_ID}
+      MERU_OIDC_CLIENT_SECRET: ${MERU_OIDC_CLIENT_SECRET}
+      # SECURITY: Keep false unless Dex connectors strictly enforce your company domain/org!
+      MERU_OIDC_TRUST_ISSUER: ${MERU_OIDC_TRUST_ISSUER:-false}
+    volumes:
+      - meru_mind_data:/var/lib/meru-mind
+    expose:
+      - "3800"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3800/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  dex:
+    image: ghcr.io/dexidp/dex:v2.46.0
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./dex-config.yaml:/etc/dex/config.yaml:ro
+      - dex_data:/var/dex
+    expose:
+      - "5556"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      meru-mind:
+        condition: service_healthy
+      dex:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      MERU_DOMAIN: ${MERU_DOMAIN}
+      OIDC_DOMAIN: ${OIDC_DOMAIN}
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/etc/caddy/Caddyfile
+        {$$MERU_DOMAIN} {
+          encode zstd gzip
+          header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+          reverse_proxy meru-mind:3800 {
+            flush_interval -1
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+          }
+        }
+        {$$OIDC_DOMAIN} {
+          encode zstd gzip
+          header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+          reverse_proxy dex:5556
+        }
+        EOF
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  meru_mind_data:
+  dex_data:
+  caddy_data:
+  caddy_config:

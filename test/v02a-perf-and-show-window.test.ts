@@ -540,7 +540,7 @@ describe("V0.2a-Perf & Show-Window: Migration v6, Covering Indexes, CJK Bigrams,
     engines.push(upgraded);
 
     expect(upgraded.db.listSchemaMigrations().map((m) => m.version)).toEqual([
-      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
     ]);
     const internalRaw = (upgraded.db as unknown as { rawDb: DatabaseSync }).rawDb;
     const bt = internalRaw.prepare("PRAGMA busy_timeout").get() as {

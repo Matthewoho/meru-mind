@@ -30,6 +30,7 @@ import type {
 import {
   MindError,
   type LsOnlyFilter,
+  type OidcConfig,
   type OrgPolicy,
   type Principal,
 } from "../types.js";
@@ -37,6 +38,12 @@ import { MERU_MIND_VERSION } from "../version.js";
 import { createSurfaceMcpServer } from "./mcp-http.js";
 import { seedDemoOrg, type DemoSeedSummary } from "./demo-seed.js";
 import { withLivePulse } from "./live-pulse.js";
+import {
+  createInvite,
+  loadOidcConfigFromEnv,
+  OidcManager,
+  toPublicInvite,
+} from "./oidc.js";
 import { MindPulseStore, sanitizeClientHint } from "./pulse.js";
 import { ChangeWakeBus } from "./pump.js";
 import {
@@ -51,7 +58,11 @@ import {
   acquireServeWriterLock,
   type ServeWriterLockHandle,
 } from "./writer-lock.js";
-import { attachPumpWebSocketServer, isOriginAllowed } from "./ws-pump.js";
+import {
+  attachPumpWebSocketServer,
+  isOriginAllowed,
+  type PumpWsHandle,
+} from "./ws-pump.js";
 import { WorkProviderRegistry } from "../work/registry.js";
 
 export const SERVER_VERSION = MERU_MIND_VERSION;
@@ -125,6 +136,8 @@ export interface MindServerOptions {
    * `MERU_MIND_MCP_SESSION_HEADER=false`.
    */
   mcpSessionHeader?: boolean;
+  /** Optional standard OIDC SSO configuration (defaults to MERU_OIDC_* env vars; pass false to disable) */
+  oidc?: OidcConfig | false;
   /** Custom access logger (pass false to disable stderr logging in tests) */
   accessLog?: ((entry: AccessLogEntry) => void) | false;
   /** Optional custom request hook invoked for non-/v1, non-/mcp paths (used by v0.4 Web UI shell) */
@@ -155,6 +168,7 @@ export interface MindServerHandle {
   readonly wakeBus: ChangeWakeBus;
   readonly pulseStore: MindPulseStore;
   readonly uiSessions: UiSessionManager;
+  readonly oidcManager: OidcManager | null;
   readonly demoSeed?: DemoSeedSummary;
   readonly httpServer: http.Server;
   createToken(params: {
@@ -164,6 +178,8 @@ export interface MindServerHandle {
     boundRealmId?: string | null;
     label?: string | null;
     createdBy?: string;
+    ttlDays?: number | null;
+    expiresAt?: string | null;
   }): CreateAuthTokenResult;
   mintUiLoginCode(principal: Principal): {
     code: string;
@@ -305,7 +321,7 @@ export async function startMindServer(
 
   let engine: MindEngine | null = null;
   let unsubChangeLog: (() => void) | null = null;
-  let detachWs: (() => void) | null = null;
+  let detachWs: PumpWsHandle | null = null;
 
   try {
     engine = await createMindEngine({
@@ -352,10 +368,18 @@ export async function startMindServer(
     pulseStore.loadSnapshot(pulseSnapshotPath);
     const touchThrottle = new TokenTouchThrottle();
     const uiSessions = new UiSessionManager();
+    const resolvedOidcConfig =
+      options.oidc === false ? null : (options.oidc ?? loadOidcConfigFromEnv());
+    const oidcManager = resolvedOidcConfig
+      ? new OidcManager(resolvedOidcConfig)
+      : null;
+    const serverUrlRef = { value: `http://${formatHostForUrl(host)}:${requestedPort}` };
     const builtInUiHandler = createUiRouteHandler({
       uiSessions,
       webDir: resolvedWebDir,
       allowedOrigins: options.allowedOrigins,
+      oidcManager,
+      getServerUrl: () => serverUrlRef.value,
     });
 
     unsubChangeLog = engine.db.onChangeCommitted((events) =>
@@ -395,12 +419,10 @@ export async function startMindServer(
         "ACCESS_DENIED",
         "Missing or invalid authentication credentials",
         {
-          try: "Pass Authorization: Bearer <MERU_MIND_TOKEN> or run 'meru-mind ui login'",
+          try: "Pass Authorization: Bearer <MERU_MIND_TOKEN> or run 'meru-mind login'",
         },
       );
     };
-
-    const serverUrlRef = { value: `http://${formatHostForUrl(host)}:${requestedPort}` };
 
     const enableMcpSessionHeader =
       options.mcpSessionHeader ??
@@ -835,6 +857,161 @@ export async function startMindServer(
               return;
             }
 
+            // ---- v0.6.0 Invitations, Identities & Actor Lifecycle (Root-Realm Human Bearer ONLY) ----
+            const assertHumanBearerAdmin = (cliHint: string) => {
+              if (principal.authKind === "cookie") {
+                throw new MindError(
+                  "ACCESS_DENIED",
+                  "Browser Cookie sessions cannot manage invites or actor accounts; use a human Bearer token via CLI.",
+                  { try: cliHint },
+                );
+              }
+              if (principal.actor.kind !== "human") {
+                throw new MindError(
+                  "ACCESS_DENIED",
+                  "Only human principals can manage invites or actor accounts.",
+                );
+              }
+              const rootRealm =
+                engine!.db.getRealmByPath(orgId, "/") ??
+                engine!.db.listRealms(orgId)[0];
+              if (rootRealm && principal.boundRealmId !== rootRealm.id) {
+                throw new MindError(
+                  "ACCESS_DENIED",
+                  "Realm-scoped humans cannot manage organization invites or actor accounts; an organization root-realm human admin token is required.",
+                  { try: cliHint },
+                );
+              }
+            };
+
+            if (method === "GET" && pathname === "/v1/invites") {
+              assertHumanBearerAdmin("meru-mind invite list");
+              const invites = engine!.db.listInvites(orgId).map(toPublicInvite);
+              sendJson(res, 200, { invites });
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/invites") {
+              assertHumanBearerAdmin(
+                "meru-mind invite create --actor-id <id> --kind human",
+              );
+              const body = (await readJsonBody(req)) as {
+                actorId?: string;
+                actorKind?: "human" | "agent";
+                boundRealmRef?: string | null;
+                ttlHours?: number;
+              };
+              const publicBase = oidcManager
+                ? oidcManager.resolvePublicBaseUrl(req, serverUrlRef.value)
+                : serverUrlRef.value;
+              const created = createInvite({
+                db: engine!.db,
+                orgId,
+                actorId: String(body.actorId ?? ""),
+                actorKind: (body.actorKind ?? "human") as "human" | "agent",
+                boundRealmRef: body.boundRealmRef ?? null,
+                createdBy: principal.actor.id,
+                ttlHours: body.ttlHours,
+                publicBaseUrl: publicBase,
+              });
+              sendJson(res, 200, created);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/invites/revoke") {
+              assertHumanBearerAdmin("meru-mind invite revoke <inviteId>");
+              const body = (await readJsonBody(req)) as { inviteId?: string };
+              const inviteId = String(body.inviteId ?? "").trim();
+              if (!inviteId) {
+                throw new MindError("INVALID_INPUT", "inviteId is required");
+              }
+              const revoked = engine!.db.revokeInvite(
+                orgId,
+                inviteId,
+                new Date().toISOString(),
+              );
+              sendJson(res, 200, { inviteId, revoked });
+              return;
+            }
+
+            if (method === "GET" && pathname === "/v1/identities") {
+              assertHumanBearerAdmin("meru-mind actor list");
+              sendJson(res, 200, {
+                identities: engine!.db.listIdentities(orgId),
+                disabledActors: engine!.db.listDisabledActors(orgId),
+              });
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/actors/disable") {
+              assertHumanBearerAdmin("meru-mind actor disable <actorId>");
+              const body = (await readJsonBody(req)) as {
+                actorId?: string;
+                reason?: string | null;
+              };
+              const targetActorId = String(body.actorId ?? "").trim();
+              if (!targetActorId) {
+                throw new MindError("INVALID_INPUT", "actorId is required");
+              }
+              if (
+                targetActorId.toLowerCase() === principal.actor.id.toLowerCase()
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  "Cannot disable your own active admin actor account.",
+                );
+              }
+              const disabledAt = new Date().toISOString();
+              const dbRes = engine!.db.disableActor({
+                orgId,
+                actorId: targetActorId,
+                reason:
+                  typeof body.reason === "string" && body.reason.trim()
+                    ? body.reason.trim()
+                    : null,
+                disabledBy: principal.actor.id,
+                disabledAt,
+              });
+              const revokedSessions = uiSessions.revokeSessionsForActor(
+                orgId,
+                targetActorId,
+              );
+              const revokedDeviceTx =
+                oidcManager?.revokeDeviceTxForActor(orgId, targetActorId) ?? 0;
+              const removedPulses = pulseStore.removeAllForActor(
+                orgId,
+                targetActorId,
+              );
+              const closedWebSockets =
+                detachWs?.closeForActor(orgId, targetActorId) ?? 0;
+              sendJson(res, 200, {
+                actorId: targetActorId,
+                disabled: true,
+                disabledAt,
+                revokedTokens: dbRes.revokedTokens,
+                revokedAgentTokens: dbRes.revokedAgentTokens,
+                revokedInvites: dbRes.revokedInvites,
+                disabledIdentities: dbRes.disabledIdentities,
+                revokedSessions,
+                revokedDeviceTx,
+                removedPulses,
+                closedWebSockets,
+              });
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/actors/enable") {
+              assertHumanBearerAdmin("meru-mind actor enable <actorId>");
+              const body = (await readJsonBody(req)) as { actorId?: string };
+              const targetActorId = String(body.actorId ?? "").trim();
+              if (!targetActorId) {
+                throw new MindError("INVALID_INPUT", "actorId is required");
+              }
+              const enabled = engine!.db.enableActor(orgId, targetActorId);
+              sendJson(res, 200, { actorId: targetActorId, enabled });
+              return;
+            }
+
             if (method === "POST" && pathname === "/v1/ui/login-code") {
               const minted = uiSessions.mintLoginCode(principal);
               const authPath = `/_meru/auth?code=${encodeURIComponent(minted.code)}`;
@@ -1179,6 +1356,7 @@ export async function startMindServer(
       wakeBus,
       pulseStore,
       uiSessions,
+      oidcManager,
       ...(demoSeed ? { demoSeed } : {}),
       httpServer,
       createToken(params) {
@@ -1191,6 +1369,8 @@ export async function startMindServer(
           boundRealmId: params.boundRealmId,
           label: params.label,
           createdBy: params.createdBy ?? "serve-bootstrap",
+          ttlDays: params.ttlDays,
+          expiresAt: params.expiresAt,
         });
       },
       mintUiLoginCode(principal) {

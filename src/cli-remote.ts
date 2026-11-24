@@ -539,6 +539,159 @@ export async function runRemoteCliCommand(
       }
     }
 
+    if (cmd === "invite") {
+      const apiBase = baseUrl.replace(/\/+$/, "");
+      if (sub === "create") {
+        const resp = await fetch(`${apiBase}/v1/invites`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            actorId: reqStr(flags, "actor-id", "invite create"),
+            actorKind: (str(flags, "kind") ?? "human") as "human" | "agent",
+            boundRealmRef: str(flags, "in") ?? null,
+            ttlHours: intFlag(flags, "ttl-hours"),
+          }),
+        });
+        const payload = (await resp.json()) as Record<string, unknown>;
+        if (!resp.ok) {
+          throw new MindError(
+            resp.status === 401 || resp.status === 403 ? "ACCESS_DENIED" : "INVALID_INPUT",
+            typeof payload.message === "string"
+              ? payload.message
+              : `Invite create failed (HTTP ${resp.status})`,
+          );
+        }
+        output(payload, formatGenericMarkdown("Invite Created (code shown ONCE)", payload));
+        return;
+      }
+      if (sub === "list") {
+        const resp = await fetch(`${apiBase}/v1/invites`, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+          },
+        });
+        const payload = (await resp.json()) as Record<string, unknown>;
+        if (!resp.ok) {
+          throw new MindError(
+            resp.status === 401 || resp.status === 403 ? "ACCESS_DENIED" : "INVALID_INPUT",
+            typeof payload.message === "string"
+              ? payload.message
+              : `Invite list failed (HTTP ${resp.status})`,
+          );
+        }
+        output(payload, formatGenericMarkdown("Invites", payload));
+        return;
+      }
+      if (sub === "revoke") {
+        if (!third?.trim()) {
+          throw new MindError("INVALID_INPUT", "invite revoke requires <inviteId>");
+        }
+        const resp = await fetch(`${apiBase}/v1/invites/revoke`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ inviteId: third.trim() }),
+        });
+        const payload = (await resp.json()) as Record<string, unknown>;
+        if (!resp.ok) {
+          throw new MindError(
+            resp.status === 401 || resp.status === 403 ? "ACCESS_DENIED" : "INVALID_INPUT",
+            typeof payload.message === "string"
+              ? payload.message
+              : `Invite revoke failed (HTTP ${resp.status})`,
+          );
+        }
+        output(payload, formatGenericMarkdown("Invite Revoked", payload));
+        return;
+      }
+    }
+
+    if (cmd === "actor") {
+      const apiBase = baseUrl.replace(/\/+$/, "");
+      if (sub === "disable") {
+        if (!third?.trim()) {
+          throw new MindError("INVALID_INPUT", "actor disable requires <actorId>");
+        }
+        const resp = await fetch(`${apiBase}/v1/actors/disable`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            actorId: third.trim(),
+            reason: str(flags, "reason") ?? null,
+          }),
+        });
+        const payload = (await resp.json()) as Record<string, unknown>;
+        if (!resp.ok) {
+          throw new MindError(
+            resp.status === 401 || resp.status === 403 ? "ACCESS_DENIED" : "INVALID_INPUT",
+            typeof payload.message === "string"
+              ? payload.message
+              : `Actor disable failed (HTTP ${resp.status})`,
+          );
+        }
+        output(payload, formatGenericMarkdown("Actor Disabled", payload));
+        return;
+      }
+      if (sub === "enable") {
+        if (!third?.trim()) {
+          throw new MindError("INVALID_INPUT", "actor enable requires <actorId>");
+        }
+        const resp = await fetch(`${apiBase}/v1/actors/enable`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ actorId: third.trim() }),
+        });
+        const payload = (await resp.json()) as Record<string, unknown>;
+        if (!resp.ok) {
+          throw new MindError(
+            resp.status === 401 || resp.status === 403 ? "ACCESS_DENIED" : "INVALID_INPUT",
+            typeof payload.message === "string"
+              ? payload.message
+              : `Actor enable failed (HTTP ${resp.status})`,
+          );
+        }
+        output(payload, formatGenericMarkdown("Actor Enabled", payload));
+        return;
+      }
+      if (sub === "list") {
+        const resp = await fetch(`${apiBase}/v1/identities`, {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+          },
+        });
+        const payload = (await resp.json()) as Record<string, unknown>;
+        if (!resp.ok) {
+          throw new MindError(
+            resp.status === 401 || resp.status === 403 ? "ACCESS_DENIED" : "INVALID_INPUT",
+            typeof payload.message === "string"
+              ? payload.message
+              : `Actor list failed (HTTP ${resp.status})`,
+          );
+        }
+        output(payload, formatGenericMarkdown("SSO Identities & Disabled Actors", payload));
+        return;
+      }
+    }
+
     if (cmd === "admin" && sub === "doctor") {
       const treeRes = await surface.tree({
         depth: "all",

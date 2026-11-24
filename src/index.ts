@@ -69,6 +69,7 @@ export {
 } from "./server/pump.js";
 export {
   TOKEN_PREFIX,
+  DEFAULT_SSO_TOKEN_TTL_DAYS,
   hashAuthToken,
   generateAuthTokenPlaintext,
   toPublicToken,
@@ -80,6 +81,30 @@ export {
   type CreateAuthTokenParams,
   type CreateAuthTokenResult,
 } from "./server/tokens.js";
+export {
+  OidcManager,
+  OIDC_TX_COOKIE_PREFIX,
+  OIDC_HOST_TX_COOKIE_PREFIX,
+  DEVICE_TX_COOKIE_NAME,
+  DEVICE_HOST_TX_COOKIE_NAME,
+  INVITE_TX_COOKIE_NAME,
+  INVITE_HOST_TX_COOKIE_NAME,
+  INVITE_CODE_PREFIX,
+  loadOidcConfigFromEnv,
+  sanitizeReturnTo,
+  hashInviteCode,
+  toPublicInvite,
+  createInvite,
+} from "./server/oidc.js";
+export {
+  resolveCredentialsFilePath,
+  readCredentialsFile,
+  saveProfileCredential,
+  lookupSavedCredential,
+  normalizeServerUrlKey,
+  type SavedProfileCredential,
+  type CredentialsFileSchema,
+} from "./credentials.js";
 export {
   SERVE_LOCK_FILENAME,
   readLiveServeLock,
@@ -159,6 +184,7 @@ export {
   attachPumpWebSocketServer,
   isOriginAllowed,
   type AttachPumpWsOptions,
+  type PumpWsHandle,
 } from "./server/ws-pump.js";
 export {
   validateWorkBindingConfig,

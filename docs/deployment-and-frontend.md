@@ -61,6 +61,34 @@ Key operational guardrails:
    ```
    Snapshots land in `<MERU_MIND_HOME>/backups/` with SHA-256 verification and can be paired with [Litestream](https://litestream.io/) for continuous WAL replication to S3 / R2 / GCS.
 
+### Optional Standard OIDC SSO & Device-Code CLI Login (`v0.6.0`)
+
+Meru Mind supports standard OpenID Connect (PKCE + `nonce` + `(issuer, subject)` identity binding) with **zero IdP-specific adapters**:
+
+- **Recommended (passkey-first lightweight IdP)**: `deploy/docker-compose.oidc-pocketid.yml` (Caddy + Meru Mind + [Pocket ID v2](https://github.com/pocket-id/pocket-id) on port `1411`, volume `/app/data`, requires `POCKET_ID_ENCRYPTION_KEY`)
+- **Secondary (existing Google Workspace / GitHub SSO)**: `deploy/docker-compose.oidc-dex.yml` (Caddy + Meru Mind + [Dex v2.46.0+](https://github.com/dexidp/dex) for native `max_age` / `auth_time` support)
+
+Configure via 4 environment variables:
+- `MERU_OIDC_ISSUER` (e.g. `https://id.example.com`)
+- `MERU_OIDC_CLIENT_ID`
+- `MERU_OIDC_CLIENT_SECRET` (optional for public PKCE clients)
+- `MERU_MIND_PUBLIC_URL` (e.g. `https://mind.example.com`; register `https://mind.example.com/_meru/oidc/callback` as redirect URI)
+- Optional `MERU_OIDC_TRUST_ISSUER=true` for dedicated single-tenant IdPs (default `false`: invite-only).
+
+Team member lifecycle & CLI onboarding (works over SSH / headless servers):
+```bash
+# 1. Admin creates a single-use invite link bound to an actorId (72h default TTL)
+MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<admin-token> \
+  meru-mind invite create --actor-id alice --kind human
+
+# 2. Teammate authenticates terminal via self-issued Device-Code flow (saves 90d token in ~/.config/meru-mind/credentials mode 0600)
+meru-mind login --url https://mind.example.com
+
+# 3. Offboarding: immediately disables account, revokes all Bearer tokens, and kills browser sessions
+MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<admin-token> \
+  meru-mind actor disable alice --reason "offboarded"
+```
+
 ### Track 2 (Future Managed Cloud / SaaS Edition): Cloudflare Workers + Durable Objects
 
 **One tenant = One Durable Object = One isolated single-writer SQLite database**:

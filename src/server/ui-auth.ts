@@ -138,6 +138,7 @@ export class UiSessionManager {
   /**
    * Resolves a weakened Cookie Principal from an incoming HTTP/WS request.
    * Re-checks live token revocation in SQLite on every call.
+   * On HTTPS connections, strictly requires `__Host-meru_session` to defeat subdomain cookie fixation.
    */
   authenticateRequest(
     req: IncomingMessage,
@@ -147,7 +148,16 @@ export class UiSessionManager {
   ): Principal | null {
     this.prune(nowMs);
     const cookies = parseCookieHeader(req.headers.cookie);
-    const sid = cookies[UI_HOST_SESSION_COOKIE_NAME] ?? cookies[UI_SESSION_COOKIE_NAME];
+    const fwdProto =
+      typeof req.headers["x-forwarded-proto"] === "string"
+        ? req.headers["x-forwarded-proto"].split(",")[0]?.trim().toLowerCase()
+        : "";
+    const isSecure =
+      fwdProto === "https" ||
+      Boolean((req.socket as { encrypted?: boolean })?.encrypted);
+    const sid = isSecure
+      ? cookies[UI_HOST_SESSION_COOKIE_NAME]
+      : (cookies[UI_HOST_SESSION_COOKIE_NAME] ?? cookies[UI_SESSION_COOKIE_NAME]);
     if (!sid) return null;
     const sess = this.sessions.get(sid);
     if (!sess || sess.expiresAtMs <= nowMs) {
@@ -162,6 +172,63 @@ export class UiSessionManager {
       return null;
     }
     return sess.principal;
+  }
+
+  /**
+   * Creates a weakened HttpOnly browser Cookie session directly for a verified OIDC Principal.
+   * Checks live actor-disabled state before issuing.
+   */
+  createSessionForPrincipal(
+    principal: Principal,
+    db: DbPort,
+    nowMs = Date.now(),
+  ): { sessionId: string; principal: Principal; maxAgeSeconds: number } {
+    this.prune(nowMs);
+    if (!isPrincipalTokenActive(db, principal, nowMs)) {
+      throw new MindError(
+        "ACCESS_DENIED",
+        "Account is disabled or underlying credential is inactive",
+      );
+    }
+    const sessionId = `msid_${crypto.randomBytes(24).toString("hex")}`;
+    const expiresAtMs = nowMs + COOKIE_SESSION_TTL_MS;
+    const cookiePrincipal: Principal = {
+      ...principal,
+      authKind: "cookie",
+    };
+    this.sessions.set(sessionId, {
+      sessionId,
+      principal: cookiePrincipal,
+      expiresAtMs,
+    });
+    return {
+      sessionId,
+      principal: cookiePrincipal,
+      maxAgeSeconds: Math.floor(COOKIE_SESSION_TTL_MS / 1000),
+    };
+  }
+
+  revokeSessionsForActor(orgId: string, actorId: string): number {
+    const targetLower = actorId.trim().toLowerCase();
+    let removed = 0;
+    for (const [k, v] of this.sessions.entries()) {
+      if (
+        v.principal.orgId === orgId &&
+        v.principal.actor.id.toLowerCase() === targetLower
+      ) {
+        this.sessions.delete(k);
+        removed += 1;
+      }
+    }
+    for (const [k, v] of this.pendingCodes.entries()) {
+      if (
+        v.principal.orgId === orgId &&
+        v.principal.actor.id.toLowerCase() === targetLower
+      ) {
+        this.pendingCodes.delete(k);
+      }
+    }
+    return removed;
   }
 
   revokeSessionFromRequest(req: IncomingMessage): void {

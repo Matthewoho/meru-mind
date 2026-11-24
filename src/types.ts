@@ -581,6 +581,7 @@ export interface AuthTokenRecord {
   label: string | null;
   createdBy: string;
   createdAt: string;
+  expiresAt: string | null;
   revokedAt: string | null;
   lastUsedAt: string | null;
 }
@@ -595,8 +596,82 @@ export interface AuthTokenPublic {
   label: string | null;
   createdBy: string;
   createdAt: string;
+  expiresAt: string | null;
   revokedAt: string | null;
   lastUsedAt: string | null;
+}
+
+export interface OidcIdentityRecord {
+  id: string;
+  orgId: string;
+  issuer: string;
+  subject: string;
+  actorId: string;
+  actorKind: "human" | "agent";
+  boundRealmId: string | null;
+  email: string | null;
+  displayName: string | null;
+  disabledAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface InviteRecord {
+  id: string;
+  orgId: string;
+  codeHash: string;
+  actorId: string;
+  actorKind: "human" | "agent";
+  boundRealmId: string | null;
+  createdBy: string;
+  expiresAt: string;
+  usedAt: string | null;
+  usedByIssuer: string | null;
+  usedBySubject: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+}
+
+export interface InvitePublic {
+  id: string;
+  orgId: string;
+  actorId: string;
+  actorKind: "human" | "agent";
+  boundRealmId: string | null;
+  createdBy: string;
+  expiresAt: string;
+  usedAt: string | null;
+  usedByIssuer: string | null;
+  usedBySubject: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+}
+
+export interface DisabledActorRecord {
+  orgId: string;
+  actorId: string;
+  reason: string | null;
+  disabledBy: string;
+  disabledAt: string;
+}
+
+export interface OidcConfig {
+  /** Standard OIDC Issuer URL (e.g. https://id.example.com) */
+  issuer: string;
+  /** OIDC Client ID */
+  clientId: string;
+  /** Optional OIDC Client Secret (confidential clients); omit for public PKCE clients */
+  clientSecret?: string | null;
+  /** Optional public external base URL for redirect_uri (e.g. https://mind.example.com) */
+  publicUrl?: string | null;
+  /**
+   * When true, users authenticated by this dedicated IdP can auto-provision on first login
+   * without an invite code (still strictly keyed by (iss, sub) and rejecting actorId collisions).
+   * Defaults to false (invite-only).
+   */
+  trustIssuer?: boolean;
+  /** Default TTL in days for tokens minted via OIDC device-code login (default: 90) */
+  tokenTtlDays?: number;
 }
 
 export interface Principal {

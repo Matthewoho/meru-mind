@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import os from "node:os";
 import {
   buildWriteRecordPayload,
   createAuthToken,
+  createInvite,
   createMindEngine,
   discoverWorkspaceRealmMarker,
   ejectDefaultUiShell,
@@ -24,6 +26,7 @@ import {
   formatWhoamiMarkdown,
   isRealmEffectivelyArchived,
   LocalMindSurface,
+  lookupSavedCredential,
   MindError,
   OPAQUE_OBJECT_NOT_FOUND,
   OPAQUE_REALM_NOT_FOUND,
@@ -36,7 +39,9 @@ import {
   resolveVisibleRealm,
   resolveWriteTargetRealm,
   runRealmDoctor,
+  saveProfileCredential,
   startMindServer,
+  toPublicInvite,
   toPublicToken,
   toSurfaceError,
   writeEverydayConclusion,
@@ -653,6 +658,33 @@ Examples:
   meru-mind token create --actor-id claude-ci --kind agent --in /ops --as-human
   meru-mind token list --as-human
 `,
+  login: `Risk: write (authenticates CLI/SSH machine via self-issued OIDC device-code flow; saves 0600 credentials)
+When to use: Sign in to an OIDC-enabled meru-mind serve instance without copying tokens manually (works over SSH/headless).
+Usage:
+  meru-mind login --url <serverUrl> [--kind human|agent] [--label <name>] [--timeout <seconds>]
+Examples:
+  meru-mind login --url https://mind.example.com
+  meru-mind login --url https://mind.example.com --kind agent --label claude-code
+`,
+  invite: `Risk: high-risk-write (human-only)
+When to use: Create, list, or revoke single-use OIDC onboarding invite codes bound to an actorId.
+Usage:
+  meru-mind invite create --actor-id <id> [--kind human|agent] [--in <realm>] [--ttl-hours <n>] [--as-human]
+  meru-mind invite list [--as-human]
+  meru-mind invite revoke <inviteId> [--as-human]
+Examples:
+  meru-mind invite create --actor-id alice --kind human --as-human
+  MERU_MIND_URL=https://mind.example.com MERU_MIND_TOKEN=<admin-token> meru-mind invite create --actor-id alice --kind human
+`,
+  actor: `Risk: high-risk-write (human-only)
+When to use: List OIDC identities or immediately disable/enable an actor (revoking all tokens and browser sessions).
+Usage:
+  meru-mind actor list [--as-human]
+  meru-mind actor disable <actorId> [--reason <text>] [--as-human]
+  meru-mind actor enable <actorId> [--as-human]
+Examples:
+  meru-mind actor disable alice --reason "offboarded" --as-human
+`,
   work: `Risk: read (list/ready/resolve) / high-risk-write (bind/unbind, human-only)
 When to use: Bind a realm to an external WorkProvider SSOT (linear or github) using env-var token refs only, or query live ready/resolved items without duplicating task tables in mind-core.
 Usage:
@@ -931,7 +963,10 @@ async function main(): Promise<void> {
     "import",
     "serve",
     "ui",
+    "login",
     "token",
+    "invite",
+    "actor",
     "work",
     "org",
     "admin",
@@ -966,6 +1001,154 @@ async function main(): Promise<void> {
     workspaceMarkerError = err;
   }
 
+  // `meru-mind login` runs the self-issued OIDC device-code flow (SSH/headless safe) and saves 0600 credentials.
+  if (cmd === "login") {
+    assertAllowedFlags(flags, ["kind", "label", "timeout"], "login");
+    const targetUrl = (
+      flagStr(flags, "url") ?? process.env.MERU_MIND_URL?.trim()
+    )?.trim().replace(/\/+$/, "");
+    if (!targetUrl) {
+      throw new MindError(
+        "INVALID_INPUT",
+        "login requires --url <serverUrl> or MERU_MIND_URL",
+        { try: "meru-mind login --url https://mind.example.com" },
+      );
+    }
+    let parsedTargetUrl: URL;
+    try {
+      parsedTargetUrl = new URL(targetUrl);
+    } catch {
+      throw new MindError("INVALID_INPUT", `Invalid --url: "${targetUrl}"`);
+    }
+    const targetIsLoopback =
+      parsedTargetUrl.hostname === "127.0.0.1" ||
+      parsedTargetUrl.hostname === "localhost" ||
+      parsedTargetUrl.hostname === "::1" ||
+      parsedTargetUrl.hostname === "[::1]";
+    if (parsedTargetUrl.protocol !== "https:" && !(parsedTargetUrl.protocol === "http:" && targetIsLoopback)) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Refusing insecure login URL "${parsedTargetUrl.origin}": remote servers must use https:// (http:// is allowed only on loopback).`,
+      );
+    }
+    const kindRaw = (flagStr(flags, "kind") ?? "human").trim().toLowerCase();
+    if (kindRaw !== "human" && kindRaw !== "agent") {
+      throw new MindError("INVALID_INPUT", '--kind must be "human" or "agent"');
+    }
+    const clientLabel = flagStr(flags, "label") ?? "meru-mind-cli";
+    const timeoutSec = Math.min(600, parseIntFlag(flags, "timeout", { min: 5 }) ?? 300);
+
+    const startResp = await fetch(`${targetUrl}/_meru/device/start`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        hostname: os.hostname(),
+        clientLabel,
+        kind: kindRaw,
+      }),
+    });
+    const startBody = (await startResp.json()) as {
+      deviceCode?: string;
+      userCode?: string;
+      verificationUri?: string;
+      verificationUriComplete?: string;
+      interval?: number;
+      expiresIn?: number;
+      message?: string;
+    };
+    if (!startResp.ok || !startBody.deviceCode || !startBody.userCode) {
+      throw new MindError(
+        startResp.status === 404 ? "NOT_FOUND" : "INVALID_INPUT",
+        startBody.message ?? `Device login start failed (HTTP ${startResp.status})`,
+      );
+    }
+
+    // Print instructions immediately to stderr so stdout stays pure JSON when `--json` is used
+    process.stderr.write(
+      [
+        `Open this URL in any browser to authorize this terminal:`,
+        `  ${startBody.verificationUriComplete ?? startBody.verificationUri}`,
+        `Verification code: ${startBody.userCode}`,
+        `Waiting for fresh SSO approval...`,
+        "",
+      ].join("\n"),
+    );
+
+    const pollIntervalMs = Math.max(250, Math.min(5000, (startBody.interval ?? 2) * 1000));
+    const deadlineMs = Date.now() + Math.min(timeoutSec, startBody.expiresIn ?? 600) * 1000;
+    while (Date.now() < deadlineMs) {
+      await new Promise((r) => setTimeout(r, Math.min(pollIntervalMs, 400)));
+      const pollResp = await fetch(`${targetUrl}/_meru/device/poll`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ deviceCode: startBody.deviceCode }),
+      });
+      const pollBody = (await pollResp.json()) as {
+        status?: string;
+        token?: string;
+        tokenId?: string;
+        actorId?: string;
+        actorKind?: "human" | "agent";
+        expiresAt?: string | null;
+        orgId?: string;
+        message?: string;
+      };
+      if (pollBody.status === "authorization_pending") {
+        continue;
+      }
+      if (pollBody.status === "access_denied") {
+        throw new MindError("ACCESS_DENIED", "Device login was denied in browser");
+      }
+      if (pollBody.status === "expired_token") {
+        throw new MindError("ACCESS_DENIED", "Device login code expired; run 'meru-mind login' again");
+      }
+      if (pollBody.status === "approved" && pollBody.token) {
+        const credentialsPath = saveProfileCredential({
+          serverUrl: targetUrl,
+          credential: {
+            token: pollBody.token,
+            tokenId: pollBody.tokenId ?? "",
+            actorId: pollBody.actorId ?? "",
+            actorKind: pollBody.actorKind === "agent" ? "agent" : "human",
+            expiresAt: pollBody.expiresAt ?? null,
+            savedAt: new Date().toISOString(),
+          },
+        });
+        const result = {
+          authenticated: true,
+          url: targetUrl,
+          actorId: pollBody.actorId,
+          actorKind: pollBody.actorKind,
+          tokenId: pollBody.tokenId,
+          expiresAt: pollBody.expiresAt,
+          credentialsPath,
+        };
+        output(
+          result,
+          [
+            `Signed in to ${targetUrl} as ${pollBody.actorId} (${pollBody.actorKind}).`,
+            `Saved credentials (0600): ${credentialsPath}`,
+            pollBody.expiresAt ? `Expires: ${pollBody.expiresAt}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
+        return;
+      }
+      throw new MindError(
+        "INVALID_INPUT",
+        pollBody.message ?? `Unexpected device poll status: ${String(pollBody.status)}`,
+      );
+    }
+    throw new MindError("ACCESS_DENIED", "Timed out waiting for device login approval");
+  }
+
   // `meru-mind ui eject <dir>` and `meru-mind ui login` work without opening local SQLite directly.
   if (cmd === "ui") {
     if (sub === "eject") {
@@ -994,8 +1177,11 @@ async function main(): Promise<void> {
         "http://127.0.0.1:3800"
       ).replace(/\/+$/, "");
       const targetToken = (
-        flagStr(flags, "token") ?? process.env.MERU_MIND_TOKEN?.trim()
-      )?.trim();
+        flagStr(flags, "token")?.trim() ||
+        process.env.MERU_MIND_TOKEN?.trim() ||
+        lookupSavedCredential(targetUrl)?.token?.trim() ||
+        ""
+      );
       if (!targetToken) {
         throw new MindError(
           "ACCESS_DENIED",
@@ -1135,13 +1321,16 @@ async function main(): Promise<void> {
   )?.trim();
   if (remoteUrl) {
     const remoteToken = (
-      flagStr(flags, "token") ?? process.env.MERU_MIND_TOKEN?.trim()
-    )?.trim();
+      flagStr(flags, "token")?.trim() ||
+      process.env.MERU_MIND_TOKEN?.trim() ||
+      lookupSavedCredential(remoteUrl)?.token?.trim() ||
+      ""
+    );
     if (!remoteToken) {
       throw new MindError(
         "ACCESS_DENIED",
-        "Remote mode (--url / MERU_MIND_URL) requires --token or MERU_MIND_TOKEN",
-        { try: `MERU_MIND_URL=${remoteUrl} MERU_MIND_TOKEN=<token> meru-mind whoami` },
+        "Remote mode (--url / MERU_MIND_URL) requires --token, MERU_MIND_TOKEN, or saved credentials from 'meru-mind login'",
+        { try: `meru-mind login --url ${remoteUrl}` },
       );
     }
     await runRemoteCliCommand({
@@ -1676,6 +1865,119 @@ async function main(): Promise<void> {
         "UNKNOWN_COMMAND",
         `Unknown token subcommand "${sub ?? ""}"`,
         { try: "meru-mind token --help" },
+      );
+    }
+
+    if (cmd === "invite") {
+      if (actor.kind !== "human") {
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Local invite management requires --as-human (actor "${actor.id}" is "${actor.kind}")`,
+          { try: "meru-mind invite list --as-human" },
+        );
+      }
+      const orgId = resolveAdminOrgId(engine, orgFlag);
+      if (sub === "create") {
+        assertAllowedFlags(
+          flags,
+          ["actor-id", "kind", "in", "ttl-hours"],
+          "invite create",
+        );
+        const created = createInvite({
+          db: engine.db,
+          orgId,
+          actorId: requireFlag(flags, "actor-id", "invite create"),
+          actorKind: (flagStr(flags, "kind") ?? "human") as "human" | "agent",
+          boundRealmRef: flagStr(flags, "in") ?? null,
+          createdBy: actor.id,
+          ttlHours: parseIntFlag(flags, "ttl-hours", { min: 1 }),
+          publicBaseUrl: process.env.MERU_MIND_PUBLIC_URL?.trim() || null,
+        });
+        output(created, formatGenericMarkdown("Invite Created (code shown ONCE)", created));
+        return;
+      }
+      if (sub === "list") {
+        assertAllowedFlags(flags, [], "invite list");
+        const invites = engine.db.listInvites(orgId).map(toPublicInvite);
+        output({ invites }, formatGenericMarkdown("Invites", { invites }));
+        return;
+      }
+      if (sub === "revoke") {
+        assertAllowedFlags(flags, [], "invite revoke");
+        if (!third?.trim()) {
+          throw new MindError("INVALID_INPUT", "invite revoke requires <inviteId>", {
+            try: "meru-mind invite revoke inv_... --as-human",
+          });
+        }
+        const revoked = engine.db.revokeInvite(
+          orgId,
+          third.trim(),
+          new Date().toISOString(),
+        );
+        const res = { inviteId: third.trim(), revoked };
+        output(res, formatGenericMarkdown("Invite Revoked", res));
+        return;
+      }
+      throw new MindError(
+        "UNKNOWN_COMMAND",
+        `Unknown invite subcommand "${sub ?? ""}"`,
+        { try: "meru-mind invite --help" },
+      );
+    }
+
+    if (cmd === "actor") {
+      if (actor.kind !== "human") {
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Local actor management requires --as-human (actor "${actor.id}" is "${actor.kind}")`,
+          { try: "meru-mind actor list --as-human" },
+        );
+      }
+      const orgId = resolveAdminOrgId(engine, orgFlag);
+      if (sub === "list") {
+        assertAllowedFlags(flags, [], "actor list");
+        const res = {
+          identities: engine.db.listIdentities(orgId),
+          disabledActors: engine.db.listDisabledActors(orgId),
+        };
+        output(res, formatGenericMarkdown("SSO Identities & Disabled Actors", res));
+        return;
+      }
+      if (sub === "disable") {
+        assertAllowedFlags(flags, ["reason"], "actor disable");
+        if (!third?.trim()) {
+          throw new MindError("INVALID_INPUT", "actor disable requires <actorId>", {
+            try: "meru-mind actor disable alice --as-human",
+          });
+        }
+        const disabledAt = new Date().toISOString();
+        const dbRes = engine.db.disableActor({
+          orgId,
+          actorId: third.trim(),
+          reason: flagStr(flags, "reason") ?? null,
+          disabledBy: actor.id,
+          disabledAt,
+        });
+        const res = { actorId: third.trim(), disabled: true, disabledAt, ...dbRes };
+        output(res, formatGenericMarkdown("Actor Disabled", res));
+        return;
+      }
+      if (sub === "enable") {
+        assertAllowedFlags(flags, [], "actor enable");
+        if (!third?.trim()) {
+          throw new MindError("INVALID_INPUT", "actor enable requires <actorId>", {
+            try: "meru-mind actor enable alice --as-human",
+          });
+        }
+        const enabled = engine.db.enableActor(orgId, third.trim());
+        const res = { actorId: third.trim(), enabled };
+        output(res, formatGenericMarkdown("Actor Enabled", res));
+        return;
+      }
+      throw new MindError(
+        "UNKNOWN_COMMAND",
+        `Unknown actor subcommand "${sub ?? ""}"`,
+        { try: "meru-mind actor --help" },
       );
     }
 

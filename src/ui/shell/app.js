@@ -1,4 +1,4 @@
-// Meru Mind Official Built-In Studio UI (v0.5.8)
+// Meru Mind Official Built-In Studio UI (v0.6.0)
 // Built strictly on the server-hosted `/_meru/client.js` contract (zero direct /v1/* calls, zero innerHTML, strict CSP).
 import { createMindClient, applyHighlightRanges, loadMarkdownTools } from "/_meru/client.js";
 
@@ -263,6 +263,8 @@ const ACTOR_SESSION_PAGE_SIZE = 5;
 const state = {
   lang: detectStudioLang(),
   readerView: "md", // md | raw | html
+  oidcEnabled: false,
+  oidcLoginUrl: null,
   whoami: null,
   realms: [],
   realmTree: [],
@@ -880,15 +882,43 @@ function renderAuthScreen() {
 
   const h1 = document.createElement("h1");
   h1.className = "auth-title";
-  h1.textContent = "Sign in via CLI";
+  h1.textContent = state.oidcEnabled ? "Sign in to Meru Mind" : "Sign in via CLI";
   card.appendChild(h1);
+
+  if (state.oidcEnabled) {
+    const pSso = document.createElement("p");
+    pSso.className = "auth-desc";
+    pSso.textContent = "Continue with your team's single sign-on provider (OIDC).";
+    card.appendChild(pSso);
+
+    const returnTo = window.location.pathname + window.location.search;
+    const ssoUrl = (state.oidcLoginUrl || "/_meru/oidc/login") +
+      "?return_to=" + encodeURIComponent(returnTo || "/");
+    const ssoBtn = document.createElement("a");
+    ssoBtn.className = "meru-btn primary auth-sso-btn";
+    ssoBtn.dataset.ui = "sso-login-btn";
+    ssoBtn.href = ssoUrl;
+    ssoBtn.textContent = "Sign in with SSO";
+    card.appendChild(ssoBtn);
+
+    const div = document.createElement("div");
+    div.className = "auth-divider";
+    const span = document.createElement("span");
+    span.textContent = "or CLI";
+    div.appendChild(span);
+    card.appendChild(div);
+  }
 
   const p = document.createElement("p");
   p.className = "auth-desc";
-  p.textContent = "Browser sessions use a 60-second single-use CLI login link (HttpOnly Cookie; read and reversible actions only). Long-lived tokens stay in your terminal.";
+  p.textContent = state.oidcEnabled
+    ? "Sign in from your terminal or headless SSH session using a fresh SSO device code (90-day token saved locally with 0600 permissions):"
+    : "Browser sessions use a 60-second single-use CLI login link (HttpOnly Cookie; read and reversible actions only). Long-lived tokens stay in your terminal.";
   card.appendChild(p);
 
-  const cmdText = "meru-mind ui login --url " + window.location.origin;
+  const cmdText = state.oidcEnabled
+    ? ("meru-mind login --url " + window.location.origin)
+    : ("meru-mind ui login --url " + window.location.origin);
   const cmdRow = document.createElement("div");
   cmdRow.className = "cli-cmd-row";
   const code = document.createElement("code");
@@ -3569,6 +3599,8 @@ async function boot() {
   try {
     const sessRes = await fetch("/_meru/session", { credentials: "same-origin" });
     const sess = sessRes.ok ? await sessRes.json() : { authenticated: false };
+    state.oidcEnabled = Boolean(sess.oidcEnabled);
+    state.oidcLoginUrl = typeof sess.oidcLoginUrl === "string" ? sess.oidcLoginUrl : null;
     if (!sess.authenticated) {
       state.whoami = null;
       render();

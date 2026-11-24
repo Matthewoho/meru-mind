@@ -42,15 +42,18 @@ import {
   type ConsumerCursor,
   type DeliveryRecord,
   type DeliveryState,
+  type DisabledActorRecord,
   type Distillation,
   type DistillationLayer,
   type DriveFileMeta,
   type EntryObjectLink,
   type IdempotencyRecord,
+  type InviteRecord,
   type LedgerRecord,
   type MindObject,
   type ObjectAlias,
   type ObjectState,
+  type OidcIdentityRecord,
   type Organization,
   type OrgPolicy,
   type PumpChangeFrame,
@@ -1287,6 +1290,66 @@ export class SqliteDb implements DbPort {
             `INSERT INTO schema_migrations (version, name, applied_at) VALUES (11, 'v11_v055_vec_pending_thin', ?)`,
           )
           .run(nowV11);
+      }
+
+      // Migration v12: v0.6.0 Standard OIDC identities, single-use invites, actor disable, and token expiry
+      if (!applied.has(12)) {
+        const nowV12 = new Date().toISOString();
+        this.ensureColumn("tokens", "expires_at", "TEXT");
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_tokens_org_actor
+            ON tokens(org_id, actor_id, revoked_at);
+
+          CREATE TABLE IF NOT EXISTS identities (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES orgs(id),
+            issuer TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human', 'agent')),
+            bound_realm_id TEXT REFERENCES realms(id),
+            email TEXT,
+            display_name TEXT,
+            disabled_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(org_id, issuer, subject)
+          );
+          CREATE INDEX IF NOT EXISTS idx_identities_org_actor
+            ON identities(org_id, actor_id);
+
+          CREATE TABLE IF NOT EXISTS invites (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES orgs(id),
+            code_hash TEXT NOT NULL UNIQUE,
+            actor_id TEXT NOT NULL,
+            actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human', 'agent')),
+            bound_realm_id TEXT REFERENCES realms(id),
+            created_by TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            used_by_issuer TEXT,
+            used_by_subject TEXT,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_invites_org
+            ON invites(org_id, created_at DESC);
+
+          CREATE TABLE IF NOT EXISTS disabled_actors (
+            org_id TEXT NOT NULL REFERENCES orgs(id),
+            actor_id TEXT NOT NULL,
+            reason TEXT,
+            disabled_by TEXT NOT NULL,
+            disabled_at TEXT NOT NULL,
+            PRIMARY KEY (org_id, actor_id)
+          );
+        `);
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (12, 'v12_v060_oidc_identities_invites', ?)`,
+          )
+          .run(nowV12);
       }
 
       if (this.vecEnabled && !this.tableExists("vec_items")) {
@@ -4479,14 +4542,14 @@ export class SqliteDb implements DbPort {
     });
   }
 
-  // ---- Auth Tokens (Migration v9) ----
+  // ---- Auth Tokens (Migration v9 + v12 expires_at) ----
 
   insertToken(token: AuthTokenRecord): void {
     this.db
       .prepare(
         `INSERT INTO tokens
-         (id, org_id, token_hash, actor_id, actor_kind, actor_family, bound_realm_id, label, created_by, created_at, revoked_at, last_used_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, org_id, token_hash, actor_id, actor_kind, actor_family, bound_realm_id, label, created_by, created_at, expires_at, revoked_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         token.id,
@@ -4499,6 +4562,7 @@ export class SqliteDb implements DbPort {
         token.label,
         token.createdBy,
         token.createdAt,
+        token.expiresAt,
         token.revokedAt,
         token.lastUsedAt,
       );
@@ -4516,6 +4580,7 @@ export class SqliteDb implements DbPort {
       label: row.label ? String(row.label) : null,
       createdBy: String(row.created_by),
       createdAt: String(row.created_at),
+      expiresAt: row.expires_at ? String(row.expires_at) : null,
       revokedAt: row.revoked_at ? String(row.revoked_at) : null,
       lastUsedAt: row.last_used_at ? String(row.last_used_at) : null,
     };
@@ -4554,10 +4619,387 @@ export class SqliteDb implements DbPort {
     return Number(res.changes) > 0;
   }
 
+  revokeTokensForActor(
+    orgId: string,
+    actorId: string,
+    revokedAt: string,
+  ): number {
+    const res = this.db
+      .prepare(
+        `UPDATE tokens SET revoked_at = ? WHERE org_id = ? AND LOWER(actor_id) = LOWER(?) AND revoked_at IS NULL`,
+      )
+      .run(revokedAt, orgId, actorId);
+    return Number(res.changes ?? 0);
+  }
+
   touchTokenLastUsed(id: string, usedAt: string): void {
     this.db
       .prepare(`UPDATE tokens SET last_used_at = ? WHERE id = ?`)
       .run(usedAt, id);
+  }
+
+  // ---- OIDC Identities, Invitations & Actor Disable (Migration v12) ----
+
+  private mapIdentity(row: Record<string, unknown>): OidcIdentityRecord {
+    return {
+      id: String(row.id),
+      orgId: String(row.org_id),
+      issuer: String(row.issuer),
+      subject: String(row.subject),
+      actorId: String(row.actor_id),
+      actorKind: String(row.actor_kind) as "human" | "agent",
+      boundRealmId: row.bound_realm_id ? String(row.bound_realm_id) : null,
+      email: row.email ? String(row.email) : null,
+      displayName: row.display_name ? String(row.display_name) : null,
+      disabledAt: row.disabled_at ? String(row.disabled_at) : null,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  insertIdentity(identity: OidcIdentityRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO identities
+         (id, org_id, issuer, subject, actor_id, actor_kind, bound_realm_id, email, display_name, disabled_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        identity.id,
+        identity.orgId,
+        identity.issuer,
+        identity.subject,
+        identity.actorId,
+        identity.actorKind,
+        identity.boundRealmId,
+        identity.email,
+        identity.displayName,
+        identity.disabledAt,
+        identity.createdAt,
+        identity.updatedAt,
+      );
+  }
+
+  updateIdentityProfile(params: {
+    id: string;
+    email: string | null;
+    displayName: string | null;
+    updatedAt: string;
+  }): void {
+    this.db
+      .prepare(
+        `UPDATE identities SET email = ?, display_name = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(params.email, params.displayName, params.updatedAt, params.id);
+  }
+
+  getIdentityBySubject(
+    orgId: string,
+    issuer: string,
+    subject: string,
+  ): OidcIdentityRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM identities WHERE org_id = ? AND issuer = ? AND subject = ?`,
+      )
+      .get(orgId, issuer, subject) as Record<string, unknown> | undefined;
+    return row ? this.mapIdentity(row) : null;
+  }
+
+  listIdentities(orgId: string): OidcIdentityRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM identities WHERE org_id = ? ORDER BY created_at DESC`)
+      .all(orgId) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapIdentity(r));
+  }
+
+  listIdentitiesByActor(orgId: string, actorId: string): OidcIdentityRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM identities WHERE org_id = ? AND LOWER(actor_id) = LOWER(?) ORDER BY created_at DESC`,
+      )
+      .all(orgId, actorId) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapIdentity(r));
+  }
+
+  private mapInvite(row: Record<string, unknown>): InviteRecord {
+    return {
+      id: String(row.id),
+      orgId: String(row.org_id),
+      codeHash: String(row.code_hash),
+      actorId: String(row.actor_id),
+      actorKind: String(row.actor_kind) as "human" | "agent",
+      boundRealmId: row.bound_realm_id ? String(row.bound_realm_id) : null,
+      createdBy: String(row.created_by),
+      expiresAt: String(row.expires_at),
+      usedAt: row.used_at ? String(row.used_at) : null,
+      usedByIssuer: row.used_by_issuer ? String(row.used_by_issuer) : null,
+      usedBySubject: row.used_by_subject ? String(row.used_by_subject) : null,
+      revokedAt: row.revoked_at ? String(row.revoked_at) : null,
+      createdAt: String(row.created_at),
+    };
+  }
+
+  insertInvite(invite: InviteRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO invites
+         (id, org_id, code_hash, actor_id, actor_kind, bound_realm_id, created_by, expires_at, used_at, used_by_issuer, used_by_subject, revoked_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        invite.id,
+        invite.orgId,
+        invite.codeHash,
+        invite.actorId,
+        invite.actorKind,
+        invite.boundRealmId,
+        invite.createdBy,
+        invite.expiresAt,
+        invite.usedAt,
+        invite.usedByIssuer,
+        invite.usedBySubject,
+        invite.revokedAt,
+        invite.createdAt,
+      );
+  }
+
+  getInvite(orgId: string, id: string): InviteRecord | null {
+    const row = this.db
+      .prepare(`SELECT * FROM invites WHERE org_id = ? AND id = ?`)
+      .get(orgId, id) as Record<string, unknown> | undefined;
+    return row ? this.mapInvite(row) : null;
+  }
+
+  getInviteByHash(orgId: string, codeHash: string): InviteRecord | null {
+    const row = this.db
+      .prepare(`SELECT * FROM invites WHERE org_id = ? AND code_hash = ?`)
+      .get(orgId, codeHash) as Record<string, unknown> | undefined;
+    return row ? this.mapInvite(row) : null;
+  }
+
+  listInvites(orgId: string): InviteRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM invites WHERE org_id = ? ORDER BY created_at DESC`)
+      .all(orgId) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapInvite(r));
+  }
+
+  consumeInviteAndBindIdentity(params: {
+    orgId: string;
+    codeHash: string;
+    nowIso: string;
+    identityId: string;
+    issuer: string;
+    subject: string;
+    email: string | null;
+    displayName: string | null;
+  }): OidcIdentityRecord | null {
+    return this.transaction(() => {
+      const invite = this.getInviteByHash(params.orgId, params.codeHash);
+      if (!invite) return null;
+      if (invite.usedAt !== null || invite.revokedAt !== null) return null;
+      if (Date.parse(invite.expiresAt) <= Date.parse(params.nowIso)) return null;
+      if (this.isActorDisabled(params.orgId, invite.actorId)) return null;
+
+      // Atomically mark invite used first (strict single-use + unexpired check inside SQL)
+      const upd = this.db
+        .prepare(
+          `UPDATE invites
+           SET used_at = ?, used_by_issuer = ?, used_by_subject = ?
+           WHERE id = ? AND org_id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?`,
+        )
+        .run(
+          params.nowIso,
+          params.issuer,
+          params.subject,
+          invite.id,
+          params.orgId,
+          params.nowIso,
+        );
+      if (Number(upd.changes ?? 0) !== 1) return null;
+
+      const identity: OidcIdentityRecord = {
+        id: params.identityId,
+        orgId: params.orgId,
+        issuer: params.issuer,
+        subject: params.subject,
+        actorId: invite.actorId,
+        actorKind: invite.actorKind,
+        boundRealmId: invite.boundRealmId,
+        email: params.email,
+        displayName: params.displayName,
+        disabledAt: null,
+        createdAt: params.nowIso,
+        updatedAt: params.nowIso,
+      };
+      this.insertIdentity(identity);
+      return identity;
+    });
+  }
+
+  revokeInvite(orgId: string, id: string, revokedAt: string): boolean {
+    const res = this.db
+      .prepare(
+        `UPDATE invites SET revoked_at = ? WHERE org_id = ? AND id = ? AND revoked_at IS NULL AND used_at IS NULL`,
+      )
+      .run(revokedAt, orgId, id);
+    return Number(res.changes ?? 0) > 0;
+  }
+
+  disableActor(params: {
+    orgId: string;
+    actorId: string;
+    reason: string | null;
+    disabledBy: string;
+    disabledAt: string;
+  }): {
+    revokedTokens: number;
+    revokedAgentTokens: number;
+    revokedInvites: number;
+    disabledIdentities: number;
+  } {
+    const normalizedActorId = params.actorId.trim().toLowerCase();
+    return this.transaction(() => {
+      this.db
+        .prepare(
+          `DELETE FROM disabled_actors WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)`,
+        )
+        .run(params.orgId, normalizedActorId);
+      this.db
+        .prepare(
+          `INSERT INTO disabled_actors (org_id, actor_id, reason, disabled_by, disabled_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(
+          params.orgId,
+          normalizedActorId,
+          params.reason,
+          params.disabledBy,
+          params.disabledAt,
+        );
+      const idRes = this.db
+        .prepare(
+          `UPDATE identities SET disabled_at = ?, updated_at = ?
+           WHERE org_id = ? AND LOWER(actor_id) = LOWER(?) AND disabled_at IS NULL`,
+        )
+        .run(
+          params.disabledAt,
+          params.disabledAt,
+          params.orgId,
+          normalizedActorId,
+        );
+      const revokedTokens = this.revokeTokensForActor(
+        params.orgId,
+        normalizedActorId,
+        params.disabledAt,
+      );
+      // Cascade: revoke any delegated agent tokens created by this actor
+      const agentTokRes = this.db
+        .prepare(
+          `UPDATE tokens SET revoked_at = ?
+           WHERE org_id = ?
+             AND actor_kind = 'agent'
+             AND revoked_at IS NULL
+             AND (LOWER(created_by) = LOWER(?) OR LOWER(created_by) = LOWER(?))`,
+        )
+        .run(
+          params.disabledAt,
+          params.orgId,
+          normalizedActorId,
+          `oidc-device:${normalizedActorId}`,
+        );
+      // Cascade: revoke all unused invites created by this actor
+      const invRes = this.db
+        .prepare(
+          `UPDATE invites SET revoked_at = ?
+           WHERE org_id = ?
+             AND LOWER(created_by) = LOWER(?)
+             AND used_at IS NULL
+             AND revoked_at IS NULL`,
+        )
+        .run(params.disabledAt, params.orgId, normalizedActorId);
+      return {
+        revokedTokens,
+        revokedAgentTokens: Number(agentTokRes.changes ?? 0),
+        revokedInvites: Number(invRes.changes ?? 0),
+        disabledIdentities: Number(idRes.changes ?? 0),
+      };
+    });
+  }
+
+  enableActor(orgId: string, actorId: string): boolean {
+    return this.transaction(() => {
+      const now = new Date().toISOString();
+      const del = this.db
+        .prepare(
+          `DELETE FROM disabled_actors WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)`,
+        )
+        .run(orgId, actorId);
+      const upd = this.db
+        .prepare(
+          `UPDATE identities SET disabled_at = NULL, updated_at = ? WHERE org_id = ? AND LOWER(actor_id) = LOWER(?) AND disabled_at IS NOT NULL`,
+        )
+        .run(now, orgId, actorId);
+      return Number(del.changes ?? 0) > 0 || Number(upd.changes ?? 0) > 0;
+    });
+  }
+
+  isActorDisabled(orgId: string, actorId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS hit FROM disabled_actors WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)`,
+      )
+      .get(orgId, actorId) as { hit?: number } | undefined;
+    return Boolean(row?.hit);
+  }
+
+  isActorIdClaimedInOrg(orgId: string, actorId: string): boolean {
+    const hit = this.db
+      .prepare(
+        `SELECT 1 AS hit FROM identities WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)
+         UNION ALL
+         SELECT 1 AS hit FROM tokens WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)
+         UNION ALL
+         SELECT 1 AS hit FROM disabled_actors WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)
+         UNION ALL
+         SELECT 1 AS hit FROM invites WHERE org_id = ? AND LOWER(actor_id) = LOWER(?) AND revoked_at IS NULL
+         UNION ALL
+         SELECT 1 AS hit FROM records r JOIN realms rm ON rm.id = r.realm_id WHERE rm.org_id = ? AND LOWER(r.author_id) = LOWER(?)
+         UNION ALL
+         SELECT 1 AS hit FROM seabed_entries s JOIN realms rm ON rm.id = s.realm_id WHERE rm.org_id = ? AND LOWER(s.author_id) = LOWER(?)
+         LIMIT 1`,
+      )
+      .get(
+        orgId,
+        actorId,
+        orgId,
+        actorId,
+        orgId,
+        actorId,
+        orgId,
+        actorId,
+        orgId,
+        actorId,
+        orgId,
+        actorId,
+      ) as { hit?: number } | undefined;
+    return Boolean(hit?.hit);
+  }
+
+  listDisabledActors(orgId: string): DisabledActorRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM disabled_actors WHERE org_id = ? ORDER BY disabled_at DESC`,
+      )
+      .all(orgId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      orgId: String(r.org_id),
+      actorId: String(r.actor_id),
+      reason: r.reason ? String(r.reason) : null,
+      disabledBy: String(r.disabled_by),
+      disabledAt: String(r.disabled_at),
+    }));
   }
 
   // ---- Outbox Consumer Cursors & Deliveries (Migration v9) ----

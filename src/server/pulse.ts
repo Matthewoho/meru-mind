@@ -1248,6 +1248,24 @@ export class MindPulseStore {
   }
 
   /**
+   * Immediately removes all active pulse sessions belonging to a disabled actor in `orgId`.
+   */
+  removeAllForActor(orgId: string, actorId: string): number {
+    const targetLower = actorId.trim().toLowerCase();
+    let removed = 0;
+    for (const [k, entry] of this.entries.entries()) {
+      if (
+        entry.orgId === orgId &&
+        entry.actorId.toLowerCase() === targetLower
+      ) {
+        this.entries.delete(k);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
+  /**
    * Writes a disposable shutdown snapshot so `turn_ended` sessions survive clean server restarts
    * without adding SQLite tables or runtime DB writes. Deleting this file loses zero durable records.
    */

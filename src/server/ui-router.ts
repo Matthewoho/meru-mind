@@ -12,6 +12,7 @@ import {
   DEFAULT_SHELL_HTML,
   DEFAULT_SHELL_JS,
 } from "./ui-assets.js";
+import type { OidcManager } from "./oidc.js";
 import type { UiSessionManager } from "./ui-auth.js";
 import { isOriginAllowed } from "./ws-pump.js";
 
@@ -116,6 +117,8 @@ export interface UiRouterOptions {
   uiSessions: UiSessionManager;
   webDir: string | null;
   allowedOrigins?: string[];
+  oidcManager?: OidcManager | null;
+  getServerUrl?: () => string;
 }
 
 /**
@@ -188,16 +191,57 @@ export function createUiRouteHandler(options: UiRouterOptions) {
         engine.db,
         params.orgId,
       );
+      const oidcEnabled = Boolean(options.oidcManager);
       sendAsset(
         res,
         200,
         "application/json; charset=utf-8",
         JSON.stringify(
           principal
-            ? { authenticated: true, actor: principal.actor }
-            : { authenticated: false },
+            ? {
+                authenticated: true,
+                actor: principal.actor,
+                oidcEnabled,
+                oidcLoginUrl: oidcEnabled ? "/_meru/oidc/login" : null,
+              }
+            : {
+                authenticated: false,
+                oidcEnabled,
+                oidcLoginUrl: oidcEnabled ? "/_meru/oidc/login" : null,
+              },
         ),
       );
+      return true;
+    }
+    if (
+      pathname.startsWith("/_meru/oidc/") ||
+      pathname === "/_meru/device" ||
+      pathname.startsWith("/_meru/device/")
+    ) {
+      if (!options.oidcManager) {
+        sendAsset(
+          res,
+          404,
+          "application/json; charset=utf-8",
+          JSON.stringify({
+            error: "not_found",
+            message: "OIDC SSO is not configured on this Meru Mind server.",
+          }),
+        );
+        return true;
+      }
+      const handled = await options.oidcManager.handleRequest({
+        req,
+        res,
+        url,
+        db: engine.db,
+        orgId: params.orgId,
+        uiSessions: options.uiSessions,
+        fallbackServerUrl: options.getServerUrl?.() ?? "http://127.0.0.1:3800",
+        allowedOrigins: options.allowedOrigins,
+      });
+      if (handled) return true;
+      sendAsset(res, 404, "text/plain; charset=utf-8", "OIDC route not found");
       return true;
     }
     if (pathname === "/_meru/auth" && method === "GET") {

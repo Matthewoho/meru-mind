@@ -1,0 +1,110 @@
+# Meru Mind Team Server + Pocket ID v2 (Recommended Passkey-First OIDC SSO) + Caddy HTTPS
+# Usage:
+#   MERU_DOMAIN=mind.example.com \
+#   OIDC_DOMAIN=id.example.com \
+#   POCKET_ID_ENCRYPTION_KEY=$(openssl rand -base64 32) \
+#   MERU_OIDC_CLIENT_ID=<pocket-id-client-id> \
+#   MERU_OIDC_CLIENT_SECRET=<pocket-id-client-secret> \
+#   docker compose -f deploy/docker-compose.oidc-pocketid.yml up -d
+#
+# In Pocket ID (https://${OIDC_DOMAIN}/setup on first boot), create an OIDC client with redirect URI:
+#   https://${MERU_DOMAIN}/_meru/oidc/callback
+# Leave MERU_OIDC_TRUST_ISSUER=false unless every user in Pocket ID should auto-join without an invite.
+
+services:
+  meru-mind:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      MERU_MIND_HOME: /var/lib/meru-mind
+      MERU_MIND_PUBLIC_URL: https://${MERU_DOMAIN}
+      MERU_OIDC_ISSUER: https://${OIDC_DOMAIN}
+      MERU_OIDC_CLIENT_ID: ${MERU_OIDC_CLIENT_ID}
+      MERU_OIDC_CLIENT_SECRET: ${MERU_OIDC_CLIENT_SECRET:-}
+      MERU_OIDC_TRUST_ISSUER: ${MERU_OIDC_TRUST_ISSUER:-false}
+    volumes:
+      - meru_mind_data:/var/lib/meru-mind
+    expose:
+      - "3800"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3800/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  pocket-id:
+    image: ghcr.io/pocket-id/pocket-id:v2
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      APP_URL: https://${OIDC_DOMAIN}
+      ENCRYPTION_KEY: ${POCKET_ID_ENCRYPTION_KEY:?Generate with openssl rand -base64 32}
+      TRUST_PROXY: "true"
+    volumes:
+      - pocket_id_data:/app/data
+    expose:
+      - "1411"
+    healthcheck:
+      test: ["CMD", "/app/pocket-id", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      meru-mind:
+        condition: service_healthy
+      pocket-id:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      MERU_DOMAIN: ${MERU_DOMAIN}
+      OIDC_DOMAIN: ${OIDC_DOMAIN}
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/etc/caddy/Caddyfile
+        {$$MERU_DOMAIN} {
+          encode zstd gzip
+          header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+          reverse_proxy meru-mind:3800 {
+            flush_interval -1
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+          }
+        }
+        {$$OIDC_DOMAIN} {
+          encode zstd gzip
+          header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+          reverse_proxy pocket-id:1411
+        }
+        EOF
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  meru_mind_data:
+  pocket_id_data:
+  caddy_data:
+  caddy_config:

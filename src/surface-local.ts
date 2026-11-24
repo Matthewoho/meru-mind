@@ -830,12 +830,26 @@ export class LocalMindSurface implements MindSurface {
     });
   }
 
+  private assertOrgRootHuman(action: string, cliCmd: string): void {
+    this.assertNotWeakenedCookie(action, cliCmd);
+    this.assertHuman(action, cliCmd);
+    const root =
+      this.engine.db.getRealmByPath(this.principal.orgId, "/") ??
+      this.engine.db.listRealms(this.principal.orgId)[0];
+    if (root && this.principal.boundRealmId !== root.id) {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Realm-scoped principals cannot ${action}; an organization root-realm human admin token is required.`,
+        { try: cliCmd },
+      );
+    }
+  }
+
   async createToken(
     params: SurfaceCreateTokenInput,
   ): Promise<SurfaceCreateTokenResult> {
     const cliCmd = `meru-mind token create --actor ${params.actorId} --kind ${params.actorKind}${params.boundRealmRef ? ` --in ${params.boundRealmRef}` : ""}`;
-    this.assertNotWeakenedCookie("token create", cliCmd);
-    this.assertHuman("create authentication tokens", cliCmd);
+    this.assertOrgRootHuman("create authentication tokens", cliCmd);
     return createAuthToken({
       db: this.engine.db,
       orgId: this.principal.orgId,
@@ -852,8 +866,7 @@ export class LocalMindSurface implements MindSurface {
     includeRevoked?: boolean;
   }): Promise<AuthTokenPublic[]> {
     const cliCmd = "meru-mind token list";
-    this.assertNotWeakenedCookie("token list", cliCmd);
-    this.assertHuman("list authentication tokens", cliCmd);
+    this.assertOrgRootHuman("list authentication tokens", cliCmd);
     return this.engine.db
       .listTokens(this.principal.orgId, Boolean(params?.includeRevoked))
       .map(toPublicToken);
@@ -861,8 +874,7 @@ export class LocalMindSurface implements MindSurface {
 
   async revokeToken(params: { tokenId: string }): Promise<boolean> {
     const cliCmd = `meru-mind token revoke ${params.tokenId}`;
-    this.assertNotWeakenedCookie("token revoke", cliCmd);
-    this.assertHuman("revoke authentication tokens", cliCmd);
+    this.assertOrgRootHuman("revoke authentication tokens", cliCmd);
     return this.engine.db.revokeToken(
       this.principal.orgId,
       params.tokenId,

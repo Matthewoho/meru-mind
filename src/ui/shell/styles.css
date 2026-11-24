@@ -2371,6 +2371,30 @@ mark.meru-hl {
   line-height: 1.55;
 }
 
+.auth-sso-btn {
+  width: 100%;
+  height: 38px;
+  font-size: var(--meru-fs-sm);
+  text-decoration: none;
+  margin-bottom: 16px;
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0;
+  color: var(--meru-fg-muted);
+  font-size: 11.5px;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--meru-rule);
+}
+
 /* Toast */
 .meru-toast {
   position: fixed;

@@ -8,6 +8,26 @@ import {
 } from "../types.js";
 
 export const TOKEN_PREFIX = "mm_live_";
+export const DEFAULT_SSO_TOKEN_TTL_DAYS = 90;
+export const MAX_TOKEN_TTL_DAYS = 365;
+
+function isIsoExpired(expiresAt: string | null, nowMs: number): boolean {
+  if (expiresAt === null) return false;
+  const parsed = Date.parse(expiresAt);
+  // Fail-closed: corrupt/unparseable timestamps are treated as expired
+  if (!Number.isFinite(parsed)) return true;
+  return parsed <= nowMs;
+}
+
+function areAllActorIdentitiesDisabled(
+  db: DbPort,
+  orgId: string,
+  actorId: string,
+): boolean {
+  const identities = db.listIdentitiesByActor(orgId, actorId);
+  if (identities.length === 0) return false;
+  return identities.every((id) => id.disabledAt !== null);
+}
 
 export function hashAuthToken(plaintextToken: string): string {
   return crypto.createHash("sha256").update(plaintextToken, "utf8").digest("hex");
@@ -28,6 +48,7 @@ export function toPublicToken(rec: AuthTokenRecord): AuthTokenPublic {
     label: rec.label,
     createdBy: rec.createdBy,
     createdAt: rec.createdAt,
+    expiresAt: rec.expiresAt,
     revokedAt: rec.revokedAt,
     lastUsedAt: rec.lastUsedAt,
   };
@@ -42,6 +63,8 @@ export interface CreateAuthTokenParams {
   boundRealmId?: string | null;
   label?: string | null;
   createdBy: string;
+  expiresAt?: string | null;
+  ttlDays?: number | null;
 }
 
 export interface CreateAuthTokenResult {
@@ -93,7 +116,21 @@ export function createAuthToken(
   }
 
   const plaintext = generateAuthTokenPlaintext();
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  let expiresAt: string | null = params.expiresAt ?? null;
+  if (!expiresAt && params.ttlDays !== undefined && params.ttlDays !== null) {
+    if (typeof params.ttlDays !== "number" || !Number.isFinite(params.ttlDays) || params.ttlDays <= 0) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Token ttlDays must be a positive number (1..${MAX_TOKEN_TTL_DAYS})`,
+      );
+    }
+    const clampedDays = Math.min(params.ttlDays, MAX_TOKEN_TTL_DAYS);
+    expiresAt = new Date(
+      nowMs + clampedDays * 24 * 60 * 60 * 1000,
+    ).toISOString();
+  }
   const id = `tok_${crypto.randomBytes(8).toString("hex")}`;
   const fullRecord: AuthTokenRecord = {
     id,
@@ -106,6 +143,7 @@ export function createAuthToken(
     label: params.label?.trim() || null,
     createdBy: params.createdBy,
     createdAt: now,
+    expiresAt,
     revokedAt: null,
     lastUsedAt: null,
   };
@@ -169,6 +207,7 @@ export function resolvePrincipalFromToken(params: {
   if (!raw) {
     throw new MindError("ACCESS_DENIED", "Missing authentication token");
   }
+  const nowMs = params.nowMs ?? Date.now();
   const tokenRec = params.db.getTokenByHash(hashAuthToken(raw));
   if (
     !tokenRec ||
@@ -176,6 +215,24 @@ export function resolvePrincipalFromToken(params: {
     tokenRec.orgId !== params.expectedOrgId
   ) {
     throw new MindError("ACCESS_DENIED", "Invalid or revoked token");
+  }
+  if (isIsoExpired(tokenRec.expiresAt, nowMs)) {
+    throw new MindError(
+      "ACCESS_DENIED",
+      "Authentication token has expired. Run 'meru-mind login' to obtain a fresh token.",
+      {
+        try: "meru-mind login --url <server-url>",
+      },
+    );
+  }
+  if (
+    params.db.isActorDisabled(tokenRec.orgId, tokenRec.actorId) ||
+    areAllActorIdentitiesDisabled(params.db, tokenRec.orgId, tokenRec.actorId)
+  ) {
+    throw new MindError(
+      "ACCESS_DENIED",
+      "Actor account has been disabled by an administrator",
+    );
   }
 
   const org = params.db.getOrg(tokenRec.orgId);
@@ -195,7 +252,6 @@ export function resolvePrincipalFromToken(params: {
     boundSource = org.policy === "open" ? "open-default:/" : "token-root:/";
   }
 
-  const nowMs = params.nowMs ?? Date.now();
   if (
     !params.skipTouchLastUsed &&
     (!params.touchThrottle || params.touchThrottle.shouldTouch(tokenRec.id, nowMs))
@@ -217,8 +273,24 @@ export function resolvePrincipalFromToken(params: {
   };
 }
 
-export function isPrincipalTokenActive(db: DbPort, principal: Principal): boolean {
+export function isPrincipalTokenActive(
+  db: DbPort,
+  principal: Principal,
+  nowMs = Date.now(),
+): boolean {
+  if (
+    db.isActorDisabled(principal.orgId, principal.actor.id) ||
+    areAllActorIdentitiesDisabled(db, principal.orgId, principal.actor.id)
+  ) {
+    return false;
+  }
   if (!principal.tokenId) return true;
   const rec = db.getToken(principal.tokenId);
-  return Boolean(rec && rec.revokedAt === null && rec.orgId === principal.orgId);
+  if (!rec || rec.revokedAt !== null || rec.orgId !== principal.orgId) {
+    return false;
+  }
+  if (isIsoExpired(rec.expiresAt, nowMs)) {
+    return false;
+  }
+  return true;
 }

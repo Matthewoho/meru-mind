@@ -7,16 +7,19 @@ import type {
   ConsumerCursor,
   DeliveryRecord,
   DeliveryState,
+  DisabledActorRecord,
   Distillation,
   DistillationLayer,
   DriveFileContent,
   DriveFileMeta,
   EntryObjectLink,
   IdempotencyRecord,
+  InviteRecord,
   LedgerRecord,
   MindObject,
   ObjectAlias,
   ObjectState,
+  OidcIdentityRecord,
   Organization,
   OrgPolicy,
   PumpChangeFrame,
@@ -515,13 +518,61 @@ export interface DbPort {
   }): { generation: number; topologyVersion: number; frames: PumpChangeFrame[] };
   resetChangeLog(): { generation: number; clearedCount: number };
 
-  // Auth Tokens (Migration v9)
+  // Auth Tokens (Migration v9 + v12 expires_at)
   insertToken(token: AuthTokenRecord): void;
   getToken(id: string): AuthTokenRecord | null;
   getTokenByHash(tokenHash: string): AuthTokenRecord | null;
   listTokens(orgId: string, includeRevoked?: boolean): AuthTokenRecord[];
   revokeToken(orgId: string, id: string, revokedAt: string): boolean;
+  revokeTokensForActor(orgId: string, actorId: string, revokedAt: string): number;
   touchTokenLastUsed(id: string, usedAt: string): void;
+
+  // OIDC Identities, Invitations & Actor Disable (Migration v12)
+  insertIdentity(identity: OidcIdentityRecord): void;
+  updateIdentityProfile(params: {
+    id: string;
+    email: string | null;
+    displayName: string | null;
+    updatedAt: string;
+  }): void;
+  getIdentityBySubject(
+    orgId: string,
+    issuer: string,
+    subject: string,
+  ): OidcIdentityRecord | null;
+  listIdentities(orgId: string): OidcIdentityRecord[];
+  listIdentitiesByActor(orgId: string, actorId: string): OidcIdentityRecord[];
+  insertInvite(invite: InviteRecord): void;
+  getInvite(orgId: string, id: string): InviteRecord | null;
+  getInviteByHash(orgId: string, codeHash: string): InviteRecord | null;
+  listInvites(orgId: string): InviteRecord[];
+  consumeInviteAndBindIdentity(params: {
+    orgId: string;
+    codeHash: string;
+    nowIso: string;
+    identityId: string;
+    issuer: string;
+    subject: string;
+    email: string | null;
+    displayName: string | null;
+  }): OidcIdentityRecord | null;
+  revokeInvite(orgId: string, id: string, revokedAt: string): boolean;
+  disableActor(params: {
+    orgId: string;
+    actorId: string;
+    reason: string | null;
+    disabledBy: string;
+    disabledAt: string;
+  }): {
+    revokedTokens: number;
+    revokedAgentTokens: number;
+    revokedInvites: number;
+    disabledIdentities: number;
+  };
+  enableActor(orgId: string, actorId: string): boolean;
+  isActorDisabled(orgId: string, actorId: string): boolean;
+  isActorIdClaimedInOrg(orgId: string, actorId: string): boolean;
+  listDisabledActors(orgId: string): DisabledActorRecord[];
 
   // Outbox Consumer Cursors & Deliveries (Migration v9)
   upsertConsumerCursor(cursor: ConsumerCursor): void;

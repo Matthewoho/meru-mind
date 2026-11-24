@@ -90,6 +90,11 @@ export interface AttachPumpWsOptions {
   inactivityTimeoutMs?: number;
 }
 
+export interface PumpWsHandle {
+  (): void;
+  closeForActor(orgId: string, actorId: string): number;
+}
+
 /**
  * Attaches the Pump-backed WebSocket endpoint at `WS /v1/ws`, strictly enforcing ALL 7 Fable hard conditions:
  * 1. Same-origin HttpOnly Cookie auth (NEVER accepts tokens in URL query string)
@@ -102,10 +107,13 @@ export interface AttachPumpWsOptions {
  */
 export function attachPumpWebSocketServer(
   options: AttachPumpWsOptions,
-): () => void {
+): PumpWsHandle {
   const pingMs = options.pingIntervalMs ?? PING_INTERVAL_MS;
   const timeoutMs = options.inactivityTimeoutMs ?? INACTIVITY_TIMEOUT_MS;
-  const activeSockets = new Set<Duplex>();
+  const activeSockets = new Map<
+    Duplex,
+    { orgId: string; actorId: string; cleanup: () => void }
+  >();
 
   const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     let url: URL;
@@ -175,8 +183,6 @@ export function attachPumpWebSocketServer(
       ].join("\r\n"),
     );
 
-    activeSockets.add(socket);
-
     const pump = new MindPump(options.db, options.wakeBus, principal);
     let cursorSeq = 0;
     let clientGen: number | undefined;
@@ -199,6 +205,12 @@ export function attachPumpWebSocketServer(
         unsubBus = null;
       }
     };
+
+    activeSockets.set(socket, {
+      orgId: principal.orgId,
+      actorId: principal.actor.id,
+      cleanup,
+    });
 
     const sendJsonFrame = (obj: unknown): Promise<void> => {
       if (closed || socket.destroyed || !socket.writable) {
@@ -447,11 +459,30 @@ export function attachPumpWebSocketServer(
 
   options.httpServer.on("upgrade", onUpgrade);
 
-  return () => {
+  const detach = (() => {
     options.httpServer.off("upgrade", onUpgrade);
-    for (const sock of activeSockets) {
+    for (const [sock, entry] of activeSockets.entries()) {
       sendClose(sock, 1001, "Server shutting down");
+      entry.cleanup();
     }
     activeSockets.clear();
+  }) as PumpWsHandle;
+
+  detach.closeForActor = (targetOrgId: string, actorId: string): number => {
+    const targetLower = actorId.trim().toLowerCase();
+    let closedCount = 0;
+    for (const [sock, entry] of Array.from(activeSockets.entries())) {
+      if (
+        entry.orgId === targetOrgId &&
+        entry.actorId.toLowerCase() === targetLower
+      ) {
+        sendClose(sock, 4001, "Actor disabled");
+        entry.cleanup();
+        closedCount += 1;
+      }
+    }
+    return closedCount;
   };
+
+  return detach;
 }
