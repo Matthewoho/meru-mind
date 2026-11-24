@@ -20,6 +20,8 @@ export interface PulseEntry {
   clientHint: string | null;
   focus: string[];
   note: string | null;
+  /** Server-observed latest safe action in this realm (never populated from confidential/secret entries or read-only realms) */
+  activity: string | null;
   lastSeenAt: string;
   /** Seconds elapsed since lastSeenAt relative to server clock `now` */
   ageSeconds: number;
@@ -39,6 +41,7 @@ export interface PulseListResult {
 export const MAX_FOCUS_REFS = 3;
 export const MAX_FOCUS_ITEM_CHARS = 120;
 export const MAX_NOTE_CHARS = 140;
+export const MAX_ACTIVITY_CHARS = 96;
 export const MAX_SESSION_TAG_CHARS = 64;
 export const MAX_CLIENT_HINT_CHARS = 32;
 export const MAX_SESSIONS_PER_PRINCIPAL = 16;
@@ -49,6 +52,8 @@ export const STALE_EVICT_MS = 45 * 60_000;
 
 const CLIENT_HINT_RE = /^[a-zA-Z0-9._-]{1,32}$/;
 const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/;
+const CREDENTIAL_LIKE_RE =
+  /(?:mm_live_|sk-[a-z0-9]{10,}|ghp_[a-z0-9]{10,}|github_pat_[a-z0-9_]{10,}|AKIA[0-9A-Z]{12,}|xox[bpas]-[a-z0-9-]+|Bearer\s+[a-z0-9._-]{10,}|-----BEGIN\s+[A-Z ]+KEY-----)/i;
 
 interface StoredPulse {
   compositeKey: string;
@@ -61,8 +66,21 @@ interface StoredPulse {
   clientHint: string | null;
   focus: string[];
   note: string | null;
+  activity: string | null;
   heartbeat: boolean;
   lastSeenMs: number;
+}
+
+export function sanitizeObservedActivity(raw?: string | null): string | null {
+  if (!raw) return null;
+  const cleaned = String(raw)
+    .replace(/[\x00-\x1f\x7f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return null;
+  if (CREDENTIAL_LIKE_RE.test(cleaned)) return null;
+  if (cleaned.length <= MAX_ACTIVITY_CHARS) return cleaned;
+  return `${cleaned.slice(0, MAX_ACTIVITY_CHARS - 1).trimEnd()}…`;
 }
 
 export function sanitizeClientHint(raw?: string | null): string | null {
@@ -199,6 +217,7 @@ export class MindPulseStore {
       clientHint: stored.clientHint,
       focus: [...stored.focus],
       note: stored.note,
+      activity: stored.activity,
       lastSeenAt: new Date(stored.lastSeenMs).toISOString(),
       ageSeconds: Math.floor(ageMs / 1000),
       heartbeat: stored.heartbeat,
@@ -326,6 +345,7 @@ export class MindPulseStore {
       clientHint,
       focus,
       note: noteRaw || null,
+      activity: existing && existing.realmId === targetRealm.id ? existing.activity : null,
       heartbeat: true,
       lastSeenMs: nowMs,
     };
@@ -347,6 +367,8 @@ export class MindPulseStore {
     sessionTag?: string | null;
     clientHint?: string | null;
     realmId?: string | null;
+    realmRef?: string | null;
+    activity?: string | null;
     nowMs?: number;
   }): void {
     const nowMs = params.nowMs ?? Date.now();
@@ -366,6 +388,28 @@ export class MindPulseStore {
     );
     const existing = this.entries.get(compositeKey);
 
+    let resolvedTargetRealmId: string | null = params.realmId ?? null;
+    if (!resolvedTargetRealmId && params.realmRef?.trim()) {
+      try {
+        const scope = resolveAccessScope({
+          realms,
+          mounts,
+          viewerRealmId: params.principal.boundRealmId,
+          orgPolicy: org.policy,
+          includeDescendantSeabed: false,
+        });
+        const targetRealm = resolveVisibleRealm({
+          realms,
+          orgId: org.id,
+          ref: params.realmRef.trim(),
+          scope,
+        });
+        resolvedTargetRealmId = targetRealm.id;
+      } catch {
+        resolvedTargetRealmId = null;
+      }
+    }
+
     const isWritable = (candidateId: string | null | undefined): candidateId is string => {
       if (!candidateId || !realmById.has(candidateId)) return false;
       const access = resolveAccess({
@@ -380,15 +424,24 @@ export class MindPulseStore {
       return access === "write";
     };
 
+    const targetWritable = isWritable(resolvedTargetRealmId);
     let nextRealmId: string | null = null;
-    if (isWritable(params.realmId)) {
-      nextRealmId = params.realmId;
+    if (targetWritable) {
+      nextRealmId = resolvedTargetRealmId;
     } else if (isWritable(existing?.realmId)) {
       nextRealmId = existing!.realmId;
     } else if (isWritable(params.principal.boundRealmId)) {
       nextRealmId = params.principal.boundRealmId;
     }
     if (!nextRealmId) return;
+
+    // Security invariant: NEVER attach activity observed from a read-only / @mounted realm
+    const safeActivity = targetWritable
+      ? sanitizeObservedActivity(params.activity)
+      : null;
+    const nextActivity =
+      safeActivity ??
+      (existing && existing.realmId === nextRealmId ? existing.activity : null);
 
     this.enforceCapacity(principalNamespace, compositeKey);
 
@@ -404,6 +457,7 @@ export class MindPulseStore {
       clientHint: sanitizedHint ?? existing?.clientHint ?? null,
       focus: existing ? [...existing.focus] : [],
       note: existing ? existing.note : null,
+      activity: nextActivity,
       heartbeat: existing?.heartbeat ?? false,
       lastSeenMs: nowMs,
     };
@@ -494,6 +548,7 @@ export class MindPulseStore {
         realmPath: entry.realmPath,
         focus: entry.focus,
         note: entry.note,
+        activity: entry.activity,
         lastSeenAt: entry.lastSeenAt,
         ageSeconds: entry.ageSeconds,
         heartbeat: entry.heartbeat,

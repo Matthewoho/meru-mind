@@ -47,6 +47,10 @@ const STUDIO_I18N = {
     htmlRender: "Render static preview",
     htmlHide: "Show raw source",
     payload: "Structured Payload",
+    activeHere: "Active here",
+    sessionsPlural: "sessions",
+    sessionSingle: "session",
+    hereTag: "Here",
   },
   "zh-CN": {
     realms: "领域目录",
@@ -67,8 +71,63 @@ const STUDIO_I18N = {
     htmlRender: "渲染静态预览",
     htmlHide: "查看源码",
     payload: "结构化 Payload",
+    activeHere: "同域活跃",
+    sessionsPlural: "个会话",
+    sessionSingle: "个会话",
+    hereTag: "当前域",
   },
 };
+
+function formatPulseAge(sec) {
+  if (typeof sec !== "number" || !Number.isFinite(sec)) return "";
+  if (sec < 60) return sec + "s";
+  const m = Math.floor(sec / 60);
+  return m < 60 ? (m + "m") : (Math.floor(m / 60) + "h");
+}
+
+function shortSessionHandle(sessionId) {
+  const cleaned = String(sessionId || "").replace(/^ps_/, "");
+  return cleaned ? ("#" + cleaned.slice(0, 4)) : "";
+}
+
+function pulseRank(p) {
+  return p.online ? 2 : (p.active ? 1 : 0);
+}
+
+function groupPulsesByActor(pulses) {
+  const byActor = new Map();
+  for (const p of pulses || []) {
+    const key = String(p.actorId || "unknown");
+    let group = byActor.get(key);
+    if (!group) {
+      group = {
+        actorId: key,
+        actorKind: p.actorKind || "agent",
+        online: false,
+        active: false,
+        sessions: [],
+      };
+      byActor.set(key, group);
+    }
+    group.sessions.push(p);
+    if (p.online) group.online = true;
+    if (p.active) group.active = true;
+  }
+  const groups = Array.from(byActor.values());
+  for (const g of groups) {
+    g.sessions.sort((a, b) => {
+      const rankDiff = pulseRank(b) - pulseRank(a);
+      if (rankDiff !== 0) return rankDiff;
+      return String(b.lastSeenAt || "").localeCompare(String(a.lastSeenAt || ""));
+    });
+  }
+  groups.sort((a, b) => {
+    const rankDiff = (b.online ? 2 : (b.active ? 1 : 0)) - (a.online ? 2 : (a.active ? 1 : 0));
+    if (rankDiff !== 0) return rankDiff;
+    return String(b.sessions[0]?.lastSeenAt || "").localeCompare(String(a.sessions[0]?.lastSeenAt || ""));
+  });
+  return groups;
+}
 
 function detectStudioLang() {
   const saved = localStorage.getItem("meru-studio-lang");
@@ -159,6 +218,7 @@ const state = {
   showLedgerHistory: false,
   inboxEntries: [],
   pulses: [],
+  selfPulseSessionId: null,
   selectedEntry: null,
   selectedChain: null,
   selectedObject: null,
@@ -324,7 +384,8 @@ async function selectRealm(realmPath, preferredTab) {
   if (inboxRes) state.inboxEntries = inboxRes.items || [];
   state.lastSyncedAt = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
-  await client.pulse.setFocus([realmPath], null, realmPath).catch(() => {});
+  const selfPulse = await client.pulse.setFocus([realmPath], null, realmPath, "browser").catch(() => null);
+  if (selfPulse?.sessionId) state.selfPulseSessionId = selfPulse.sessionId;
   const pulseRes = await client.pulse.list().catch(() => null);
   if (pulseRes?.pulses) state.pulses = pulseRes.pulses;
   render();
@@ -533,16 +594,17 @@ function buildSidebar() {
   focusLabel.textContent = st("activeFocus");
   scroll.appendChild(focusLabel);
 
-  if (state.pulses.length === 0) {
+  const actorGroups = groupPulsesByActor(state.pulses);
+  if (actorGroups.length === 0) {
     const dash = document.createElement("div");
     dash.className = "nav-group-label";
     dash.textContent = "-";
     scroll.appendChild(dash);
   } else {
-    for (const p of state.pulses) {
+    for (const g of actorGroups) {
       const row = document.createElement("div");
       row.className = "member-row";
-      row.dataset.actorId = p.actorId;
+      row.dataset.actorId = g.actorId;
       row.tabIndex = 0;
 
       const left = document.createElement("div");
@@ -552,16 +614,20 @@ function buildSidebar() {
       av.appendChild(ICONS.user());
       const nm = document.createElement("span");
       nm.className = "member-name";
-      nm.textContent = p.actorId;
+      nm.textContent = g.actorId;
       const dot = document.createElement("span");
-      dot.className = "status-dot" + (p.online ? "" : (p.active ? " active" : " idle"));
-      const ageTxt = typeof p.ageSeconds === "number"
-        ? (p.ageSeconds < 60 ? p.ageSeconds + "s ago" : Math.floor(p.ageSeconds / 60) + "m ago")
-        : "";
-      const roleTxt = p.actorKind === "agent"
-        ? ("Agent" + (p.clientHint ? " (" + p.clientHint + ", self-reported)" : ""))
-        : "Human";
-      dot.title = [roleTxt, p.online ? "Online" : (p.active ? "Active " + ageTxt : "Idle"), p.realmPath || "/"].filter(Boolean).join(" · ");
+      dot.className = "status-dot" + (g.online ? "" : (g.active ? " active" : " idle"));
+      const sessionSummary = g.sessions
+        .map((s) => {
+          const client = s.clientHint || s.actorKind || "session";
+          const detail = s.activity || s.note || s.realmPath || "/";
+          return client + " (" + detail + ")";
+        })
+        .join(", ");
+      const countLabel = g.sessions.length + " " + (g.sessions.length === 1 ? st("sessionSingle") : st("sessionsPlural"));
+      const tip = [g.actorId, g.actorKind, countLabel, sessionSummary].filter(Boolean).join(" · ");
+      dot.title = tip;
+      row.title = tip;
       left.appendChild(av);
       left.appendChild(nm);
       left.appendChild(dot);
@@ -570,12 +636,12 @@ function buildSidebar() {
       dotsBtn.type = "button";
       dotsBtn.className = "row-dots-btn";
       dotsBtn.title = "Member actions";
-      dotsBtn.setAttribute("aria-label", "Actions for " + p.actorId);
+      dotsBtn.setAttribute("aria-label", "Actions for " + g.actorId);
       dotsBtn.appendChild(ICONS.dots());
       dotsBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         const rect = dotsBtn.getBoundingClientRect();
-        state.popover = { kind: "member-menu", x: rect.right + 6, y: rect.top, pulse: p };
+        state.popover = { kind: "member-menu", x: rect.right + 6, y: rect.top, group: g, pulse: g.sessions[0] };
         render();
       });
 
@@ -584,12 +650,12 @@ function buildSidebar() {
 
       row.addEventListener("click", () => {
         const rect = row.getBoundingClientRect();
-        state.popover = { kind: "member-card", x: rect.right + 8, y: rect.top, pulse: p };
+        state.popover = { kind: "member-card", x: rect.right + 8, y: rect.top, group: g, pulse: g.sessions[0] };
         render();
       });
       row.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
-        state.popover = { kind: "member-menu", x: ev.clientX, y: ev.clientY, pulse: p };
+        state.popover = { kind: "member-menu", x: ev.clientX, y: ev.clientY, group: g, pulse: g.sessions[0] };
         render();
       });
       scroll.appendChild(row);
@@ -1070,6 +1136,78 @@ function buildWorkspace() {
   scopeP.textContent = scopeText;
   head.appendChild(scopeP);
 
+  // Contextual inline Active Peers strip: strictly hidden when 0 other peers are active here
+  const realmPeers = (state.pulses || []).filter(
+    (p) => p.realmPath === state.activeRealmPath && p.active && p.sessionId !== state.selfPulseSessionId,
+  );
+  if (realmPeers.length > 0) {
+    const peersBar = document.createElement("div");
+    peersBar.className = "realm-peers-bar";
+    peersBar.dataset.ui = "realm-peers-bar";
+
+    const peersLbl = document.createElement("span");
+    peersLbl.className = "realm-peers-label";
+    peersLbl.textContent = st("activeHere");
+    peersBar.appendChild(peersLbl);
+
+    const groupsByActor = new Map(groupPulsesByActor(state.pulses).map((g) => [g.actorId, g]));
+    const shownPeers = realmPeers.slice(0, 4);
+    for (const peer of shownPeers) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "peer-chip";
+      const dot = document.createElement("span");
+      dot.className = "status-dot" + (peer.online ? "" : " active");
+      const who = document.createElement("span");
+      who.className = "peer-chip-who";
+      who.textContent = peer.clientHint ? (peer.actorId + " · " + peer.clientHint) : peer.actorId;
+      chip.appendChild(dot);
+      chip.appendChild(who);
+
+      const summary = peer.activity || peer.note || "";
+      if (summary) {
+        const ctx = document.createElement("span");
+        ctx.className = "peer-chip-ctx";
+        ctx.textContent = summary;
+        chip.appendChild(ctx);
+      }
+
+      const age = document.createElement("span");
+      age.className = "peer-chip-age";
+      age.textContent = peer.online ? "now" : formatPulseAge(peer.ageSeconds);
+      chip.appendChild(age);
+
+      chip.title = [
+        peer.actorId + " (" + (peer.actorKind || "agent") + (peer.clientHint ? ", " + peer.clientHint : "") + " " + shortSessionHandle(peer.sessionId) + ")",
+        peer.activity || "",
+        peer.note ? ('"' + peer.note + '"') : "",
+      ].filter(Boolean).join(" · ");
+
+      chip.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const rect = chip.getBoundingClientRect();
+        const group = groupsByActor.get(peer.actorId) || {
+          actorId: peer.actorId,
+          actorKind: peer.actorKind,
+          online: peer.online,
+          active: peer.active,
+          sessions: [peer],
+        };
+        state.popover = { kind: "member-card", x: rect.left, y: rect.bottom + 6, group, pulse: peer };
+        render();
+      });
+      peersBar.appendChild(chip);
+    }
+
+    if (realmPeers.length > shownPeers.length) {
+      const more = document.createElement("span");
+      more.className = "realm-peers-more";
+      more.textContent = "+" + (realmPeers.length - shownPeers.length);
+      peersBar.appendChild(more);
+    }
+    head.appendChild(peersBar);
+  }
+
   const tabs = document.createElement("div");
   tabs.className = "tab-bar";
   tabs.setAttribute("role", "tablist");
@@ -1494,12 +1632,13 @@ function buildInspector() {
 
 function renderPopover() {
   if (!state.popover) return null;
+  const isMemberCard = state.popover.kind === "member-card";
   const pop = document.createElement("div");
-  pop.className = "floating-popover";
-  const maxX = Math.max(12, window.innerWidth - 292);
-  const maxY = Math.max(12, window.innerHeight - 200);
-  pop.style.left = Math.min(state.popover.x, maxX) + "px";
-  pop.style.top = Math.min(state.popover.y, maxY) + "px";
+  pop.className = "floating-popover" + (isMemberCard ? " wide" : "");
+  const maxX = Math.max(12, window.innerWidth - (isMemberCard ? 356 : 292));
+  const maxY = Math.max(12, window.innerHeight - (isMemberCard ? 320 : 200));
+  pop.style.left = Math.min(Math.max(12, state.popover.x), maxX) + "px";
+  pop.style.top = Math.min(Math.max(12, state.popover.y), maxY) + "px";
   pop.addEventListener("click", (ev) => ev.stopPropagation());
 
   if (state.popover.kind === "profile") {
@@ -1533,56 +1672,109 @@ function renderPopover() {
     return pop;
   }
 
-  const p = state.popover.pulse;
-  if (state.popover.kind === "member-card" && p) {
+  const group = state.popover.group || (state.popover.pulse ? {
+    actorId: state.popover.pulse.actorId,
+    actorKind: state.popover.pulse.actorKind,
+    online: state.popover.pulse.online,
+    active: state.popover.pulse.active,
+    sessions: [state.popover.pulse],
+  } : null);
+
+  if (state.popover.kind === "member-card" && group) {
     const head = document.createElement("div");
     head.className = "popover-head";
     const nm = document.createElement("div");
     nm.className = "popover-name";
-    nm.textContent = p.actorId;
+    nm.textContent = group.actorId;
     const sub = document.createElement("div");
     sub.className = "popover-sub";
-    const ageStr = typeof p.ageSeconds === "number"
-      ? (p.ageSeconds < 60 ? p.ageSeconds + "s ago" : Math.floor(p.ageSeconds / 60) + "m ago")
-      : "";
-    const statusStr = p.online ? "Online" : (p.active ? "Active " + ageStr : "Idle");
-    const kindStr = p.actorKind === "agent"
-      ? ("agent" + (p.clientHint ? " · client: " + p.clientHint : ""))
-      : "human";
-    sub.textContent = [kindStr, statusStr, p.realmPath || "/"].join(" · ");
+    const countLabel = group.sessions.length + " " + (group.sessions.length === 1 ? st("sessionSingle") : st("sessionsPlural"));
+    sub.textContent = (group.actorKind || "agent") + " · " + countLabel;
     head.appendChild(nm);
     head.appendChild(sub);
     pop.appendChild(head);
 
-    if (p.focus?.length) {
-      const focusItem = document.createElement("button");
-      focusItem.type = "button";
-      focusItem.className = "menu-item";
-      focusItem.appendChild(ICONS.arrowRight());
-      const span = document.createElement("span");
-      span.textContent = "Jump to " + p.focus[0];
-      focusItem.appendChild(span);
-      focusItem.addEventListener("click", () => {
+    const list = document.createElement("div");
+    list.className = "popover-session-list";
+    for (const s of group.sessions) {
+      const item = document.createElement("div");
+      item.className = "popover-session-item";
+
+      const topRow = document.createElement("div");
+      topRow.className = "popover-session-top";
+      const leftMeta = document.createElement("span");
+      leftMeta.className = "popover-session-client";
+      const sDot = document.createElement("span");
+      sDot.className = "status-dot" + (s.online ? "" : (s.active ? " active" : " idle"));
+      const clientText = document.createElement("span");
+      clientText.textContent = (s.clientHint || s.actorKind || "session") + " " + shortSessionHandle(s.sessionId);
+      leftMeta.appendChild(sDot);
+      leftMeta.appendChild(clientText);
+
+      const ageMeta = document.createElement("span");
+      ageMeta.className = "popover-session-age";
+      ageMeta.textContent = s.online
+        ? "Online"
+        : (s.active ? ("Active " + formatPulseAge(s.ageSeconds) + " ago") : ("Idle " + formatPulseAge(s.ageSeconds) + " ago"));
+      topRow.appendChild(leftMeta);
+      topRow.appendChild(ageMeta);
+      item.appendChild(topRow);
+
+      if (s.activity) {
+        const actEl = document.createElement("div");
+        actEl.className = "popover-session-activity";
+        actEl.textContent = s.activity;
+        item.appendChild(actEl);
+      }
+
+      if (s.note) {
+        const noteEl = document.createElement("div");
+        noteEl.className = "popover-session-note";
+        noteEl.textContent = s.note;
+        item.appendChild(noteEl);
+      }
+
+      const targetRealm = s.realmPath || (s.focus && s.focus[0]) || "/";
+      const realmBtn = document.createElement("button");
+      realmBtn.type = "button";
+      realmBtn.className = "popover-session-realm";
+      realmBtn.appendChild(ICONS.arrowRight());
+      const rSpan = document.createElement("span");
+      rSpan.textContent = targetRealm === state.activeRealmPath
+        ? (targetRealm + " · " + st("hereTag"))
+        : targetRealm;
+      realmBtn.appendChild(rSpan);
+      realmBtn.addEventListener("click", () => {
         state.popover = null;
-        void selectRealm(p.focus[0]);
+        void selectRealm(targetRealm);
       });
-      pop.appendChild(focusItem);
+      item.appendChild(realmBtn);
+
+      list.appendChild(item);
     }
+    pop.appendChild(list);
     return pop;
   }
 
-  if (state.popover.kind === "member-menu" && p) {
-    const jump = document.createElement("button");
-    jump.type = "button";
-    jump.className = "menu-item";
-    jump.appendChild(ICONS.arrowRight());
-    const jSpan = document.createElement("span");
-    jSpan.textContent = "Open active realm (" + (p.realmPath || "/") + ")";
-    jump.appendChild(jSpan);
-    jump.addEventListener("click", () => {
-      state.popover = null;
-      void selectRealm(p.realmPath || "/");
-    });
+  if (state.popover.kind === "member-menu" && group) {
+    const seenRealms = new Set();
+    for (const s of group.sessions) {
+      const rp = s.realmPath || "/";
+      if (seenRealms.has(rp)) continue;
+      seenRealms.add(rp);
+      const jump = document.createElement("button");
+      jump.type = "button";
+      jump.className = "menu-item";
+      jump.appendChild(ICONS.arrowRight());
+      const jSpan = document.createElement("span");
+      jSpan.textContent = "Open " + rp;
+      jump.appendChild(jSpan);
+      jump.addEventListener("click", () => {
+        state.popover = null;
+        void selectRealm(rp);
+      });
+      pop.appendChild(jump);
+    }
 
     const cp = document.createElement("button");
     cp.type = "button";
@@ -1594,10 +1786,9 @@ function renderPopover() {
     cp.addEventListener("click", () => {
       state.popover = null;
       render();
-      void copyText(p.actorId, "Copied " + p.actorId);
+      void copyText(group.actorId, "Copied " + group.actorId);
     });
 
-    pop.appendChild(jump);
     pop.appendChild(cp);
     return pop;
   }
@@ -2089,7 +2280,8 @@ client.pump.subscribe((snap) => {
 async function studioPulseKeepaliveTick() {
   if (!state.whoami || document.visibilityState !== "visible") return;
   try {
-    await client.pulse.setFocus([state.activeRealmPath], null, state.activeRealmPath, "browser").catch(() => {});
+    const selfPulse = await client.pulse.setFocus([state.activeRealmPath], null, state.activeRealmPath, "browser").catch(() => null);
+    if (selfPulse?.sessionId) state.selfPulseSessionId = selfPulse.sessionId;
     const pulseRes = await client.pulse.list().catch(() => null);
     if (pulseRes?.pulses) {
       state.pulses = pulseRes.pulses;

@@ -1847,7 +1847,7 @@ async function selectRealm(realmPath, opts = {}) {
   state.realmObjects = Array.isArray(objRes?.objects) ? objRes.objects : [];
   if (inboxRes) state.inboxEntries = inboxRes.items || [];
   await fetchEntriesPage({ reset: true });
-  await client.pulse.setFocus([realmPath], null, realmPath).catch(() => {});
+  await client.pulse.setFocus([realmPath], null, realmPath, "browser").catch(() => {});
   const pulseRes = await client.pulse.list().catch(() => null);
   if (pulseRes?.pulses) state.pulses = pulseRes.pulses;
   render();
@@ -2370,11 +2370,13 @@ function render() {
       const name = document.createElement("span");
       name.className = "pulse-name";
       const target = p.focus?.length ? p.focus[0] : p.realmPath;
-      name.textContent = p.actorId + (target ? (" · " + target) : "");
+      const clientLabel = p.clientHint ? (" · " + p.clientHint) : "";
+      name.textContent = p.actorId + clientLabel + (target ? (" · " + target) : "");
       const metaParts = [
         p.actorKind || "agent",
         p.clientHint ? ("client: " + p.clientHint + " (self-reported)") : "",
         p.online ? "online" : ("active " + formatAge(p.ageSeconds) + " ago"),
+        p.activity || "",
         p.note || "",
       ].filter(Boolean);
       name.title = metaParts.join(" · ");

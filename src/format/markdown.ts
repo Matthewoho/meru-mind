@@ -927,12 +927,16 @@ export function formatShowMarkdown(res: ShowResult): string {
       "",
       `## Active Peers (${res.activePeers.length})`,
       ...res.activePeers.map((p) => {
-        const who = p.clientHint
-          ? `${p.actorId} (${p.actorKind}, client: ${p.clientHint})`
-          : `${p.actorId} (${p.actorKind})`;
+        const handle = `#${p.sessionId.replace(/^ps_/, "").slice(0, 4)}`;
+        const clientPart = p.clientHint
+          ? `${p.actorKind}, ${p.clientHint} ${handle}`
+          : `${p.actorKind} ${handle}`;
+        const who = `${p.actorId} (${clientPart})`;
         const age = p.online ? "online" : `active ${formatRelativeAge(p.ageSeconds)}`;
+        const extraFocus = p.focus.filter((f) => f && f !== p.realmPath);
         const details = [
-          p.focus.length > 0 ? `focus: ${p.focus.join(", ")}` : "",
+          p.activity ? p.activity : "",
+          extraFocus.length > 0 ? `focus: ${extraFocus.join(", ")}` : "",
           p.note ? `"${p.note}"` : "",
         ].filter(Boolean);
         return `- ${who} · ${age}${details.length > 0 ? ` · ${details.join(" · ")}` : ""}`;

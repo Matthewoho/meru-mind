@@ -487,4 +487,179 @@ describe("v0.5.4 MindPulse v2 — Security Hardening, Unified withLivePulse, Cro
     }
     expect(touchSpy).toHaveBeenCalledTimes(1);
   });
+
+  it("5. Server-observed activity & multi-session isolation: safe action summaries surface in activePeers while confidential/secret/credential/read-only actions NEVER leak", async () => {
+    const srv = await startMindServer({
+      homeDir: makeTempDir("meru-v054-activity-multisession-"),
+      host: "127.0.0.1",
+      port: 0,
+      enableVector: false,
+      accessLog: false,
+    });
+    openServers.push(srv);
+
+    const adminTok = srv.createToken({ actorId: "admin", actorKind: "human" });
+    const admin = await RemoteMindSurface.connect({
+      baseUrl: srv.url,
+      token: adminTok.token,
+    });
+    await admin.createRealm({
+      parentRef: "/",
+      slug: "eng",
+      name: "Engineering",
+      scope: "Include: engineering. Exclude: ops.",
+    });
+
+    // Concurrent sessions sharing the SAME /eng-bound token with different session headers (X-Meru-Session-Id vs Mcp-Session-Id)
+    const devTok = await admin.createToken({
+      actorId: "matthew",
+      actorKind: "agent",
+      boundRealmRef: "/eng",
+    });
+
+    // Session 1 writes a public/internal decision in /eng
+    const writePublic = await mcpCall({
+      url: srv.url,
+      token: devTok.token,
+      method: "tools/call",
+      id: 1,
+      toolName: "mind_write",
+      toolArgs: {
+        in: "/eng",
+        kind: "decision",
+        title: "Fix auth refresh timeout",
+        body: "Use 30s timeout with exponential backoff.",
+        about: ["service:auth"],
+      },
+      headers: {
+        "X-Meru-Session-Id": "win-1",
+        "X-Meru-Client": "claude-code",
+      },
+    });
+    expect(writePublic.status).toBe(200);
+
+    // Session 2 uses standard Mcp-Session-Id header and searches inside /eng
+    const searchRes = await mcpCall({
+      url: srv.url,
+      token: devTok.token,
+      method: "tools/call",
+      id: 2,
+      toolName: "mind_search",
+      toolArgs: { in: "/eng", query: "billing retry policy" },
+      headers: {
+        "Mcp-Session-Id": "mcp-win-2",
+        "X-Meru-Client": "codex",
+      },
+    });
+    expect(searchRes.status).toBe(200);
+
+    // Session 3 writes a confidential entry -> title MUST NEVER appear in activity!
+    const writeConf = await mcpCall({
+      url: srv.url,
+      token: devTok.token,
+      method: "tools/call",
+      id: 3,
+      toolName: "mind_write",
+      toolArgs: {
+        in: "/eng",
+        kind: "finding",
+        title: "TOP_SECRET_CUSTOMER_SSN_LEAK",
+        body: "Restricted incident note.",
+        sensitivity: "confidential",
+      },
+      headers: {
+        "X-Meru-Session-Id": "win-conf",
+        "X-Meru-Client": "claude-code",
+      },
+    });
+    expect(writeConf.status).toBe(200);
+
+    // Session 4 searches a credential-like string -> MUST be stripped!
+    const searchCred = await mcpCall({
+      url: srv.url,
+      token: devTok.token,
+      method: "tools/call",
+      id: 4,
+      toolName: "mind_search",
+      toolArgs: { in: "/eng", query: "mm_live_supersecret1234567890" },
+      headers: {
+        "X-Meru-Session-Id": "win-cred",
+        "X-Meru-Client": "codex",
+      },
+    });
+    expect(searchCred.status).toBe(200);
+
+    // Peer checking `show /eng` sees all 4 distinct concurrent sessions with safe activities
+    const peerRes = await mcpCall({
+      url: srv.url,
+      token: devTok.token,
+      method: "tools/call",
+      id: 5,
+      toolName: "mind_show",
+      toolArgs: { ref: "/eng" },
+      headers: {
+        "X-Meru-Session-Id": "win-observer",
+        "X-Meru-Client": "agy",
+      },
+    });
+    const showData = parseMcpToolJson<{
+      activePeers?: Array<{
+        sessionId: string;
+        clientHint: string | null;
+        activity?: string | null;
+      }>;
+    }>(peerRes.body);
+    const peers = showData.activePeers ?? [];
+    expect(peers.length).toBe(4);
+    expect(new Set(peers.map((p) => p.sessionId)).size).toBe(4);
+
+    const activities = peers.map((p) => p.activity ?? "");
+    expect(
+      activities.some((a) => a.includes('wrote decision: "Fix auth refresh timeout"')),
+    ).toBe(true);
+    expect(
+      activities.some((a) => a.includes('searching "billing retry policy"')),
+    ).toBe(true);
+    // Confidential title and credential query MUST NEVER appear anywhere
+    const joined = JSON.stringify(peers);
+    expect(joined).not.toContain("TOP_SECRET_CUSTOMER_SSN_LEAK");
+    expect(joined).not.toContain("mm_live_supersecret");
+    expect(activities.some((a) => a === "wrote entry")).toBe(true);
+
+    // Tree-mode security check: reading a read-only ancestor entry MUST NOT attach its activity
+    const rootEntry = await admin.write({
+      in: "/",
+      kind: "decision",
+      title: "ROOT_ONLY_ANCESTOR_DECISION",
+      body: "Visible read-only to children in tree mode.",
+    });
+    await admin.setOrgPolicy({ policy: "tree" });
+
+    const treeReader = await mcpCall({
+      url: srv.url,
+      token: devTok.token,
+      method: "tools/call",
+      id: 6,
+      toolName: "mind_show",
+      toolArgs: { ref: rootEntry.record.id },
+      headers: {
+        "X-Meru-Session-Id": "win-tree-reader",
+        "X-Meru-Client": "claude-code",
+      },
+    });
+    expect(treeReader.status).toBe(200);
+
+    const pulseAfterTree = await fetch(`${srv.url}/v1/pulse`, {
+      headers: { Authorization: `Bearer ${adminTok.token}` },
+    });
+    const pulseJson = (await pulseAfterTree.json()) as {
+      pulses: Array<{ actorId: string; realmPath: string; activity?: string | null }>;
+    };
+    const matthewPulses = pulseJson.pulses.filter((p) => p.actorId === "matthew");
+    // Agent bound to /eng MUST stay on /eng and NEVER attach read-only ancestor title as activity
+    expect(matthewPulses.every((p) => p.realmPath === "/eng")).toBe(true);
+    expect(JSON.stringify(matthewPulses)).not.toContain("ROOT_ONLY_ANCESTOR_DECISION");
+
+    await admin.close();
+  });
 });

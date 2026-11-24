@@ -25,19 +25,28 @@ export function withLivePulse(
   inner: MindSurface,
   ctx: LivePulseSessionContext,
 ): MindSurface {
-  const safeObserve = (realmId?: string | null): void => {
+  const safeObserve = (opts?: {
+    realmId?: string | null;
+    realmRef?: string | null;
+    activity?: string | null;
+  }): void => {
     try {
       ctx.pulseStore.observe({
         db: ctx.db,
         principal: ctx.principal,
         sessionTag: ctx.sessionTag,
         clientHint: ctx.clientHint,
-        realmId: realmId ?? null,
+        realmId: opts?.realmId ?? null,
+        realmRef: opts?.realmRef ?? null,
+        activity: opts?.activity ?? null,
       });
     } catch {
       // Never allow ephemeral telemetry failures to disrupt committed reads/writes
     }
   };
+
+  const isPublicOrInternal = (sensitivity?: string | null): boolean =>
+    sensitivity !== "confidential" && sensitivity !== "secret";
 
   return {
     get mode() {
@@ -53,20 +62,20 @@ export function withLivePulse(
 
     async tree(params) {
       const out = await inner.tree(params);
-      safeObserve(null);
+      safeObserve();
       return out;
     },
 
     async ls(params) {
       const out = await inner.ls(params);
-      safeObserve(null);
+      safeObserve();
       return out;
     },
 
     async show(params): Promise<ShowResult> {
       const out = await inner.show(params);
       if (out.refType === "realm") {
-        safeObserve(out.brief.realm.id);
+        safeObserve({ realmId: out.brief.realm.id });
         try {
           const activePeers = ctx.pulseStore.listActivePeersForRealm({
             db: ctx.db,
@@ -83,13 +92,63 @@ export function withLivePulse(
         }
         return out;
       }
-      safeObserve(null);
+      if (out.refType === "object") {
+        safeObserve({
+          realmId: out.card.object?.realmId ?? null,
+          activity: out.card.object
+            ? `inspecting ${out.card.kind}:${out.card.name}`
+            : null,
+        });
+        return out;
+      }
+      if (out.refType === "entry") {
+        const entry = out.entry;
+        if (entry.kind === "record") {
+          safeObserve({
+            realmId: entry.record.realmId,
+            activity: isPublicOrInternal(entry.record.sensitivity)
+              ? `reading "${entry.record.title}"`
+              : null,
+          });
+        } else if (entry.kind === "seabed") {
+          safeObserve({
+            realmId: entry.seabed.realmId,
+            activity: isPublicOrInternal(entry.seabed.sensitivity)
+              ? `reading raw (${entry.seabed.kind})`
+              : null,
+          });
+        } else if (entry.kind === "distillation") {
+          safeObserve({
+            realmId: entry.distillation.realmId,
+            activity: `reading distillation (${entry.distillation.periodKey})`,
+          });
+        } else {
+          safeObserve();
+        }
+        return out;
+      }
+      if (out.refType === "file") {
+        const baseName = out.file.relPath.split("/").pop() || "file";
+        safeObserve({
+          realmId: out.file.realmId,
+          activity: `reading file:${baseName}`,
+        });
+        return out;
+      }
+      safeObserve();
       return out;
     },
 
     async search(params) {
       const out = await inner.search(params);
-      safeObserve(null);
+      if (params.in?.trim()) {
+        safeObserve({
+          realmRef: params.in.trim(),
+          activity: `searching "${params.query}"`,
+        });
+      } else {
+        safeObserve();
+      }
       return out;
     },
 
@@ -99,13 +158,23 @@ export function withLivePulse(
     async write(params) {
       const out = await inner.write(params);
       // Strictly post-commit and write-only into pulseStore (never calls listVisible)
-      safeObserve(out.record.realmId);
+      safeObserve({
+        realmId: out.record.realmId,
+        activity: isPublicOrInternal(out.record.sensitivity)
+          ? `wrote ${out.record.kind}: "${out.record.title}"`
+          : "wrote entry",
+      });
       return out;
     },
 
     async rawAdd(params) {
       const out = await inner.rawAdd(params);
-      safeObserve(out.realmId);
+      safeObserve({
+        realmId: out.realmId,
+        activity: isPublicOrInternal(out.sensitivity)
+          ? `added raw (${out.kind})`
+          : "added raw entry",
+      });
       return out;
     },
 

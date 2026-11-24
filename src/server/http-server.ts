@@ -401,7 +401,8 @@ export async function startMindServer(
       const clientHint = sanitizeClientHint(
         typeof rawClient === "string" ? rawClient : null,
       );
-      const rawSession = req.headers["x-meru-session-id"];
+      const rawSession =
+        req.headers["x-meru-session-id"] ?? req.headers["mcp-session-id"];
       const headerSession =
         typeof rawSession === "string" && rawSession.trim()
           ? rawSession.trim()

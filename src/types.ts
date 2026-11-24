@@ -873,6 +873,8 @@ export interface ActivePeerSummary {
   realmPath: string;
   focus: string[];
   note: string | null;
+  /** Server-observed latest safe action in this realm (e.g. `wrote decision: "..."`, `inspecting service:auth`) */
+  activity?: string | null;
   lastSeenAt: string;
   ageSeconds: number;
   heartbeat: boolean;
