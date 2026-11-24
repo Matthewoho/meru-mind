@@ -206,6 +206,9 @@ describe("v0.5.8 Center Full Reader, URL SSOT SPA Fallback, Paginated Presence &
     expect(DEFAULT_SHELL_JS).toContain("properties-rail");
     expect(DEFAULT_SHELL_JS).toContain("presence-pane");
     expect(DEFAULT_SHELL_JS).toContain("presence-load-more");
+    expect(DEFAULT_SHELL_JS).toContain("meru-icon-switch-thumb");
+    expect(DEFAULT_SHELL_CSS).toContain(".meru-icon-switch-thumb");
+    expect(DEFAULT_SHELL_CSS).not.toContain(".studio-seg");
     expect(DEFAULT_SHELL_JS).toContain("popstate");
     expect(DEFAULT_SHELL_JS).toContain("pushState");
     expect(DEFAULT_SHELL_JS).not.toMatch(/\.innerHTML\b|\.outerHTML\b|insertAdjacentHTML\s*\(|document\.write\s*\(/);

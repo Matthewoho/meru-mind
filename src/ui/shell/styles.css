@@ -180,28 +180,92 @@ button, input, select, textarea {
 .brand-mark .logo-left { fill: var(--meru-logo-left); }
 .brand-mark .logo-right { fill: var(--meru-logo-right); }
 .brand-mark .logo-top { fill: var(--meru-logo-top); }
-.studio-seg {
+
+/* Unified whisper-quiet sliding icon switch (Icon Over Text) */
+.meru-icon-switch {
+  --switch-slot-w: 24px;
+  --switch-slot-h: 22px;
+  --switch-idx: 0;
+  position: relative;
   display: inline-flex;
-  background: var(--meru-surface-control);
+  align-items: center;
+  background: transparent;
   border-radius: 7px;
   padding: 2px;
-  gap: 2px;
-  margin-bottom: 10px;
+  flex-shrink: 0;
+  transition: background 160ms ease;
 }
-.studio-seg-btn {
+.meru-icon-switch.toolbar {
+  --switch-slot-w: 26px;
+  --switch-slot-h: 24px;
+}
+.presence-pane:hover .meru-icon-switch,
+.reader-toolbar-right:hover .meru-icon-switch,
+.meru-icon-switch:hover,
+.meru-icon-switch:focus-within {
+  background: var(--meru-surface-control);
+}
+.meru-icon-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: var(--switch-slot-w);
+  height: var(--switch-slot-h);
+  border-radius: 5px;
+  background: var(--meru-surface-hover);
+  box-shadow: inset 0 0 0 1px var(--meru-border);
+  transform: translateX(calc(var(--switch-idx) * var(--switch-slot-w)));
+  transition: transform 190ms cubic-bezier(0.22, 1, 0.36, 1), background 160ms ease;
+  pointer-events: none;
+}
+.meru-icon-switch-btn {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--switch-slot-w);
+  height: var(--switch-slot-h);
   border: none;
   background: transparent;
   color: var(--meru-fg-muted);
-  font-size: 11.5px;
-  font-weight: 500;
-  padding: 3px 8px;
+  opacity: 0.8;
+  padding: 0;
   border-radius: 5px;
   cursor: pointer;
+  transition: color 150ms ease, opacity 150ms ease;
 }
-.studio-seg-btn.active {
-  background: var(--meru-surface);
+.meru-icon-switch-btn:hover {
+  color: var(--meru-fg-secondary);
+  opacity: 1;
+}
+.meru-icon-switch-btn.active {
   color: var(--meru-fg);
-  font-weight: 600;
+  opacity: 1;
+}
+.meru-icon-switch-btn:focus-visible {
+  outline: 1.5px solid var(--meru-border-strong);
+  outline-offset: -1px;
+}
+@keyframes meruPanelEnter {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.meru-panel-enter {
+  animation: meruPanelEnter 160ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .meru-icon-switch-thumb,
+  .meru-panel-enter {
+    transition: none;
+    animation: none;
+  }
 }
 .html-preview-banner {
   display: flex;
@@ -331,31 +395,6 @@ button, input, select, textarea {
 .presence-collapse-btn:hover {
   background: var(--meru-surface-hover);
   color: var(--meru-fg);
-}
-
-.presence-seg {
-  display: inline-flex;
-  background: var(--meru-surface-control);
-  border-radius: 6px;
-  padding: 2px;
-  gap: 2px;
-  flex-shrink: 0;
-}
-.presence-seg-btn {
-  border: none;
-  background: transparent;
-  color: var(--meru-fg-muted);
-  font-size: 11px;
-  font-weight: 500;
-  padding: 2px 7px;
-  border-radius: 4px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.presence-seg-btn.active {
-  background: var(--meru-surface);
-  color: var(--meru-fg);
-  font-weight: 600;
 }
 
 .presence-scroll {
@@ -1520,12 +1559,8 @@ button, input, select, textarea {
 .reader-toolbar-right {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   flex-shrink: 0;
-}
-
-.reader-view-seg {
-  margin-bottom: 0;
 }
 
 .reader-nav-group {

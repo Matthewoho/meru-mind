@@ -36,9 +36,10 @@ const STUDIO_I18N = {
     languageDesc: "Switch Studio chrome between English and Simplified Chinese.",
     themeTitle: "Surface Theme",
     themeDesc: "Monochromatic two-tone light or dark liquid glass.",
-    md: "MD",
-    raw: "Raw",
-    html: "HTML",
+    md: "Markdown view",
+    raw: "Raw source",
+    html: "HTML preview",
+    readerViewMode: "Document view mode",
     htmlNotice: "Static HTML preview (scripts & network disabled).",
     htmlRender: "Render static preview",
     htmlHide: "Show raw source",
@@ -47,8 +48,9 @@ const STUDIO_I18N = {
     activeInChildren: "Active in child realms",
     expandRealm: "Expand child realms",
     collapseRealm: "Collapse child realms",
-    inFlight: "In Flight",
-    people: "People",
+    inFlight: "Group by work",
+    people: "Group by identity",
+    presenceGrouping: "Presence grouping",
     presence: "Presence",
     unkeyedBucket: "Unkeyed",
     collisionNote: "independent sessions working",
@@ -87,9 +89,10 @@ const STUDIO_I18N = {
     languageDesc: "在英文与简体中文之间切换界面文案。",
     themeTitle: "外观主题",
     themeDesc: "极简双色浅色 / 深色液态玻璃主题。",
-    md: "MD",
-    raw: "原文",
-    html: "HTML",
+    md: "Markdown 阅读视图",
+    raw: "查看原文",
+    html: "HTML 沙箱预览",
+    readerViewMode: "文档阅读视图",
     htmlNotice: "静态 HTML 沙箱预览（脚本与外链请求已完全禁用）。",
     htmlRender: "渲染静态预览",
     htmlHide: "查看源码",
@@ -98,8 +101,9 @@ const STUDIO_I18N = {
     activeInChildren: "子识界活跃",
     expandRealm: "展开子识界",
     collapseRealm: "折叠子识界",
-    inFlight: "按事",
-    people: "按身份",
+    inFlight: "按事分组",
+    people: "按身份分组",
+    presenceGrouping: "在线分组视图",
     presence: "当前在线",
     unkeyedBucket: "未挂事",
     collisionNote: "个独立会话同时施工",
@@ -227,6 +231,12 @@ const ICONS = {
   realm: () => makeSvg(["M3 7.5A2 2 0 0 1 5 5.5h4.2l1.8 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-10Z"], 14),
   inbox: () => makeSvg(["M22 12h-6l-2 3h-4l-2-3H2", "M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"], 14),
   user: () => makeSvg(["M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2", "M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"], 12),
+  users: () => makeSvg([
+    "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2",
+    "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z",
+    "M22 21v-2a4 4 0 0 0-3-3.87",
+    "M16 3.13a4 4 0 0 1 0 7.75",
+  ], 13),
   search: () => makeSvg(["M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z", "M21 21l-4.35-4.35"], 15),
   plus: () => makeSvg(["M12 5v14", "M5 12h14"], 15),
   refresh: () => makeSvg(["M21 12a9 9 0 1 1-2.64-6.36", "M21 3v6h-6"], 15),
@@ -250,7 +260,60 @@ const ICONS = {
   link: () => makeSvg(["M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71", "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"], 14),
   terminal: () => makeSvg(["M4 17l6-6-6-6", "M12 19h8"], 14),
   bookOpen: () => makeSvg(["M2 4h6a4 4 0 0 1 4 4v12a3 3 0 0 0-3-3H2z", "M22 4h-6a4 4 0 0 0-4 4v12a3 3 0 0 1 3-3h7z"], 14),
+  code: () => makeSvg(["M16 18l6-6-6-6", "M8 6l-6 6 6 6"], 14),
+  eye: () => makeSvg(["M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z", "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"], 14),
 };
+
+/**
+ * Unified whisper-quiet sliding icon switch (Icon Over Text).
+ * Used for both sidebar Presence grouping and center Document Reader view modes.
+ */
+function createIconSwitch({ uiId, ariaLabel, variant, options, activeKey, datasetKey, onChange }) {
+  const seg = document.createElement("div");
+  seg.className = "meru-icon-switch" + (variant ? (" " + variant) : "");
+  seg.dataset.ui = uiId;
+  seg.dataset.activeMode = activeKey;
+  seg.setAttribute("role", "tablist");
+  seg.setAttribute("aria-label", ariaLabel);
+
+  const initialIdx = Math.max(0, options.findIndex((o) => o.key === activeKey));
+  seg.style.setProperty("--switch-idx", String(initialIdx));
+
+  const thumb = document.createElement("span");
+  thumb.className = "meru-icon-switch-thumb";
+  thumb.setAttribute("aria-hidden", "true");
+  seg.appendChild(thumb);
+
+  let currentKey = activeKey;
+  const buttons = [];
+  options.forEach((opt, idx) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "meru-icon-switch-btn" + (opt.key === currentKey ? " active" : "");
+    b.dataset[datasetKey] = opt.key;
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", String(opt.key === currentKey));
+    b.setAttribute("aria-label", opt.label);
+    b.title = opt.label;
+    b.appendChild(opt.icon());
+    b.addEventListener("click", () => {
+      if (currentKey === opt.key) return;
+      currentKey = opt.key;
+      seg.dataset.activeMode = opt.key;
+      seg.style.setProperty("--switch-idx", String(idx));
+      for (const btn of buttons) {
+        const isAct = btn.dataset[datasetKey] === opt.key;
+        btn.classList.toggle("active", isAct);
+        btn.setAttribute("aria-selected", String(isAct));
+      }
+      onChange(opt.key);
+    });
+    buttons.push(b);
+    seg.appendChild(b);
+  });
+
+  return seg;
+}
 
 const app = document.getElementById("app");
 const client = createMindClient();
@@ -1134,33 +1197,21 @@ function buildSidebar() {
   });
   presenceHeader.appendChild(toggleSectionBtn);
 
-  if (!state.presenceCollapsed) {
-    const seg = document.createElement("div");
-    seg.className = "presence-seg";
-    seg.dataset.ui = "presence-mode-switch";
-    for (const [mKey, mLbl] of [["in-flight", st("inFlight")], ["people", st("people")]]) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "presence-seg-btn" + (state.presenceMode === mKey ? " active" : "");
-      b.dataset.presenceMode = mKey;
-      b.textContent = mLbl;
-      b.addEventListener("click", () => {
-        if (state.presenceMode === mKey) return;
-        state.presenceMode = mKey;
-        state.presenceModeUserSet = true;
-        state.presenceScrollTop = 0;
-        render();
-      });
-      seg.appendChild(b);
-    }
-    presenceHeader.appendChild(seg);
-  }
-  presencePane.appendChild(presenceHeader);
-
-  if (!state.presenceCollapsed) {
-    const pScroll = document.createElement("div");
+  const pScroll = !state.presenceCollapsed ? document.createElement("div") : null;
+  if (pScroll) {
     pScroll.className = "presence-scroll";
     pScroll.dataset.ui = "presence-scroll";
+  }
+
+  let scrollLoadBound = false;
+  function populatePresenceScroll(animate) {
+    if (!pScroll) return;
+    pScroll.textContent = "";
+    pScroll.classList.remove("meru-panel-enter");
+    if (animate) {
+      void pScroll.offsetWidth;
+      pScroll.classList.add("meru-panel-enter");
+    }
 
     if (state.presenceMode === "in-flight") {
       if (inFlight.length === 0 && unkeyedPulses.length === 0) {
@@ -1321,7 +1372,7 @@ function buildSidebar() {
             } else {
               state.collapsedActorIds.add(g.actorId);
             }
-            render();
+            populatePresenceScroll(false);
           });
 
           const av = document.createElement("span");
@@ -1423,7 +1474,7 @@ function buildSidebar() {
                 ev.stopPropagation();
                 state.presenceScrollTop = pScroll.scrollTop;
                 state.actorVisibleCounts.set(g.actorId, visibleLimit + ACTOR_SESSION_PAGE_SIZE);
-                render();
+                populatePresenceScroll(false);
               });
               sessList.appendChild(moreBtn);
             }
@@ -1433,24 +1484,51 @@ function buildSidebar() {
           pScroll.appendChild(groupEl);
         }
 
-        if (expandableActorsWithMore.length > 0) {
-          let scrollLoadTriggered = false;
+        if (expandableActorsWithMore.length > 0 && !scrollLoadBound) {
+          scrollLoadBound = true;
           pScroll.addEventListener("scroll", () => {
             state.presenceScrollTop = pScroll.scrollTop;
-            if (scrollLoadTriggered) return;
             const nearBottom = pScroll.scrollTop + pScroll.clientHeight >= pScroll.scrollHeight - 24;
-            if (nearBottom) {
-              scrollLoadTriggered = true;
-              const nextActor = expandableActorsWithMore[0];
-              const cur = state.actorVisibleCounts.get(nextActor) || ACTOR_SESSION_PAGE_SIZE;
-              state.actorVisibleCounts.set(nextActor, cur + ACTOR_SESSION_PAGE_SIZE);
-              render();
+            if (!nearBottom) return;
+            for (const g of actorGroups) {
+              if (state.collapsedActorIds.has(g.actorId)) continue;
+              const cur = state.actorVisibleCounts.get(g.actorId) || ACTOR_SESSION_PAGE_SIZE;
+              if (g.sessions.length > cur) {
+                state.actorVisibleCounts.set(g.actorId, cur + ACTOR_SESSION_PAGE_SIZE);
+                populatePresenceScroll(false);
+                break;
+              }
             }
           });
         }
       }
     }
+  }
 
+  if (!state.presenceCollapsed) {
+    const seg = createIconSwitch({
+      uiId: "presence-mode-switch",
+      ariaLabel: st("presenceGrouping"),
+      options: [
+        { key: "in-flight", label: st("inFlight"), icon: ICONS.work },
+        { key: "people", label: st("people"), icon: ICONS.users },
+      ],
+      activeKey: state.presenceMode,
+      datasetKey: "presenceMode",
+      onChange: (mKey) => {
+        state.presenceMode = mKey;
+        state.presenceModeUserSet = true;
+        state.presenceScrollTop = 0;
+        populatePresenceScroll(true);
+        if (pScroll) pScroll.scrollTop = 0;
+      },
+    });
+    presenceHeader.appendChild(seg);
+  }
+  presencePane.appendChild(presenceHeader);
+
+  if (pScroll) {
+    populatePresenceScroll(false);
     presencePane.appendChild(pScroll);
     if (state.presenceScrollTop > 0) {
       requestAnimationFrame(() => {
@@ -1953,29 +2031,82 @@ function buildDocumentReader() {
   const rightControls = document.createElement("div");
   rightControls.className = "reader-toolbar-right";
 
-  if (!isRedacted) {
-    const seg = document.createElement("div");
-    seg.className = "studio-seg reader-view-seg";
-    seg.dataset.ui = "reader-view-switch";
-    // Show ONLY views that actually apply to this document (never show HTML tab on plain MD!)
-    const modes = isHtmlDoc
-      ? [["html", st("html")], ["md", st("md")], ["raw", st("raw")]]
-      : [["md", st("md")], ["raw", st("raw")]];
+  const bodyWrap = document.createElement("div");
+  bodyWrap.className = "reader-doc-body";
+
+  function populateReaderBody(animate) {
+    teardownStudioHtmlPreview();
+    bodyWrap.textContent = "";
+    bodyWrap.classList.remove("meru-panel-enter");
+    if (animate) {
+      void bodyWrap.offsetWidth;
+      bodyWrap.classList.add("meru-panel-enter");
+    }
+    if (isRedacted) {
+      const body = document.createElement("p");
+      body.className = "inspector-body redacted";
+      body.textContent = mainBodyText;
+      bodyWrap.appendChild(body);
+      return;
+    }
     const effectiveView = (state.readerView === "html" && !isHtmlDoc) ? "md" : state.readerView;
-    for (const [mKey, mLbl] of modes) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.className = "studio-seg-btn" + (effectiveView === mKey ? " active" : "");
-      b.dataset.readerView = mKey;
-      b.textContent = mLbl;
-      b.addEventListener("click", () => {
-        if (state.readerView === mKey) return;
+    if (effectiveView === "raw") {
+      const pre = document.createElement("pre");
+      pre.className = "reader-raw-pre";
+      pre.textContent = mainBodyText;
+      bodyWrap.appendChild(pre);
+    } else if (effectiveView === "html") {
+      const htmlBox = document.createElement("div");
+      htmlBox.className = "reader-html-box";
+      bodyWrap.appendChild(htmlBox);
+      const currentId = e.id;
+      loadMarkdownTools().then((mod) => {
+        if (state.openEntry?.id !== currentId || state.readerView !== "html") return;
+        activeStudioHtmlPreview = mod.mountStaticHtmlPreview(htmlBox, mainBodyText, {
+          notice: st("htmlNotice"),
+          renderBtn: st("htmlRender"),
+          hideBtn: st("htmlHide"),
+        });
+      }).catch(() => {
+        const pre = document.createElement("pre");
+        pre.className = "html-source-pre";
+        pre.textContent = mainBodyText;
+        htmlBox.appendChild(pre);
+      });
+    } else {
+      const mdEl = document.createElement("meru-markdown");
+      mdEl.className = "reader-markdown";
+      mdEl.source = mainBodyText;
+      bodyWrap.appendChild(mdEl);
+    }
+  }
+
+  if (!isRedacted) {
+    // Show ONLY views that actually apply to this document (never show HTML tab on plain MD!)
+    const modeOptions = isHtmlDoc
+      ? [
+          { key: "html", label: st("html"), icon: ICONS.eye },
+          { key: "md", label: st("md"), icon: ICONS.bookOpen },
+          { key: "raw", label: st("raw"), icon: ICONS.code },
+        ]
+      : [
+          { key: "md", label: st("md"), icon: ICONS.bookOpen },
+          { key: "raw", label: st("raw"), icon: ICONS.code },
+        ];
+    const effectiveView = (state.readerView === "html" && !isHtmlDoc) ? "md" : state.readerView;
+    const seg = createIconSwitch({
+      uiId: "reader-view-switch",
+      ariaLabel: st("readerViewMode"),
+      variant: "toolbar",
+      options: modeOptions,
+      activeKey: effectiveView,
+      datasetKey: "readerView",
+      onChange: (mKey) => {
         state.readerView = mKey;
         syncUrlFromState(true);
-        render();
-      });
-      seg.appendChild(b);
-    }
+        populateReaderBody(true);
+      },
+    });
     rightControls.appendChild(seg);
   }
 
@@ -2031,47 +2162,7 @@ function buildDocumentReader() {
   submeta.appendChild(tsSpan);
   canvas.appendChild(submeta);
 
-  const bodyWrap = document.createElement("div");
-  bodyWrap.className = "reader-doc-body";
-
-  teardownStudioHtmlPreview();
-  if (isRedacted) {
-    const body = document.createElement("p");
-    body.className = "inspector-body redacted";
-    body.textContent = mainBodyText;
-    bodyWrap.appendChild(body);
-  } else {
-    const effectiveView = (state.readerView === "html" && !isHtmlDoc) ? "md" : state.readerView;
-    if (effectiveView === "raw") {
-      const pre = document.createElement("pre");
-      pre.className = "reader-raw-pre";
-      pre.textContent = mainBodyText;
-      bodyWrap.appendChild(pre);
-    } else if (effectiveView === "html") {
-      const htmlBox = document.createElement("div");
-      htmlBox.className = "reader-html-box";
-      bodyWrap.appendChild(htmlBox);
-      const currentId = e.id;
-      loadMarkdownTools().then((mod) => {
-        if (state.openEntry?.id !== currentId || state.readerView !== "html") return;
-        activeStudioHtmlPreview = mod.mountStaticHtmlPreview(htmlBox, mainBodyText, {
-          notice: st("htmlNotice"),
-          renderBtn: st("htmlRender"),
-          hideBtn: st("htmlHide"),
-        });
-      }).catch(() => {
-        const pre = document.createElement("pre");
-        pre.className = "html-source-pre";
-        pre.textContent = mainBodyText;
-        htmlBox.appendChild(pre);
-      });
-    } else {
-      const mdEl = document.createElement("meru-markdown");
-      mdEl.className = "reader-markdown";
-      mdEl.source = mainBodyText;
-      bodyWrap.appendChild(mdEl);
-    }
-  }
+  populateReaderBody(false);
   canvas.appendChild(bodyWrap);
 
   if (rawPayloadText) {
