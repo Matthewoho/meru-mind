@@ -134,7 +134,7 @@ MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
 - **实验功能面**（已在 `--help` 标注 `[experimental]`，未写入官方 Skill）：`file`（本地共享文件盘）、`raw`（直接写入海床 CLI）、`settle`（蒸馏卡片）及 `thing` 记录类型。
 - **SQLite 唯一核心后端**：SQLite（`node:sqlite` WAL）是唯一核心存储与在线真源；未来迁移至 Postgres 属于由明确容量指标触发的独立迁移项目，不承诺接口层零重写替换。
 
-### 已知局限（`v0.6.3`）
+### 已知局限（`v0.6.4`）
 1. **默认纯字面检索**：未配置外部 Embedding 时仅使用 CJK 双字 + 拉丁 FTS5 与局部窗口覆盖度。
 2. **批量导入不自动建 `supersedes` 链**：导入语料中未声明取代关系的新旧文档会并排保持 `active`（日常写入已提供中性相似条目回显，方便 Agent 显式挂取代链）。
 3. **单写者 SQLite 服务约束**：`meru-mind serve` 持有独占写锁，需部署在带持久本地块存储的单实例节点（避免多副本共享 NFS/SMB）。
@@ -161,7 +161,7 @@ MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
 
 ---
 
-## 已交付能力演进（`v0.2.0` → `v0.6.3`）
+## 已交付能力演进（`v0.2.0` → `v0.6.4`）
 
 完整云端自托管部署方案、安全模型与自定义前端指南见 [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md)、[`docs/UI_BUILDER_SKILL.md`](./docs/UI_BUILDER_SKILL.md) 与 [`THREAT_MODEL.md`](./THREAT_MODEL.md)：
 
@@ -175,6 +175,7 @@ MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
 - **`v0.6.1`**：组织显式角色权限（`admin` / `member`，`meru-mind actor set-role|disable|enable`）与安全清洗的用户可编辑 `displayName`（`POST /v1/me/profile` + Studio Profile Popover）。
 - **`v0.6.2`**：GitHub Actions 自动发布多架构 GHCR 镜像（`linux/amd64` + `linux/arm64` + SLSA provenance）、预构建镜像 Compose 栈、`meru-mind upgrade` / `update`（容器内自动防原地升级），以及多 Harness（Antigravity / Claude Code / Codex / OpenCode）`/swarm` 与子 Agent 会话自动透传。
 - **`v0.6.3`**：实测修复 GHCR Docker Compose 首次初始化引导（`admin init` + `--role admin`）、基础 Compose 补齐 `MERU_MIND_PUBLIC_URL`、CLI 新增 `--version` / `-v` 及零组织清晰报错指引。
+- **`v0.6.4`**：内置 Studio UI 大白话与极简交互重构——统一 `VOCAB` 词汇层（识界 / 记录 / 对象 / 规矩 / 待分拣）、取消冗余 Overview 与 4 格统计条默认直出记录流、右侧属性栏自动收放（列表卡去 `rec_xxx`）、Linear 风格「发现 / 决定 / 提议」分段器新建弹窗（替代原生 `<select>`）以及可复制命令的引导空态。
 
 ## 开源协议
 

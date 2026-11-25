@@ -145,7 +145,7 @@ export MERU_MIND_EMBED_DIM="1536"
 - **Experimental surfaces** (marked `[experimental]` in `--help`, excluded from the official Agent Skill): `file` (local shared drive), `raw` (direct seabed CLI capture), `settle` (distillation cards), and the `thing` record kind.
 - **SQLite canonical backend**: SQLite (`node:sqlite` WAL) is the sole core backend and online source of truth. Migrating to Postgres is a future trigger-based project (not a zero-rewrite port swap).
 
-### Known Limitations (`v0.6.3`)
+### Known Limitations (`v0.6.4`)
 1. **Lexical-only by default**: Without an external embedding endpoint configured, recall relies purely on CJK-bigram + Latin FTS5 and windowed coverage.
 2. **Bulk import does not auto-link `supersedes`**: Imported Markdown/JSONL entries without explicit `supersedes` references remain active side-by-side until explicitly linked (live writes return a neutral related-active echo so agents can link them explicitly).
 3. **Single-writer SQLite server model**: `meru-mind serve` takes an exclusive writer lock on `mind.sqlite` and expects persistent local block storage (avoid multi-replica containers over NFS/SMB).
@@ -172,7 +172,7 @@ We evaluated Meru Mind (lexical-only, `vector_enabled: false`) against a real-wo
 
 ---
 
-## Shipped Capabilities (`v0.2.0` → `v0.6.3`)
+## Shipped Capabilities (`v0.2.0` → `v0.6.4`)
 
 See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md), [`docs/UI_BUILDER_SKILL.md`](./docs/UI_BUILDER_SKILL.md), and [`THREAT_MODEL.md`](./THREAT_MODEL.md) for deployment, security, and custom UI authoring details:
 
@@ -186,6 +186,7 @@ See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md), [`do
 - **`v0.6.1`**: Explicit organization actor RBAC (`admin` vs `member`, `meru-mind actor set-role|disable|enable`) and sanitized user-editable `displayName` (`POST /v1/me/profile` + Studio Profile Popover).
 - **`v0.6.2`**: Automated multi-arch GHCR Docker publishing (`linux/amd64`, `linux/arm64` + SLSA provenance), prebuilt-image Compose stacks, `meru-mind upgrade` / `update` (with container self-upgrade guard), and zero-prompt multi-harness `/swarm` & subagent session propagation (`examples/hooks/` + `src/harness-session.ts`).
 - **`v0.6.3`**: Verified GHCR Docker Compose one-shot bootstrap (`admin init` + `--role admin`), `MERU_MIND_PUBLIC_URL` wiring in base Compose, `meru-mind --version` / `-v`, and clear zero-organization guidance errors.
+- **`v0.6.4`**: Studio UI UX & plain-language redesign — single `VOCAB` translation layer (`Entries` / `Objects` / `Rules` / `Inbox` & `记录` / `对象` / `规矩` / `待分拣`), direct-content workspace (removing the redundant Overview tab & 4-cell KPI strip), auto-collapsing right properties rail (moving `rec_xxx` off list cards), Linear-style certainty-circle segmented composer (replacing native `<select>`), and teaching empty states.
 
 ## License
 

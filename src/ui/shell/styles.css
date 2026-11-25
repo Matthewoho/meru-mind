@@ -1,8 +1,7 @@
 /* Meru Mind Studio — Framed Sheet × Monochromatic Two-Tone Liquid Glass
- * Grid arithmetic (1440px desktop):
- *   236px L-frame sidebar + (1440 - 236 - 8 = 1196px) inset white sheet + 8px right inset = 1440px
- *   Inside sheet: 1fr fluid workspace (815px) + 1px hairline + 380px inspector = 1196px
- *   KPI strip: 4 equal columns split by 1px hairlines inside one shared container (zero tile borders)
+ * Default 2-pane calm layout (Left Sidebar ⊥ Fluid Center Content);
+ * Right Properties Rail expands automatically when an entry or object is focused,
+ * or on demand via top-right toggle ([).
  */
 
 :root {
@@ -36,6 +35,8 @@
   --meru-live-dot: #15803d;
   --meru-status-warn: #b45309;
   --meru-status-err: #b91c1c;
+  --meru-warn-tint: rgba(180, 83, 9, 0.08);
+  --meru-err-tint: rgba(185, 28, 28, 0.08);
 
   --meru-shadow-float: 0 14px 34px rgba(15, 23, 42, 0.12), 0 2px 6px rgba(15, 23, 42, 0.06);
   --meru-radius-sm: 6px;
@@ -88,6 +89,8 @@ html[data-theme="dark"] {
   --meru-live-dot: #34d399;
   --meru-status-warn: #fbbf24;
   --meru-status-err: #f87171;
+  --meru-warn-tint: rgba(251, 191, 36, 0.11);
+  --meru-err-tint: rgba(248, 113, 113, 0.11);
 
   --meru-shadow-float: 0 18px 42px rgba(0, 0, 0, 0.48), 0 2px 8px rgba(0, 0, 0, 0.28);
 }
@@ -126,7 +129,7 @@ html, body {
   border-radius: 999px;
 }
 
-button, input, select, textarea {
+button, input, textarea {
   font-family: inherit;
   color: inherit;
 }
@@ -247,6 +250,42 @@ button, input, select, textarea {
   outline: 1.5px solid var(--meru-border-strong);
   outline-offset: -1px;
 }
+
+/* Monochrome Segmented Choice Control (Settings) */
+.meru-choice-group {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border-radius: 7px;
+  border: 1px solid var(--meru-border);
+  background: var(--meru-surface-control);
+  flex-shrink: 0;
+}
+.meru-choice-btn {
+  border: none;
+  background: transparent;
+  color: var(--meru-fg-muted);
+  font-size: var(--meru-fs-xs);
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+.meru-choice-btn:hover {
+  color: var(--meru-fg);
+}
+.meru-choice-btn.active {
+  background: var(--meru-surface);
+  color: var(--meru-fg);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08), inset 0 0 0 1px var(--meru-border);
+}
+.meru-choice-btn:focus-visible {
+  outline: 2px solid var(--meru-data-hue);
+  outline-offset: 1px;
+}
+
 @keyframes meruPanelEnter {
   from {
     opacity: 0;
@@ -267,6 +306,7 @@ button, input, select, textarea {
     animation: none;
   }
 }
+
 .html-preview-banner {
   display: flex;
   align-items: center;
@@ -901,7 +941,7 @@ button, input, select, textarea {
   display: none;
 }
 
-/* ==================== Inset White Sheet ==================== */
+/* ==================== Inset Sheet ==================== */
 
 .studio-sheet {
   grid-column: 2;
@@ -929,7 +969,7 @@ button, input, select, textarea {
 }
 
 .workspace-header {
-  padding: 20px 24px 0;
+  padding: 20px 28px 0;
   flex-shrink: 0;
 }
 
@@ -947,13 +987,6 @@ button, input, select, textarea {
   letter-spacing: -0.02em;
   line-height: 1.25;
   color: var(--meru-fg);
-}
-
-.freshness-meta {
-  font-size: var(--meru-fs-xs);
-  color: var(--meru-fg-muted);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
 }
 
 .scope-line {
@@ -1034,11 +1067,11 @@ button, input, select, textarea {
   padding: 0 4px;
 }
 
-/* Underline Tabs on a single hairline rule */
+/* Underline Tabs on a single hairline rule (Icon + Label + optional count > 0) */
 .tab-bar {
   display: flex;
   align-items: center;
-  gap: 20px;
+  gap: 22px;
   margin-top: 16px;
   border-bottom: 1px solid var(--meru-rule);
   overflow-x: auto;
@@ -1077,7 +1110,7 @@ button, input, select, textarea {
   right: 0;
   bottom: -1px;
   height: 2px;
-  background: var(--meru-data-hue);
+  background: var(--meru-fg);
 }
 .tab-btn:focus-visible {
   outline: 2px solid var(--meru-data-hue);
@@ -1085,104 +1118,40 @@ button, input, select, textarea {
   border-radius: 3px;
 }
 
+.tab-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.78;
+}
+.tab-btn.active .tab-icon,
+.tab-btn:hover .tab-icon {
+  opacity: 1;
+}
+
 .tab-count {
-  font-size: var(--meru-fs-xs);
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
   color: var(--meru-fg-muted);
+  background: var(--meru-surface-control);
+  padding: 0 6px;
+  border-radius: 999px;
+  line-height: 18px;
 }
 
 .workspace-scroll {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 20px 24px 32px;
-}
-
-/* Shared 4-Cell Ledger Summary Strip (One Container, 1px Hairlines, Zero Tiles/Sparklines) */
-.ledger-strip {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  border: 1px solid var(--meru-rule);
-  border-radius: var(--meru-radius);
-  background: var(--meru-surface-subtle);
-  overflow: hidden;
-  margin-bottom: 24px;
-}
-
-.ledger-cell {
-  border: none;
-  background: transparent;
-  padding: 14px 16px;
-  text-align: left;
-  cursor: pointer;
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  transition: background 110ms ease;
-}
-.ledger-cell + .ledger-cell {
-  border-left: 1px solid var(--meru-rule);
-}
-.ledger-cell:hover {
-  background: var(--meru-surface-control);
-}
-.ledger-cell:focus-visible {
-  outline: 2px solid var(--meru-data-hue);
-  outline-offset: -2px;
-}
-
-.ledger-label {
-  font-size: var(--meru-fs-xs);
-  font-weight: 500;
-  color: var(--meru-fg-muted);
-}
-
-.ledger-value {
-  font-size: 24px;
-  font-weight: 400;
-  line-height: 1.2;
-  letter-spacing: -0.02em;
-  font-variant-numeric: tabular-nums;
-  color: var(--meru-fg);
-}
-.ledger-value.zero {
-  color: var(--meru-fg-muted);
-}
-.ledger-value.actionable {
-  color: var(--meru-data-hue);
-}
-
-.ledger-sub {
-  font-size: var(--meru-fs-xs);
-  color: var(--meru-fg-muted);
+  padding: 18px 28px 36px;
 }
 
 /* Content Sections */
 .content-section {
-  margin-bottom: 28px;
+  margin-bottom: 24px;
 }
 .content-section:last-child {
   margin-bottom: 0;
-}
-
-.section-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 10px;
-}
-
-.section-title {
-  margin: 0;
-  font-size: var(--meru-fs-md);
-  font-weight: 500;
-  letter-spacing: -0.015em;
-  color: var(--meru-fg);
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 
 .section-meta {
@@ -1191,7 +1160,258 @@ button, input, select, textarea {
   color: var(--meru-fg-muted);
 }
 
-/* Binding Rules List — 100% Untruncated, Hairline Table Rhythm, Zero Heavy Left Stripes */
+/* Whisper-Quiet Collapsible Rules Banner above Entries */
+.rules-whisper-banner {
+  margin-bottom: 16px;
+  border: 1px solid var(--meru-rule);
+  border-radius: var(--meru-radius-sm);
+  background: var(--meru-surface-subtle);
+  overflow: hidden;
+}
+
+.rules-whisper-toggle {
+  width: 100%;
+  border: none;
+  background: transparent;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--meru-fs-xs);
+  font-weight: 500;
+  color: var(--meru-fg-secondary);
+  cursor: pointer;
+  text-align: left;
+  transition: background 110ms ease, color 110ms ease;
+}
+.rules-whisper-toggle:hover {
+  background: var(--meru-surface-control);
+  color: var(--meru-fg);
+}
+.rules-whisper-toggle:focus-visible {
+  outline: 2px solid var(--meru-data-hue);
+  outline-offset: -2px;
+}
+
+.rules-whisper-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.rules-whisper-chev {
+  display: inline-flex;
+  color: var(--meru-fg-muted);
+}
+
+.rules-whisper-list {
+  border-top: 1px solid var(--meru-rule);
+  background: var(--meru-surface);
+}
+
+/* Lightweight Entries Filter Toolbar (Only when list has entries) */
+.entries-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.entries-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.kind-filter-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.kind-filter-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--meru-fg-muted);
+  font-size: var(--meru-fs-xs);
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 110ms ease, color 110ms ease, border-color 110ms ease;
+}
+.kind-filter-btn:hover {
+  background: var(--meru-surface-control);
+  color: var(--meru-fg);
+}
+.kind-filter-btn.active {
+  background: var(--meru-surface-hover);
+  border-color: var(--meru-border);
+  color: var(--meru-fg);
+}
+.kind-filter-btn:focus-visible {
+  outline: 2px solid var(--meru-data-hue);
+  outline-offset: 1px;
+}
+
+.entries-search-input {
+  height: 28px;
+  min-width: 160px;
+  flex: 0 1 220px;
+  padding: 0 10px;
+  border-radius: var(--meru-radius-sm);
+  border: 1px solid var(--meru-border);
+  background: var(--meru-surface);
+  color: var(--meru-fg);
+  font-size: var(--meru-fs-xs);
+  transition: border-color 110ms ease;
+}
+.entries-search-input:focus {
+  outline: none;
+  border-color: var(--meru-border-strong);
+}
+
+/* Clean Linear-Style Scannable Entry Rows (Zero Raw ID / Zero Screaming Enum Noise) */
+.entry-list {
+  border-top: 1px solid var(--meru-rule);
+}
+
+.studio-entry-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+  padding: 13px 10px;
+  border: none;
+  border-bottom: 1px solid var(--meru-rule);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background 110ms ease;
+}
+.studio-entry-row:hover {
+  background: var(--meru-surface-control);
+}
+.studio-entry-row.selected {
+  background: var(--meru-data-tint);
+}
+.studio-entry-row.redacted {
+  opacity: 0.65;
+}
+.studio-entry-row.compact {
+  border-bottom: none;
+  padding: 12px 14px;
+}
+.studio-entry-row:focus-visible {
+  outline: 2px solid var(--meru-data-hue);
+  outline-offset: -2px;
+}
+
+.studio-entry-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  flex-shrink: 0;
+  color: var(--meru-fg-muted);
+}
+.studio-entry-icon.kind-decision,
+.studio-entry-icon.kind-verdict,
+.studio-entry-icon.kind-rule {
+  color: var(--meru-fg);
+}
+.studio-entry-icon.kind-finding {
+  color: var(--meru-fg-secondary);
+}
+.studio-entry-icon.kind-proposal {
+  color: var(--meru-fg-muted);
+}
+
+.studio-entry-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.studio-entry-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.studio-entry-title {
+  font-size: var(--meru-fs-base);
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--meru-fg);
+  word-break: break-word;
+}
+
+.studio-entry-status {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 0 7px;
+  line-height: 18px;
+  border-radius: 999px;
+  background: var(--meru-chip-bg);
+  color: var(--meru-fg-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.studio-entry-status.status-superseded {
+  text-decoration: line-through;
+}
+.studio-entry-status.status-redacted {
+  color: var(--meru-status-err);
+  background: var(--meru-err-tint);
+}
+
+.studio-entry-excerpt {
+  margin: 0;
+  font-size: var(--meru-fs-sm);
+  line-height: 1.5;
+  color: var(--meru-fg-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.studio-entry-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: var(--meru-fs-xs);
+  color: var(--meru-fg-muted);
+  font-variant-numeric: tabular-nums;
+  margin-top: 1px;
+}
+
+.meta-sep {
+  opacity: 0.55;
+}
+
+/* Rules List — Hairline Table Rhythm */
 .rule-list {
   border-top: 1px solid var(--meru-rule);
 }
@@ -1212,6 +1432,13 @@ button, input, select, textarea {
   border-top: none;
   text-align: left;
   transition: background 100ms ease;
+}
+.rule-row.compact {
+  min-height: 36px;
+  padding: 6px 12px;
+}
+.rule-row.compact:last-child {
+  border-bottom: none;
 }
 .rule-row:hover {
   background: var(--meru-surface-control);
@@ -1246,9 +1473,55 @@ button, input, select, textarea {
   white-space: nowrap;
 }
 
-/* Inbox CAS Triage Rows (Primary One-Click Human Action) */
-.triage-stack,
-.entry-stack {
+/* Teaching Empty States */
+.teaching-empty {
+  padding: 36px 24px;
+  border: 1px dashed var(--meru-border);
+  border-radius: var(--meru-radius);
+  background: var(--meru-surface-subtle);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+}
+
+.teaching-empty-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--meru-surface-control);
+  border: 1px solid var(--meru-border);
+  color: var(--meru-fg-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.teaching-empty-desc {
+  margin: 0;
+  max-width: 52ch;
+  font-size: var(--meru-fs-sm);
+  line-height: 1.6;
+  color: var(--meru-fg-secondary);
+}
+
+.teaching-empty-actions {
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.teaching-empty-cli {
+  width: min(560px, 100%);
+  text-align: left;
+  margin-top: 2px;
+}
+
+/* Inbox CAS Triage Rows (Zero Native Select) */
+.triage-stack {
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1259,13 +1532,6 @@ button, input, select, textarea {
   border-radius: var(--meru-radius);
   background: var(--meru-surface);
   overflow: hidden;
-}
-
-.triage-item meru-entry {
-  --meru-border: transparent;
-  --meru-border-strong: transparent;
-  --meru-radius: 0px;
-  --meru-surface: transparent;
 }
 
 .triage-controls {
@@ -1286,9 +1552,10 @@ button, input, select, textarea {
   min-width: 0;
 }
 
-.meru-select {
+.realm-picker-trigger {
   height: 30px;
   min-width: 148px;
+  max-width: 260px;
   padding: 0 10px;
   border-radius: var(--meru-radius-sm);
   border: 1px solid var(--meru-border-strong);
@@ -1296,10 +1563,48 @@ button, input, select, textarea {
   color: var(--meru-fg);
   font-family: var(--meru-mono);
   font-size: var(--meru-fs-xs);
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  transition: background 110ms ease, border-color 110ms ease;
 }
-.meru-select:focus-visible {
+.realm-picker-trigger:hover {
+  background: var(--meru-surface-hover);
+}
+.realm-picker-trigger:focus-visible {
   outline: 2px solid var(--meru-data-hue);
   outline-offset: 1px;
+}
+.realm-picker-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.realm-picker-menu {
+  min-width: 180px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.realm-picker-option {
+  font-family: var(--meru-mono);
+  font-size: var(--meru-fs-xs);
+}
+.realm-picker-option.active {
+  color: var(--meru-fg);
+  font-weight: 500;
+}
+.realm-picker-check {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
 .meru-btn {
@@ -1345,6 +1650,13 @@ button, input, select, textarea {
   border-radius: var(--meru-radius);
   font-size: var(--meru-fs-sm);
   color: var(--meru-fg-muted);
+}
+.empty-filter-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 /* Objects Grid & List */
@@ -1469,22 +1781,6 @@ button, input, select, textarea {
   font-variant-numeric: tabular-nums;
 }
 
-.inspector-back-btn {
-  border: none;
-  background: transparent;
-  padding: 2px 6px 2px 0;
-  font-size: var(--meru-fs-xs);
-  color: var(--meru-data-hue);
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  cursor: pointer;
-  margin-bottom: 10px;
-}
-.inspector-back-btn:hover {
-  text-decoration: underline;
-}
-
 .payload-details {
   margin: 0 0 16px;
   border: 1px solid var(--meru-rule);
@@ -1516,7 +1812,7 @@ button, input, select, textarea {
   word-break: break-word;
 }
 
-/* ==================== Center Full Document Reader (v0.5.8 Linear Style) ==================== */
+/* ==================== Center Full Document Reader ==================== */
 
 .reader-toolbar {
   height: 52px;
@@ -1602,19 +1898,18 @@ button, input, select, textarea {
   gap: 10px;
   font-size: var(--meru-fs-xs);
   color: var(--meru-fg-muted);
-  font-family: var(--meru-mono);
   padding-bottom: 18px;
   margin-bottom: 22px;
   border-bottom: 1px solid var(--meru-rule);
 }
 
-.reader-kind-pill {
-  font-family: var(--meru-font);
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 2px 8px;
+.reader-kind-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--meru-fs-xs);
+  font-weight: 500;
+  padding: 2px 9px;
   border-radius: 999px;
   background: var(--meru-chip-bg);
   color: var(--meru-fg);
@@ -1646,7 +1941,7 @@ button, input, select, textarea {
   word-break: break-word;
 }
 
-/* ==================== Linear Right Properties & Actions Rail ==================== */
+/* ==================== Right Properties & Actions Rail ==================== */
 
 .inspector-head-actions {
   display: inline-flex;
@@ -1664,8 +1959,8 @@ button, input, select, textarea {
 
 .prop-row {
   display: grid;
-  grid-template-columns: 84px minmax(0, 1fr);
-  align-items: baseline;
+  grid-template-columns: 76px minmax(0, 1fr);
+  align-items: center;
   gap: 8px;
   padding: 5px 0;
   font-size: var(--meru-fs-xs);
@@ -1689,6 +1984,25 @@ button, input, select, textarea {
   font-family: var(--meru-mono);
   font-size: 11.5px;
   color: var(--meru-fg-secondary);
+}
+
+.prop-id-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  max-width: 100%;
+}
+.prop-id-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.prop-copy-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
 }
 
 .prop-value-btn {
@@ -1844,24 +2158,9 @@ button, input, select, textarea {
   word-break: break-word;
 }
 
-.inspector-meta-grid {
-  display: grid;
-  grid-template-columns: 78px minmax(0, 1fr);
-  row-gap: 6px;
-  column-gap: 10px;
-  padding: 12px 0;
-  border-top: 1px solid var(--meru-rule);
-  border-bottom: 1px solid var(--meru-rule);
-  font-size: var(--meru-fs-xs);
-  margin-bottom: 14px;
-}
-
-.meta-key {
-  color: var(--meru-fg-muted);
-}
-
 .meta-val {
   font-family: var(--meru-mono);
+  font-size: var(--meru-fs-xs);
   color: var(--meru-fg-secondary);
   word-break: break-all;
   font-variant-numeric: tabular-nums;
@@ -1885,22 +2184,6 @@ button, input, select, textarea {
 }
 
 /* Vertical Supersede Provenance Chain */
-.chain-block {
-  margin-top: 18px;
-  padding-top: 16px;
-  border-top: 1px solid var(--meru-rule);
-}
-
-.chain-block-label {
-  font-size: var(--meru-fs-xs);
-  font-weight: 500;
-  color: var(--meru-fg-muted);
-  margin-bottom: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
 .chain-rail {
   position: relative;
   padding-left: 16px;
@@ -1960,18 +2243,11 @@ button, input, select, textarea {
 
 .chain-node-meta {
   margin-top: 3px;
-  font-family: var(--meru-mono);
   font-size: 11px;
   color: var(--meru-fg-muted);
 }
 
 /* CLI Governance Boundary Box */
-.cli-boundary {
-  margin-top: 18px;
-  padding-top: 14px;
-  border-top: 1px solid var(--meru-rule);
-}
-
 .cli-boundary-note {
   font-size: var(--meru-fs-xs);
   color: var(--meru-fg-muted);
@@ -2009,10 +2285,11 @@ button, input, select, textarea {
   color: var(--meru-fg-muted);
   cursor: pointer;
   user-select: none;
+  flex-shrink: 0;
 }
 .history-toggle input {
   margin: 0;
-  accent-color: var(--meru-data-hue);
+  accent-color: var(--meru-accent);
 }
 
 /* ==================== Floating Popovers, Context Menu & Modals ==================== */
@@ -2053,11 +2330,6 @@ button, input, select, textarea {
   padding-left: 10px;
   border-left: 1.5px solid var(--meru-border-strong);
   border-top-style: dashed;
-}
-.popover-session-meta {
-  font-family: var(--meru-mono);
-  font-size: 11px;
-  color: var(--meru-fg-muted);
 }
 .popover-sub.collision {
   color: #b6554e;
@@ -2331,6 +2603,14 @@ button, input, select, textarea {
   margin-bottom: 4px;
 }
 
+.search-result-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--meru-fg-muted);
+}
+
 .search-result-title {
   font-size: var(--meru-fs-sm);
   font-weight: 500;
@@ -2351,56 +2631,151 @@ mark.meru-hl {
   padding: 0 2px;
 }
 
-/* Quick Write & Settings Form */
-.form-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+/* ==================== Linear-Style Calm Composer Modal ==================== */
+
+.composer-panel {
+  width: min(620px, 100%);
 }
 
-.field-label {
+.composer-header {
   display: flex;
-  flex-direction: column;
-  gap: 5px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 16px 10px 20px;
+  border-bottom: 1px solid var(--meru-rule);
+  flex-shrink: 0;
+}
+
+.composer-context {
   font-size: var(--meru-fs-xs);
   font-weight: 500;
-  color: var(--meru-fg-secondary);
+  color: var(--meru-fg-muted);
+  font-family: var(--meru-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.meru-input,
-.meru-textarea {
+.composer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 20px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.composer-title-input {
   width: 100%;
-  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  padding: 4px 0;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.35;
+  color: var(--meru-fg);
+  outline: none;
+}
+.composer-title-input::placeholder {
+  color: var(--meru-fg-muted);
+  font-weight: 400;
+}
+
+.composer-body-textarea {
+  width: 100%;
+  min-height: 168px;
+  border: none;
+  background: transparent;
+  padding: 4px 0;
+  font-size: var(--meru-fs-base);
+  line-height: 1.62;
+  color: var(--meru-fg-secondary);
+  resize: vertical;
+  outline: none;
+}
+.composer-body-textarea::placeholder {
+  color: var(--meru-fg-muted);
+}
+
+.composer-inline-alert {
+  padding: 10px 12px;
   border-radius: var(--meru-radius-sm);
   border: 1px solid var(--meru-border-strong);
-  background: var(--meru-surface);
-  color: var(--meru-fg);
-  font-size: var(--meru-fs-sm);
-}
-.meru-textarea {
-  min-height: 96px;
-  resize: vertical;
+  background: var(--meru-err-tint);
+  color: var(--meru-status-err);
+  font-size: var(--meru-fs-xs);
   line-height: 1.5;
 }
-.meru-input:focus-visible,
-.meru-textarea:focus-visible {
+.composer-inline-alert.is-secret {
+  background: var(--meru-warn-tint);
+  color: var(--meru-status-warn);
+  border-color: rgba(180, 83, 9, 0.25);
+}
+
+.composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--meru-rule);
+  background: var(--meru-surface-subtle);
+  flex-wrap: wrap;
+}
+
+/* 3-Way Certainty-Family Icon Segmented Kind Selector */
+.kind-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--meru-surface-control);
+  border: 1px solid var(--meru-border);
+}
+
+.kind-switcher-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--meru-fg-muted);
+  font-size: var(--meru-fs-xs);
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms ease, color 120ms ease, box-shadow 120ms ease;
+}
+.kind-switcher-btn:hover {
+  color: var(--meru-fg);
+}
+.kind-switcher-btn.active {
+  background: var(--meru-surface);
+  color: var(--meru-fg);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08), inset 0 0 0 1px var(--meru-border);
+}
+.kind-switcher-btn:focus-visible {
   outline: 2px solid var(--meru-data-hue);
   outline-offset: 1px;
 }
 
-.form-row-2 {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+.composer-submit-btn {
+  height: 32px;
+  padding: 0 14px;
 }
 
-.modal-foot {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 12px 16px;
-  border-top: 1px solid var(--meru-rule);
+.composer-kbd {
+  font-family: var(--meru-mono);
+  font-size: 11px;
+  opacity: 0.72;
+  margin-left: 2px;
 }
 
 /* Settings Layout */
@@ -2640,16 +3015,6 @@ mark.meru-hl {
   }
   .reader-doc-title {
     font-size: 20px;
-  }
-  .ledger-strip {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  .ledger-cell:nth-child(3) {
-    border-left: none;
-    border-top: 1px solid var(--meru-rule);
-  }
-  .ledger-cell:nth-child(4) {
-    border-top: 1px solid var(--meru-rule);
   }
   .settings-grid {
     grid-template-columns: 1fr;

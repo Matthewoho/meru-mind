@@ -1,5 +1,5 @@
-// Meru Mind Official Built-In Studio UI (v0.6.2)
-// Built strictly on the server-hosted `/_meru/client.js` contract (zero direct /v1/* calls, zero innerHTML, strict CSP).
+// Meru Mind Official Built-In Studio UI
+// Built strictly on the server-hosted `/_meru/client.js` contract (zero direct /v1/* calls, zero raw HTML injection, strict CSP).
 import { createMindClient, applyHighlightRanges, loadMarkdownTools } from "/_meru/client.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -23,19 +23,136 @@ function makeMeruSubLogo(size = 18) {
   return svg;
 }
 
-const STUDIO_I18N = {
+/* ==================== Single Source of Truth Vocabulary (EN + ZH-CN) ==================== */
+
+const VOCAB = {
   en: {
+    // Core domain concepts
     realms: "Realms",
-    activeFocus: "Active Focus",
-    searchPrompt: "Search visible memory...",
-    settings: "Settings",
-    appearance: "Appearance",
-    realtimeAuth: "Realtime & Auth",
-    shortcuts: "Shortcuts",
-    language: "Language",
-    languageDesc: "Switch Studio chrome between English and Simplified Chinese.",
-    themeTitle: "Surface Theme",
-    themeDesc: "Monochromatic two-tone light or dark liquid glass.",
+    rootRealm: "Root",
+    tabEntries: "Entries",
+    tabObjects: "Objects",
+    tabRules: "Rules",
+    tabInbox: "Inbox",
+
+    // Record kinds (certainty family)
+    kindFinding: "Finding",
+    kindDecision: "Decision",
+    kindProposal: "Proposal",
+    kindClaim: "Claim",
+    kindVerdict: "Verdict",
+    kindRule: "Rule",
+    kindEntry: "Entry",
+    kindAll: "All",
+
+    // Record statuses
+    statusActive: "Active",
+    statusSuperseded: "Superseded",
+    statusRedacted: "Redacted",
+    statusDraft: "Draft",
+    statusArchived: "Archived",
+    redactedTitle: "[Redacted]",
+    redactedBody: "This entry has been permanently redacted.",
+
+    // Rule origin & whisper banner
+    ruleLocal: "Local",
+    ruleInherited: "Inherited",
+    rulesBannerCount: (n) => "Rules (" + n + ")",
+    rulesBannerHint: "Expand realm rules",
+    rulesBannerCollapse: "Collapse realm rules",
+
+    // Topbar & navigation
+    toggleNav: "Toggle navigation",
+    searchPrompt: "Search visible realms...",
+    newEntryTooltip: "New entry (C)",
+    refreshTooltip: "Refresh (R)",
+    showInspectorTooltip: "Show properties ([)",
+    hideInspectorTooltip: "Hide properties ([)",
+    realtimeStatusPrefix: "Realtime",
+    realtimeWs: "Live (WebSocket)",
+    realtimeLongPoll: "Live (Long-Poll)",
+    realtimeConnecting: "Connecting",
+    realtimeDisconnected: "Disconnected",
+    realtimeAuthRequired: "Sign-in required",
+
+    // Presence
+    presence: "Presence",
+    activeFocus: "Active",
+    activeHere: "Active here",
+    activeInChildren: "Active in child realms",
+    expandRealm: "Expand child realms",
+    collapseRealm: "Collapse child realms",
+    expandActor: "Expand",
+    collapseActor: "Collapse",
+    inFlight: "Group by work",
+    people: "Group by identity",
+    presenceGrouping: "Presence grouping",
+    unkeyedBucket: "Unkeyed",
+    collisionNote: "independent sessions working",
+    sessionsPlural: "sessions",
+    sessionSingle: "session",
+    hereTag: "Here",
+    nowTag: "now",
+    loadMoreSessions: "Load more",
+    noInFlight: "No active keyed work right now.",
+    noPresence: "No active sessions.",
+    inspectWork: "Inspect work",
+    memberActions: "Member actions",
+    openRealmPrefix: "Open",
+    copyActorId: "Copy actor ID",
+    sessWorking: "Working",
+    sessOnline: "Online",
+    sessTurnEnded: (age) => "Ended " + age + " ago",
+    sessSilent: (age) => "Silent " + age + " ago",
+    sessActive: (age) => "Active " + age + " ago",
+    sessQuiet: (age) => "Quiet " + age + " ago",
+
+    // Entries list & filters
+    filterEntriesPlaceholder: "Filter entries...",
+    showHistory: "Include history",
+    loadMoreEntries: "Load more",
+    loadedEntriesCount: (n) => n + " shown",
+    noFilteredEntries: "No entries match the current filter.",
+    clearFilter: "Clear filter",
+    noBodyText: "No body text.",
+
+    // Teaching empty states
+    emptyEntriesDesc: "Entries hold findings, decisions, and proposals shared with every agent in this realm.",
+    emptyEntriesSubtree: (n, childCount) =>
+      "No direct entries here yet. " + childCount + " child realms hold " + n + " entries — pick one on the left or press ⌘K to search.",
+    newEntryBtn: "New Entry",
+    emptyObjectsDesc: "Objects represent people, projects, and services. They appear automatically when entries link them with --about.",
+    emptyObjectsHint: (realm) => 'meru-mind write --in ' + realm + ' --about service:api --title "..."',
+    emptyObjectsFiltered: (q) => 'No objects matching "' + q + '".',
+    filterObjectsPlaceholder: "Filter objects by name or type...",
+    emptyRulesDesc: "Rules apply automatically to every agent in this realm. As a human-only guardrail, add rules from your terminal:",
+    emptyInboxDesc: "Inbox is clear. Notes written without a target realm land here until you route them.",
+
+    // Inbox triage
+    chooseRealm: "Choose realm",
+    moveToRealm: "Move",
+    routedToast: (dest) => "Moved to " + dest,
+    triageConflict: "Could not move entry (it may have been moved already).",
+
+    // Composer modal
+    composerTitle: (realm) => "New Entry · " + realm,
+    composerClose: "Close (Esc)",
+    composerKindLabel: "Entry kind",
+    composerPlaceholderFinding: "What did you find or confirm?",
+    composerPlaceholderDecision: "What was decided?",
+    composerPlaceholderProposal: "What are you proposing?",
+    composerBodyPlaceholder: "Add context, evidence, or details...",
+    composerSave: "Save",
+    composerSaving: "Saving...",
+    composerTitleRequired: "Please enter a title before saving.",
+    composerSavedToast: (realm) => "Saved to " + realm,
+    composerSecretBlocked: (pattern) =>
+      "This looks like it contains a secret" +
+      (pattern ? " (" + pattern + ")" : "") +
+      ", so it wasn't saved. Remove the sensitive value or reference an environment variable name (e.g. env:API_KEY) and try again.",
+    composerWriteFailed: "Could not save entry.",
+
+    // Document Reader
     md: "Markdown view",
     raw: "Raw source",
     html: "HTML preview",
@@ -44,57 +161,252 @@ const STUDIO_I18N = {
     htmlRender: "Render static preview",
     htmlHide: "Show raw source",
     payload: "Structured Payload",
-    activeHere: "Active here",
-    activeInChildren: "Active in child realms",
-    expandRealm: "Expand child realms",
-    collapseRealm: "Collapse child realms",
-    inFlight: "Group by work",
-    people: "Group by identity",
-    presenceGrouping: "Presence grouping",
-    presence: "Presence",
-    unkeyedBucket: "Unkeyed",
-    collisionNote: "independent sessions working",
-    sessionsPlural: "sessions",
-    sessionSingle: "session",
-    hereTag: "Here",
-    loadMoreSessions: "Load more",
-    properties: "Properties",
-    realmProperties: "Realm",
-    objectProperties: "Object",
-    openDocument: "Open full document",
-    linkedRefs: "Linked Objects & Tags",
-    supersedeChain: "Supersede History",
-    activePeers: "Active Peers",
-    actions: "Actions",
-    copyId: "Copy ID",
-    copyLink: "Copy link",
-    cliMoveCmd: "Copy CLI move command",
-    cliRedactCmd: "Copy CLI redact command",
-    cliRequiresBearer: "Irreversible or cross-realm governance requires a CLI Bearer token:",
     backToList: "Back to list",
     prevEntry: "Previous entry (K)",
     nextEntry: "Next entry (J)",
-    noInFlight: "No active keyed work right now.",
-    noPresence: "No active sessions.",
+
+    // Right Inspector
+    properties: "Properties",
+    realmProperties: "Realm",
+    objectProperties: "Object",
+    closeInspector: "Close properties ([)",
+    openDocument: "Open full document",
+    linkedRefs: "Linked Objects & Tags",
+    linkedContext: (n) => "Linked Entries (" + n + ")",
+    supersedeChain: "History",
+    headTag: "Current",
+    activePeers: "Active Peers",
+    actions: "Actions",
+    copyId: "Copy ID",
+    copyRef: "Copy Ref",
+    copyLink: "Copy link",
+    copyCmd: "Copy command",
+    copiedToast: (what) => "Copied " + what,
+    copiedLinkToast: "Copied link",
+    copiedCmdToast: "Copied command",
+    copyUnavailable: "Copy unavailable in this context",
+    cliMoveCmd: "Copy CLI move command",
+    cliRedactCmd: "Copy CLI redact command",
+    cliMoveLabel: "Move via CLI",
+    cliRedactLabel: "Redact via CLI",
+    cliRequiresBearer: "Irreversible or cross-realm actions run via CLI with a Bearer token:",
+    dismiss: "Dismiss",
+    propId: "ID",
+    propRef: "Ref",
+    propKind: "Kind",
+    propStatus: "Status",
+    propRealm: "Realm",
+    propAuthor: "Author",
+    propRecorded: "Recorded",
+    propSource: "Source",
+    propPath: "Path",
+    propName: "Name",
+    propEntries: "Entries",
+    propObjects: "Objects",
+    propRules: "Rules",
+    propLinked: "Linked",
+
+    // Profile & Auth
+    profileTooltip: "Profile & session",
+    roleAdmin: "admin",
+    roleMember: "member",
+    actorHuman: "human",
+    actorAgent: "agent",
     displayNameLabel: "Display name",
     displayNamePlaceholder: "Display name",
     save: "Save",
     saving: "Saving...",
     displayNameSaved: "Display name updated",
+    saveFailed: "Failed to save",
     signOut: "Sign out",
+    authTitleSso: "Sign in to Meru Mind",
+    authTitleCli: "Sign in via CLI",
+    authSsoDesc: "Continue with your team's single sign-on provider (OIDC).",
+    authSsoBtn: "Sign in with SSO",
+    authOrCli: "or CLI",
+    authCliDescSso: "Sign in from your terminal or SSH session using an SSO device code:",
+    authCliDescLocal: "Run this command in your terminal to open a single-use browser sign-in link:",
+    copyLoginCmd: "Copy login command",
+
+    // Search Modal
+    searchModalPlaceholder: "Search visible realms... (Press Enter)",
+    searchClose: "Close search",
+    searchHint: "Type keywords and press Enter to search across all visible realms.",
+    searchNoResults: (q) => 'No matching entries for "' + q + '".',
+    searchFailed: "Search failed",
+
+    // Settings Modal
+    settings: "Settings",
+    settingsTooltip: "Settings (⌘,)",
+    closeSettings: "Close settings",
+    appearance: "Appearance",
+    realtimeAuth: "Realtime & Session",
+    shortcuts: "Shortcuts",
+    language: "Language",
+    languageDesc: "Switch interface language between English and Simplified Chinese.",
+    themeTitle: "Theme",
+    themeDesc: "Monochromatic two-tone light or dark liquid glass.",
+    themeLight: "Light",
+    themeDark: "Dark",
+    transportTitle: "Realtime Transport",
+    transportDesc: "WebSocket primary with automatic Long-Poll fallback.",
+    sessionScopeTitle: "Session Scope",
+    sessionScopeDesc: "Browser sessions support reading, writing, and inbox routing. Irreversible actions stay CLI-only.",
+    sessionScopeVal: "HttpOnly Cookie",
+    shortcutHint: "Active when not typing in an input.",
+    scSearch: "Open global search",
+    scStep: "Focus next / previous entry",
+    scOpen: "Open focused entry",
+    scEsc: "Return to list / close dialog",
+    scCompose: "Compose a new entry",
+    scRefresh: "Refresh current realm",
+    scInspector: "Toggle properties panel",
+    scSettings: "Open settings",
+
+    // Relative time
+    timeJustNow: "just now",
+    timeMinAgo: (m) => m + "m ago",
+    timeHourAgo: (h) => h + "h ago",
+    timeDayAgo: (d) => d + "d ago",
+
+    // Object kinds
+    objKindPerson: "Person",
+    objKindProject: "Project",
+    objKindService: "Service",
+    objKindRepo: "Repo",
+    objKindEnv: "Environment",
+
+    // Generic errors
+    loadEntryFailed: "Failed to load entry",
+    loadObjectFailed: "Failed to load object",
   },
   "zh-CN": {
+    // Core domain concepts (approved terminology)
     realms: "识界",
-    activeFocus: "当前在线",
-    searchPrompt: "搜索当前可见记忆...",
-    settings: "设置",
-    appearance: "外观与语言",
-    realtimeAuth: "实时同步与认证",
-    shortcuts: "快捷键",
-    language: "界面语言",
-    languageDesc: "在英文与简体中文之间切换界面文案。",
-    themeTitle: "外观主题",
-    themeDesc: "极简双色浅色 / 深色液态玻璃主题。",
+    rootRealm: "根识界",
+    tabEntries: "记录",
+    tabObjects: "对象",
+    tabRules: "规矩",
+    tabInbox: "待分拣",
+
+    // Record kinds (certainty family)
+    kindFinding: "发现",
+    kindDecision: "决定",
+    kindProposal: "提议",
+    kindClaim: "主张",
+    kindVerdict: "裁决",
+    kindRule: "规矩",
+    kindEntry: "记录",
+    kindAll: "全部",
+
+    // Record statuses
+    statusActive: "生效中",
+    statusSuperseded: "已被取代",
+    statusRedacted: "已销毁",
+    statusDraft: "草稿",
+    statusArchived: "已归档",
+    redactedTitle: "[已销毁]",
+    redactedBody: "该记录的内容已被永久销毁。",
+
+    // Rule origin & whisper banner
+    ruleLocal: "本识界",
+    ruleInherited: "继承自上级",
+    rulesBannerCount: (n) => "规矩 " + n + " 条",
+    rulesBannerHint: "展开本识界规矩",
+    rulesBannerCollapse: "收起本识界规矩",
+
+    // Topbar & navigation
+    toggleNav: "切换导航栏",
+    searchPrompt: "搜索可见识界…",
+    newEntryTooltip: "新记录 (C)",
+    refreshTooltip: "刷新 (R)",
+    showInspectorTooltip: "显示属性栏 ([)",
+    hideInspectorTooltip: "收起属性栏 ([)",
+    realtimeStatusPrefix: "实时连接",
+    realtimeWs: "已连接（WebSocket）",
+    realtimeLongPoll: "已连接（长轮询）",
+    realtimeConnecting: "连接中",
+    realtimeDisconnected: "未连接",
+    realtimeAuthRequired: "需要重新登录",
+
+    // Presence
+    presence: "当前在线",
+    activeFocus: "在线",
+    activeHere: "同域活跃",
+    activeInChildren: "子识界活跃",
+    expandRealm: "展开子识界",
+    collapseRealm: "折叠子识界",
+    expandActor: "展开",
+    collapseActor: "折叠",
+    inFlight: "按事分组",
+    people: "按身份分组",
+    presenceGrouping: "在线分组视图",
+    unkeyedBucket: "未挂事",
+    collisionNote: "个独立会话同时施工",
+    sessionsPlural: "个会话",
+    sessionSingle: "个会话",
+    hereTag: "当前域",
+    nowTag: "刚刚",
+    loadMoreSessions: "加载更多",
+    noInFlight: "当前无挂事会话。",
+    noPresence: "当前无活跃会话。",
+    inspectWork: "查看进展详情",
+    memberActions: "成员操作",
+    openRealmPrefix: "前往",
+    copyActorId: "复制成员 ID",
+    sessWorking: "工作中",
+    sessOnline: "在线",
+    sessTurnEnded: (age) => age + " 前结束",
+    sessSilent: (age) => "静默 " + age,
+    sessActive: (age) => age + " 前活跃",
+    sessQuiet: (age) => age + " 前静默",
+
+    // Entries list & filters
+    filterEntriesPlaceholder: "筛选记录…",
+    showHistory: "包含历史版本",
+    loadMoreEntries: "加载更多",
+    loadedEntriesCount: (n) => "已加载 " + n + " 条",
+    noFilteredEntries: "没有符合当前筛选条件的记录。",
+    clearFilter: "清除筛选",
+    noBodyText: "暂无正文内容。",
+
+    // Teaching empty states
+    emptyEntriesDesc: "记录用于沉淀本识界内的发现、决定与提议，供你和所有 Agent 共同读取。",
+    emptyEntriesSubtree: (n, childCount) =>
+      "当前识界下还没有直接记录。下级 " + childCount + " 个子识界共有 " + n + " 条记录，可从左侧切换或按 ⌘K 搜索。",
+    newEntryBtn: "新记录",
+    emptyObjectsDesc: "对象代表本识界里的人、项目或服务。写入记录时通过 --about 关联即可自动出现在这里。",
+    emptyObjectsHint: (realm) => 'meru-mind write --in ' + realm + ' --about service:api --title "..."',
+    emptyObjectsFiltered: (q) => '没有匹配“' + q + '”的对象。',
+    filterObjectsPlaceholder: "按名称或类型筛选对象…",
+    emptyRulesDesc: "规矩会自动约束本识界下的所有 Agent。为防误改，规矩仅支持人类在终端通过 CLI 添加：",
+    emptyInboxDesc: "待分拣已清空。写入时未指定识界的记录会先落到这里，方便后续分流。",
+
+    // Inbox triage
+    chooseRealm: "选择目标识界",
+    moveToRealm: "移入",
+    routedToast: (dest) => "已移入 " + dest,
+    triageConflict: "移动失败，该记录可能已被分拣。",
+
+    // Composer modal
+    composerTitle: (realm) => "新记录 · " + realm,
+    composerClose: "关闭 (Esc)",
+    composerKindLabel: "记录类型",
+    composerPlaceholderFinding: "写下你知道的一件事…",
+    composerPlaceholderDecision: "定了什么？",
+    composerPlaceholderProposal: "你想提议什么？",
+    composerBodyPlaceholder: "补充背景、依据或细节…",
+    composerSave: "保存",
+    composerSaving: "保存中…",
+    composerTitleRequired: "请先填写标题再保存。",
+    composerSavedToast: (realm) => "已保存到 " + realm,
+    composerSecretBlocked: (pattern) =>
+      "内容里疑似包含密钥或敏感凭据" +
+      (pattern ? "（" + pattern + "）" : "") +
+      "，为防泄露未保存。请移除敏感值（或改为环境变量名，如 env:API_KEY）后重试。",
+    composerWriteFailed: "保存失败，请稍后重试。",
+
+    // Document Reader
     md: "Markdown 阅读视图",
     raw: "查看原文",
     html: "HTML 沙箱预览",
@@ -102,53 +414,328 @@ const STUDIO_I18N = {
     htmlNotice: "静态 HTML 沙箱预览（脚本与外链请求已完全禁用）。",
     htmlRender: "渲染静态预览",
     htmlHide: "查看源码",
-    payload: "结构化 Payload",
-    activeHere: "同域活跃",
-    activeInChildren: "子识界活跃",
-    expandRealm: "展开子识界",
-    collapseRealm: "折叠子识界",
-    inFlight: "按事分组",
-    people: "按身份分组",
-    presenceGrouping: "在线分组视图",
-    presence: "当前在线",
-    unkeyedBucket: "未挂事",
-    collisionNote: "个独立会话同时施工",
-    sessionsPlural: "个会话",
-    sessionSingle: "个会话",
-    hereTag: "当前域",
-    loadMoreSessions: "加载更多",
-    properties: "属性",
-    realmProperties: "识界属性",
-    objectProperties: "对象属性",
-    openDocument: "在中间展开全文",
-    linkedRefs: "关联对象与标签",
-    supersedeChain: "演进链",
-    activePeers: "同域活跃会话",
-    actions: "操作",
-    copyId: "复制 ID",
-    copyLink: "复制文档链接",
-    cliMoveCmd: "复制 CLI 移动命令",
-    cliRedactCmd: "复制 CLI 销毁命令",
-    cliRequiresBearer: "不可逆治理动作需在终端使用 CLI Bearer Token 执行：",
+    payload: "结构化数据",
     backToList: "返回列表",
     prevEntry: "上一条 (K)",
     nextEntry: "下一条 (J)",
-    noInFlight: "当前无挂事会话。",
-    noPresence: "当前无活跃会话。",
+
+    // Right Inspector
+    properties: "属性",
+    realmProperties: "识界属性",
+    objectProperties: "对象属性",
+    closeInspector: "收起属性栏 ([)",
+    openDocument: "展开全文",
+    linkedRefs: "关联对象与标签",
+    linkedContext: (n) => "关联记录（" + n + "）",
+    supersedeChain: "演进历史",
+    headTag: "当前版本",
+    activePeers: "同域活跃会话",
+    actions: "操作",
+    copyId: "复制 ID",
+    copyRef: "复制引用",
+    copyLink: "复制文档链接",
+    copyCmd: "复制命令",
+    copiedToast: (what) => "已复制 " + what,
+    copiedLinkToast: "已复制链接",
+    copiedCmdToast: "已复制命令",
+    copyUnavailable: "当前环境不支持复制到剪贴板",
+    cliMoveCmd: "复制 CLI 移动命令",
+    cliRedactCmd: "复制 CLI 销毁命令",
+    cliMoveLabel: "通过 CLI 移动",
+    cliRedactLabel: "通过 CLI 销毁",
+    cliRequiresBearer: "不可逆或跨识界治理操作需在终端使用 CLI 执行：",
+    dismiss: "关闭",
+    propId: "ID",
+    propRef: "引用",
+    propKind: "类型",
+    propStatus: "状态",
+    propRealm: "识界",
+    propAuthor: "作者",
+    propRecorded: "时间",
+    propSource: "来源",
+    propPath: "路径",
+    propName: "名称",
+    propEntries: "记录",
+    propObjects: "对象",
+    propRules: "规矩",
+    propLinked: "关联数",
+
+    // Profile & Auth
+    profileTooltip: "个人资料与会话",
+    roleAdmin: "管理员",
+    roleMember: "成员",
+    actorHuman: "人类",
+    actorAgent: "Agent",
     displayNameLabel: "显示名称",
     displayNamePlaceholder: "输入显示名称",
     save: "保存",
-    saving: "保存中...",
+    saving: "保存中…",
     displayNameSaved: "显示名称已更新",
+    saveFailed: "保存失败",
     signOut: "退出登录",
+    authTitleSso: "登录 Meru Mind",
+    authTitleCli: "通过 CLI 登录",
+    authSsoDesc: "使用团队的单点登录（OIDC）继续。",
+    authSsoBtn: "使用 SSO 登录",
+    authOrCli: "或通过终端 CLI",
+    authCliDescSso: "在终端或 SSH 中运行以下命令，通过设备码完成登录：",
+    authCliDescLocal: "在终端运行以下命令获取一次性浏览器登录链接：",
+    copyLoginCmd: "复制登录命令",
+
+    // Search Modal
+    searchModalPlaceholder: "搜索所有可见识界…（按 Enter）",
+    searchClose: "关闭搜索",
+    searchHint: "输入关键词后按 Enter，在当前可见识界中搜索。",
+    searchNoResults: (q) => "未找到与“" + q + "”相关的记录。",
+    searchFailed: "搜索失败",
+
+    // Settings Modal
+    settings: "设置",
+    settingsTooltip: "设置 (⌘,)",
+    closeSettings: "关闭设置",
+    appearance: "外观与语言",
+    realtimeAuth: "实时同步与会话",
+    shortcuts: "快捷键",
+    language: "界面语言",
+    languageDesc: "在英文与简体中文之间切换界面文案。",
+    themeTitle: "外观主题",
+    themeDesc: "单色调浅色 / 深色液态玻璃主题。",
+    themeLight: "浅色液态玻璃",
+    themeDark: "深色液态玻璃",
+    transportTitle: "实时传输",
+    transportDesc: "优先 WebSocket，不可用时自动降级长轮询。",
+    sessionScopeTitle: "会话权限",
+    sessionScopeDesc: "浏览器会话支持浏览、写入与待分拣归档，不可逆操作保留在终端 CLI。",
+    sessionScopeVal: "HttpOnly Cookie",
+    shortcutHint: "未聚焦输入框时生效。",
+    scSearch: "打开全局搜索",
+    scStep: "切换上一条 / 下一条记录",
+    scOpen: "展开当前选中的记录",
+    scEsc: "返回列表 / 关闭弹窗",
+    scCompose: "撰写新记录",
+    scRefresh: "刷新当前识界",
+    scInspector: "显示 / 收起右侧属性栏",
+    scSettings: "打开设置",
+
+    // Relative time
+    timeJustNow: "刚刚",
+    timeMinAgo: (m) => m + " 分钟前",
+    timeHourAgo: (h) => h + " 小时前",
+    timeDayAgo: (d) => d + " 天前",
+
+    // Object kinds
+    objKindPerson: "成员",
+    objKindProject: "项目",
+    objKindService: "服务",
+    objKindRepo: "代码库",
+    objKindEnv: "环境",
+
+    // Generic errors
+    loadEntryFailed: "加载记录失败",
+    loadObjectFailed: "加载对象失败",
   },
 };
+
+function detectStudioLang() {
+  const saved = localStorage.getItem("meru-studio-lang");
+  if (saved === "en" || saved === "zh-CN") return saved;
+  return (navigator.language || "").toLowerCase().startsWith("zh") ? "zh-CN" : "en";
+}
+
+function st(key, ...args) {
+  const dict = VOCAB[state.lang] || VOCAB.en;
+  const val = dict[key] !== undefined ? dict[key] : VOCAB.en[key];
+  if (typeof val === "function") return val(...args);
+  return val !== undefined ? val : key;
+}
+
+/* ==================== Monochrome Linear SVG Icon Registry (1.5px stroke, 24×24) ==================== */
+
+function makeSvg(elements, size = 16, strokeWidth = 1.5) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", String(strokeWidth));
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  for (const item of elements) {
+    if (typeof item === "string") {
+      const p = document.createElementNS(SVG_NS, "path");
+      p.setAttribute("d", item);
+      svg.appendChild(p);
+    } else if (item && item.tag) {
+      const el = document.createElementNS(SVG_NS, item.tag);
+      for (const [k, v] of Object.entries(item.attrs || {})) {
+        el.setAttribute(k, String(v));
+      }
+      svg.appendChild(el);
+    }
+  }
+  return svg;
+}
+
+const ICONS = {
+  logo: () => makeMeruSubLogo(18),
+  realm: () => makeSvg(["M3 7.5A2 2 0 0 1 5 5.5h4.2l1.8 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-10Z"], 14),
+  inbox: () => makeSvg(["M22 12h-6l-2 3h-4l-2-3H2", "M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"], 14),
+  entries: () => makeSvg(["M5 7h14", "M5 12h14", "M5 17h9"], 14),
+  objects: () => makeSvg(["M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3Z", "M12 12l8-4.5", "M12 12v9", "M12 12L4 7.5"], 14),
+  rules: () => makeSvg(["M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6l7-3Z"], 14),
+
+  // Certainty-family kind icons
+  kindFinding: (size = 14) => makeSvg([
+    { tag: "circle", attrs: { cx: 12, cy: 12, r: 8.5 } },
+    { tag: "circle", attrs: { cx: 12, cy: 12, r: 2.6, fill: "currentColor", stroke: "none" } },
+  ], size),
+  kindDecision: (size = 14) => makeSvg([
+    { tag: "circle", attrs: { cx: 12, cy: 12, r: 8.5 } },
+    "M8.5 12.2l2.3 2.3 4.8-4.8",
+  ], size),
+  kindProposal: (size = 14) => makeSvg([
+    { tag: "circle", attrs: { cx: 12, cy: 12, r: 8.5, "stroke-dasharray": "3.4 3.1" } },
+  ], size),
+  kindClaim: (size = 14) => makeSvg([
+    { tag: "circle", attrs: { cx: 12, cy: 12, r: 8.5 } },
+    "M9.75 9.25v5.5",
+    "M14.25 9.25v5.5",
+  ], size),
+  kindVerdict: (size = 14) => makeSvg([
+    { tag: "circle", attrs: { cx: 12, cy: 12, r: 9 } },
+    { tag: "circle", attrs: { cx: 12, cy: 12, r: 5 } },
+  ], size),
+  kindRule: (size = 14) => makeSvg(["M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6l7-3Z"], size),
+  kindNeutral: (size = 14) => makeSvg([
+    { tag: "circle", attrs: { cx: 12, cy: 12, r: 8 } },
+  ], size),
+
+  user: () => makeSvg(["M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2", "M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"], 12),
+  users: () => makeSvg([
+    "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2",
+    "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z",
+    "M22 21v-2a4 4 0 0 0-3-3.87",
+    "M16 3.13a4 4 0 0 1 0 7.75",
+  ], 13),
+  search: () => makeSvg(["M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z", "M21 21l-4.35-4.35"], 15),
+  plus: () => makeSvg(["M12 5v14", "M5 12h14"], 15),
+  refresh: () => makeSvg(["M21 12a9 9 0 1 1-2.64-6.36", "M21 3v6h-6"], 15),
+  panelRight: () => makeSvg(["M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5Z", "M15 3v18"], 15),
+  settings: () => makeSvg([
+    "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z",
+    "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.08a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z",
+  ], 15),
+  dots: () => makeSvg(["M5 12h.01", "M12 12h.01", "M19 12h.01"], 14, 2.2),
+  copy: () => makeSvg(["M8 8h11a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2Z", "M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3"], 14),
+  check: () => makeSvg(["M5 12.5l4.2 4.2L19 7"], 13),
+  arrowRight: () => makeSvg(["M5 12h14", "M13 6l6 6-6 6"], 14),
+  arrowLeft: () => makeSvg(["M19 12H5", "M11 18l-6-6 6-6"], 13),
+  close: () => makeSvg(["M18 6L6 18", "M6 6l12 12"], 15),
+  menu: () => makeSvg(["M4 7h16", "M4 12h16", "M4 17h16"], 16),
+  logout: () => makeSvg(["M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4", "M16 17l5-5-5-5", "M21 12H9"], 14),
+  work: () => makeSvg(["M6 3v12", "M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M18 9a9 9 0 0 1-9 9"], 13),
+  collision: () => makeSvg(["M16 3h5v5", "M4 20L21 3", "M21 16v5h-5", "M15 15l6 6", "M4 4l5 5"], 13),
+  chevronRight: () => makeSvg(["M9 6l6 6-6 6"], 12),
+  chevronDown: () => makeSvg(["M6 9l6 6 6-6"], 12),
+  chevronUp: () => makeSvg(["M18 15l-6-6-6 6"], 14),
+  link: () => makeSvg(["M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71", "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"], 14),
+  terminal: () => makeSvg(["M4 17l6-6-6-6", "M12 19h8"], 14),
+  bookOpen: () => makeSvg(["M2 4h6a4 4 0 0 1 4 4v12a3 3 0 0 0-3-3H2z", "M22 4h-6a4 4 0 0 0-4 4v12a3 3 0 0 1 3-3h7z"], 14),
+  code: () => makeSvg(["M16 18l6-6-6-6", "M8 6l-6 6 6 6"], 14),
+  eye: () => makeSvg(["M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z", "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"], 14),
+};
+
+function kindMeta(rawKind) {
+  const k = String(rawKind || "").trim().toLowerCase();
+  switch (k) {
+    case "finding":
+      return { key: "finding", label: st("kindFinding"), icon: ICONS.kindFinding };
+    case "decision":
+      return { key: "decision", label: st("kindDecision"), icon: ICONS.kindDecision };
+    case "proposal":
+      return { key: "proposal", label: st("kindProposal"), icon: ICONS.kindProposal };
+    case "claim":
+      return { key: "claim", label: st("kindClaim"), icon: ICONS.kindClaim };
+    case "verdict":
+      return { key: "verdict", label: st("kindVerdict"), icon: ICONS.kindVerdict };
+    case "rule":
+      return { key: "rule", label: st("kindRule"), icon: ICONS.kindRule };
+    default:
+      return { key: "other", label: st("kindEntry"), icon: ICONS.kindNeutral };
+  }
+}
+
+function statusMeta(rawStatus, isRedacted = false) {
+  if (isRedacted) return { key: "redacted", label: st("statusRedacted"), notable: true };
+  const s = String(rawStatus || "").trim().toLowerCase();
+  if (s === "superseded") return { key: "superseded", label: st("statusSuperseded"), notable: true };
+  if (s === "retracted" || s === "redacted") return { key: "redacted", label: st("statusRedacted"), notable: true };
+  if (s === "draft") return { key: "draft", label: st("statusDraft"), notable: true };
+  if (s === "archived") return { key: "archived", label: st("statusArchived"), notable: true };
+  return { key: "active", label: st("statusActive"), notable: false };
+}
+
+function objectKindLabel(rawKind) {
+  const k = String(rawKind || "").trim().toLowerCase();
+  if (k === "person") return st("objKindPerson");
+  if (k === "project") return st("objKindProject");
+  if (k === "service") return st("objKindService");
+  if (k === "repo") return st("objKindRepo");
+  if (k === "env") return st("objKindEnv");
+  return rawKind ? String(rawKind) : st("tabObjects");
+}
+
+function realtimeStatusLabel(status) {
+  switch (status) {
+    case "ws": return st("realtimeWs");
+    case "long-poll": return st("realtimeLongPoll");
+    case "connecting": return st("realtimeConnecting");
+    case "auth-required": return st("realtimeAuthRequired");
+    default: return st("realtimeDisconnected");
+  }
+}
 
 function formatPulseAge(sec) {
   if (typeof sec !== "number" || !Number.isFinite(sec)) return "";
   if (sec < 60) return sec + "s";
   const m = Math.floor(sec / 60);
   return m < 60 ? (m + "m") : (Math.floor(m / 60) + "h");
+}
+
+function formatRelativeTime(iso) {
+  if (!iso) return "";
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return formatStamp(iso);
+  const diffSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (diffSec < 60) return st("timeJustNow");
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return st("timeMinAgo", diffMin);
+  const diffHour = Math.floor(diffMin / 60);
+  if (diffHour < 24) return st("timeHourAgo", diffHour);
+  const diffDay = Math.floor(diffHour / 24);
+  if (diffDay < 30) return st("timeDayAgo", diffDay);
+  return String(iso).slice(0, 10);
+}
+
+function formatStamp(iso) {
+  if (!iso) return "-";
+  return String(iso).slice(0, 16).replace("T", " ");
+}
+
+function formatAuthorName(entry) {
+  if (!entry) return "";
+  if (entry.authorDisplayName && String(entry.authorDisplayName).trim()) {
+    return String(entry.authorDisplayName).trim();
+  }
+  if (entry.authorId) {
+    if (state.whoami?.actor?.id === entry.authorId && state.whoami?.actor?.displayName) {
+      return state.whoami.actor.displayName;
+    }
+    return "@" + entry.authorId;
+  }
+  return "";
 }
 
 function shortSessionHandle(sessionId) {
@@ -195,17 +782,6 @@ function groupPulsesByActor(pulses) {
   return groups;
 }
 
-function detectStudioLang() {
-  const saved = localStorage.getItem("meru-studio-lang");
-  if (saved === "en" || saved === "zh-CN") return saved;
-  return (navigator.language || "").toLowerCase().startsWith("zh") ? "zh-CN" : "en";
-}
-
-function st(key) {
-  const dict = STUDIO_I18N[state.lang] || STUDIO_I18N.en;
-  return dict[key] ?? STUDIO_I18N.en[key] ?? key;
-}
-
 function looksLikeHtmlDoc(text, sourceRef) {
   if (typeof sourceRef === "string" && /\.html?$/i.test(sourceRef.trim())) return true;
   return /^(?:<!doctype\s+html|<html\b|<head\b|<body\b|<div\b|<section\b|<article\b|<main\b|<table\b|<style\b)/i.test(String(text || "").trim());
@@ -218,63 +794,6 @@ function teardownStudioHtmlPreview() {
     activeStudioHtmlPreview = null;
   }
 }
-
-function makeSvg(paths, size = 16, strokeWidth = 1.5) {
-  const svg = document.createElementNS(SVG_NS, "svg");
-  svg.setAttribute("width", String(size));
-  svg.setAttribute("height", String(size));
-  svg.setAttribute("viewBox", "0 0 24 24");
-  svg.setAttribute("fill", "none");
-  svg.setAttribute("stroke", "currentColor");
-  svg.setAttribute("stroke-width", String(strokeWidth));
-  svg.setAttribute("stroke-linecap", "round");
-  svg.setAttribute("stroke-linejoin", "round");
-  svg.setAttribute("aria-hidden", "true");
-  for (const d of paths) {
-    const p = document.createElementNS(SVG_NS, "path");
-    p.setAttribute("d", d);
-    svg.appendChild(p);
-  }
-  return svg;
-}
-
-const ICONS = {
-  logo: () => makeMeruSubLogo(18),
-  realm: () => makeSvg(["M3 7.5A2 2 0 0 1 5 5.5h4.2l1.8 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-10Z"], 14),
-  inbox: () => makeSvg(["M22 12h-6l-2 3h-4l-2-3H2", "M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"], 14),
-  user: () => makeSvg(["M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2", "M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"], 12),
-  users: () => makeSvg([
-    "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2",
-    "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z",
-    "M22 21v-2a4 4 0 0 0-3-3.87",
-    "M16 3.13a4 4 0 0 1 0 7.75",
-  ], 13),
-  search: () => makeSvg(["M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z", "M21 21l-4.35-4.35"], 15),
-  plus: () => makeSvg(["M12 5v14", "M5 12h14"], 15),
-  refresh: () => makeSvg(["M21 12a9 9 0 1 1-2.64-6.36", "M21 3v6h-6"], 15),
-  panelRight: () => makeSvg(["M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5Z", "M15 3v18"], 15),
-  settings: () => makeSvg([
-    "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z",
-    "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.08a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z",
-  ], 15),
-  dots: () => makeSvg(["M5 12h.01", "M12 12h.01", "M19 12h.01"], 14, 2.2),
-  copy: () => makeSvg(["M8 8h11a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2Z", "M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3"], 14),
-  arrowRight: () => makeSvg(["M5 12h14", "M13 6l6 6-6 6"], 14),
-  arrowLeft: () => makeSvg(["M19 12H5", "M11 18l-6-6 6-6"], 13),
-  close: () => makeSvg(["M18 6L6 18", "M6 6l12 12"], 15),
-  menu: () => makeSvg(["M4 7h16", "M4 12h16", "M4 17h16"], 16),
-  logout: () => makeSvg(["M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4", "M16 17l5-5-5-5", "M21 12H9"], 14),
-  work: () => makeSvg(["M6 3v12", "M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M18 9a9 9 0 0 1-9 9"], 13),
-  collision: () => makeSvg(["M16 3h5v5", "M4 20L21 3", "M21 16v5h-5", "M15 15l6 6", "M4 4l5 5"], 13),
-  chevronRight: () => makeSvg(["M9 6l6 6-6 6"], 12),
-  chevronDown: () => makeSvg(["M6 9l6 6 6-6"], 12),
-  chevronUp: () => makeSvg(["M18 15l-6-6-6 6"], 14),
-  link: () => makeSvg(["M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71", "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"], 14),
-  terminal: () => makeSvg(["M4 17l6-6-6-6", "M12 19h8"], 14),
-  bookOpen: () => makeSvg(["M2 4h6a4 4 0 0 1 4 4v12a3 3 0 0 0-3-3H2z", "M22 4h-6a4 4 0 0 0-4 4v12a3 3 0 0 1 3-3h7z"], 14),
-  code: () => makeSvg(["M16 18l6-6-6-6", "M8 6l-6 6 6 6"], 14),
-  eye: () => makeSvg(["M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z", "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"], 14),
-};
 
 /**
  * Unified whisper-quiet sliding icon switch (Icon Over Text).
@@ -327,6 +846,34 @@ function createIconSwitch({ uiId, ariaLabel, variant, options, activeKey, datase
   return seg;
 }
 
+/**
+ * Quiet monochrome segmented choice group (replaces native OS <select> in Settings).
+ */
+function createChoiceGroup({ ariaLabel, options, activeKey, onChange, uiId }) {
+  const group = document.createElement("div");
+  group.className = "meru-choice-group";
+  if (uiId) group.dataset.ui = uiId;
+  group.setAttribute("role", "radiogroup");
+  group.setAttribute("aria-label", ariaLabel);
+
+  for (const opt of options) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    const isSelected = opt.key === activeKey;
+    btn.className = "meru-choice-btn" + (isSelected ? " active" : "");
+    btn.setAttribute("role", "radio");
+    btn.setAttribute("aria-checked", String(isSelected));
+    btn.dataset.choice = opt.key;
+    btn.textContent = opt.label;
+    btn.addEventListener("click", () => {
+      if (opt.key === activeKey) return;
+      onChange(opt.key);
+    });
+    group.appendChild(btn);
+  }
+  return group;
+}
+
 const app = document.getElementById("app");
 const client = createMindClient();
 
@@ -345,18 +892,22 @@ const state = {
   realmTree: [],
   collapsedRealmIds: new Set(),
   collapsedLoadedForOrgId: null,
-  realmCounts: {}, // path -> { directRules, directConclusions, subtreeConclusions, directObjects, subtreeObjects, childRealmsCount }
+  realmCounts: {},
   hasInboxRealm: false,
   activeRealmPath: "/",
-  activeTab: "overview", // overview | conclusions | objects | rules | inbox
+  activeTab: "entries", // entries | objects | rules | inbox
   brief: null,
   realmEntries: [],
   realmEntriesHasMore: false,
   realmEntriesCursor: null,
+  entryKindFilter: "all",
+  entrySearchFilter: "",
+  rulesBannerExpanded: false,
   realmObjects: [],
   objectFilter: "",
   showLedgerHistory: false,
   inboxEntries: [],
+  triageTargets: new Map(), // entryId -> targetRealmPath
   pulses: [],
   inFlight: [],
   unkeyedCount: 0,
@@ -365,20 +916,22 @@ const state = {
   presenceMode: "people", // "in-flight" | "people"
   presenceModeUserSet: false,
   collapsedActorIds: new Set(),
-  actorVisibleCounts: new Map(), // actorId -> visible session count
+  actorVisibleCounts: new Map(),
   presenceHovered: false,
   pendingPulsePatch: null,
   presenceScrollTop: 0,
   openEntry: null, // entry opened full-width in Center Document Reader
   focusedEntryId: null, // list row focused via J/K (or matching openEntry)
   focusedEntry: null, // entry shown in Right Properties Rail
+  focusedObjectRef: null, // ref of selected object in Right Properties Rail
   selectedChain: null,
   selectedObject: null,
   previousObject: null,
-  railCliCommand: null, // { label, cmd } shown ONLY on explicit action or 403
+  railCliCommand: null,
   savedListScrollTop: 0,
   restoreListScrollPending: false,
-  inspectorOpen: window.innerWidth > 1120,
+  inspectorOpen: false, // Auto-collapsed by default when nothing is selected (clean 2-pane workspace)
+  inspectorPinned: false, // Set when user explicitly opens/closes inspector via toggle button or [
   mobileNavOpen: false,
   pumpStatus: "disconnected",
   pumpGeneration: null,
@@ -392,9 +945,11 @@ const state = {
   writeTitle: "",
   writeBody: "",
   writeSubmitting: false,
-  writeError: null,
+  writeError: null, // null | { kind: "secret" | "error", text: string }
   popover: null,
 };
+
+document.documentElement.lang = state.lang;
 
 function clearEl(el) {
   while (el.firstChild) el.removeChild(el.firstChild);
@@ -409,12 +964,12 @@ function showToast(msg) {
   el._timer = setTimeout(() => el.classList.remove("show"), 3200);
 }
 
-async function copyText(text, label = "Copied command") {
+async function copyText(text, label) {
   try {
     await navigator.clipboard.writeText(text);
-    showToast(label);
+    showToast(label || st("copiedCmdToast"));
   } catch {
-    showToast("Copy unavailable in this context");
+    showToast(st("copyUnavailable"));
   }
 }
 
@@ -429,11 +984,6 @@ function makeIconBtn(iconEl, label, onClick, extraClass = "") {
   return btn;
 }
 
-function formatStamp(iso) {
-  if (!iso) return "-";
-  return String(iso).slice(0, 16).replace("T", " ");
-}
-
 function fmtNum(n) {
   return Number(n || 0).toLocaleString();
 }
@@ -444,8 +994,8 @@ function pathDepth(p) {
 }
 
 function realmDisplayName(realm) {
-  if (!realm) return "Root";
-  if (realm.path === "/") return realm.name || "Organization Root";
+  if (!realm) return st("rootRealm");
+  if (realm.path === "/") return realm.name || st("rootRealm");
   return realm.name || realm.path.slice(1);
 }
 
@@ -460,10 +1010,6 @@ function getOrgId() {
 
 function getOrgName() {
   return state.whoami?.org?.name || state.whoami?.organization?.name || "Workspace";
-}
-
-function getOrgPolicy() {
-  return state.whoami?.org?.policy || state.whoami?.organization?.policy || null;
 }
 
 function collapsedStorageKey(orgId) {
@@ -585,25 +1131,10 @@ function flattenRealmTreeCounts(nodes, out = {}) {
   return out;
 }
 
-function collectOverviewConclusions(brief, fallbackEntries) {
-  const seen = new Set();
-  const list = [];
-  const pushAll = (arr) => {
-    if (!Array.isArray(arr)) return;
-    for (const item of arr) {
-      if (!item?.id || seen.has(item.id)) continue;
-      if (item.kind === "rule") continue;
-      seen.add(item.id);
-      list.push(item);
-    }
-  };
-  pushAll(brief?.upperLedger?.activeDecisions?.items);
-  pushAll(brief?.upperLedger?.recentFindings?.items);
-  pushAll(brief?.recentConclusions?.items);
-  if (list.length === 0) {
-    pushAll(fallbackEntries);
-  }
-  return list;
+function normalizeTabParam(rawTab) {
+  if (rawTab === "overview" || rawTab === "conclusions" || rawTab === "entries") return "entries";
+  if (rawTab === "objects" || rawTab === "rules" || rawTab === "inbox") return rawTab;
+  return null;
 }
 
 /* ==================== URL as Single Source of Truth ==================== */
@@ -625,9 +1156,7 @@ function parseUrlState() {
   const realmPath = onShell
     ? normalizeRealmPathname(sp.get("realm") || "/")
     : normalizeRealmPathname(loc.pathname);
-  const rawTab = sp.get("tab") || "";
-  const validTabs = new Set(["overview", "conclusions", "objects", "rules", "inbox"]);
-  const tab = validTabs.has(rawTab) ? rawTab : null;
+  const tab = normalizeTabParam(sp.get("tab") || "");
   const entryId = sp.get("entry") || null;
   const objectRef = sp.get("object") || null;
   const rawView = sp.get("view") || "";
@@ -642,7 +1171,7 @@ function buildUrlFromState() {
   if (onShell && state.activeRealmPath && state.activeRealmPath !== "/") {
     sp.set("realm", state.activeRealmPath);
   }
-  const defaultTab = state.activeRealmPath === "/inbox" ? "inbox" : "overview";
+  const defaultTab = state.activeRealmPath === "/inbox" ? "inbox" : "entries";
   if (state.activeTab && state.activeTab !== defaultTab) {
     sp.set("tab", state.activeTab);
   }
@@ -673,14 +1202,28 @@ function syncUrlFromState(replace = false) {
   }
 }
 
+function getFilteredRealmEntries() {
+  const base = state.realmEntries.filter((x) => x.kind !== "rule");
+  const q = state.entrySearchFilter.trim().toLowerCase();
+  return base.filter((item) => {
+    if (state.entryKindFilter !== "all") {
+      const km = kindMeta(item.extKind || item.kind);
+      if (km.key !== state.entryKindFilter) return false;
+    }
+    if (q) {
+      const hay = [item.title, item.snippet, item.body, item.authorId, item.authorDisplayName]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+}
+
 function getVisibleListEntries() {
-  if (state.activeTab === "overview") {
-    const conclusions = collectOverviewConclusions(state.brief, state.realmEntries);
-    const rules = state.brief?.middleMind?.rules?.items || [];
-    return [...conclusions, ...rules];
-  }
-  if (state.activeTab === "conclusions") {
-    return state.realmEntries.filter((x) => x.kind !== "rule");
+  if (state.activeTab === "entries") {
+    return getFilteredRealmEntries();
   }
   if (state.activeTab === "rules") {
     return state.brief?.middleMind?.rules?.items || [];
@@ -736,7 +1279,12 @@ async function selectRealm(realmPath, preferredTab, opts = {}) {
   expandAncestorsForPath(realmPath);
   state.mobileNavOpen = false;
   state.popover = null;
-  state.objectFilter = "";
+  if (prevRealm !== realmPath) {
+    state.objectFilter = "";
+    state.entryKindFilter = "all";
+    state.entrySearchFilter = "";
+    state.rulesBannerExpanded = false;
+  }
   if (!opts.keepReader) {
     teardownStudioHtmlPreview();
     state.openEntry = null;
@@ -744,18 +1292,23 @@ async function selectRealm(realmPath, preferredTab, opts = {}) {
     if (prevRealm !== realmPath) {
       state.focusedEntryId = null;
       state.focusedEntry = null;
+      state.focusedObjectRef = null;
       state.selectedChain = null;
       state.selectedObject = null;
       state.previousObject = null;
       state.savedListScrollTop = 0;
+      if (!state.inspectorPinned) {
+        state.inspectorOpen = false;
+      }
     }
   }
-  if (preferredTab) {
-    state.activeTab = preferredTab;
+  const normalizedPreferred = preferredTab ? normalizeTabParam(preferredTab) : null;
+  if (normalizedPreferred) {
+    state.activeTab = normalizedPreferred;
   } else if (realmPath === "/inbox") {
     state.activeTab = "inbox";
   } else {
-    state.activeTab = "overview";
+    state.activeTab = "entries";
   }
 
   const [showRes, objRes, inboxRes] = await Promise.all([
@@ -790,6 +1343,7 @@ async function selectObjectByRef(objRef, openInspector = true, opts = {}) {
     if (res?.refType === "object" && res.card) {
       teardownStudioHtmlPreview();
       state.selectedObject = res.card;
+      state.focusedObjectRef = res.card.ref || objRef;
       state.previousObject = null;
       state.openEntry = null;
       state.focusedEntryId = null;
@@ -801,7 +1355,7 @@ async function selectObjectByRef(objRef, openInspector = true, opts = {}) {
       render();
     }
   } catch (err) {
-    showToast(err?.message || "Failed to load object");
+    showToast(err?.message || st("loadObjectFailed"));
   }
 }
 
@@ -846,12 +1400,16 @@ async function openEntryInCenter(entryId, opts = {}) {
       state.previousObject = null;
     }
     state.selectedObject = null;
+    state.focusedObjectRef = null;
     state.openEntry = flat;
     state.focusedEntryId = flat.id;
     state.focusedEntry = flat;
     state.selectedChain = chainRes;
     state.railCliCommand = null;
     state.readerView = pickInitialReaderView(flat, opts.requestedView || null);
+    if (window.innerWidth > 1120) {
+      state.inspectorOpen = true;
+    }
     if (flat.realmPath && state.realms.some((r) => r.path === flat.realmPath)) {
       expandAncestorsForPath(flat.realmPath);
     }
@@ -860,7 +1418,7 @@ async function openEntryInCenter(entryId, opts = {}) {
     }
     render();
   } catch (err) {
-    showToast(err?.message || "Failed to load entry");
+    showToast(err?.message || st("loadEntryFailed"));
   }
 }
 
@@ -868,8 +1426,14 @@ function closeReaderToList(opts = {}) {
   if (!state.openEntry) return;
   teardownStudioHtmlPreview();
   state.openEntry = null;
+  state.focusedEntryId = null;
+  state.focusedEntry = null;
+  state.selectedChain = null;
   state.railCliCommand = null;
   state.restoreListScrollPending = true;
+  if (!state.inspectorPinned) {
+    state.inspectorOpen = false;
+  }
   if (!opts.skipUrlSync) {
     syncUrlFromState(Boolean(opts.replaceUrl));
   }
@@ -879,12 +1443,15 @@ function closeReaderToList(opts = {}) {
 async function focusEntryInList(entryId, summaryHint = null) {
   state.focusedEntryId = entryId;
   state.selectedObject = null;
+  state.focusedObjectRef = null;
   state.railCliCommand = null;
   if (summaryHint) {
     state.focusedEntry = summaryHint;
   }
+  if (window.innerWidth > 1120) {
+    state.inspectorOpen = true;
+  }
   render();
-  // Scroll focused card/row smoothly into view
   requestAnimationFrame(() => {
     const rowEl = document.querySelector('[data-list-entry-id="' + CSS.escape(entryId) + '"]');
     if (rowEl && typeof rowEl.scrollIntoView === "function") {
@@ -934,6 +1501,113 @@ async function refreshAll(opts = {}) {
   });
 }
 
+function openWriteModal() {
+  state.popover = null;
+  state.writeError = null;
+  state.modal = "write";
+  render();
+  const inp = document.getElementById("composer-title-input");
+  if (inp) inp.focus();
+}
+
+/* ==================== Clean Studio Entry Row Builder ==================== */
+
+function buildStudioEntryRow(item, opts = {}) {
+  const isRedacted = Boolean(item.redactedAt) || item.status === "retracted";
+  const km = kindMeta(item.extKind || item.kind);
+  const sm = statusMeta(item.status, isRedacted);
+  const isSelected = state.focusedEntryId === item.id;
+
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "studio-entry-row" +
+    (isSelected ? " selected" : "") +
+    (isRedacted ? " redacted" : "") +
+    (opts.compact ? " compact" : "");
+  row.dataset.listEntryId = item.id;
+  row.dataset.ui = "studio-entry-row";
+
+  const iconCol = document.createElement("span");
+  iconCol.className = "studio-entry-icon kind-" + km.key;
+  iconCol.title = km.label;
+  iconCol.setAttribute("aria-label", km.label);
+  iconCol.appendChild(km.icon(15));
+  row.appendChild(iconCol);
+
+  const mainCol = document.createElement("div");
+  mainCol.className = "studio-entry-main";
+
+  const headLine = document.createElement("div");
+  headLine.className = "studio-entry-head";
+
+  const titleEl = document.createElement("span");
+  titleEl.className = "studio-entry-title";
+  titleEl.textContent = isRedacted ? st("redactedTitle") : String(item.title || st("kindEntry"));
+  headLine.appendChild(titleEl);
+
+  if (sm.notable) {
+    const statusPill = document.createElement("span");
+    statusPill.className = "studio-entry-status status-" + sm.key;
+    statusPill.textContent = sm.label;
+    headLine.appendChild(statusPill);
+  }
+  mainCol.appendChild(headLine);
+
+  const excerptRaw = isRedacted
+    ? ""
+    : String(item.snippet ?? item.body ?? item.payload?.body ?? item.text ?? "").replace(/\s+/g, " ").trim();
+  if (excerptRaw) {
+    const excerpt = document.createElement("p");
+    excerpt.className = "studio-entry-excerpt";
+    excerpt.textContent = excerptRaw;
+    mainCol.appendChild(excerpt);
+  }
+
+  const metaLine = document.createElement("div");
+  metaLine.className = "studio-entry-meta";
+
+  const kindText = document.createElement("span");
+  kindText.textContent = km.label;
+  metaLine.appendChild(kindText);
+
+  const authorName = formatAuthorName(item);
+  if (authorName) {
+    const sep1 = document.createElement("span");
+    sep1.className = "meta-sep";
+    sep1.setAttribute("aria-hidden", "true");
+    sep1.textContent = "·";
+    const authEl = document.createElement("span");
+    authEl.textContent = authorName;
+    metaLine.appendChild(sep1);
+    metaLine.appendChild(authEl);
+  }
+
+  const tsIso = item.occurredAt || item.createdAt || "";
+  if (tsIso) {
+    const sep2 = document.createElement("span");
+    sep2.className = "meta-sep";
+    sep2.setAttribute("aria-hidden", "true");
+    sep2.textContent = "·";
+    const timeEl = document.createElement("time");
+    timeEl.setAttribute("datetime", String(tsIso));
+    timeEl.title = formatStamp(tsIso);
+    timeEl.textContent = formatRelativeTime(tsIso);
+    metaLine.appendChild(sep2);
+    metaLine.appendChild(timeEl);
+  }
+
+  mainCol.appendChild(metaLine);
+  row.appendChild(mainCol);
+
+  row.addEventListener("click", () => {
+    const sel = typeof window !== "undefined" && window.getSelection ? window.getSelection() : null;
+    if (sel && String(sel).trim().length > 0) return;
+    void openEntryInCenter(item.id);
+  });
+
+  return row;
+}
+
 /* ==================== Component Builders ==================== */
 
 function renderAuthScreen() {
@@ -957,13 +1631,13 @@ function renderAuthScreen() {
 
   const h1 = document.createElement("h1");
   h1.className = "auth-title";
-  h1.textContent = state.oidcEnabled ? "Sign in to Meru Mind" : "Sign in via CLI";
+  h1.textContent = state.oidcEnabled ? st("authTitleSso") : st("authTitleCli");
   card.appendChild(h1);
 
   if (state.oidcEnabled) {
     const pSso = document.createElement("p");
     pSso.className = "auth-desc";
-    pSso.textContent = "Continue with your team's single sign-on provider (OIDC).";
+    pSso.textContent = st("authSsoDesc");
     card.appendChild(pSso);
 
     const returnTo = window.location.pathname + window.location.search;
@@ -973,22 +1647,20 @@ function renderAuthScreen() {
     ssoBtn.className = "meru-btn primary auth-sso-btn";
     ssoBtn.dataset.ui = "sso-login-btn";
     ssoBtn.href = ssoUrl;
-    ssoBtn.textContent = "Sign in with SSO";
+    ssoBtn.textContent = st("authSsoBtn");
     card.appendChild(ssoBtn);
 
     const div = document.createElement("div");
     div.className = "auth-divider";
     const span = document.createElement("span");
-    span.textContent = "or CLI";
+    span.textContent = st("authOrCli");
     div.appendChild(span);
     card.appendChild(div);
   }
 
   const p = document.createElement("p");
   p.className = "auth-desc";
-  p.textContent = state.oidcEnabled
-    ? "Sign in from your terminal or headless SSH session using a fresh SSO device code (90-day token saved locally with 0600 permissions):"
-    : "Browser sessions use a 60-second single-use CLI login link (HttpOnly Cookie; read and reversible actions only). Long-lived tokens stay in your terminal.";
+  p.textContent = state.oidcEnabled ? st("authCliDescSso") : st("authCliDescLocal");
   card.appendChild(p);
 
   const cmdText = state.oidcEnabled
@@ -1000,7 +1672,7 @@ function renderAuthScreen() {
   code.className = "cli-cmd-text";
   code.textContent = cmdText;
   cmdRow.appendChild(code);
-  cmdRow.appendChild(makeIconBtn(ICONS.copy(), "Copy login command", () => copyText(cmdText)));
+  cmdRow.appendChild(makeIconBtn(ICONS.copy(), st("copyLoginCmd"), () => copyText(cmdText)));
   card.appendChild(cmdRow);
 
   screen.appendChild(card);
@@ -1026,7 +1698,7 @@ function buildSidebar() {
   lamp.className = "ws-lamp";
   lamp.dataset.ui = "ws-connection-status";
   lamp.dataset.status = state.pumpStatus;
-  lamp.title = "Realtime transport: " + state.pumpStatus;
+  lamp.title = st("realtimeStatusPrefix") + ": " + realtimeStatusLabel(state.pumpStatus);
   identity.appendChild(mark);
   identity.appendChild(word);
   identity.appendChild(lamp);
@@ -1098,13 +1770,15 @@ function buildSidebar() {
     const name = document.createElement("span");
     name.className = "realm-label";
     if (r.path === "/") {
-      name.textContent = "Root (/)";
+      name.textContent = st("rootRealm") + " (/)";
+    } else if (r.path === "/inbox") {
+      name.textContent = st("tabInbox");
     } else if (pathDepth(r.path) >= 2) {
       name.textContent = r.slug || r.path.split("/").pop();
     } else {
       name.textContent = r.path;
     }
-    name.title = r.name + " (" + r.path + ")";
+    name.title = (r.name || r.path) + " (" + r.path + ")";
     left.appendChild(ico);
     left.appendChild(name);
     selectBtn.appendChild(left);
@@ -1272,8 +1946,8 @@ function buildSidebar() {
           const dotsBtn = document.createElement("button");
           dotsBtn.type = "button";
           dotsBtn.className = "row-dots-btn";
-          dotsBtn.title = "Inspect in-flight work";
-          dotsBtn.setAttribute("aria-label", "Inspect " + w.label);
+          dotsBtn.title = st("inspectWork");
+          dotsBtn.setAttribute("aria-label", st("inspectWork") + " " + w.label);
           dotsBtn.appendChild(ICONS.dots());
           dotsBtn.addEventListener("click", (ev) => {
             ev.stopPropagation();
@@ -1343,7 +2017,6 @@ function buildSidebar() {
         }
       }
     } else {
-      // People mode (按身份): collapsible per actor, DEFAULT EXPANDED, paginated incremental scroll loading
       if (actorGroups.length === 0) {
         const empty = document.createElement("div");
         empty.className = "presence-empty";
@@ -1373,7 +2046,7 @@ function buildSidebar() {
           chev.dataset.ui = "actor-chevron";
           chev.dataset.actorId = g.actorId;
           chev.setAttribute("aria-expanded", String(!isActorCollapsed));
-          chev.title = (isActorCollapsed ? "Expand " : "Collapse ") + g.actorId;
+          chev.title = (isActorCollapsed ? st("expandActor") : st("collapseActor")) + " " + g.actorId;
           chev.setAttribute("aria-label", chev.title);
           chev.appendChild(isActorCollapsed ? ICONS.chevronRight() : ICONS.chevronDown());
           chev.addEventListener("click", (ev) => {
@@ -1396,7 +2069,8 @@ function buildSidebar() {
           const dot = document.createElement("span");
           dot.className = "status-dot" + (g.online ? "" : (g.active ? " active" : " idle"));
           const countLabel = g.sessions.length + " " + (g.sessions.length === 1 ? st("sessionSingle") : st("sessionsPlural"));
-          const tip = [g.actorId, g.actorKind, countLabel].filter(Boolean).join(" · ");
+          const actorKindLabel = g.actorKind === "human" ? st("actorHuman") : st("actorAgent");
+          const tip = [g.actorId, actorKindLabel, countLabel].filter(Boolean).join(" · ");
           dot.title = tip;
           row.title = tip;
           left.appendChild(chev);
@@ -1415,8 +2089,8 @@ function buildSidebar() {
           const dotsBtn = document.createElement("button");
           dotsBtn.type = "button";
           dotsBtn.className = "row-dots-btn";
-          dotsBtn.title = "Member actions";
-          dotsBtn.setAttribute("aria-label", "Actions for " + g.actorId);
+          dotsBtn.title = st("memberActions");
+          dotsBtn.setAttribute("aria-label", st("memberActions") + " " + g.actorId);
           dotsBtn.appendChild(ICONS.dots());
           dotsBtn.addEventListener("click", (ev) => {
             ev.stopPropagation();
@@ -1559,7 +2233,7 @@ function buildSidebar() {
   profileBtn.type = "button";
   profileBtn.className = "profile-trigger";
   profileBtn.dataset.ui = "profile-trigger";
-  profileBtn.title = "Profile & session";
+  profileBtn.title = st("profileTooltip");
   const myDisplayName = state.whoami.actor.displayName || state.whoami.actor.id;
   const avCircle = document.createElement("span");
   avCircle.className = "avatar-circle";
@@ -1581,7 +2255,7 @@ function buildSidebar() {
     render();
   });
 
-  const gearBtn = makeIconBtn(ICONS.settings(), "Settings (Cmd+,)", () => {
+  const gearBtn = makeIconBtn(ICONS.settings(), st("settingsTooltip"), () => {
     state.popover = null;
     state.modal = "settings";
     render();
@@ -1602,7 +2276,7 @@ function buildTopbar() {
   const left = document.createElement("div");
   left.className = "topbar-left";
 
-  const menuBtn = makeIconBtn(ICONS.menu(), "Toggle realms navigation", () => {
+  const menuBtn = makeIconBtn(ICONS.menu(), st("toggleNav"), () => {
     state.mobileNavOpen = !state.mobileNavOpen;
     render();
   }, "mobile-menu-btn");
@@ -1610,7 +2284,7 @@ function buildTopbar() {
 
   const crumb = document.createElement("span");
   crumb.className = "scope-crumb";
-  crumb.textContent = getOrgName() + " / " + (state.activeRealmPath === "/" ? "root" : state.activeRealmPath.slice(1));
+  crumb.textContent = getOrgName() + " / " + (state.activeRealmPath === "/" ? st("rootRealm") : state.activeRealmPath.slice(1));
   left.appendChild(crumb);
 
   const searchBtn = document.createElement("button");
@@ -1632,24 +2306,28 @@ function buildTopbar() {
 
   const actions = document.createElement("div");
   actions.className = "topbar-actions";
-  actions.appendChild(makeIconBtn(ICONS.plus(), "New entry in " + state.activeRealmPath + " (N)", () => {
-    state.popover = null;
-    state.writeError = null;
-    state.modal = "write";
-    render();
-  }));
-  actions.appendChild(makeIconBtn(ICONS.refresh(), "Refresh realm snapshot (R)", () => {
+  const newBtn = makeIconBtn(ICONS.plus(), st("newEntryTooltip"), () => {
+    openWriteModal();
+  });
+  newBtn.dataset.ui = "new-entry-trigger";
+  actions.appendChild(newBtn);
+
+  actions.appendChild(makeIconBtn(ICONS.refresh(), st("refreshTooltip"), () => {
     void refreshAll();
   }));
-  actions.appendChild(makeIconBtn(
+
+  const inspectorBtn = makeIconBtn(
     ICONS.panelRight(),
-    state.inspectorOpen ? "Hide inspector ([)" : "Show inspector ([)",
+    state.inspectorOpen ? st("hideInspectorTooltip") : st("showInspectorTooltip"),
     () => {
       state.inspectorOpen = !state.inspectorOpen;
+      state.inspectorPinned = state.inspectorOpen;
       render();
     },
     state.inspectorOpen ? "active" : "",
-  ));
+  );
+  inspectorBtn.dataset.ui = "inspector-toggle";
+  actions.appendChild(inspectorBtn);
 
   header.appendChild(left);
   header.appendChild(searchBtn);
@@ -1657,27 +2335,105 @@ function buildTopbar() {
   return header;
 }
 
+/* ==================== Workspace Tab Sections ==================== */
+
+function buildRulesWhisperBanner(rules) {
+  if (!Array.isArray(rules) || rules.length === 0) return null;
+
+  const box = document.createElement("div");
+  box.className = "rules-whisper-banner" + (state.rulesBannerExpanded ? " expanded" : "");
+  box.dataset.ui = "rules-whisper-banner";
+
+  const toggleBtn = document.createElement("button");
+  toggleBtn.type = "button";
+  toggleBtn.className = "rules-whisper-toggle";
+  toggleBtn.setAttribute("aria-expanded", String(state.rulesBannerExpanded));
+  toggleBtn.title = state.rulesBannerExpanded ? st("rulesBannerCollapse") : st("rulesBannerHint");
+
+  const left = document.createElement("span");
+  left.className = "rules-whisper-left";
+  left.appendChild(ICONS.kindRule(14));
+  const txt = document.createElement("span");
+  txt.textContent = st("rulesBannerCount", rules.length);
+  left.appendChild(txt);
+
+  const chev = document.createElement("span");
+  chev.className = "rules-whisper-chev";
+  chev.appendChild(state.rulesBannerExpanded ? ICONS.chevronDown() : ICONS.chevronRight());
+
+  toggleBtn.appendChild(left);
+  toggleBtn.appendChild(chev);
+  toggleBtn.addEventListener("click", () => {
+    state.rulesBannerExpanded = !state.rulesBannerExpanded;
+    render();
+  });
+  box.appendChild(toggleBtn);
+
+  if (state.rulesBannerExpanded) {
+    const list = document.createElement("div");
+    list.className = "rules-whisper-list";
+    rules.forEach((rule, idx) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "rule-row compact" + (state.focusedEntryId === rule.id ? " selected" : "");
+      row.dataset.ruleId = rule.id;
+      row.dataset.listEntryId = rule.id;
+
+      const num = document.createElement("span");
+      num.className = "rule-idx";
+      num.textContent = String(idx + 1);
+
+      const title = document.createElement("span");
+      title.className = "rule-title";
+      title.textContent = rule.title;
+
+      const origin = document.createElement("span");
+      origin.className = "origin-tag";
+      origin.textContent = rule.inherited ? st("ruleInherited") : st("ruleLocal");
+
+      row.appendChild(num);
+      row.appendChild(title);
+      row.appendChild(origin);
+      row.addEventListener("click", () => { void openEntryInCenter(rule.id); });
+      list.appendChild(row);
+    });
+    box.appendChild(list);
+  }
+
+  return box;
+}
+
 function buildRulesSection(rules) {
   const sec = document.createElement("section");
   sec.className = "content-section";
   sec.dataset.section = "rules";
 
-  const head = document.createElement("div");
-  head.className = "section-head";
-  const h2 = document.createElement("h2");
-  h2.className = "section-title";
-  h2.textContent = "Binding Rules";
-  const meta = document.createElement("span");
-  meta.className = "section-meta";
-  meta.textContent = rules.length + " active · untruncated";
-  head.appendChild(h2);
-  head.appendChild(meta);
-  sec.appendChild(head);
-
   if (rules.length === 0) {
     const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.textContent = "No explicit binding rules in this realm.";
+    empty.className = "teaching-empty";
+    empty.dataset.ui = "empty-rules";
+
+    const ico = document.createElement("div");
+    ico.className = "teaching-empty-icon";
+    ico.appendChild(ICONS.kindRule(18));
+    empty.appendChild(ico);
+
+    const desc = document.createElement("p");
+    desc.className = "teaching-empty-desc";
+    desc.textContent = st("emptyRulesDesc");
+    empty.appendChild(desc);
+
+    const cmdText = 'meru-mind rule add --in ' + state.activeRealmPath + ' --title "..." --body "..." --as-human';
+    const cmdRow = document.createElement("div");
+    cmdRow.className = "cli-cmd-row teaching-empty-cli";
+    const code = document.createElement("code");
+    code.className = "cli-cmd-text";
+    code.textContent = cmdText;
+    code.title = cmdText;
+    cmdRow.appendChild(code);
+    cmdRow.appendChild(makeIconBtn(ICONS.copy(), st("copyCmd"), () => copyText(cmdText)));
+    empty.appendChild(cmdRow);
+
     sec.appendChild(empty);
     return sec;
   }
@@ -1702,12 +2458,12 @@ function buildRulesSection(rules) {
 
     const origin = document.createElement("span");
     origin.className = "origin-tag";
-    origin.textContent = rule.inherited ? "inherited" : "local";
+    origin.textContent = rule.inherited ? st("ruleInherited") : st("ruleLocal");
 
     row.appendChild(num);
     row.appendChild(title);
     row.appendChild(origin);
-    row.addEventListener("click", () => { void selectEntryById(rule.id, true); });
+    row.addEventListener("click", () => { void openEntryInCenter(rule.id); });
     list.appendChild(row);
   });
   sec.appendChild(list);
@@ -1719,27 +2475,24 @@ function buildInboxTriageSection() {
   sec.className = "content-section";
   sec.dataset.section = "inbox-triage";
 
-  const head = document.createElement("div");
-  head.className = "section-head";
-  const h2 = document.createElement("h2");
-  h2.className = "section-title";
-  h2.textContent = "Inbox Triage Queue";
-  const meta = document.createElement("span");
-  meta.className = "section-meta";
-  meta.textContent = state.inboxEntries.length + " waiting";
-  head.appendChild(h2);
-  head.appendChild(meta);
-  sec.appendChild(head);
-
   if (state.inboxEntries.length === 0) {
     const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.textContent = "Inbox is clear. Unassigned notes written without --in land here for routing.";
+    empty.className = "teaching-empty";
+    empty.dataset.ui = "empty-inbox";
+    const ico = document.createElement("div");
+    ico.className = "teaching-empty-icon";
+    ico.appendChild(ICONS.inbox());
+    const desc = document.createElement("p");
+    desc.className = "teaching-empty-desc";
+    desc.textContent = st("emptyInboxDesc");
+    empty.appendChild(ico);
+    empty.appendChild(desc);
     sec.appendChild(empty);
     return sec;
   }
 
   const targets = state.realms.filter((r) => r.path !== "/inbox");
+  const defaultTarget = targets.find((t) => t.path === "/ops")?.path || targets[0]?.path || "/";
   const stack = document.createElement("div");
   stack.className = "triage-stack";
 
@@ -1747,29 +2500,47 @@ function buildInboxTriageSection() {
     const wrap = document.createElement("div");
     wrap.className = "triage-item";
 
-    const entryEl = document.createElement("meru-entry");
-    entryEl.entry = item;
-    entryEl.addEventListener("meru-select", () => { void selectEntryById(item.id, true); });
-    wrap.appendChild(entryEl);
+    wrap.appendChild(buildStudioEntryRow(item, { compact: true }));
 
     if (targets.length > 0) {
+      const selectedTarget = state.triageTargets.get(item.id) || defaultTarget;
+      if (!state.triageTargets.has(item.id)) {
+        state.triageTargets.set(item.id, selectedTarget);
+      }
+
       const bar = document.createElement("div");
       bar.className = "triage-controls";
 
       const destGroup = document.createElement("div");
       destGroup.className = "triage-dest-group";
 
-      const sel = document.createElement("select");
-      sel.className = "meru-select";
-      sel.setAttribute("aria-label", "Destination realm for " + item.id);
-      for (const t of targets) {
-        const opt = document.createElement("option");
-        opt.value = t.path;
-        opt.textContent = t.path;
-        if (t.path === "/ops") opt.selected = true;
-        sel.appendChild(opt);
-      }
-      destGroup.appendChild(sel);
+      // Custom accessible monochrome realm picker (zero native OS <select>)
+      const pickerBtn = document.createElement("button");
+      pickerBtn.type = "button";
+      pickerBtn.className = "realm-picker-trigger";
+      pickerBtn.dataset.ui = "triage-realm-picker";
+      pickerBtn.setAttribute("aria-haspopup", "listbox");
+      pickerBtn.setAttribute("aria-label", st("chooseRealm"));
+      const pickerVal = document.createElement("span");
+      pickerVal.className = "realm-picker-value";
+      pickerVal.textContent = selectedTarget;
+      pickerBtn.appendChild(ICONS.realm());
+      pickerBtn.appendChild(pickerVal);
+      pickerBtn.appendChild(ICONS.chevronDown());
+      pickerBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const rect = pickerBtn.getBoundingClientRect();
+        state.popover = {
+          kind: "triage-picker",
+          x: rect.left,
+          y: rect.bottom + 4,
+          entryId: item.id,
+          targets,
+          selected: state.triageTargets.get(item.id) || defaultTarget,
+        };
+        render();
+      });
+      destGroup.appendChild(pickerBtn);
 
       const moveBtn = document.createElement("button");
       moveBtn.type = "button";
@@ -1777,16 +2548,17 @@ function buildInboxTriageSection() {
       moveBtn.dataset.triageEntry = item.id;
       moveBtn.appendChild(ICONS.arrowRight());
       const lbl = document.createElement("span");
-      lbl.textContent = "Route";
+      lbl.textContent = st("moveToRealm");
       moveBtn.appendChild(lbl);
       moveBtn.addEventListener("click", async () => {
+        const dest = state.triageTargets.get(item.id) || defaultTarget;
         moveBtn.disabled = true;
         try {
-          await client.inbox.triage(item.id, sel.value, { expectedFromRealmRef: "/inbox" });
-          showToast("Routed to " + sel.value);
+          await client.inbox.triage(item.id, dest, { expectedFromRealmRef: "/inbox" });
+          showToast(st("routedToast", dest));
           await refreshAll();
         } catch (err) {
-          showToast(err?.message || "Triage conflict");
+          showToast(err?.message || st("triageConflict"));
           moveBtn.disabled = false;
         }
       });
@@ -1802,201 +2574,302 @@ function buildInboxTriageSection() {
   return sec;
 }
 
-function buildObjectsSection(limitCount = null) {
+function buildObjectsSection() {
   const sec = document.createElement("section");
   sec.className = "content-section";
   sec.dataset.section = "objects";
 
-  const head = document.createElement("div");
-  head.className = "section-head";
-  const h2 = document.createElement("h2");
-  h2.className = "section-title";
-  h2.textContent = limitCount ? "Key Objects" : "Objects in " + state.activeRealmPath;
-  const meta = document.createElement("span");
-  meta.className = "section-meta";
-  meta.textContent = fmtNum(state.realmObjects.length) + " tracked";
-  head.appendChild(h2);
-  head.appendChild(meta);
-  sec.appendChild(head);
+  if (state.realmObjects.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "teaching-empty";
+    empty.dataset.ui = "empty-objects";
 
-  if (!limitCount && state.realmObjects.length > 8) {
+    const ico = document.createElement("div");
+    ico.className = "teaching-empty-icon";
+    ico.appendChild(ICONS.objects());
+    empty.appendChild(ico);
+
+    const desc = document.createElement("p");
+    desc.className = "teaching-empty-desc";
+    desc.textContent = st("emptyObjectsDesc");
+    empty.appendChild(desc);
+
+    const hintCmd = st("emptyObjectsHint", state.activeRealmPath);
+    const cmdRow = document.createElement("div");
+    cmdRow.className = "cli-cmd-row teaching-empty-cli";
+    const code = document.createElement("code");
+    code.className = "cli-cmd-text";
+    code.textContent = hintCmd;
+    code.title = hintCmd;
+    cmdRow.appendChild(code);
+    cmdRow.appendChild(makeIconBtn(ICONS.copy(), st("copyCmd"), () => copyText(hintCmd)));
+    empty.appendChild(cmdRow);
+
+    sec.appendChild(empty);
+    return sec;
+  }
+
+  const listWrap = document.createElement("div");
+
+  function renderObjectsGrid() {
+    clearEl(listWrap);
+    const q = state.objectFilter.trim().toLowerCase();
+    const filtered = q
+      ? state.realmObjects.filter((o) =>
+          String(o.name || "").toLowerCase().includes(q) ||
+          String(o.ref || "").toLowerCase().includes(q) ||
+          String(o.kind || "").toLowerCase().includes(q))
+      : state.realmObjects;
+
+    if (filtered.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty-state";
+      empty.textContent = st("emptyObjectsFiltered", state.objectFilter);
+      listWrap.appendChild(empty);
+      return;
+    }
+
+    const grid = document.createElement("div");
+    grid.className = "object-chip-grid";
+    for (const obj of filtered) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "object-row-btn" + (state.selectedObject?.ref === obj.ref ? " selected" : "");
+      btn.dataset.objectRef = obj.ref;
+
+      const main = document.createElement("span");
+      main.className = "object-row-main";
+      const nm = document.createElement("span");
+      nm.className = "object-row-name";
+      nm.textContent = obj.name || obj.ref;
+      const kd = document.createElement("span");
+      kd.className = "object-row-kind";
+      kd.textContent = objectKindLabel(obj.kind) + " · " + obj.realmPath;
+      main.appendChild(nm);
+      main.appendChild(kd);
+
+      btn.appendChild(main);
+      btn.appendChild(ICONS.arrowRight());
+      btn.addEventListener("click", () => { void selectObjectByRef(obj.ref, true); });
+      grid.appendChild(btn);
+    }
+    listWrap.appendChild(grid);
+  }
+
+  if (state.realmObjects.length > 6) {
     const bar = document.createElement("div");
     bar.className = "filter-inline-bar";
     const inp = document.createElement("input");
     inp.className = "filter-inline-input";
     inp.type = "search";
-    inp.placeholder = "Filter objects by name or kind...";
+    inp.placeholder = st("filterObjectsPlaceholder");
     inp.value = state.objectFilter;
     inp.addEventListener("input", () => {
       state.objectFilter = inp.value;
-      render();
+      renderObjectsGrid();
     });
     bar.appendChild(inp);
     sec.appendChild(bar);
   }
 
-  const q = state.objectFilter.trim().toLowerCase();
-  const filtered = q
-    ? state.realmObjects.filter((o) =>
-        String(o.name || "").toLowerCase().includes(q) ||
-        String(o.ref || "").toLowerCase().includes(q) ||
-        String(o.kind || "").toLowerCase().includes(q))
-    : state.realmObjects;
-  const shown = limitCount ? filtered.slice(0, limitCount) : filtered;
-
-  if (shown.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.textContent = q ? ("No objects matching \"" + state.objectFilter + "\".") : "No structured objects directly in this realm.";
-    sec.appendChild(empty);
-    return sec;
-  }
-
-  const grid = document.createElement("div");
-  grid.className = "object-chip-grid";
-  for (const obj of shown) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "object-row-btn" + (state.selectedObject?.ref === obj.ref ? " selected" : "");
-    btn.dataset.objectRef = obj.ref;
-
-    const main = document.createElement("span");
-    main.className = "object-row-main";
-    const nm = document.createElement("span");
-    nm.className = "object-row-name";
-    nm.textContent = obj.name || obj.ref;
-    const kd = document.createElement("span");
-    kd.className = "object-row-kind";
-    kd.textContent = obj.kind + " · " + obj.realmPath;
-    main.appendChild(nm);
-    main.appendChild(kd);
-
-    btn.appendChild(main);
-    btn.appendChild(ICONS.arrowRight());
-    btn.addEventListener("click", () => { void selectObjectByRef(obj.ref, true); });
-    grid.appendChild(btn);
-  }
-  sec.appendChild(grid);
-
-  if (limitCount && state.realmObjects.length > limitCount) {
-    const foot = document.createElement("div");
-    foot.className = "load-more-row";
-    const note = document.createElement("span");
-    note.className = "section-meta";
-    note.textContent = "Showing " + shown.length + " of " + fmtNum(state.realmObjects.length) + " objects";
-    const allBtn = document.createElement("button");
-    allBtn.type = "button";
-    allBtn.className = "meru-btn";
-    allBtn.textContent = "Browse all objects";
-    allBtn.addEventListener("click", () => {
-      state.activeTab = "objects";
-      render();
-    });
-    foot.appendChild(note);
-    foot.appendChild(allBtn);
-    sec.appendChild(foot);
-  }
-
+  renderObjectsGrid();
+  sec.appendChild(listWrap);
   return sec;
 }
 
-function buildRecentConclusionsSection(items, opts = {}) {
+function buildEntriesSection(rules, rc) {
   const sec = document.createElement("section");
   sec.className = "content-section";
-  sec.dataset.section = "conclusions";
+  sec.dataset.section = "entries";
 
-  const head = document.createElement("div");
-  head.className = "section-head";
-  const h2 = document.createElement("h2");
-  h2.className = "section-title";
-  h2.textContent = opts.title || "Recent Conclusions";
-
-  if (opts.includeHistoryToggle) {
-    const toggle = document.createElement("label");
-    toggle.className = "history-toggle";
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.dataset.ui = "ledger-history-toggle";
-    cb.checked = state.showLedgerHistory;
-    cb.addEventListener("change", async () => {
-      state.showLedgerHistory = cb.checked;
-      await loadRealmEntries(state.activeRealmPath, true);
-      render();
-    });
-    const lbl = document.createElement("span");
-    lbl.textContent = "Include superseded & redacted";
-    toggle.appendChild(cb);
-    toggle.appendChild(lbl);
-    head.appendChild(h2);
-    head.appendChild(toggle);
-  } else {
-    const meta = document.createElement("span");
-    meta.className = "section-meta";
-    meta.textContent = opts.totalCount ? ("Latest " + items.length + " of " + fmtNum(opts.totalCount)) : String(items.length);
-    head.appendChild(h2);
-    head.appendChild(meta);
+  const rulesBanner = buildRulesWhisperBanner(rules);
+  if (rulesBanner) {
+    sec.appendChild(rulesBanner);
   }
-  sec.appendChild(head);
 
-  if (items.length === 0) {
+  const allNonRuleEntries = state.realmEntries.filter((x) => x.kind !== "rule");
+  const hasAnyEntries = allNonRuleEntries.length > 0;
+  const hasActiveFilter = state.entryKindFilter !== "all" || Boolean(state.entrySearchFilter.trim()) || state.showLedgerHistory;
+
+  if (!hasAnyEntries && !hasActiveFilter) {
     const empty = document.createElement("div");
-    empty.className = "empty-state";
-    empty.textContent = "No direct entries in this realm. Select a child realm in the sidebar or search across the full tree with ⌘K.";
+    empty.className = "teaching-empty";
+    empty.dataset.ui = "empty-entries";
+
+    const ico = document.createElement("div");
+    ico.className = "teaching-empty-icon";
+    ico.appendChild(ICONS.entries());
+    empty.appendChild(ico);
+
+    const subtreeConclusions = rc.subtreeConclusions ?? 0;
+    const childRealmsCount = rc.childRealmsCount ?? 0;
+    const desc = document.createElement("p");
+    desc.className = "teaching-empty-desc";
+    desc.textContent = (subtreeConclusions > 0 && childRealmsCount > 0)
+      ? st("emptyEntriesSubtree", fmtNum(subtreeConclusions), childRealmsCount)
+      : st("emptyEntriesDesc");
+    empty.appendChild(desc);
+
+    const actions = document.createElement("div");
+    actions.className = "teaching-empty-actions";
+    const createBtn = document.createElement("button");
+    createBtn.type = "button";
+    createBtn.className = "meru-btn primary";
+    createBtn.dataset.ui = "empty-new-entry-btn";
+    createBtn.appendChild(ICONS.plus());
+    const createLbl = document.createElement("span");
+    createLbl.textContent = st("newEntryBtn");
+    createBtn.appendChild(createLbl);
+    createBtn.addEventListener("click", () => openWriteModal());
+    actions.appendChild(createBtn);
+    empty.appendChild(actions);
+
     sec.appendChild(empty);
     return sec;
   }
 
-  const stack = document.createElement("div");
-  stack.className = "entry-stack";
-  for (const item of items) {
-    const el = document.createElement("meru-entry");
-    el.dataset.listEntryId = item.id;
-    el.entry = { ...item, realmPath: item.realmPath || state.activeRealmPath };
-    el.selected = state.focusedEntryId === item.id;
-    el.addEventListener("meru-select", () => { void openEntryInCenter(item.id); });
-    stack.appendChild(el);
-  }
-  sec.appendChild(stack);
+  const listWrap = document.createElement("div");
 
-  if (opts.showBrowseAll && opts.totalCount > items.length) {
-    const foot = document.createElement("div");
-    foot.className = "load-more-row";
-    const info = document.createElement("span");
-    info.className = "section-meta";
-    info.textContent = fmtNum(opts.totalCount) + " total entries in " + state.activeRealmPath;
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "meru-btn";
-    btn.textContent = "Browse paginated ledger";
-    btn.addEventListener("click", () => {
-      state.activeTab = "conclusions";
-      render();
-    });
-    foot.appendChild(info);
-    foot.appendChild(btn);
-    sec.appendChild(foot);
-  } else if (opts.paginated && state.realmEntriesHasMore) {
-    const foot = document.createElement("div");
-    foot.className = "load-more-row";
-    const info = document.createElement("span");
-    info.className = "section-meta";
-    info.textContent = "Loaded " + fmtNum(items.length) + " entries";
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "meru-btn";
-    btn.textContent = "Load 25 more";
-    btn.addEventListener("click", async () => {
-      btn.disabled = true;
-      await loadRealmEntries(state.activeRealmPath, false);
-      render();
-    });
-    foot.appendChild(info);
-    foot.appendChild(btn);
-    sec.appendChild(foot);
+  function renderEntriesList() {
+    clearEl(listWrap);
+    const items = getFilteredRealmEntries();
+
+    if (items.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty-state empty-filter-row";
+      const txt = document.createElement("span");
+      txt.textContent = st("noFilteredEntries");
+      empty.appendChild(txt);
+      if (state.entryKindFilter !== "all" || state.entrySearchFilter.trim()) {
+        const clearBtn = document.createElement("button");
+        clearBtn.type = "button";
+        clearBtn.className = "meru-btn";
+        clearBtn.textContent = st("clearFilter");
+        clearBtn.addEventListener("click", () => {
+          state.entryKindFilter = "all";
+          state.entrySearchFilter = "";
+          render();
+        });
+        empty.appendChild(clearBtn);
+      }
+      listWrap.appendChild(empty);
+      return;
+    }
+
+    const list = document.createElement("div");
+    list.className = "entry-list";
+    for (const item of items) {
+      list.appendChild(buildStudioEntryRow(item));
+    }
+    listWrap.appendChild(list);
+
+    if (state.realmEntriesHasMore) {
+      const foot = document.createElement("div");
+      foot.className = "load-more-row";
+      const info = document.createElement("span");
+      info.className = "section-meta";
+      info.textContent = st("loadedEntriesCount", fmtNum(items.length));
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "meru-btn";
+      btn.textContent = st("loadMoreEntries");
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        await loadRealmEntries(state.activeRealmPath, false);
+        render();
+      });
+      foot.appendChild(info);
+      foot.appendChild(btn);
+      listWrap.appendChild(foot);
+    }
   }
+
+  // Clean filter/kind toolbar shown ONLY when entries exist (or filters active)
+  const toolbar = document.createElement("div");
+  toolbar.className = "entries-toolbar";
+  toolbar.dataset.ui = "entries-toolbar";
+
+  const leftTools = document.createElement("div");
+  leftTools.className = "entries-toolbar-left";
+
+  const presentKinds = new Set(allNonRuleEntries.map((x) => kindMeta(x.extKind || x.kind).key));
+  const filterableKinds = ["finding", "decision", "proposal", "claim", "verdict"].filter(
+    (k) => presentKinds.has(k) || state.entryKindFilter === k,
+  );
+  if (filterableKinds.length > 1 || state.entryKindFilter !== "all") {
+    const filterGroup = document.createElement("div");
+    filterGroup.className = "kind-filter-group";
+    filterGroup.setAttribute("role", "group");
+    filterGroup.setAttribute("aria-label", st("composerKindLabel"));
+
+    const allBtn = document.createElement("button");
+    allBtn.type = "button";
+    allBtn.className = "kind-filter-btn" + (state.entryKindFilter === "all" ? " active" : "");
+    allBtn.textContent = st("kindAll");
+    allBtn.addEventListener("click", () => {
+      state.entryKindFilter = "all";
+      render();
+    });
+    filterGroup.appendChild(allBtn);
+
+    for (const k of filterableKinds) {
+      const km = kindMeta(k);
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "kind-filter-btn" + (state.entryKindFilter === k ? " active" : "");
+      b.appendChild(km.icon(13));
+      const lbl = document.createElement("span");
+      lbl.textContent = km.label;
+      b.appendChild(lbl);
+      b.addEventListener("click", () => {
+        state.entryKindFilter = k;
+        render();
+      });
+      filterGroup.appendChild(b);
+    }
+    leftTools.appendChild(filterGroup);
+  }
+
+  if (allNonRuleEntries.length > 4 || state.entrySearchFilter) {
+    const searchInp = document.createElement("input");
+    searchInp.type = "search";
+    searchInp.className = "entries-search-input";
+    searchInp.placeholder = st("filterEntriesPlaceholder");
+    searchInp.value = state.entrySearchFilter;
+    searchInp.addEventListener("input", () => {
+      state.entrySearchFilter = searchInp.value;
+      renderEntriesList();
+    });
+    leftTools.appendChild(searchInp);
+  }
+
+  toolbar.appendChild(leftTools);
+
+  const histToggle = document.createElement("label");
+  histToggle.className = "history-toggle";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.dataset.ui = "entries-history-toggle";
+  cb.checked = state.showLedgerHistory;
+  cb.addEventListener("change", async () => {
+    state.showLedgerHistory = cb.checked;
+    await loadRealmEntries(state.activeRealmPath, true);
+    render();
+  });
+  const histLbl = document.createElement("span");
+  histLbl.textContent = st("showHistory");
+  histToggle.appendChild(cb);
+  histToggle.appendChild(histLbl);
+  toolbar.appendChild(histToggle);
+
+  sec.appendChild(toolbar);
+  renderEntriesList();
+  sec.appendChild(listWrap);
 
   return sec;
 }
+
+/* ==================== Center Full Document Reader ==================== */
 
 function buildDocumentReader() {
   const main = document.createElement("main");
@@ -2005,9 +2878,11 @@ function buildDocumentReader() {
 
   const e = state.openEntry;
   const isRedacted = Boolean(e.redactedAt) || e.status === "retracted";
+  const km = kindMeta(e.extKind || e.kind);
+  const sm = statusMeta(e.status, isRedacted);
   const rawBody = isRedacted
-    ? "[REDACTED: content permanently removed]"
-    : String(e.body || e.snippet || "No body text.");
+    ? st("redactedBody")
+    : String(e.body || e.snippet || st("noBodyText"));
   const payloadSplitIdx = !isRedacted ? rawBody.indexOf("\n## Payload\n") : -1;
   const mainBodyText = payloadSplitIdx >= 0 ? rawBody.slice(0, payloadSplitIdx).trim() : rawBody;
   const rawPayloadText = payloadSplitIdx >= 0 ? rawBody.slice(payloadSplitIdx + "\n## Payload\n".length).trim() : "";
@@ -2038,7 +2913,10 @@ function buildDocumentReader() {
       state.previousObject = null;
       teardownStudioHtmlPreview();
       state.openEntry = null;
+      state.focusedEntryId = null;
+      state.focusedEntry = null;
       state.selectedObject = obj;
+      state.focusedObjectRef = obj.ref || null;
       syncUrlFromState(false);
       render();
     } else {
@@ -2101,7 +2979,6 @@ function buildDocumentReader() {
   }
 
   if (!isRedacted) {
-    // Show ONLY views that actually apply to this document (never show HTML tab on plain MD!)
     const modeOptions = isHtmlDoc
       ? [
           { key: "html", label: st("html"), icon: ICONS.eye },
@@ -2157,28 +3034,39 @@ function buildDocumentReader() {
 
   const h1 = document.createElement("h1");
   h1.className = "reader-doc-title";
-  h1.textContent = isRedacted ? "[REDACTED]" : String(e.title || e.id);
+  h1.textContent = isRedacted ? st("redactedTitle") : String(e.title || st("kindEntry"));
   canvas.appendChild(h1);
 
   const submeta = document.createElement("div");
   submeta.className = "reader-doc-submeta";
-  const kindBadge = document.createElement("span");
-  kindBadge.className = "reader-kind-pill";
-  kindBadge.textContent = String(e.extKind || e.kind || "entry");
-  submeta.appendChild(kindBadge);
-  if (e.status && e.status !== "active" && e.status !== "evidence") {
+  const kindTag = document.createElement("span");
+  kindTag.className = "reader-kind-tag";
+  kindTag.appendChild(km.icon(13));
+  const kindLbl = document.createElement("span");
+  kindLbl.textContent = km.label;
+  kindTag.appendChild(kindLbl);
+  submeta.appendChild(kindTag);
+
+  if (sm.notable) {
     const stSpan = document.createElement("span");
-    stSpan.textContent = String(e.status);
+    stSpan.className = "studio-entry-status status-" + sm.key;
+    stSpan.textContent = sm.label;
     submeta.appendChild(stSpan);
   }
-  if (e.authorId) {
+  const authorName = formatAuthorName(e);
+  if (authorName) {
     const authSpan = document.createElement("span");
-    authSpan.textContent = "@" + e.authorId;
+    authSpan.textContent = authorName;
     submeta.appendChild(authSpan);
   }
-  const tsSpan = document.createElement("span");
-  tsSpan.textContent = formatStamp(e.occurredAt || e.createdAt);
-  submeta.appendChild(tsSpan);
+  const tsIso = e.occurredAt || e.createdAt;
+  if (tsIso) {
+    const tsSpan = document.createElement("time");
+    tsSpan.setAttribute("datetime", String(tsIso));
+    tsSpan.title = formatStamp(tsIso);
+    tsSpan.textContent = formatRelativeTime(tsIso);
+    submeta.appendChild(tsSpan);
+  }
   canvas.appendChild(submeta);
 
   populateReaderBody(false);
@@ -2202,6 +3090,8 @@ function buildDocumentReader() {
   return main;
 }
 
+/* ==================== Main Workspace ==================== */
+
 function buildWorkspace() {
   if (state.openEntry) {
     return buildDocumentReader();
@@ -2210,12 +3100,9 @@ function buildWorkspace() {
   main.className = "workspace-col";
 
   const rules = state.brief?.middleMind?.rules?.items || [];
-  const overviewConclusions = collectOverviewConclusions(state.brief, state.realmEntries);
   const rc = state.realmCounts[state.activeRealmPath] || {};
-  const directConclusions = state.brief?.buckets?.conclusions ?? rc.directConclusions ?? overviewConclusions.length;
-  const subtreeConclusions = rc.subtreeConclusions ?? directConclusions;
-  const totalObjects = rc.subtreeObjects ?? state.realmObjects.length;
-  const childRealmsCount = rc.childRealmsCount ?? 0;
+  const nonRuleEntries = state.realmEntries.filter((x) => x.kind !== "rule");
+  const directEntriesCount = state.brief?.buckets?.conclusions ?? rc.directConclusions ?? nonRuleEntries.length;
   const activeRealmObj = state.realms.find((r) => r.path === state.activeRealmPath);
 
   const head = document.createElement("div");
@@ -2225,21 +3112,17 @@ function buildWorkspace() {
   titleRow.className = "title-row";
   const h1 = document.createElement("h1");
   h1.className = "page-title";
-  h1.textContent = realmDisplayName(activeRealmObj);
-  const fresh = document.createElement("span");
-  fresh.className = "freshness-meta";
-  fresh.textContent = state.lastSyncedAt
-    ? ("Synced " + state.lastSyncedAt + " · seq " + state.pumpCursorSeq)
-    : "Connecting...";
+  h1.textContent = state.activeRealmPath === "/inbox" ? st("tabInbox") : realmDisplayName(activeRealmObj);
   titleRow.appendChild(h1);
-  titleRow.appendChild(fresh);
   head.appendChild(titleRow);
 
-  const scopeText = state.brief?.realm?.scope || activeRealmObj?.scope || "Shared realm context, inherited rules, and active ledger conclusions.";
-  const scopeP = document.createElement("p");
-  scopeP.className = "scope-line";
-  scopeP.textContent = scopeText;
-  head.appendChild(scopeP);
+  const scopeText = state.brief?.realm?.scope || activeRealmObj?.scope || "";
+  if (scopeText) {
+    const scopeP = document.createElement("p");
+    scopeP.className = "scope-line";
+    scopeP.textContent = scopeText;
+    head.appendChild(scopeP);
+  }
 
   // Contextual inline Active Peers strip: strictly hidden when 0 other peers are active here
   const realmPeers = (state.pulses || []).filter(
@@ -2279,11 +3162,11 @@ function buildWorkspace() {
 
       const age = document.createElement("span");
       age.className = "peer-chip-age";
-      age.textContent = peer.online ? "now" : formatPulseAge(peer.ageSeconds);
+      age.textContent = peer.online ? st("nowTag") : formatPulseAge(peer.ageSeconds);
       chip.appendChild(age);
 
       chip.title = [
-        peer.actorId + " (" + (peer.actorKind || "agent") + (peer.clientHint ? ", " + peer.clientHint : "") + " " + shortSessionHandle(peer.sessionId) + ")",
+        peer.actorId + " (" + (peer.actorKind === "human" ? st("actorHuman") : st("actorAgent")) + (peer.clientHint ? ", " + peer.clientHint : "") + " " + shortSessionHandle(peer.sessionId) + ")",
         peer.activity || "",
         peer.note ? ('"' + peer.note + '"') : "",
       ].filter(Boolean).join(" · ");
@@ -2313,31 +3196,35 @@ function buildWorkspace() {
     head.appendChild(peersBar);
   }
 
+  // Clean 3-tab bar (+ conditional Inbox tab when /inbox exists); count pills hidden when 0
   const tabs = document.createElement("div");
   tabs.className = "tab-bar";
   tabs.setAttribute("role", "tablist");
 
   const tabDefs = [
-    { id: "overview", label: "Overview", count: null },
-    { id: "conclusions", label: "Ledger", count: directConclusions },
-    { id: "objects", label: "Objects", count: state.realmObjects.length },
-    { id: "rules", label: "Binding Rules", count: rules.length },
+    { id: "entries", label: st("tabEntries"), icon: ICONS.entries, count: Math.max(directEntriesCount, nonRuleEntries.length) },
+    { id: "objects", label: st("tabObjects"), icon: ICONS.objects, count: state.realmObjects.length },
+    { id: "rules", label: st("tabRules"), icon: ICONS.rules, count: rules.length },
   ];
   if (state.hasInboxRealm) {
-    tabDefs.push({ id: "inbox", label: "Inbox Triage", count: state.inboxEntries.length });
+    tabDefs.push({ id: "inbox", label: st("tabInbox"), icon: ICONS.inbox, count: state.inboxEntries.length });
   }
 
   for (const t of tabDefs) {
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.role = "tab";
+    btn.setAttribute("role", "tab");
     btn.className = "tab-btn" + (state.activeTab === t.id ? " active" : "");
     btn.setAttribute("aria-selected", String(state.activeTab === t.id));
     btn.dataset.tab = t.id;
+    const ico = document.createElement("span");
+    ico.className = "tab-icon";
+    ico.appendChild(t.icon());
     const lbl = document.createElement("span");
     lbl.textContent = t.label;
+    btn.appendChild(ico);
     btn.appendChild(lbl);
-    if (t.count !== null) {
+    if (typeof t.count === "number" && t.count > 0) {
       const cnt = document.createElement("span");
       cnt.className = "tab-count";
       cnt.textContent = fmtNum(t.count);
@@ -2356,108 +3243,14 @@ function buildWorkspace() {
   const scroll = document.createElement("div");
   scroll.className = "workspace-scroll";
 
-  if (state.activeTab === "overview") {
-    const strip = document.createElement("div");
-    strip.className = "ledger-strip";
-
-    const cells = [
-      {
-        label: subtreeConclusions > directConclusions ? "Subtree Conclusions" : "Active Conclusions",
-        value: subtreeConclusions > directConclusions ? subtreeConclusions : directConclusions,
-        sub: subtreeConclusions > directConclusions ? (fmtNum(directConclusions) + " direct in " + state.activeRealmPath) : ("In " + state.activeRealmPath),
-        tab: "conclusions",
-        actionable: false,
-      },
-      {
-        label: "Tracked Objects",
-        value: totalObjects,
-        sub: state.realmObjects.length > 0 ? (fmtNum(state.realmObjects.length) + " direct here") : "Across child realms",
-        tab: "objects",
-        actionable: false,
-      },
-      {
-        label: "Binding Rules",
-        value: rules.length,
-        sub: "Always untruncated",
-        tab: "rules",
-        actionable: false,
-      },
-      state.hasInboxRealm
-        ? {
-            label: "Inbox Queue",
-            value: state.inboxEntries.length,
-            sub: state.inboxEntries.length > 0 ? "Needs routing" : "Clear",
-            tab: "inbox",
-            actionable: state.inboxEntries.length > 0,
-          }
-        : {
-            label: "Child Realms",
-            value: childRealmsCount,
-            sub: getOrgPolicy() ? ("Policy: " + getOrgPolicy()) : "Scoped tree",
-            tab: "overview",
-            actionable: false,
-          },
-    ];
-
-    for (const c of cells) {
-      const cell = document.createElement("button");
-      cell.type = "button";
-      cell.className = "ledger-cell";
-      const l = document.createElement("span");
-      l.className = "ledger-label";
-      l.textContent = c.label;
-      const v = document.createElement("span");
-      v.className = "ledger-value" + (c.value === 0 ? " zero" : "") + (c.actionable ? " actionable" : "");
-      v.textContent = fmtNum(c.value);
-      const s = document.createElement("span");
-      s.className = "ledger-sub";
-      s.textContent = c.sub;
-      cell.appendChild(l);
-      cell.appendChild(v);
-      cell.appendChild(s);
-      cell.addEventListener("click", () => {
-        state.activeTab = c.tab;
-        render();
-      });
-      strip.appendChild(cell);
-    }
-    scroll.appendChild(strip);
-
-    if (state.hasInboxRealm && state.inboxEntries.length > 0) {
+  if (state.activeTab === "entries") {
+    if (state.activeRealmPath === "/inbox" && state.hasInboxRealm && state.inboxEntries.length > 0) {
       scroll.appendChild(buildInboxTriageSection());
+    } else {
+      scroll.appendChild(buildEntriesSection(rules, rc));
     }
-
-    if (overviewConclusions.length > 0) {
-      scroll.appendChild(buildRecentConclusionsSection(overviewConclusions, {
-        title: "Recent Conclusions",
-        totalCount: directConclusions,
-        showBrowseAll: true,
-      }));
-    }
-
-    if (state.realmObjects.length > 0) {
-      scroll.appendChild(buildObjectsSection(6));
-    }
-
-    if (rules.length > 0) {
-      scroll.appendChild(buildRulesSection(rules));
-    }
-
-    if (overviewConclusions.length === 0 && state.realmObjects.length === 0 && rules.length === 0 && state.inboxEntries.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "empty-state";
-      empty.textContent = "This parent realm organizes child realms (" + childRealmsCount + " below). Pick a child realm on the left or press ⌘K to search across all " + fmtNum(subtreeConclusions) + " conclusions.";
-      scroll.appendChild(empty);
-    }
-  } else if (state.activeTab === "conclusions") {
-    const listItems = state.realmEntries.filter((x) => x.kind !== "rule");
-    scroll.appendChild(buildRecentConclusionsSection(listItems, {
-      title: "Ledger Entries in " + state.activeRealmPath,
-      includeHistoryToggle: true,
-      paginated: true,
-    }));
   } else if (state.activeTab === "objects") {
-    scroll.appendChild(buildObjectsSection(null));
+    scroll.appendChild(buildObjectsSection());
   } else if (state.activeTab === "rules") {
     scroll.appendChild(buildRulesSection(rules));
   } else if (state.activeTab === "inbox") {
@@ -2475,6 +3268,8 @@ function buildWorkspace() {
   return main;
 }
 
+/* ==================== Right Properties Rail ==================== */
+
 function buildPropList(rows) {
   const list = document.createElement("dl");
   list.className = "prop-list";
@@ -2487,7 +3282,25 @@ function buildPropList(rows) {
     dt.textContent = row.label;
     const dd = document.createElement("dd");
     dd.className = "prop-value" + (row.mono ? " mono" : "");
-    if (typeof row.onClick === "function") {
+
+    if (row.copyValue) {
+      const wrap = document.createElement("span");
+      wrap.className = "prop-id-wrap";
+      const valSpan = document.createElement("span");
+      valSpan.className = "prop-id-text";
+      valSpan.textContent = String(row.value);
+      valSpan.title = String(row.value);
+      const cpBtn = makeIconBtn(
+        ICONS.copy(),
+        row.copyLabel || st("copyId"),
+        () => { void copyText(row.copyValue, st("copiedToast", row.copyValue)); },
+        "prop-copy-btn",
+      );
+      cpBtn.dataset.ui = row.copyUi || "prop-copy-id";
+      wrap.appendChild(valSpan);
+      wrap.appendChild(cpBtn);
+      dd.appendChild(wrap);
+    } else if (typeof row.onClick === "function") {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "prop-value-btn" + (row.mono ? " mono" : "");
@@ -2540,8 +3353,9 @@ function buildInspector() {
     actionsBtn.dataset.ui = "rail-actions-trigger";
     headActions.appendChild(actionsBtn);
   }
-  headActions.appendChild(makeIconBtn(ICONS.close(), "Close properties ([)", () => {
+  headActions.appendChild(makeIconBtn(ICONS.close(), st("closeInspector"), () => {
     state.inspectorOpen = false;
+    state.inspectorPinned = false;
     render();
   }));
   head.appendChild(headActions);
@@ -2559,15 +3373,15 @@ function buildInspector() {
     scroll.appendChild(title);
 
     scroll.appendChild(buildPropList([
-      { label: "Ref", value: card.ref, mono: true, onClick: () => copyText(card.ref, "Copied " + card.ref) },
-      { label: "Kind", value: card.kind },
+      { label: st("propRef"), value: card.ref, mono: true, copyValue: card.ref, copyLabel: st("copyRef") },
+      { label: st("propKind"), value: objectKindLabel(card.kind) },
       {
-        label: "Realm",
+        label: st("propRealm"),
         value: card.realmPath,
         mono: true,
         onClick: card.realmPath ? () => { void selectRealm(card.realmPath); } : null,
       },
-      { label: "Linked", value: fmtNum(card.counts?.total ?? card.recentEntries?.length ?? 0) },
+      { label: st("propLinked"), value: fmtNum(card.counts?.total ?? card.recentEntries?.length ?? 0) },
     ]));
 
     if (Array.isArray(card.recentEntries) && card.recentEntries.length > 0) {
@@ -2575,21 +3389,23 @@ function buildInspector() {
       sec.className = "rail-section";
       const lbl = document.createElement("div");
       lbl.className = "rail-section-head";
-      lbl.textContent = "Linked Context (" + card.recentEntries.length + ")";
+      lbl.textContent = st("linkedContext", card.recentEntries.length);
       sec.appendChild(lbl);
 
       const list = document.createElement("div");
       list.className = "object-entries-list";
       for (const item of card.recentEntries) {
+        const km = kindMeta(item.extKind || item.kind);
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "object-entry-mini";
         const t = document.createElement("div");
         t.className = "object-entry-mini-title";
-        t.textContent = item.title || item.id;
+        t.textContent = item.title || st("kindEntry");
         const m = document.createElement("div");
         m.className = "object-entry-mini-meta";
-        m.textContent = (item.extKind || item.kind || "entry") + " · " + formatStamp(item.occurredAt || item.createdAt);
+        const tsIso = item.occurredAt || item.createdAt;
+        m.textContent = [km.label, tsIso ? formatRelativeTime(tsIso) : ""].filter(Boolean).join(" · ");
         btn.appendChild(t);
         btn.appendChild(m);
         btn.addEventListener("click", () => { void openEntryInCenter(item.id, { fromObject: true }); });
@@ -2603,16 +3419,17 @@ function buildInspector() {
     return aside;
   }
 
-  // Mode 2: Entry focus (either open full-width in Center Reader or focused via J/K in List)
+  // Mode 2: Entry focus
   if (focusEntry) {
     const e = focusEntry;
     const isRedacted = Boolean(e.redactedAt) || e.status === "retracted";
+    const km = kindMeta(e.extKind || e.kind);
+    const sm = statusMeta(e.status, isRedacted);
 
-    // When NOT yet open in Center Reader, show compact title + 2-line excerpt + Open button
     if (!state.openEntry) {
       const title = document.createElement("h3");
       title.className = "inspector-title";
-      title.textContent = isRedacted ? "[REDACTED]" : String(e.title || e.id);
+      title.textContent = isRedacted ? st("redactedTitle") : String(e.title || st("kindEntry"));
       scroll.appendChild(title);
 
       const snippet = isRedacted ? "" : String(e.snippet || e.body || "").trim();
@@ -2635,23 +3452,26 @@ function buildInspector() {
       scroll.appendChild(openBtn);
     }
 
-    // Flat single-line properties (zero card-in-card, zero duplicate document body!)
     scroll.appendChild(buildPropList([
-      { label: "ID", value: e.id, mono: true, onClick: () => copyText(e.id, "Copied " + e.id) },
-      { label: "Kind", value: e.extKind || e.kind || "entry" },
-      { label: "Status", value: e.status || "active" },
+      { label: st("propId"), value: e.id, mono: true, copyValue: e.id, copyLabel: st("copyId"), copyUi: "inspector-copy-id" },
+      { label: st("propKind"), value: km.label },
+      { label: st("propStatus"), value: sm.label },
       {
-        label: "Realm",
+        label: st("propRealm"),
         value: e.realmPath || state.activeRealmPath,
         mono: true,
         onClick: () => { void selectRealm(e.realmPath || state.activeRealmPath); },
       },
-      { label: "Author", value: e.authorId ? ("@" + e.authorId) : null, mono: true },
-      { label: "Recorded", value: formatStamp(e.occurredAt || e.createdAt), mono: true },
-      { label: "Source", value: e.sourceRef || null, mono: true },
+      { label: st("propAuthor"), value: formatAuthorName(e) || null },
+      {
+        label: st("propRecorded"),
+        value: formatStamp(e.occurredAt || e.createdAt),
+        mono: true,
+      },
+      { label: st("propSource"), value: e.sourceRef || null, mono: true },
     ]));
 
-    // Linked Objects & Resource Tags — COMPLETELY HIDDEN when empty
+    // Linked Objects & Resource Tags — hidden when empty
     const linkedRefs = [
       ...(Array.isArray(e.objectIds) ? e.objectIds : []),
       ...(Array.isArray(e.refs) ? e.refs : []),
@@ -2675,7 +3495,7 @@ function buildInspector() {
         chip.textContent = ref;
         chip.addEventListener("click", () => {
           if (ref.startsWith("#")) {
-            void copyText(ref, "Copied " + ref);
+            void copyText(ref, st("copiedToast", ref));
           } else {
             void selectObjectByRef(ref, true);
           }
@@ -2686,7 +3506,7 @@ function buildInspector() {
       scroll.appendChild(sec);
     }
 
-    // Supersede Provenance — COMPLETELY HIDDEN if <= 1 revision
+    // Supersede History — hidden if <= 1 revision
     if (state.selectedChain && Array.isArray(state.selectedChain.nodes) && state.selectedChain.nodes.length > 1) {
       const sec = document.createElement("div");
       sec.className = "rail-section";
@@ -2704,6 +3524,8 @@ function buildInspector() {
       const rail = document.createElement("div");
       rail.className = "chain-rail";
       for (const n of state.selectedChain.nodes) {
+        const nKm = kindMeta(n.extKind || n.kind);
+        const nSm = statusMeta(n.status, Boolean(n.redactedAt) || n.status === "retracted");
         const node = document.createElement("button");
         node.type = "button";
         const isHead = n.id === state.selectedChain.currentHeadId;
@@ -2711,10 +3533,14 @@ function buildInspector() {
         node.className = "chain-node" + (isHead ? " head" : "") + (isCurr ? " current" : "");
         const nt = document.createElement("div");
         nt.className = "chain-node-title";
-        nt.textContent = n.title;
+        nt.textContent = n.title || st("kindEntry");
         const nm = document.createElement("div");
         nm.className = "chain-node-meta";
-        nm.textContent = (isHead ? "head · " : "") + n.kind + " · " + n.status + " · " + n.id.slice(0, 12);
+        nm.textContent = [
+          isHead ? st("headTag") : null,
+          nKm.label,
+          nSm.notable ? nSm.label : null,
+        ].filter(Boolean).join(" · ");
         node.appendChild(nt);
         node.appendChild(nm);
         node.addEventListener("click", () => { void openEntryInCenter(n.id); });
@@ -2724,7 +3550,7 @@ function buildInspector() {
       scroll.appendChild(sec);
     }
 
-    // Active Peers touching this realm/entry — COMPLETELY HIDDEN if 0 peers
+    // Active Peers touching this realm/entry — hidden if 0 peers
     const entryRealm = e.realmPath || state.activeRealmPath;
     const relevantPeers = (state.pulses || []).filter(
       (p) =>
@@ -2751,7 +3577,7 @@ function buildInspector() {
         who.textContent = peer.clientHint ? (peer.actorId + " · " + peer.clientHint) : peer.actorId;
         const act = document.createElement("span");
         act.className = "rail-peer-act";
-        act.textContent = peer.activity || peer.note || (peer.online ? "now" : formatPulseAge(peer.ageSeconds));
+        act.textContent = peer.activity || peer.note || (peer.online ? st("nowTag") : formatPulseAge(peer.ageSeconds));
         pRow.appendChild(dot);
         pRow.appendChild(who);
         pRow.appendChild(act);
@@ -2761,7 +3587,7 @@ function buildInspector() {
       scroll.appendChild(sec);
     }
 
-    // Contextual CLI Governance Command Box — SHOWN ONLY when explicitly requested from ⋯ menu or on 403
+    // Contextual CLI Governance Command Box — shown only on explicit request
     if (state.railCliCommand) {
       const cliBlock = document.createElement("div");
       cliBlock.className = "rail-section rail-cli-box";
@@ -2771,7 +3597,7 @@ function buildInspector() {
       const lbl = document.createElement("span");
       lbl.textContent = state.railCliCommand.label || "CLI";
       top.appendChild(lbl);
-      top.appendChild(makeIconBtn(ICONS.close(), "Dismiss", () => {
+      top.appendChild(makeIconBtn(ICONS.close(), st("dismiss"), () => {
         state.railCliCommand = null;
         render();
       }));
@@ -2789,7 +3615,7 @@ function buildInspector() {
       cmdCode.textContent = state.railCliCommand.cmd;
       cmdCode.title = state.railCliCommand.cmd;
       cmdRow.appendChild(cmdCode);
-      cmdRow.appendChild(makeIconBtn(ICONS.copy(), "Copy CLI command", () => copyText(state.railCliCommand.cmd)));
+      cmdRow.appendChild(makeIconBtn(ICONS.copy(), st("copyCmd"), () => copyText(state.railCliCommand.cmd)));
       cliBlock.appendChild(cmdRow);
       scroll.appendChild(cliBlock);
     }
@@ -2798,17 +3624,16 @@ function buildInspector() {
     return aside;
   }
 
-  // Mode 3: No specific entry/object focused -> show active Realm properties
+  // Mode 3: Realm properties (when inspector explicitly toggled open with nothing selected)
   const activeRealmObj = state.realms.find((r) => r.path === state.activeRealmPath);
   const rc = state.realmCounts[state.activeRealmPath] || {};
   const rulesCount = state.brief?.middleMind?.rules?.items?.length || 0;
   scroll.appendChild(buildPropList([
-    { label: "Path", value: state.activeRealmPath, mono: true },
-    { label: "Name", value: realmDisplayName(activeRealmObj) },
-    { label: "Conclusions", value: fmtNum(rc.subtreeConclusions ?? rc.directConclusions ?? 0), mono: true },
-    { label: "Objects", value: fmtNum(rc.subtreeObjects ?? state.realmObjects.length), mono: true },
-    { label: "Rules", value: fmtNum(rulesCount), mono: true },
-    { label: "Policy", value: getOrgPolicy(), mono: true },
+    { label: st("propPath"), value: state.activeRealmPath, mono: true },
+    { label: st("propName"), value: realmDisplayName(activeRealmObj) },
+    { label: st("propEntries"), value: fmtNum(rc.subtreeConclusions ?? rc.directConclusions ?? 0), mono: true },
+    { label: st("propObjects"), value: fmtNum(rc.subtreeObjects ?? state.realmObjects.length), mono: true },
+    { label: st("propRules"), value: fmtNum(rulesCount), mono: true },
   ]));
 
   const realmPeers = (state.pulses || []).filter(
@@ -2833,7 +3658,7 @@ function buildInspector() {
       who.textContent = peer.clientHint ? (peer.actorId + " · " + peer.clientHint) : peer.actorId;
       const act = document.createElement("span");
       act.className = "rail-peer-act";
-      act.textContent = peer.activity || peer.note || (peer.online ? "now" : formatPulseAge(peer.ageSeconds));
+      act.textContent = peer.activity || peer.note || (peer.online ? st("nowTag") : formatPulseAge(peer.ageSeconds));
       pRow.appendChild(dot);
       pRow.appendChild(who);
       pRow.appendChild(act);
@@ -2850,12 +3675,13 @@ function buildInspector() {
 /* ==================== Popovers & Modals ==================== */
 
 function formatSessionStateBadge(s) {
-  if (s.state === "turn_ended") return "Turn ended " + formatPulseAge(s.ageSeconds) + " ago";
-  if (s.state === "silent") return "Silent " + formatPulseAge(s.ageSeconds) + " ago";
-  if (s.state === "working" || (s.online && s.mode === "working")) return "Working";
-  if (s.online) return "Online";
-  if (s.active) return "Active " + formatPulseAge(s.ageSeconds) + " ago";
-  return "Quiet " + formatPulseAge(s.ageSeconds) + " ago";
+  const age = formatPulseAge(s.ageSeconds);
+  if (s.state === "turn_ended") return st("sessTurnEnded", age);
+  if (s.state === "silent") return st("sessSilent", age);
+  if (s.state === "working" || (s.online && s.mode === "working")) return st("sessWorking");
+  if (s.online) return st("sessOnline");
+  if (s.active) return st("sessActive", age);
+  return st("sessQuiet", age);
 }
 
 function buildPopoverSessionItem(s, opts = {}) {
@@ -2882,13 +3708,6 @@ function buildPopoverSessionItem(s, opts = {}) {
   topRow.appendChild(leftMeta);
   topRow.appendChild(ageMeta);
   item.appendChild(topRow);
-
-  if (s.source || s.mode) {
-    const prov = document.createElement("div");
-    prov.className = "popover-session-meta";
-    prov.textContent = [s.mode, s.source ? ("source=" + s.source) : ""].filter(Boolean).join(" · ");
-    item.appendChild(prov);
-  }
 
   if (s.activity) {
     const actEl = document.createElement("div");
@@ -2930,11 +3749,40 @@ function renderPopover() {
   const maxX = Math.max(12, window.innerWidth - (isWideCard ? 356 : 292));
   const maxY = Math.max(
     12,
-    window.innerHeight - (isWideCard ? 404 : state.popover.kind === "profile" ? 248 : 200),
+    window.innerHeight - (isWideCard ? 404 : state.popover.kind === "profile" ? 248 : 220),
   );
   pop.style.left = Math.min(Math.max(12, state.popover.x), maxX) + "px";
   pop.style.top = Math.min(Math.max(12, state.popover.y), maxY) + "px";
   pop.addEventListener("click", (ev) => ev.stopPropagation());
+
+  if (state.popover.kind === "triage-picker") {
+    const pickerEntryId = state.popover.entryId;
+    const pickerSelected = state.popover.selected;
+    pop.setAttribute("role", "listbox");
+    pop.className += " realm-picker-menu";
+    for (const target of state.popover.targets || []) {
+      const isSelected = target.path === pickerSelected;
+      const optBtn = document.createElement("button");
+      optBtn.type = "button";
+      optBtn.setAttribute("role", "option");
+      optBtn.setAttribute("aria-selected", String(isSelected));
+      optBtn.className = "menu-item realm-picker-option" + (isSelected ? " active" : "");
+      const ico = document.createElement("span");
+      ico.className = "realm-picker-check";
+      if (isSelected) ico.appendChild(ICONS.check());
+      const lbl = document.createElement("span");
+      lbl.textContent = target.path;
+      optBtn.appendChild(ico);
+      optBtn.appendChild(lbl);
+      optBtn.addEventListener("click", () => {
+        state.triageTargets.set(pickerEntryId, target.path);
+        state.popover = null;
+        render();
+      });
+      pop.appendChild(optBtn);
+    }
+    return pop;
+  }
 
   if (state.popover.kind === "work-card" && state.popover.work) {
     const w = state.popover.work;
@@ -2952,7 +3800,6 @@ function renderPopover() {
     head.appendChild(sub);
     pop.appendChild(head);
 
-    // Order participants as parent -> children tree (pure read-only projection)
     const byId = new Map(w.participants.map((p) => [p.sessionId, p]));
     const childrenByParent = new Map();
     const roots = [];
@@ -3003,7 +3850,7 @@ function renderPopover() {
     if (entry) {
       addAction(ICONS.copy(), st("copyId"), () => {
         render();
-        void copyText(entry.id, "Copied " + entry.id);
+        void copyText(entry.id, st("copiedToast", entry.id));
       });
       addAction(ICONS.link(), st("copyLink"), () => {
         const u = new URL(window.location.href);
@@ -3011,24 +3858,24 @@ function renderPopover() {
         u.pathname = targetRealm;
         u.search = "?entry=" + encodeURIComponent(entry.id);
         render();
-        void copyText(u.toString(), "Copied document link");
+        void copyText(u.toString(), st("copiedLinkToast"));
       });
       const moveCmd = "meru-mind entry move " + entry.id + " --to /target-realm";
       addAction(ICONS.terminal(), st("cliMoveCmd"), () => {
-        state.railCliCommand = { label: "CLI Move", cmd: moveCmd };
+        state.railCliCommand = { label: st("cliMoveLabel"), cmd: moveCmd };
         render();
-        void copyText(moveCmd, "Copied CLI move command");
+        void copyText(moveCmd, st("copiedCmdToast"));
       });
       const redactCmd = "meru-mind redact " + entry.id + ' --reason "compliance"';
       addAction(ICONS.terminal(), st("cliRedactCmd"), () => {
-        state.railCliCommand = { label: "CLI Redact", cmd: redactCmd };
+        state.railCliCommand = { label: st("cliRedactLabel"), cmd: redactCmd };
         render();
-        void copyText(redactCmd, "Copied CLI redact command");
+        void copyText(redactCmd, st("copiedCmdToast"));
       }, true);
     } else if (obj) {
-      addAction(ICONS.copy(), "Copy Ref", () => {
+      addAction(ICONS.copy(), st("copyRef"), () => {
         render();
-        void copyText(obj.ref, "Copied " + obj.ref);
+        void copyText(obj.ref, st("copiedToast", obj.ref));
       });
     }
     return pop;
@@ -3046,9 +3893,9 @@ function renderPopover() {
     handleSpan.textContent = "@" + state.whoami.actor.id;
     const roleBadge = document.createElement("span");
     roleBadge.className = "profile-role-badge" + (state.whoami.actor.role === "admin" ? " is-admin" : "");
-    roleBadge.textContent = state.whoami.actor.role === "admin" ? "admin" : "member";
+    roleBadge.textContent = state.whoami.actor.role === "admin" ? st("roleAdmin") : st("roleMember");
     const kindSpan = document.createElement("span");
-    kindSpan.textContent = "· " + state.whoami.actor.kind;
+    kindSpan.textContent = "· " + (state.whoami.actor.kind === "human" ? st("actorHuman") : st("actorAgent"));
     sub.appendChild(handleSpan);
     sub.appendChild(roleBadge);
     sub.appendChild(kindSpan);
@@ -3105,7 +3952,7 @@ function renderPopover() {
         showToast(st("displayNameSaved"));
         render();
       } catch (err) {
-        errEl.textContent = (err && err.message) ? String(err.message) : "Failed to save";
+        errEl.textContent = (err && err.message) ? String(err.message) : st("saveFailed");
         saveBtn.disabled = false;
         saveBtn.textContent = st("save");
       }
@@ -3147,7 +3994,10 @@ function renderPopover() {
     const sub = document.createElement("div");
     sub.className = "popover-sub";
     const countLabel = group.sessions.length + " " + (group.sessions.length === 1 ? st("sessionSingle") : st("sessionsPlural"));
-    sub.textContent = (group.actorKind || "agent") + " · " + countLabel;
+    const actorKindLabel = group.actorKind === "human"
+      ? st("actorHuman")
+      : (group.actorKind === "unkeyed" ? st("unkeyedBucket") : st("actorAgent"));
+    sub.textContent = actorKindLabel + " · " + countLabel;
     head.appendChild(nm);
     head.appendChild(sub);
     pop.appendChild(head);
@@ -3172,7 +4022,7 @@ function renderPopover() {
       jump.className = "menu-item";
       jump.appendChild(ICONS.arrowRight());
       const jSpan = document.createElement("span");
-      jSpan.textContent = "Open " + rp;
+      jSpan.textContent = st("openRealmPrefix") + " " + rp;
       jump.appendChild(jSpan);
       jump.addEventListener("click", () => {
         state.popover = null;
@@ -3186,12 +4036,12 @@ function renderPopover() {
     cp.className = "menu-item";
     cp.appendChild(ICONS.copy());
     const cSpan = document.createElement("span");
-    cSpan.textContent = "Copy actor ID";
+    cSpan.textContent = st("copyActorId");
     cp.appendChild(cSpan);
     cp.addEventListener("click", () => {
       state.popover = null;
       render();
-      void copyText(group.actorId, "Copied " + group.actorId);
+      void copyText(group.actorId, st("copiedToast", group.actorId));
     });
 
     pop.appendChild(cp);
@@ -3209,6 +4059,66 @@ function openSearchModal() {
   if (inp) inp.focus();
 }
 
+function composerTitlePlaceholderForKind(kind) {
+  if (kind === "decision") return st("composerPlaceholderDecision");
+  if (kind === "proposal") return st("composerPlaceholderProposal");
+  return st("composerPlaceholderFinding");
+}
+
+function parseSecretGuardError(err) {
+  const msg = String(err?.message || "");
+  const isSecret = /plaintext credential|secret_detected|non-secret memory|--sensitivity secret/i.test(msg);
+  if (!isSecret) return null;
+  const m = /\(([^()]+)\)\s+in non-secret memory/i.exec(msg);
+  return st("composerSecretBlocked", m ? m[1] : "");
+}
+
+async function submitComposer() {
+  if (state.writeSubmitting) return;
+  if (!state.writeTitle.trim()) {
+    state.writeError = { kind: "error", text: st("composerTitleRequired") };
+    render();
+    requestAnimationFrame(() => {
+      const inp = document.getElementById("composer-title-input");
+      if (inp) inp.focus();
+    });
+    return;
+  }
+  state.writeSubmitting = true;
+  state.writeError = null;
+  render();
+  try {
+    const res = await client.write({
+      kind: state.writeKind,
+      title: state.writeTitle.trim(),
+      body: state.writeBody.trim(),
+      in: state.activeRealmPath,
+    });
+    state.writeTitle = "";
+    state.writeBody = "";
+    state.writeSubmitting = false;
+    state.writeError = null;
+    state.modal = null;
+    showToast(st("composerSavedToast", state.activeRealmPath));
+    await refreshAll();
+    if (res?.record?.id) await openEntryInCenter(res.record.id);
+  } catch (err) {
+    state.writeSubmitting = false;
+    const secretNotice = parseSecretGuardError(err);
+    if (secretNotice) {
+      state.writeError = { kind: "secret", text: secretNotice };
+    } else {
+      state.writeError = {
+        kind: "error",
+        text: err?.cliCommand
+          ? (err.message + " — " + err.cliCommand)
+          : (err?.message || st("composerWriteFailed")),
+      };
+    }
+    render();
+  }
+}
+
 function renderModal() {
   if (!state.modal) return null;
 
@@ -3222,7 +4132,7 @@ function renderModal() {
   });
 
   const panel = document.createElement("div");
-  panel.className = "modal-panel";
+  panel.className = "modal-panel" + (state.modal === "write" ? " composer-panel" : "");
   panel.setAttribute("role", "dialog");
   panel.setAttribute("aria-modal", "true");
 
@@ -3235,7 +4145,7 @@ function renderModal() {
     inp.id = "studio-search-input";
     inp.className = "search-input";
     inp.type = "search";
-    inp.placeholder = "Search visible memory across realms... (Press Enter)";
+    inp.placeholder = st("searchModalPlaceholder");
     inp.value = state.searchQuery;
     inp.addEventListener("keydown", async (ev) => {
       if (ev.key === "Escape") {
@@ -3250,12 +4160,12 @@ function renderModal() {
           const nextInp = document.getElementById("studio-search-input");
           if (nextInp) nextInp.focus();
         } catch (err) {
-          showToast(err?.message || "Search failed");
+          showToast(err?.message || st("searchFailed"));
         }
       }
     });
     head.appendChild(inp);
-    head.appendChild(makeIconBtn(ICONS.close(), "Close search", () => {
+    head.appendChild(makeIconBtn(ICONS.close(), st("searchClose"), () => {
       state.modal = null;
       render();
     }));
@@ -3267,33 +4177,39 @@ function renderModal() {
     if (!state.searchResults) {
       const hint = document.createElement("div");
       hint.className = "empty-state";
-      hint.textContent = "Type keywords and press Enter. Runs live v0.5.1 FTS5 + 240-char coverage-first snippet search across all visible realms.";
+      hint.textContent = st("searchHint");
       body.appendChild(hint);
     } else if (items.length === 0) {
       const none = document.createElement("div");
       none.className = "empty-state";
-      none.textContent = "No matching entries for \"" + state.searchQuery + "\".";
+      none.textContent = st("searchNoResults", state.searchQuery);
       body.appendChild(none);
     } else {
       for (const item of items) {
         const hl = state.searchResults.highlights?.[item.id] || null;
+        const km = kindMeta(item.extKind || item.kind);
         const row = document.createElement("button");
         row.type = "button";
         row.className = "search-result-row";
 
         const top = document.createElement("div");
         top.className = "search-result-top";
+        const leftTitle = document.createElement("span");
+        leftTitle.className = "search-result-title-wrap";
+        leftTitle.appendChild(km.icon(13));
         const tEl = document.createElement("span");
         tEl.className = "search-result-title";
         if (hl?.titleRanges?.length) {
-          tEl.appendChild(applyHighlightRanges(item.title || item.id, hl.titleRanges));
+          tEl.appendChild(applyHighlightRanges(item.title || st("kindEntry"), hl.titleRanges));
         } else {
-          tEl.textContent = String(item.title || item.id);
+          tEl.textContent = String(item.title || st("kindEntry"));
         }
+        leftTitle.appendChild(tEl);
+
         const tag = document.createElement("span");
         tag.className = "origin-tag";
-        tag.textContent = (item.extKind || item.kind || "entry") + " · " + (item.realmPath || "/");
-        top.appendChild(tEl);
+        tag.textContent = km.label + " · " + (item.realmPath || "/");
+        top.appendChild(leftTitle);
         top.appendChild(tag);
         row.appendChild(top);
 
@@ -3310,144 +4226,159 @@ function renderModal() {
 
         row.addEventListener("click", () => {
           state.modal = null;
-          void selectEntryById(item.id, true);
+          void openEntryInCenter(item.id);
         });
         body.appendChild(row);
       }
     }
     panel.appendChild(body);
   } else if (state.modal === "write") {
+    panel.dataset.ui = "composer-modal";
+
     const head = document.createElement("div");
-    head.className = "inspector-head";
-    const h = document.createElement("span");
-    h.className = "inspector-heading";
-    h.textContent = "New Entry in " + state.activeRealmPath;
-    head.appendChild(h);
-    head.appendChild(makeIconBtn(ICONS.close(), "Close", () => {
+    head.className = "composer-header";
+    const ctx = document.createElement("span");
+    ctx.className = "composer-context";
+    ctx.textContent = st("composerTitle", state.activeRealmPath);
+    head.appendChild(ctx);
+    head.appendChild(makeIconBtn(ICONS.close(), st("composerClose"), () => {
+      // Keep draft intact when dismissing
       state.modal = null;
       render();
     }));
     panel.appendChild(head);
 
     const body = document.createElement("div");
-    body.className = "modal-body";
-    const form = document.createElement("div");
-    form.className = "form-stack";
+    body.className = "composer-body";
 
-    const row2 = document.createElement("div");
-    row2.className = "form-row-2";
-
-    const kindLbl = document.createElement("label");
-    kindLbl.className = "field-label";
-    kindLbl.textContent = "Kind";
-    const kindSel = document.createElement("select");
-    kindSel.className = "meru-select";
-    for (const k of ["finding", "decision", "proposal"]) {
-      const opt = document.createElement("option");
-      opt.value = k;
-      opt.textContent = k;
-      if (state.writeKind === k) opt.selected = true;
-      kindSel.appendChild(opt);
-    }
-    kindSel.addEventListener("change", () => { state.writeKind = kindSel.value; });
-    kindLbl.appendChild(kindSel);
-
-    const realmLbl = document.createElement("label");
-    realmLbl.className = "field-label";
-    realmLbl.textContent = "Target Realm";
-    const realmInput = document.createElement("input");
-    realmInput.className = "meru-input";
-    realmInput.value = state.activeRealmPath;
-    realmInput.disabled = true;
-    realmLbl.appendChild(realmInput);
-
-    row2.appendChild(kindLbl);
-    row2.appendChild(realmLbl);
-    form.appendChild(row2);
-
-    const titleLbl = document.createElement("label");
-    titleLbl.className = "field-label";
-    titleLbl.textContent = "Title";
     const titleInp = document.createElement("input");
-    titleInp.className = "meru-input";
-    titleInp.placeholder = "Concise decision or finding title";
+    titleInp.id = "composer-title-input";
+    titleInp.type = "text";
+    titleInp.className = "composer-title-input";
+    titleInp.dataset.ui = "composer-title-input";
+    titleInp.placeholder = composerTitlePlaceholderForKind(state.writeKind);
     titleInp.value = state.writeTitle;
-    titleInp.addEventListener("input", () => { state.writeTitle = titleInp.value; });
-    titleLbl.appendChild(titleInp);
-    form.appendChild(titleLbl);
+    titleInp.autocomplete = "off";
+    titleInp.addEventListener("input", () => {
+      state.writeTitle = titleInp.value;
+      if (state.writeError) {
+        state.writeError = null;
+        const alertEl = panel.querySelector(".composer-inline-alert");
+        if (alertEl) alertEl.remove();
+      }
+    });
+    body.appendChild(titleInp);
 
-    const bodyLbl = document.createElement("label");
-    bodyLbl.className = "field-label";
-    bodyLbl.textContent = "Body";
     const bodyTa = document.createElement("textarea");
-    bodyTa.className = "meru-textarea";
-    bodyTa.placeholder = "Evidence, trade-offs, or verification details (Secret Guard scans writes automatically)";
+    bodyTa.id = "composer-body-textarea";
+    bodyTa.className = "composer-body-textarea";
+    bodyTa.dataset.ui = "composer-body-textarea";
+    bodyTa.placeholder = st("composerBodyPlaceholder");
     bodyTa.value = state.writeBody;
-    bodyTa.addEventListener("input", () => { state.writeBody = bodyTa.value; });
-    bodyLbl.appendChild(bodyTa);
-    form.appendChild(bodyLbl);
+    bodyTa.addEventListener("input", () => {
+      state.writeBody = bodyTa.value;
+      if (state.writeError) {
+        state.writeError = null;
+        const alertEl = panel.querySelector(".composer-inline-alert");
+        if (alertEl) alertEl.remove();
+      }
+    });
+    body.appendChild(bodyTa);
 
     if (state.writeError) {
-      const errBox = document.createElement("div");
-      errBox.className = "empty-state";
-      errBox.textContent = state.writeError;
-      form.appendChild(errBox);
+      const alertBox = document.createElement("div");
+      alertBox.className = "composer-inline-alert" + (state.writeError.kind === "secret" ? " is-secret" : "");
+      alertBox.setAttribute("role", "alert");
+      if (state.writeError.kind === "secret") {
+        alertBox.dataset.ui = "composer-secret-warning";
+      }
+      alertBox.textContent = state.writeError.text;
+      body.appendChild(alertBox);
     }
 
-    body.appendChild(form);
     panel.appendChild(body);
 
     const foot = document.createElement("div");
-    foot.className = "modal-foot";
-    const cancelBtn = document.createElement("button");
-    cancelBtn.type = "button";
-    cancelBtn.className = "meru-btn";
-    cancelBtn.textContent = "Cancel";
-    cancelBtn.addEventListener("click", () => {
-      state.modal = null;
-      render();
+    foot.className = "composer-footer";
+
+    // Quiet 3-way certainty-family icon segmented selector (zero native OS <select>)
+    const kindSwitcher = document.createElement("div");
+    kindSwitcher.className = "kind-switcher";
+    kindSwitcher.dataset.ui = "composer-kind-switcher";
+    kindSwitcher.setAttribute("role", "radiogroup");
+    kindSwitcher.setAttribute("aria-label", st("composerKindLabel"));
+
+    const kindOptions = ["finding", "decision", "proposal"];
+    const kindBtns = [];
+    const applyKindSelection = (nextKind) => {
+      state.writeKind = nextKind;
+      titleInp.placeholder = composerTitlePlaceholderForKind(nextKind);
+      for (const kb of kindBtns) {
+        const active = kb.dataset.kind === nextKind;
+        kb.classList.toggle("active", active);
+        kb.setAttribute("aria-checked", String(active));
+        kb.setAttribute("aria-pressed", String(active));
+      }
+    };
+
+    kindOptions.forEach((k, idx) => {
+      const km = kindMeta(k);
+      const kb = document.createElement("button");
+      kb.type = "button";
+      const isAct = state.writeKind === k;
+      kb.className = "kind-switcher-btn" + (isAct ? " active" : "");
+      kb.dataset.kind = k;
+      kb.setAttribute("role", "radio");
+      kb.setAttribute("aria-checked", String(isAct));
+      kb.setAttribute("aria-pressed", String(isAct));
+      kb.appendChild(km.icon(14));
+      const lbl = document.createElement("span");
+      lbl.textContent = km.label;
+      kb.appendChild(lbl);
+      kb.addEventListener("click", () => applyKindSelection(k));
+      kb.addEventListener("keydown", (ev) => {
+        if (ev.key === "ArrowRight" || ev.key === "ArrowDown") {
+          ev.preventDefault();
+          const nextIdx = (idx + 1) % kindOptions.length;
+          applyKindSelection(kindOptions[nextIdx]);
+          kindBtns[nextIdx].focus();
+        } else if (ev.key === "ArrowLeft" || ev.key === "ArrowUp") {
+          ev.preventDefault();
+          const prevIdx = (idx - 1 + kindOptions.length) % kindOptions.length;
+          applyKindSelection(kindOptions[prevIdx]);
+          kindBtns[prevIdx].focus();
+        }
+      });
+      kindBtns.push(kb);
+      kindSwitcher.appendChild(kb);
     });
+    foot.appendChild(kindSwitcher);
 
     const saveBtn = document.createElement("button");
     saveBtn.type = "button";
-    saveBtn.className = "meru-btn primary";
+    saveBtn.className = "meru-btn primary composer-submit-btn";
+    saveBtn.dataset.ui = "composer-submit";
     saveBtn.disabled = state.writeSubmitting;
-    saveBtn.textContent = state.writeSubmitting ? "Writing..." : "Write to Ledger";
-    saveBtn.addEventListener("click", async () => {
-      if (!state.writeTitle.trim()) {
-        state.writeError = "Title is required.";
-        render();
-        return;
-      }
-      state.writeSubmitting = true;
-      state.writeError = null;
-      render();
-      try {
-        const res = await client.write({
-          kind: state.writeKind,
-          title: state.writeTitle.trim(),
-          body: state.writeBody.trim(),
-          in: state.activeRealmPath,
-        });
-        state.writeTitle = "";
-        state.writeBody = "";
-        state.writeSubmitting = false;
-        state.modal = null;
-        showToast("Written to " + state.activeRealmPath);
-        await refreshAll();
-        if (res?.record?.id) await selectEntryById(res.record.id, true);
-      } catch (err) {
-        state.writeSubmitting = false;
-        state.writeError = err?.cliCommand
-          ? (err.message + ". Run in CLI: " + err.cliCommand)
-          : (err?.message || "Write failed");
-        render();
+    const saveText = document.createElement("span");
+    saveText.textContent = state.writeSubmitting ? st("composerSaving") : st("composerSave");
+    saveBtn.appendChild(saveText);
+    if (!state.writeSubmitting) {
+      const kbd = document.createElement("span");
+      kbd.className = "composer-kbd";
+      kbd.textContent = "⌘↵";
+      saveBtn.appendChild(kbd);
+    }
+    saveBtn.addEventListener("click", () => { void submitComposer(); });
+    foot.appendChild(saveBtn);
+
+    panel.appendChild(foot);
+
+    panel.addEventListener("keydown", (ev) => {
+      if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") {
+        ev.preventDefault();
+        void submitComposer();
       }
     });
-
-    foot.appendChild(cancelBtn);
-    foot.appendChild(saveBtn);
-    panel.appendChild(foot);
   } else if (state.modal === "settings") {
     const head = document.createElement("div");
     head.className = "inspector-head";
@@ -3455,7 +4386,7 @@ function renderModal() {
     h.className = "inspector-heading";
     h.textContent = st("settings");
     head.appendChild(h);
-    head.appendChild(makeIconBtn(ICONS.close(), "Close settings", () => {
+    head.appendChild(makeIconBtn(ICONS.close(), st("closeSettings"), () => {
       state.modal = null;
       render();
     }));
@@ -3504,64 +4435,63 @@ function renderModal() {
     };
 
     if (state.settingsTab === "appearance") {
-      const themeSel = document.createElement("select");
-      themeSel.className = "meru-select";
-      themeSel.setAttribute("aria-label", "Theme");
-      for (const [val, lbl] of [["light", "Light Liquid Glass"], ["dark", "Dark Liquid Glass"]]) {
-        const o = document.createElement("option");
-        o.value = val;
-        o.textContent = lbl;
-        if ((document.documentElement.dataset.theme || "light") === val) o.selected = true;
-        themeSel.appendChild(o);
-      }
-      themeSel.addEventListener("change", () => {
-        applyTheme(themeSel.value);
-        render();
+      const currentTheme = document.documentElement.dataset.theme || "light";
+      const themeControl = createChoiceGroup({
+        uiId: "settings-theme-choice",
+        ariaLabel: st("themeTitle"),
+        activeKey: currentTheme,
+        options: [
+          { key: "light", label: st("themeLight") },
+          { key: "dark", label: st("themeDark") },
+        ],
+        onChange: (val) => {
+          applyTheme(val);
+          render();
+        },
       });
-      addSettingRow(st("themeTitle"), st("themeDesc"), themeSel);
+      addSettingRow(st("themeTitle"), st("themeDesc"), themeControl);
 
-      const langSel = document.createElement("select");
-      langSel.className = "meru-select";
-      langSel.setAttribute("aria-label", "Language");
-      for (const [val, lbl] of [["en", "English"], ["zh-CN", "简体中文"]]) {
-        const o = document.createElement("option");
-        o.value = val;
-        o.textContent = lbl;
-        if (state.lang === val) o.selected = true;
-        langSel.appendChild(o);
-      }
-      langSel.addEventListener("change", () => {
-        state.lang = langSel.value;
-        document.documentElement.lang = state.lang;
-        localStorage.setItem("meru-studio-lang", state.lang);
-        render();
+      const langControl = createChoiceGroup({
+        uiId: "settings-lang-choice",
+        ariaLabel: st("language"),
+        activeKey: state.lang,
+        options: [
+          { key: "zh-CN", label: "简体中文" },
+          { key: "en", label: "English" },
+        ],
+        onChange: (val) => {
+          state.lang = val;
+          document.documentElement.lang = state.lang;
+          localStorage.setItem("meru-studio-lang", state.lang);
+          render();
+        },
       });
-      addSettingRow(st("language"), st("languageDesc"), langSel);
+      addSettingRow(st("language"), st("languageDesc"), langControl);
     } else if (state.settingsTab === "realtime") {
       const statusBadge = document.createElement("span");
       statusBadge.className = "meta-val";
-      statusBadge.textContent = state.pumpStatus + " · seq " + state.pumpCursorSeq;
-      addSettingRow("Pump Transport", "WebSocket primary with automatic Long-Poll fallback.", statusBadge);
+      statusBadge.textContent = realtimeStatusLabel(state.pumpStatus) + " · #" + state.pumpCursorSeq;
+      addSettingRow(st("transportTitle"), st("transportDesc"), statusBadge);
 
       const authBadge = document.createElement("span");
       authBadge.className = "meta-val";
-      authBadge.textContent = "HttpOnly Cookie (read + reversible)";
-      addSettingRow("Session Scope", "Irreversible actions remain CLI-only.", authBadge);
+      authBadge.textContent = st("sessionScopeVal");
+      addSettingRow(st("sessionScopeTitle"), st("sessionScopeDesc"), authBadge);
     } else {
       for (const [k, desc] of [
-        ["⌘K / Ctrl+K", "Open global visible-memory search"],
-        ["J / K", "Focus next / previous entry (or step in document reader)"],
-        ["Enter", "Open focused entry full-width in center reader"],
-        ["Esc", "Return from document reader to list / close dialogs"],
-        ["N", "Open new entry drawer in active realm"],
-        ["R", "Refresh current realm snapshot"],
-        ["[", "Toggle right properties rail"],
-        ["⌘,", "Open settings"],
+        ["⌘K", st("scSearch")],
+        ["C / N", st("scCompose")],
+        ["J / K", st("scStep")],
+        ["Enter", st("scOpen")],
+        ["Esc", st("scEsc")],
+        ["R", st("scRefresh")],
+        ["[", st("scInspector")],
+        ["⌘,", st("scSettings")],
       ]) {
         const keycap = document.createElement("span");
         keycap.className = "kbd-hint";
         keycap.textContent = k;
-        addSettingRow(desc, "Active when no input field is focused.", keycap);
+        addSettingRow(desc, st("shortcutHint"), keycap);
       }
     }
 
@@ -3623,7 +4553,7 @@ function render() {
 
 window.addEventListener("keydown", (ev) => {
   const tag = (ev.target && ev.target.tagName) ? ev.target.tagName.toLowerCase() : "";
-  const inInput = tag === "input" || tag === "textarea" || tag === "select";
+  const inInput = tag === "input" || tag === "textarea" || Boolean(ev.target && ev.target.isContentEditable);
 
   if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") {
     ev.preventDefault();
@@ -3643,15 +4573,29 @@ window.addEventListener("keydown", (ev) => {
   }
   if (ev.key === "Escape") {
     if (state.modal || state.popover) {
+      // Closing composer via Esc preserves state.writeTitle / state.writeBody draft
       state.modal = null;
       state.popover = null;
       render();
     } else if (state.openEntry) {
       closeReaderToList();
+    } else if (state.focusedEntryId || state.focusedObjectRef) {
+      state.focusedEntryId = null;
+      state.focusedEntry = null;
+      state.focusedObjectRef = null;
+      state.selectedObject = null;
+      state.selectedChain = null;
+      if (!state.inspectorPinned) {
+        state.inspectorOpen = false;
+      }
+      syncUrlFromState(true);
+      render();
     }
     return;
   }
   if (inInput || state.modal) return;
+  if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+
   const lowKey = ev.key.toLowerCase();
   if (lowKey === "j" || lowKey === "k") {
     const list = getVisibleListEntries();
@@ -3673,20 +4617,18 @@ window.addEventListener("keydown", (ev) => {
       void focusEntryInList(target.id, target);
     }
   } else if (ev.key === "Enter" && !state.openEntry && state.focusedEntryId) {
-    // Only trigger when not clicking an interactive button/link directly
     if (tag !== "button" && tag !== "a") {
       ev.preventDefault();
       void openEntryInCenter(state.focusedEntryId);
     }
   } else if (lowKey === "r") {
     void refreshAll();
-  } else if (lowKey === "n") {
+  } else if (lowKey === "c" || lowKey === "n") {
     ev.preventDefault();
-    state.writeError = null;
-    state.modal = "write";
-    render();
+    openWriteModal();
   } else if (ev.key === "[") {
     state.inspectorOpen = !state.inspectorOpen;
+    state.inspectorPinned = state.inspectorOpen;
     render();
   }
 });
@@ -3720,6 +4662,8 @@ async function applyUrlStateFromLocation() {
     closeReaderToList({ skipUrlSync: true });
   } else if (state.selectedObject) {
     state.selectedObject = null;
+    state.focusedObjectRef = null;
+    if (!state.inspectorPinned) state.inspectorOpen = false;
     render();
   }
 }
@@ -3737,7 +4681,7 @@ client.pump.subscribe((snap) => {
   const lamp = document.querySelector('[data-ui="ws-connection-status"]');
   if (lamp) {
     lamp.dataset.status = snap.status;
-    lamp.title = "Realtime transport: " + snap.status;
+    lamp.title = st("realtimeStatusPrefix") + ": " + realtimeStatusLabel(snap.status);
   } else if (prevStatus !== snap.status) {
     render();
   }
