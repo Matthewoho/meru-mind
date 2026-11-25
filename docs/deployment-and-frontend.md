@@ -15,7 +15,7 @@ Meru Mind `v0.3+` runs as a **single Node.js 22+ process owning one SQLite WAL d
 
 A 1 vCPU / 1 GB RAM instance handles a small-to-medium human-AI team comfortably with zero heavy middleware (no Kafka, no Elasticsearch, no Neo4j, no CockroachDB).
 
-All Compose files (`deploy/docker-compose.yml`, `deploy/docker-compose.oidc-pocketid.yml`, `deploy/docker-compose.oidc-dex.yml`) pull the multi-arch (`linux/amd64`, `linux/arm64`) prebuilt image `ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.2}` automatically published on release tags by `.github/workflows/docker-publish.yml`. For local source builds during development, layer `deploy/docker-compose.build.yml`:
+All Compose files (`deploy/docker-compose.yml`, `deploy/docker-compose.oidc-pocketid.yml`, `deploy/docker-compose.oidc-dex.yml`) pull the multi-arch (`linux/amd64`, `linux/arm64`) prebuilt image `ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.3}` automatically published on release tags by `.github/workflows/docker-publish.yml`. For local source builds during development, layer `deploy/docker-compose.build.yml`:
 
 ```bash
 docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.build.yml up -d --build
@@ -50,11 +50,19 @@ Internet (HTTPS / WSS)
 
 Key operational guardrails:
 1. **Safe one-shot first-token bootstrap (NEVER leave `--init-token` in `docker-compose.yml` logs)**:
+   `deploy/Dockerfile` already sets `ENTRYPOINT ["node", "/app/dist/cli.js"]`, so pass subcommands directly to `docker compose run`. On a fresh volume, initialize the org first and pass `--role admin` when minting the bootstrap human token:
    ```bash
-   # Before starting the long-running server, mint the first human admin token in a one-shot container
+   # 1. Initialize the organization in the persistent volume (use --policy open for single teams,
+   #    or --policy tree when strict hard-wall isolation is needed — note: in tree mode, tokens
+   #    write strictly to their own bound realm and read ancestors/descendants)
    docker compose -f deploy/docker-compose.yml run --rm meru-mind \
-     node /app/dist/cli.js token create --actor-id admin --kind human --as-human
-   # Then start the persistent server + Caddy HTTPS proxy
+     admin init --org "MyTeam" --policy open
+
+   # 2. Mint the first root-realm human admin token (printed once)
+   docker compose -f deploy/docker-compose.yml run --rm meru-mind \
+     token create --actor-id admin --kind human --role admin --as-human
+
+   # 3. Start the persistent server + Caddy automatic HTTPS proxy
    MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
    ```
    Mint teammate tokens and 60-second browser login links remotely with your saved admin token:

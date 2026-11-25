@@ -90,6 +90,18 @@ node dist/cli.js ui eject ./my-custom-ui
 node dist/cli.js work bind --in /backend --provider github --repo acme/api --token-env GITHUB_TOKEN --as-human
 ```
 
+### Optional Cloud Self-Hosted Quick Start (Prebuilt GHCR Image + Caddy HTTPS)
+
+For cloud team deployments, pull the prebuilt multi-arch (`linux/amd64`, `linux/arm64`) GHCR image directly via Docker Compose:
+
+```bash
+docker compose -f deploy/docker-compose.yml run --rm meru-mind admin init --org "MyTeam" --policy open
+docker compose -f deploy/docker-compose.yml run --rm meru-mind token create --actor-id admin --kind human --role admin --as-human
+MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
+```
+
+See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md) for optional Pocket ID / Dex OIDC SSO stacks, online `admin backup`, `meru-mind upgrade`, and multi-harness `/swarm` session hooks.
+
 ---
 
 ## MCP Server & Official Agent Skill
@@ -133,11 +145,12 @@ export MERU_MIND_EMBED_DIM="1536"
 - **Experimental surfaces** (marked `[experimental]` in `--help`, excluded from the official Agent Skill): `file` (local shared drive), `raw` (direct seabed CLI capture), `settle` (distillation cards), and the `thing` record kind.
 - **SQLite canonical backend**: SQLite (`node:sqlite` WAL) is the sole core backend and online source of truth. Migrating to Postgres is a future trigger-based project (not a zero-rewrite port swap).
 
-### Known Limitations (`v0.5.1`)
+### Known Limitations (`v0.6.3`)
 1. **Lexical-only by default**: Without an external embedding endpoint configured, recall relies purely on CJK-bigram + Latin FTS5 and windowed coverage.
 2. **Bulk import does not auto-link `supersedes`**: Imported Markdown/JSONL entries without explicit `supersedes` references remain active side-by-side until explicitly linked (live writes return a neutral related-active echo so agents can link them explicitly).
 3. **Single-writer SQLite server model**: `meru-mind serve` takes an exclusive writer lock on `mind.sqlite` and expects persistent local block storage (avoid multi-replica containers over NFS/SMB).
 4. **`node:sqlite` experimental runtime**: Node.js currently marks `node:sqlite` experimental; CI verifies both Node 22 and Node 24.
+5. **`tree` mode self-realm write boundary**: In `--policy tree`, writes target the token's own bound realm (ancestors/descendants are read-only). Single teams sharing one workspace should use `--policy open`, or keep flat writable realms per isolation boundary and organize sub-topics via `--about project:<name>`.
 
 ---
 
@@ -159,7 +172,7 @@ We evaluated Meru Mind (lexical-only, `vector_enabled: false`) against a real-wo
 
 ---
 
-## Shipped Capabilities (`v0.2.0` → `v0.5.1`)
+## Shipped Capabilities (`v0.2.0` → `v0.6.3`)
 
 See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md), [`docs/UI_BUILDER_SKILL.md`](./docs/UI_BUILDER_SKILL.md), and [`THREAT_MODEL.md`](./THREAT_MODEL.md) for deployment, security, and custom UI authoring details:
 
@@ -168,7 +181,11 @@ See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md), [`do
 - **`v0.3.0`**: Unified `MindSurface` (`LocalMindSurface` / `RemoteMindSurface`), single-writer `meru-mind serve` with exclusive lock, hashed Bearer tokens (`meru-mind token`), write-time Secret Guard, Pump Model + Long-Poll (`GET /v1/changes?wait=25`), Streamable HTTP MCP (`/mcp`), `meru-mind admin backup`, and Cloud Deploy Kit (`deploy/Dockerfile`, `docker-compose.yml`, `Caddyfile`, `fly.toml`).
 - **`v0.4.0`**: 1.5-layer zero-extra-package composable Web Governance UI — server-hosted `/_meru/client.js` (Pump, CAS `inbox.triage()`, sanitized Shadow DOM `<meru-entry>`, visible-scope snapshots), built-in `/_meru/shell`, 7-condition Pump WebSocket (`WS /v1/ws`), in-process `MindPulse`, 60s single-use CLI browser login (`meru-mind ui login` -> weakened `HttpOnly; SameSite=Strict` Cookie), `meru-mind ui eject`, `--demo` adversarial sandbox, and 6 hard security guardrails.
 - **`v0.5.0`**: Narrow SSOT `WorkProvider` contract (zero task tables in `mind-core`, MCP stays strictly 7 tools), official Linear & GitHub providers, `work_bindings` (`env:VAR` secret refs only), circuit-breaker degradation, `DeliveryRetryWorker` exponential backoff + dead-lettering, and local/remote `meru-mind work` CLI commands.
-- **`v0.5.1`**: FTS5-aligned underscore (`_`) word boundary verification (plain words and pure `snake_case` align with SQLite FTS5 `unicode61` while delimiter identifiers `- / :` keep strict sibling-service isolation; zero DB migration) and coverage-first `<= 240`-char 2-segment snippet synthesis with candidate-pool rare-term prioritization (`100%` byte-identical fast path when title + Window 1 already cover all matched concepts).
+- **`v0.5.1`**: FTS5-aligned underscore (`_`) word boundary verification and coverage-first `<= 240`-char 2-segment snippet synthesis.
+- **`v0.6.0`**: Standard OIDC SSO (PKCE + `nonce`, Pocket ID & Dex Compose stacks), self-issued Device-Code CLI login (`meru-mind login`), single-use invite links, redesigned built-in Studio UI (collapsible MindRealm tree, full-pane Markdown document reader, identity-grouped MindPulse presence).
+- **`v0.6.1`**: Explicit organization actor RBAC (`admin` vs `member`, `meru-mind actor set-role|disable|enable`) and sanitized user-editable `displayName` (`POST /v1/me/profile` + Studio Profile Popover).
+- **`v0.6.2`**: Automated multi-arch GHCR Docker publishing (`linux/amd64`, `linux/arm64` + SLSA provenance), prebuilt-image Compose stacks, `meru-mind upgrade` / `update` (with container self-upgrade guard), and zero-prompt multi-harness `/swarm` & subagent session propagation (`examples/hooks/` + `src/harness-session.ts`).
+- **`v0.6.3`**: Verified GHCR Docker Compose one-shot bootstrap (`admin init` + `--role admin`), `MERU_MIND_PUBLIC_URL` wiring in base Compose, `meru-mind --version` / `-v`, and clear zero-organization guidance errors.
 
 ## License
 

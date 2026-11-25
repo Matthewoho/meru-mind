@@ -378,6 +378,23 @@ export async function startMindServer(
       ? new OidcManager(resolvedOidcConfig)
       : null;
     const serverUrlRef = { value: `http://${formatHostForUrl(host)}:${requestedPort}` };
+    const configuredPublicBaseUrl = (() => {
+      const raw = process.env.MERU_MIND_PUBLIC_URL?.trim();
+      if (!raw) return null;
+      try {
+        const parsed = new URL(raw);
+        if (
+          (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+          parsed.username ||
+          parsed.password
+        ) {
+          return null;
+        }
+        return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+      } catch {
+        return null;
+      }
+    })();
     const builtInUiHandler = createUiRouteHandler({
       uiSessions,
       webDir: resolvedWebDir,
@@ -961,8 +978,11 @@ export async function startMindServer(
                 );
               }
               const publicBase = oidcManager
-                ? oidcManager.resolvePublicBaseUrl(req, serverUrlRef.value)
-                : serverUrlRef.value;
+                ? oidcManager.resolvePublicBaseUrl(
+                    req,
+                    configuredPublicBaseUrl ?? serverUrlRef.value,
+                  )
+                : (configuredPublicBaseUrl ?? serverUrlRef.value);
               const created = createInvite({
                 db: engine!.db,
                 orgId,

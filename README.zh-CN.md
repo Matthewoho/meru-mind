@@ -90,6 +90,18 @@ node dist/cli.js ui eject ./my-custom-ui
 node dist/cli.js work bind --in /backend --provider github --repo acme/api --token-env GITHUB_TOKEN --as-human
 ```
 
+### 可选云端自托管速启（GHCR 预构建多架构镜像 + Caddy 自动 HTTPS）
+
+云端团队部署可直接通过 Docker Compose 拉取预构建的 `linux/amd64` + `linux/arm64` 镜像：
+
+```bash
+docker compose -f deploy/docker-compose.yml run --rm meru-mind admin init --org "MyTeam" --policy open
+docker compose -f deploy/docker-compose.yml run --rm meru-mind token create --actor-id admin --kind human --role admin --as-human
+MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
+```
+
+更多关于 Pocket ID / Dex OIDC SSO、在线 `admin backup`、`meru-mind upgrade` 及多 Harness `/swarm` 会话透传配置，详见 [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md)。
+
 ---
 
 ## MCP 接入与 23 行官方 Skill
@@ -122,11 +134,12 @@ node dist/cli.js work bind --in /backend --provider github --repo acme/api --tok
 - **实验功能面**（已在 `--help` 标注 `[experimental]`，未写入官方 Skill）：`file`（本地共享文件盘）、`raw`（直接写入海床 CLI）、`settle`（蒸馏卡片）及 `thing` 记录类型。
 - **SQLite 唯一核心后端**：SQLite（`node:sqlite` WAL）是唯一核心存储与在线真源；未来迁移至 Postgres 属于由明确容量指标触发的独立迁移项目，不承诺接口层零重写替换。
 
-### 已知局限（`v0.5.1`）
+### 已知局限（`v0.6.3`）
 1. **默认纯字面检索**：未配置外部 Embedding 时仅使用 CJK 双字 + 拉丁 FTS5 与局部窗口覆盖度。
 2. **批量导入不自动建 `supersedes` 链**：导入语料中未声明取代关系的新旧文档会并排保持 `active`（日常写入已提供中性相似条目回显，方便 Agent 显式挂取代链）。
 3. **单写者 SQLite 服务约束**：`meru-mind serve` 持有独占写锁，需部署在带持久本地块存储的单实例节点（避免多副本共享 NFS/SMB）。
 4. **`node:sqlite` 实验接口**：属于 Node.js 当前实验内置 API，CI 已覆盖 Node 22 与 Node 24 矩阵。
+5. **`tree` 模式写权限边界**：在 `--policy tree` 模式下，写操作严格限定在凭据绑定的当前识界自身（祖先与后代域仅可读）。单团队共享写作建议使用 `--policy open`，或按权限墙设立扁平可写识界并用 `--about project:<name>` 组织子项目。
 
 ---
 
@@ -148,16 +161,20 @@ node dist/cli.js work bind --in /backend --provider github --repo acme/api --tok
 
 ---
 
-## 已交付能力演进（`v0.2.0` → `v0.5.1`）
+## 已交付能力演进（`v0.2.0` → `v0.6.3`）
 
 完整云端自托管部署方案、安全模型与自定义前端指南见 [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md)、[`docs/UI_BUILDER_SKILL.md`](./docs/UI_BUILDER_SKILL.md) 与 [`THREAT_MODEL.md`](./THREAT_MODEL.md)：
 
 - **`v0.2.0`**：树状空间隔离 `MindRealm`（`open | tree` + `@mount`）、单真相库分层 `MindSea`（证据 `Seabed` ⊥ 定论 `Ledger`）、7 动词 CLI、7 工具 stdio MCP + 23 行官方 Skill、合规级 `redact`、只读切片导出与 Node 22/24 CI。
 - **`v0.2.1`**：有方向跨 kind 取代、中性写入相似回显、导入保留同日精确时间戳、确定性 L1 简报（规则永不截断）与迁移前自动 `VACUUM INTO` 快照。
 - **`v0.3.0`**：统一 `MindSurface` 门面（`LocalMindSurface` / `RemoteMindSurface`）、单写者 `meru-mind serve` 独占锁、哈希 Bearer Token 管理（`meru-mind token`）、写期 Secret Guard、泵模型 + 长轮询（`GET /v1/changes?wait=25`）、Streamable HTTP MCP（`/mcp`）、`meru-mind admin backup` 与云端部署套件（`deploy/Dockerfile`、`docker-compose.yml`、`Caddyfile`、`fly.toml`）。
-- **`v0.4.0`**：零新增依赖 1.5 层可组合 Web 治理前端——服务端托管 `/_meru/client.js`（泵状态、CAS `inbox.triage()`、消毒 Shadow DOM `<meru-entry>`、可见作用域快照）、内置 `/_meru/shell` 官方壳、7 条件泵 WebSocket（`WS /v1/ws`）、进程内 `MindPulse`、60 秒一次性 CLI 登录码换弱化 `HttpOnly; SameSite=Strict` Cookie（`meru-mind ui login`）、`meru-mind ui eject`、`--demo` 对抗演练沙箱与 6 条安全硬护栏。
-- **`v0.5.0`**：单真源 `WorkProvider` 窄契约（`mind-core` 零任务表、MCP 严格保持 7 工具）、官方 Linear 与 GitHub Provider、`work_bindings`（强制仅存 `env:VAR` 凭据引用）、熔断降级、`DeliveryRetryWorker` 指数退避重试与死信、以及本地/远程 `meru-mind work` 命令。
-- **`v0.5.1`**：下划线 `_` 词边界与 SQLite FTS5 `unicode61` 对齐（普通词与纯 `snake_case` 跨 `_` 正常命中，带 `- / :` 的服务名与路径保留严格兄弟隔离；零数据库迁移）以及覆盖优先 `<= 240` 字两段摘要拼接（结合候选池稀有词兜底；标题与首段已覆盖全词时 `100%` 逐字节不变）。
+- **`v0.4.0`**：零新增依赖 1.5 层可组合 Web 治理前端——服务端托管 `/_meru/client.js`、内置 `/_meru/shell`、7 条件泵 WebSocket（`WS /v1/ws`）、进程内 `MindPulse`、60 秒一次性 CLI 登录码换弱化 `HttpOnly; SameSite=Strict` Cookie（`meru-mind ui login`）、`meru-mind ui eject`、`--demo` 对抗演练沙箱与 6 条安全硬护栏。
+- **`v0.5.0`**：单真源 `WorkProvider` 窄契约（`mind-core` 零任务表、MCP 严格保持 7 工具）、官方 Linear 与 GitHub Provider、`work_bindings`（仅存 `env:VAR` 凭据引用）、熔断降级、`DeliveryRetryWorker` 指数退避重试与死信、以及本地/远程 `meru-mind work` 命令。
+- **`v0.5.1`**：下划线 `_` 词边界与 SQLite FTS5 `unicode61` 对齐及覆盖优先 `<= 240` 字两段摘要拼接。
+- **`v0.6.0`**：标准 OIDC SSO（PKCE + `nonce`，提供 Pocket ID 与 Dex 一键栈）、自签发 Device-Code CLI 登录（`meru-mind login`）、一次性邀请链接与重构版内置 Studio UI（可折叠识界树、全栏 Markdown 阅读器、按身份折叠的 MindPulse 在线视图）。
+- **`v0.6.1`**：组织显式角色权限（`admin` / `member`，`meru-mind actor set-role|disable|enable`）与安全清洗的用户可编辑 `displayName`（`POST /v1/me/profile` + Studio Profile Popover）。
+- **`v0.6.2`**：GitHub Actions 自动发布多架构 GHCR 镜像（`linux/amd64` + `linux/arm64` + SLSA provenance）、预构建镜像 Compose 栈、`meru-mind upgrade` / `update`（容器内自动防原地升级），以及多 Harness（Antigravity / Claude Code / Codex / OpenCode）`/swarm` 与子 Agent 会话自动透传。
+- **`v0.6.3`**：实测修复 GHCR Docker Compose 首次初始化引导（`admin init` + `--role admin`）、基础 Compose 补齐 `MERU_MIND_PUBLIC_URL`、CLI 新增 `--version` / `-v` 及零组织清晰报错指引。
 
 ## 开源协议
 

@@ -378,8 +378,7 @@ describe("v0.6.2 Upgrade CLI, GHCR/Compose, Multi-Harness Session Propagation & 
     expect(wf).toContain("^(dev|preview)-[a-z0-9._-]{1,40}$");
     expect(wf).toContain("latest=false");
 
-    const expectedImageLine =
-      "image: ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.2}";
+    const expectedImageLine = `image: ghcr.io/matthewoho/meru-mind:\${MERU_MIND_TAG:-v${MERU_MIND_VERSION}}`;
     for (const rel of [
       "deploy/docker-compose.yml",
       "deploy/docker-compose.oidc-pocketid.yml",
@@ -416,13 +415,14 @@ describe("v0.6.2 Upgrade CLI, GHCR/Compose, Multi-Harness Session Propagation & 
       hasDocker = false;
     }
     if (hasDocker) {
+      const expectedResolvedImage = `ghcr.io/matthewoho/meru-mind:v${MERU_MIND_VERSION}`;
       const { stdout: baseCfg } = await execFileAsync("docker", [
         "compose",
         "-f",
         "deploy/docker-compose.yml",
         "config",
       ]);
-      expect(baseCfg).toContain("ghcr.io/matthewoho/meru-mind:v0.6.2");
+      expect(baseCfg).toContain(expectedResolvedImage);
 
       const { stdout: buildCfg } = await execFileAsync("docker", [
         "compose",
@@ -447,7 +447,7 @@ describe("v0.6.2 Upgrade CLI, GHCR/Compose, Multi-Harness Session Propagation & 
           },
         },
       );
-      expect(pocketCfg).toContain("ghcr.io/matthewoho/meru-mind:v0.6.2");
+      expect(pocketCfg).toContain(expectedResolvedImage);
 
       const { stdout: dexCfg } = await execFileAsync(
         "docker",
@@ -462,7 +462,7 @@ describe("v0.6.2 Upgrade CLI, GHCR/Compose, Multi-Harness Session Propagation & 
           },
         },
       );
-      expect(dexCfg).toContain("ghcr.io/matthewoho/meru-mind:v0.6.2");
+      expect(dexCfg).toContain(expectedResolvedImage);
     }
   });
 

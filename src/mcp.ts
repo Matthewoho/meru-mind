@@ -117,6 +117,14 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
       const orgs = engine.ledger.listOrgs();
       if (orgs.length === 1) {
         boundOrg = orgs[0]!;
+      } else if (orgs.length === 0) {
+        throw new MindError(
+          "NOT_BOUND",
+          "No organization found in this store. Run 'meru-mind admin init' first.",
+          {
+            try: 'meru-mind admin init --org "MyTeam" --policy open',
+          },
+        );
       } else {
         throw new MindError(
           "NOT_BOUND",

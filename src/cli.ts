@@ -28,6 +28,7 @@ import {
   isRealmEffectivelyArchived,
   LocalMindSurface,
   lookupSavedCredential,
+  MERU_MIND_VERSION,
   MindError,
   OPAQUE_OBJECT_NOT_FOUND,
   OPAQUE_REALM_NOT_FOUND,
@@ -93,11 +94,13 @@ const GLOBAL_FLAGS = new Set([
   "org",
   "json",
   "help",
+  "version",
 ]);
 
 const BOOLEAN_FLAGS = new Set([
   "json",
   "help",
+  "version",
   "personal",
   "as-human",
   "init-token",
@@ -208,6 +211,8 @@ function parseArgs(argv: string[]): ParsedArgs {
       recordFlag("depth", token.slice(3));
     } else if (token === "-h") {
       recordFlag("help", true);
+    } else if (token === "-v") {
+      recordFlag("version", true);
     } else if (token.startsWith("--") && token.length > 2) {
       const eq = token.indexOf("=");
       if (eq !== -1) {
@@ -748,6 +753,13 @@ function resolveAdminOrgId(
   if (explicit) return explicit;
   const orgs = engine.ledger.listOrgs();
   if (orgs.length === 1) return orgs[0]!.id;
+  if (orgs.length === 0) {
+    throw new MindError(
+      "NOT_BOUND",
+      "No organization found in this store. Run 'meru-mind admin init' first.",
+      { try: 'meru-mind admin init --org "MyTeam" --policy open' },
+    );
+  }
   throw new MindError(
     "NOT_BOUND",
     "Organization ID (--org or MERU_MIND_ORG_ID) is required when multiple organizations exist",
@@ -954,6 +966,15 @@ function resolveSingleObjectIdForManage(params: {
 async function main(): Promise<void> {
   const { positionals, flags, multiFlags } = parseArgs(process.argv.slice(2));
   const [cmd, sub, third, fourth] = positionals;
+
+  if (flagBool(flags, "version") && !cmd) {
+    if (flagBool(flags, "json")) {
+      process.stdout.write(`${JSON.stringify({ version: MERU_MIND_VERSION })}\n`);
+    } else {
+      process.stdout.write(`${MERU_MIND_VERSION}\n`);
+    }
+    return;
+  }
 
   if (!cmd || cmd === "help") {
     printHelp(sub);
