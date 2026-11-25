@@ -79,14 +79,15 @@ export function readLiveServeLock(
 export function assertNoLiveServeLock(homeDir: string): void {
   const live = readLiveServeLock(homeDir);
   if (!live) return;
+  const targetUrl = live.url?.trim() || "http://127.0.0.1:3800";
   throw new MindError(
     "CONFLICT",
-    `Store "${path.resolve(homeDir)}" is exclusively locked by running meru-mind serve (pid ${live.pid} at ${live.url}). Direct local SQLite access is blocked while the server is running; connect over HTTP with MERU_MIND_URL and MERU_MIND_TOKEN.`,
+    `Store "${path.resolve(homeDir)}" is exclusively locked by running meru-mind serve (pid ${live.pid} at ${targetUrl}). Direct local SQLite access is blocked while the server is running; connect over HTTP with MERU_MIND_URL and MERU_MIND_TOKEN.`,
     {
       reason: "serve_lock_active",
       pid: live.pid,
-      url: live.url,
-      try: `MERU_MIND_URL=${live.url} MERU_MIND_TOKEN=<token> meru-mind whoami`,
+      url: targetUrl,
+      try: `MERU_MIND_URL=${targetUrl} MERU_MIND_TOKEN=<token> meru-mind whoami`,
     },
   );
 }
@@ -165,13 +166,15 @@ export function acquireServeWriterLock(params: {
       if (code !== "EEXIST") throw err;
       const live = readLiveServeLock(absHome, { ignoreSelfPid: true });
       if (live) {
+        const targetUrl = live.url?.trim() || "http://127.0.0.1:3800";
         throw new MindError(
           "CONFLICT",
-          `Another meru-mind serve instance (pid ${live.pid}) already holds the exclusive writer lock on "${absHome}" (${live.url}).`,
+          `Another meru-mind serve instance (pid ${live.pid}) already holds the exclusive writer lock on "${absHome}" (${targetUrl}).`,
           {
             reason: "serve_lock_active",
             pid: live.pid,
-            url: live.url,
+            url: targetUrl,
+            try: `MERU_MIND_URL=${targetUrl} MERU_MIND_TOKEN=<token> meru-mind whoami`,
           },
         );
       }

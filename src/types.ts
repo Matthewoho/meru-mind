@@ -147,6 +147,8 @@ export interface RealmMount {
 
 export type AssetKind = "rule" | "ledger" | "drive" | "seabed";
 export type AccessLevel = "none" | "read" | "write";
+export type TokenWriteScope = "self" | "subtree";
+export type WriteCategory = "content" | "admin";
 
 export interface VisibleScope {
   orgId: string;
@@ -250,6 +252,19 @@ export interface ObjectAliasUpdateResult {
   aliases: string[];
   added: string[];
   removed: string[];
+}
+
+export interface ObjectCreateDrift {
+  parentObjectId?: {
+    existing: string | null;
+    requested: string | null;
+  };
+}
+
+export interface CreateObjectResult {
+  object: MindObject;
+  created: boolean;
+  drift?: ObjectCreateDrift;
 }
 
 export interface EntryObjectLink {
@@ -594,6 +609,7 @@ export interface AuthTokenRecord {
   actorKind: "human" | "agent";
   actorFamily: string | null;
   boundRealmId: string | null;
+  writeScope?: TokenWriteScope;
   label: string | null;
   createdBy: string;
   createdAt: string;
@@ -609,6 +625,7 @@ export interface AuthTokenPublic {
   actorKind: "human" | "agent";
   actorFamily: string | null;
   boundRealmId: string | null;
+  writeScope: TokenWriteScope;
   label: string | null;
   createdBy: string;
   createdAt: string;
@@ -699,6 +716,7 @@ export interface Principal {
   boundRealmId: string;
   boundSource: string;
   authKind: AuthKind;
+  writeScope?: TokenWriteScope;
 }
 
 export interface ConsumerCursor {
@@ -914,6 +932,7 @@ export interface WhoamiResult {
     seabedRealms: number;
   };
   write: {
+    scope?: TokenWriteScope;
     allowed: string;
     canWriteRules: boolean;
     canRedact: boolean;
@@ -1197,6 +1216,133 @@ export interface ImportJsonlResult {
   embeddingsSynced?: SyncEmbeddingsResult;
 }
 
+export type ImportTargetLayer = "record" | "seabed";
+
+export interface ImportBatchItemInput {
+  target: ImportTargetLayer;
+  sourceRef: string;
+  realmRef?: string;
+  kind?: string;
+  extKind?: string | null;
+  title?: string;
+  summary?: string;
+  body?: string;
+  text?: string;
+  rawContentSha256?: string;
+  contentSha256: string;
+  frontmatter?: Record<string, unknown>;
+  extraPayload?: Record<string, unknown>;
+  externalRef?: string | null;
+  sourceId?: string | null;
+  thingRef?: string | null;
+  objectRefs?: string[];
+  resourceTags?: string[];
+  refs?: string[];
+  supersedesSourceRefs?: string[];
+  supersedesIds?: string[];
+  initialStatus?: "active" | "superseded";
+  occurredAt?: string | null;
+  sensitivity?: Sensitivity;
+  filePath?: string;
+  idempotencyPrefix?: string;
+}
+
+export interface ImportBatchInput {
+  items: ImportBatchItemInput[];
+  defaultRealmRef?: string;
+  skipSecret?: boolean;
+  dryRun?: boolean;
+  relocate?: boolean;
+}
+
+export type ImportBatchItemAction =
+  | "created"
+  | "superseded"
+  | "relocated"
+  | "skipped_unchanged"
+  | "skipped_redacted"
+  | "skipped_secret";
+
+export interface ImportBatchItemResult {
+  index: number;
+  sourceRef: string;
+  target: ImportTargetLayer;
+  contentSha256: string;
+  action: ImportBatchItemAction;
+  entryId: string | null;
+  supersedesId: string | null;
+  realmId: string;
+  realmPath: string;
+  occurredAt: string | null;
+  filePath?: string;
+  sourceId?: string | null;
+}
+
+export interface ImportBatchRealmProjection {
+  realmId: string;
+  realmPath: string;
+  isLeaf: boolean;
+  existingDirectCount: number;
+  projectedDelta: number;
+  projectedDirectCount: number;
+  doctorThreshold: number;
+  exceedsDoctorThreshold: boolean;
+}
+
+export interface ImportBatchResult {
+  dryRun: boolean;
+  totalItems: number;
+  created: number;
+  superseded: number;
+  relocated: number;
+  skippedUnchanged: number;
+  skippedRedacted: number;
+  skippedSecret: number;
+  treeDegradedCrossRealmSupersedes: number;
+  undatedCount: number;
+  defaultRealmCount: number;
+  items: ImportBatchItemResult[];
+  realmProjections?: ImportBatchRealmProjection[];
+}
+
+export interface VerifyImportManifestItem {
+  sourceRef: string;
+  target: ImportTargetLayer;
+  expectedRealmRef: string;
+  contentSha256: string;
+  rawContentSha256?: string;
+  byteLength: number;
+  expectedTitle?: string;
+  expectedStatus: "active" | "superseded";
+  expectedOccurredAt: string | null;
+  secretSkipped?: boolean;
+  filePath?: string;
+}
+
+export interface VerifyImportExpectedKey {
+  realmRef: string;
+  target: ImportTargetLayer;
+  sourceRef: string;
+}
+
+export interface VerifyImportInput {
+  items: VerifyImportManifestItem[];
+  checkUnexpectedInRealmRefs?: string[];
+  allExpectedSourceRefs?: string[];
+  allExpectedEntries?: VerifyImportExpectedKey[];
+  allowSkips?: number;
+  totalSourceFiles?: number;
+  excludedCount?: number;
+  unaccountedPaths?: string[];
+}
+
+export interface VerifyImportUnexpectedEntry {
+  sourceRef: string;
+  entryId: string;
+  realmPath: string;
+  layer: ImportTargetLayer;
+}
+
 export interface ImportConsistencyMismatch {
   sourceRef: string;
   recordId: string | null;
@@ -1205,15 +1351,35 @@ export interface ImportConsistencyMismatch {
   reason: string;
 }
 
-export interface ImportConsistencyResult {
+export interface VerifyImportResult {
   passed: boolean;
-  totalChecked: number;
+  totalSourceFiles: number;
+  expectedCount: number;
+  excludedCount: number;
+  unaccountedCount: number;
+  unaccountedPaths: string[];
+  foundCount: number;
   missingCount: number;
+  contentMismatchCount: number;
+  realmMismatchCount: number;
+  layerMismatchCount: number;
+  statusMismatchCount: number;
+  timestampMismatchCount: number;
+  unexpectedCount: number;
+  skippedSecretCount: number;
+  skippedRedactedCount: number;
+  allowSkips: number;
+  mismatches: ImportConsistencyMismatch[];
+  unexpectedEntries: VerifyImportUnexpectedEntry[];
+  // Backward-compatible summary fields
+  totalChecked: number;
   undatedCount: number;
   defaultRealmFallbackCount: number;
   activeSupersededMismatches: ImportConsistencyMismatch[];
   timestampMismatches: ImportConsistencyMismatch[];
 }
+
+export type ImportConsistencyResult = VerifyImportResult;
 
 export interface ImportDryRunUnresolvedRealm {
   rawValue: string;

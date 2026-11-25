@@ -5,18 +5,25 @@ import type {
   MindSurface,
   SurfaceAddRuleInput,
   SurfaceChangesParams,
+  SurfaceCreateObjectInput,
   SurfaceCreateRealmInput,
   SurfaceUpdateRealmInput,
   SurfaceCreateTokenInput,
   SurfaceCreateTokenResult,
+  SurfaceDeleteObjectInput,
+  SurfaceLinkObjectInput,
   SurfaceLsParams,
   SurfaceMountRealmInput,
   SurfaceMoveInput,
+  SurfaceMoveObjectInput,
   SurfaceRawAddInput,
   SurfaceRedactInput,
   SurfaceSearchParams,
+  SurfaceSetObjectStateInput,
   SurfaceShowParams,
   SurfaceTreeParams,
+  SurfaceUnlinkObjectInput,
+  SurfaceUpdateObjectAliasesInput,
   SurfaceWriteInput,
   SurfaceWriteResult,
 } from "./surface.js";
@@ -24,10 +31,17 @@ import {
   MindError,
   type AuthTokenPublic,
   type ChangesResult,
+  type CreateObjectResult,
+  type EntryObjectLink,
+  type ImportBatchInput,
+  type ImportBatchResult,
   type LedgerRecord,
   type LsResult,
   type MindErrorCode,
+  type MindObject,
   type MoveEntriesResult,
+  type ObjectAliasUpdateResult,
+  type ObjectStateSetResult,
   type Organization,
   type Principal,
   type Realm,
@@ -41,6 +55,8 @@ import {
   type ShowSupersedeChainResult,
   type SurfaceErrorPayload,
   type TreeResult,
+  type VerifyImportInput,
+  type VerifyImportResult,
   type WhoamiResult,
 } from "./types.js";
 
@@ -144,6 +160,7 @@ export class RemoteMindSurface implements MindSurface {
       boundRealmId: info.bound.realmId,
       boundSource: info.bound.source,
       authKind: "bearer",
+      writeScope: info.write.scope ?? "self",
     };
     return surface;
   }
@@ -439,6 +456,74 @@ export class RemoteMindSurface implements MindSurface {
       { body: params },
     );
     return res.revoked;
+  }
+
+  async createObject(
+    params: SurfaceCreateObjectInput,
+  ): Promise<CreateObjectResult> {
+    return this.request<CreateObjectResult>("POST", "/v1/objects", {
+      body: params,
+    });
+  }
+
+  async moveObject(params: SurfaceMoveObjectInput): Promise<MindObject> {
+    return this.request<MindObject>("POST", "/v1/objects/move", {
+      body: params,
+    });
+  }
+
+  async deleteObject(params: SurfaceDeleteObjectInput): Promise<boolean> {
+    const res = await this.request<{ removed: boolean }>(
+      "POST",
+      "/v1/objects/delete",
+      { body: params },
+    );
+    return res.removed;
+  }
+
+  async linkObject(params: SurfaceLinkObjectInput): Promise<EntryObjectLink> {
+    return this.request<EntryObjectLink>("POST", "/v1/objects/link", {
+      body: params,
+    });
+  }
+
+  async unlinkObject(params: SurfaceUnlinkObjectInput): Promise<boolean> {
+    const res = await this.request<{ removed: boolean }>(
+      "POST",
+      "/v1/objects/unlink",
+      { body: params },
+    );
+    return res.removed;
+  }
+
+  async setObjectState(
+    params: SurfaceSetObjectStateInput,
+  ): Promise<ObjectStateSetResult> {
+    return this.request<ObjectStateSetResult>("POST", "/v1/objects/state", {
+      body: params,
+    });
+  }
+
+  async updateObjectAliases(
+    params: SurfaceUpdateObjectAliasesInput,
+  ): Promise<ObjectAliasUpdateResult> {
+    return this.request<ObjectAliasUpdateResult>(
+      "POST",
+      "/v1/objects/aliases",
+      { body: params },
+    );
+  }
+
+  async importBatch(params: ImportBatchInput): Promise<ImportBatchResult> {
+    return this.request<ImportBatchResult>("POST", "/v1/import/batch", {
+      body: params,
+    });
+  }
+
+  async verifyImport(params: VerifyImportInput): Promise<VerifyImportResult> {
+    return this.request<VerifyImportResult>("POST", "/v1/import/verify", {
+      body: params,
+    });
   }
 
   async bindWork(params: {

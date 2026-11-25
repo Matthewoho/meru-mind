@@ -7,7 +7,9 @@ import {
   type OrgPolicy,
   type Realm,
   type RealmMount,
+  type TokenWriteScope,
   type VisibleScope,
+  type WriteCategory,
 } from "./types.js";
 
 /**
@@ -462,6 +464,214 @@ export function assertAccess(params: {
         viewerRealmId: params.viewerRealmId,
         targetRealmId: params.targetRealmId,
         assetKind: params.assetKind,
+      },
+    );
+  }
+}
+
+/**
+ * Normalizes a token writeScope strictly to "self" | "subtree" (fail-closed to "self").
+ */
+export function normalizeWriteScope(
+  raw?: TokenWriteScope | string | null,
+): TokenWriteScope {
+  return raw === "subtree" ? "subtree" : "self";
+}
+
+/**
+ * Computes all realm IDs writable for `category: "content"` writes from `viewerRealmId`,
+ * unified with `scopeCeiling` (if provided) and archive-freeze filtering (`excludeArchived`, default true).
+ * Defense-in-depth: in `tree` mode, root realm `/` is NEVER granted subtree write scope.
+ */
+export function getWritableRealmIds(params: {
+  realms: Realm[];
+  viewerRealmId: string;
+  orgPolicy?: OrgPolicy;
+  writeScope?: TokenWriteScope;
+  scopeCeiling?: AccessScope;
+  assetKind?: AssetKind;
+  excludeArchived?: boolean;
+}): string[] {
+  const viewer = params.realms.find((r) => r.id === params.viewerRealmId);
+  if (!viewer) return [];
+  const orgRealms = params.realms.filter((r) => r.orgId === viewer.orgId);
+  const policy = params.orgPolicy ?? "tree";
+  let candidates: string[];
+  if (policy === "open") {
+    candidates = orgRealms.map((r) => r.id);
+  } else {
+    const scope = normalizeWriteScope(params.writeScope);
+    candidates =
+      scope === "subtree" && viewer.parentId !== null
+        ? [viewer.id, ...getDescendantIds(orgRealms, viewer.id)]
+        : [viewer.id];
+  }
+  if (params.scopeCeiling) {
+    const allowedLedger = new Set(params.scopeCeiling.readableLedgerIds);
+    const allowedSeabed = new Set(params.scopeCeiling.readableSeabedIds);
+    candidates = candidates.filter((id) =>
+      params.assetKind === "seabed"
+        ? allowedLedger.has(id) && allowedSeabed.has(id)
+        : allowedLedger.has(id),
+    );
+  }
+  if (params.excludeArchived !== false) {
+    candidates = candidates.filter(
+      (id) => !isRealmEffectivelyArchived(orgRealms, id),
+    );
+  }
+  return candidates;
+}
+
+/**
+ * Dedicated authoritative write-access policy (strictly separate from `resolveAccess()` reads).
+ * - `category` ("content" | "admin") is REQUIRED with no default so callers must classify every write.
+ * - Cross-org or missing viewer/target -> always "none".
+ * - `orgPolicy === "open"`: rules require human actor; all other asset kinds -> "write".
+ * - `orgPolicy === "tree"`:
+ *     - Self: rules require human actor; all other asset kinds -> "write".
+ *     - Strict descendant (verified via `getAncestorIds`, NEVER string prefix, NEVER `@mount`):
+ *       ONLY when `category === "content"` AND `writeScope === "subtree"` AND `assetKind !== "rule"`
+ *       AND `viewer.parentId !== null` (root `/` is never granted subtree write in tree mode).
+ *     - Ancestors, siblings, `@mount`, unrelated -> always "none".
+ */
+export function resolveWriteAccess(params: {
+  realms: Realm[];
+  mounts: RealmMount[];
+  actor: Actor;
+  viewerRealmId: string;
+  targetRealmId: string;
+  assetKind: AssetKind;
+  orgPolicy?: OrgPolicy;
+  writeScope?: TokenWriteScope;
+  category: WriteCategory;
+}): "none" | "write" {
+  const {
+    realms,
+    actor,
+    viewerRealmId,
+    targetRealmId,
+    assetKind,
+    orgPolicy = "tree",
+    writeScope = "self",
+    category,
+  } = params;
+
+  const realmsById = new Map(realms.map((r) => [r.id, r]));
+  const viewer = realmsById.get(viewerRealmId);
+  const target = realmsById.get(targetRealmId);
+
+  if (!viewer || !target) {
+    return "none";
+  }
+
+  // Organization is an absolute boundary in both open and tree modes.
+  if (viewer.orgId !== target.orgId) {
+    return "none";
+  }
+
+  if (orgPolicy === "open") {
+    if (assetKind === "rule") {
+      return actor.kind === "human" ? "write" : "none";
+    }
+    return "write";
+  }
+
+  // 1. Self
+  if (viewerRealmId === targetRealmId) {
+    if (assetKind === "rule") {
+      return actor.kind === "human" ? "write" : "none";
+    }
+    return "write";
+  }
+
+  // 2. Strict descendant (verified via parent_id ancestry chain — never string prefix, never @mount)
+  const targetAncestors = getAncestorIds(realmsById, targetRealmId);
+  if (targetAncestors.includes(viewerRealmId)) {
+    if (
+      category === "content" &&
+      normalizeWriteScope(writeScope) === "subtree" &&
+      assetKind !== "rule" &&
+      viewer.parentId !== null
+    ) {
+      return "write";
+    }
+    return "none";
+  }
+
+  // 3. Ancestors, siblings, @mount, unrelated -> strictly denied
+  return "none";
+}
+
+/**
+ * Single choke-point write assertion combining `resolveWriteAccess()` and archive-freeze enforcement.
+ * Checks visibility/write permissions strictly BEFORE archive state so invisible realms never leak archive state.
+ */
+export function assertWriteAccess(params: {
+  realms: Realm[];
+  mounts: RealmMount[];
+  actor: Actor;
+  viewerRealmId: string;
+  targetRealmId: string;
+  assetKind: AssetKind;
+  orgPolicy?: OrgPolicy;
+  writeScope?: TokenWriteScope;
+  category: WriteCategory;
+}): void {
+  const actual = resolveWriteAccess(params);
+  if (actual !== "write") {
+    if (params.assetKind === "rule" && params.actor.kind !== "human") {
+      throw new MindError(
+        "RULE_REQUIRES_HUMAN",
+        `Only human actors can create or modify rules (actor "${params.actor.id}" is "${params.actor.kind}").`,
+        {
+          actorId: params.actor.id,
+          actorKind: params.actor.kind,
+          targetRealmId: params.targetRealmId,
+        },
+      );
+    }
+    throw new MindError(
+      "ACCESS_DENIED",
+      `Write access denied for ${params.assetKind} (${params.category}) in realm "${params.targetRealmId}" from viewer "${params.viewerRealmId}".`,
+      {
+        viewerRealmId: params.viewerRealmId,
+        targetRealmId: params.targetRealmId,
+        assetKind: params.assetKind,
+        category: params.category,
+        writeScope: normalizeWriteScope(params.writeScope),
+        actual,
+      },
+    );
+  }
+
+  const archivedSource = findEffectiveArchivedRealm(
+    params.realms,
+    params.targetRealmId,
+  );
+  if (archivedSource) {
+    const realmsById = new Map(params.realms.map((r) => [r.id, r]));
+    const viewerAncestors = getAncestorIds(realmsById, params.viewerRealmId);
+    const archivedAncestors = getAncestorIds(realmsById, archivedSource.id);
+    const canShowArchivePath =
+      params.orgPolicy === "open" ||
+      archivedSource.id === params.targetRealmId ||
+      archivedSource.id === params.viewerRealmId ||
+      viewerAncestors.includes(archivedSource.id) ||
+      archivedAncestors.includes(params.viewerRealmId);
+    const tryHint = canShowArchivePath
+      ? `meru-mind realm unarchive ${archivedSource.path} --as-human`
+      : "meru-mind realm unarchive <realm> --as-human";
+    throw new MindError(
+      "CONFLICT",
+      canShowArchivePath
+        ? `Realm "${archivedSource.path}" is archived and frozen for writes.`
+        : `Target realm is archived and frozen for writes.`,
+      {
+        reason: "realm_archived",
+        targetRealmId: params.targetRealmId,
+        archivedRealmId: archivedSource.id,
+        try: tryHint,
       },
     );
   }

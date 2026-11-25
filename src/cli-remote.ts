@@ -1,22 +1,38 @@
 import fs from "node:fs";
 import {
+  chunkImportBatchItems,
+  chunkVerifyManifestItems,
   formatChangesMarkdown,
   formatDoctorMarkdown,
   formatGenericMarkdown,
+  formatImportBatchMarkdown,
+  formatImportVerifyMarkdown,
   formatLsMarkdown,
   formatSearchMarkdown,
   formatShowMarkdown,
   formatTreeMarkdown,
   formatWhoamiMarkdown,
+  mergeVerifyImportResults,
   MindError,
+  planJsonlImport,
+  planMarkdownImport,
+  planSourceVerification,
   RemoteMindSurface,
   runRealmDoctor,
   type ActorRole,
+  type ImportBatchItemResult,
+  type ImportBatchRealmProjection,
+  type ImportBatchResult,
+  type ImportMappingConfig,
+  type ImportTargetLayer,
   type LsOnlyFilter,
   type MountScope,
+  type ObjectState,
   type OrgPolicy,
   type SeabedKind,
   type Sensitivity,
+  type TokenWriteScope,
+  type VerifyImportResult,
 } from "./index.js";
 
 export interface RemoteCliDispatchParams {
@@ -93,7 +109,7 @@ export async function runRemoteCliCommand(
     );
   }
 
-  const [cmd, sub, third] = positionals;
+  const [cmd, sub, third, fourth] = positionals;
   const surface = await RemoteMindSurface.connect({
     baseUrl,
     token,
@@ -424,6 +440,7 @@ export async function runRemoteCliCommand(
           actorFamily: str(flags, "family"),
           actorRole: str(flags, "role") as ActorRole | undefined,
           boundRealmRef: str(flags, "in"),
+          writeScope: str(flags, "write-scope") as TokenWriteScope | undefined,
           label: str(flags, "label"),
         });
         output(
@@ -450,6 +467,389 @@ export async function runRemoteCliCommand(
         output({ tokenId: third.trim(), revoked }, formatGenericMarkdown("Token Revoked", { tokenId: third.trim(), revoked }));
         return;
       }
+    }
+
+    if (cmd === "object") {
+      if (sub === "create") {
+        const res = await surface.createObject({
+          in: str(flags, "in") ?? third,
+          kind: reqStr(flags, "kind", "object create"),
+          name: reqStr(flags, "name", "object create"),
+          parentRef: str(flags, "parent"),
+          ifNotExists: bool(flags, "if-not-exists"),
+        });
+        const payload = {
+          ...res.object,
+          created: res.created,
+          ...(res.drift ? { drift: res.drift } : {}),
+        };
+        output(
+          payload,
+          formatGenericMarkdown(
+            res.created ? "Object Created" : "Object Already Exists",
+            payload,
+          ),
+        );
+        return;
+      }
+      if (sub === "move") {
+        if (!third?.trim()) {
+          throw new MindError("INVALID_REF", "object move requires an <objRef> argument", {
+            try: "meru-mind object move service:api --parent none",
+          });
+        }
+        const parentRaw = reqStr(flags, "parent", "object move").trim();
+        const nextParentRef =
+          parentRaw.toLowerCase() === "none" ||
+          parentRaw.toLowerCase() === "null"
+            ? null
+            : parentRaw;
+        const moved = await surface.moveObject({
+          ref: third.trim(),
+          parentRef: nextParentRef,
+        });
+        output(moved, formatGenericMarkdown("Object Moved", moved));
+        return;
+      }
+      if (sub === "delete") {
+        if (!third?.trim()) {
+          throw new MindError("INVALID_REF", "object delete requires an <objRef> argument", {
+            try: "meru-mind object delete service:api",
+          });
+        }
+        const removed = await surface.deleteObject({ ref: third.trim() });
+        output({ removed }, formatGenericMarkdown("Object Deleted", { removed }));
+        return;
+      }
+      if (sub === "link") {
+        if (!third?.trim() || !fourth?.trim()) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "object link requires <entryId> and <objRef> positional arguments",
+            { try: "meru-mind object link rec_... service:api" },
+          );
+        }
+        const link = await surface.linkObject({
+          entryId: third.trim(),
+          objectRef: fourth.trim(),
+        });
+        output(link, formatGenericMarkdown("Entry Linked to Object", link));
+        return;
+      }
+      if (sub === "unlink") {
+        if (!third?.trim() || !fourth?.trim()) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "object unlink requires <entryId> and <objRef> positional arguments",
+            { try: "meru-mind object unlink rec_... service:api" },
+          );
+        }
+        const removed = await surface.unlinkObject({
+          entryId: third.trim(),
+          objectRef: fourth.trim(),
+        });
+        output(
+          { removed },
+          formatGenericMarkdown("Entry Unlinked from Object", { removed }),
+        );
+        return;
+      }
+      if (sub === "set") {
+        if (!third?.trim()) {
+          throw new MindError("INVALID_REF", "object set requires an <objRef> argument", {
+            try: "meru-mind object set service:api --state inactive --label deprecated --because rec_...",
+          });
+        }
+        const res = await surface.setObjectState({
+          ref: third.trim(),
+          state: reqStr(flags, "state", "object set") as ObjectState,
+          label: str(flags, "label"),
+          since: str(flags, "since"),
+          because: str(flags, "because"),
+        });
+        output(res, formatGenericMarkdown("Object State Updated", res));
+        return;
+      }
+      if (sub === "alias") {
+        if (!third?.trim()) {
+          throw new MindError("INVALID_REF", "object alias requires an <objRef> argument", {
+            try: 'meru-mind object alias service:api --add "Billing API"',
+          });
+        }
+        const res = await surface.updateObjectAliases({
+          ref: third.trim(),
+          add: multi(multiFlags, "add"),
+          remove: multi(multiFlags, "remove"),
+        });
+        output(res, formatGenericMarkdown("Object Aliases Updated", res));
+        return;
+      }
+      throw new MindError("UNKNOWN_COMMAND", `Unknown object subcommand "${sub ?? ""}"`, {
+        try: "meru-mind object --help",
+      });
+    }
+
+    if (cmd === "import") {
+      const loadRemoteMapping = (mapPath?: string): ImportMappingConfig | undefined => {
+        if (!mapPath) return undefined;
+        if (!fs.existsSync(mapPath)) {
+          throw new MindError("NOT_FOUND", `Mapping JSON file not found: ${mapPath}`);
+        }
+        try {
+          return JSON.parse(fs.readFileSync(mapPath, "utf8")) as ImportMappingConfig;
+        } catch (err) {
+          throw new MindError(
+            "INVALID_INPUT",
+            `Invalid mapping JSON: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      };
+
+      const runChunkedBatch = async (
+        items: ReturnType<typeof planMarkdownImport>["items"],
+        opts: {
+          defaultRealmRef?: string;
+          skipSecret: boolean;
+          dryRun: boolean;
+          relocate: boolean;
+        },
+      ): Promise<ImportBatchResult> => {
+        const sanitizedItems = items.map(({ filePath: _omit, ...rest }) => rest);
+        const chunks = chunkImportBatchItems(sanitizedItems);
+        if (chunks.length === 0) {
+          return {
+            dryRun: opts.dryRun,
+            totalItems: 0,
+            created: 0,
+            superseded: 0,
+            relocated: 0,
+            skippedUnchanged: 0,
+            skippedRedacted: 0,
+            skippedSecret: 0,
+            treeDegradedCrossRealmSupersedes: 0,
+            undatedCount: 0,
+            defaultRealmCount: 0,
+            items: [],
+            ...(opts.dryRun ? { realmProjections: [] } : {}),
+          };
+        }
+        let created = 0;
+        let superseded = 0;
+        let relocated = 0;
+        let skippedUnchanged = 0;
+        let skippedRedacted = 0;
+        let skippedSecret = 0;
+        let treeDegradedCrossRealmSupersedes = 0;
+        let undatedCount = 0;
+        let defaultRealmCount = 0;
+        const mergedItems: ImportBatchItemResult[] = [];
+        const projMap = new Map<string, ImportBatchRealmProjection>();
+
+        for (const chunk of chunks) {
+          const part = await surface.importBatch({
+            items: chunk,
+            defaultRealmRef: opts.defaultRealmRef,
+            skipSecret: opts.skipSecret,
+            dryRun: opts.dryRun,
+            relocate: opts.relocate,
+          });
+          created += part.created;
+          superseded += part.superseded;
+          relocated += part.relocated;
+          skippedUnchanged += part.skippedUnchanged;
+          skippedRedacted += part.skippedRedacted;
+          skippedSecret += part.skippedSecret;
+          treeDegradedCrossRealmSupersedes += part.treeDegradedCrossRealmSupersedes;
+          undatedCount += part.undatedCount;
+          defaultRealmCount += part.defaultRealmCount;
+          const offset = mergedItems.length;
+          for (const it of part.items) {
+            mergedItems.push({ ...it, index: offset + it.index });
+          }
+          if (part.realmProjections) {
+            for (const p of part.realmProjections) {
+              const prev = projMap.get(p.realmId);
+              if (!prev) {
+                projMap.set(p.realmId, { ...p });
+              } else {
+                const nextDelta = prev.projectedDelta + p.projectedDelta;
+                const nextProjected = prev.existingDirectCount + nextDelta;
+                projMap.set(p.realmId, {
+                  ...prev,
+                  projectedDelta: nextDelta,
+                  projectedDirectCount: nextProjected,
+                  exceedsDoctorThreshold: nextProjected > prev.doctorThreshold,
+                });
+              }
+            }
+          }
+        }
+
+        return {
+          dryRun: opts.dryRun,
+          totalItems: mergedItems.length,
+          created,
+          superseded,
+          relocated,
+          skippedUnchanged,
+          skippedRedacted,
+          skippedSecret,
+          treeDegradedCrossRealmSupersedes,
+          undatedCount,
+          defaultRealmCount,
+          items: mergedItems,
+          ...(opts.dryRun
+            ? {
+                realmProjections: Array.from(projMap.values()).sort((a, b) =>
+                  a.realmPath.localeCompare(b.realmPath),
+                ),
+              }
+            : {}),
+        };
+      };
+
+      if (sub === "md") {
+        if (!third?.trim()) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "import md requires a Markdown file or directory path",
+            { try: "meru-mind import md ./notes --in /ops" },
+          );
+        }
+        const mapping = loadRemoteMapping(str(flags, "map"));
+        const planned = planMarkdownImport({
+          inputPath: third,
+          baseDir: str(flags, "base-dir"),
+          sourceRef: str(flags, "source-ref"),
+          target: str(flags, "target") as ImportTargetLayer | undefined,
+          targetRealmRef: str(flags, "in"),
+          kind: str(flags, "kind"),
+          extKind: str(flags, "ext-kind"),
+          sensitivity: str(flags, "sensitivity") as Sensitivity | undefined,
+          objectRefs: multi(multiFlags, "about"),
+          mapping,
+          exclude: multi(multiFlags, "exclude"),
+        });
+        const merged = await runChunkedBatch(planned.items, {
+          defaultRealmRef: str(flags, "in") ?? mapping?.defaultRealm,
+          skipSecret: bool(flags, "include-secret")
+            ? false
+            : (mapping?.skipSecret ?? true),
+          dryRun: bool(flags, "dry-run"),
+          relocate: bool(flags, "relocate"),
+        });
+        output(merged, formatImportBatchMarkdown(merged));
+        return;
+      }
+
+      if (sub === "jsonl") {
+        if (!third?.trim()) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "import jsonl requires a JSONL file path",
+            { try: "meru-mind import jsonl ./events.jsonl --map ./map.json" },
+          );
+        }
+        const mapping = loadRemoteMapping(reqStr(flags, "map", "import jsonl"))!;
+        const planned = planJsonlImport({
+          jsonlPath: third,
+          mapping,
+          target: str(flags, "target") as ImportTargetLayer | undefined,
+          targetRealmRef: str(flags, "in"),
+        });
+        const merged = await runChunkedBatch(planned.items, {
+          defaultRealmRef: str(flags, "in") ?? mapping.defaultRealm,
+          skipSecret: bool(flags, "include-secret")
+            ? false
+            : (mapping.skipSecret ?? true),
+          dryRun: bool(flags, "dry-run"),
+          relocate: bool(flags, "relocate"),
+        });
+        output(merged, formatImportBatchMarkdown(merged));
+        return;
+      }
+
+      if (sub === "verify") {
+        const sourcePath = str(flags, "source") ?? third;
+        if (!sourcePath?.trim()) {
+          throw new MindError(
+            "INVALID_INPUT",
+            "import verify requires --source <file|dir>",
+            { try: "meru-mind import verify --source ./notes" },
+          );
+        }
+        const mapping = loadRemoteMapping(str(flags, "map"));
+        const whoami = await surface.whoami();
+        const planned = planSourceVerification({
+          sourcePath,
+          mapping,
+          baseDir: str(flags, "base-dir"),
+          target: str(flags, "target") as ImportTargetLayer | undefined,
+          targetRealmRef: str(flags, "in"),
+          defaultRealmRef: whoami.bound.realmPath,
+          skipSecret: bool(flags, "include-secret")
+            ? false
+            : (mapping?.skipSecret ?? true),
+          exclude: multi(multiFlags, "exclude"),
+        });
+        const allowSkips = intFlag(flags, "allow-skips") ?? 0;
+        const checkRealmRefs = multi(multiFlags, "check-realm");
+        // Strip local filesystem path before sending over HTTP (P2 privacy hygiene)
+        const sanitizedVerifyItems = planned.items.map(
+          ({ filePath: _omit, ...rest }) => rest,
+        );
+        const chunks = chunkVerifyManifestItems(sanitizedVerifyItems, 200);
+        const parts: VerifyImportResult[] = [];
+        if (chunks.length === 0) {
+          parts.push(
+            await surface.verifyImport({
+              items: [],
+              checkUnexpectedInRealmRefs:
+                checkRealmRefs.length > 0 ? checkRealmRefs : undefined,
+              allExpectedSourceRefs: planned.allExpectedSourceRefs,
+              allExpectedEntries: planned.allExpectedEntries,
+              allowSkips,
+              totalSourceFiles: planned.totalSourceFiles,
+              excludedCount: planned.excludedCount,
+              unaccountedPaths: planned.unaccountedPaths,
+            }),
+          );
+        } else {
+          for (let i = 0; i < chunks.length; i += 1) {
+            parts.push(
+              await surface.verifyImport({
+                items: chunks[i]!,
+                checkUnexpectedInRealmRefs:
+                  i === 0 && checkRealmRefs.length > 0
+                    ? checkRealmRefs
+                    : undefined,
+                allExpectedSourceRefs:
+                  i === 0 ? planned.allExpectedSourceRefs : undefined,
+                allExpectedEntries:
+                  i === 0 ? planned.allExpectedEntries : undefined,
+                allowSkips,
+              }),
+            );
+          }
+        }
+        const merged = mergeVerifyImportResults(parts, {
+          totalSourceFiles: planned.totalSourceFiles,
+          excludedCount: planned.excludedCount,
+          unaccountedPaths: planned.unaccountedPaths,
+          allowSkips,
+          undatedCount: planned.undatedCount,
+          defaultRealmFallbackCount: planned.defaultRealmFallbackCount,
+        });
+        output(merged, formatImportVerifyMarkdown(merged));
+        if (!merged.passed) {
+          process.exitCode = 1;
+        }
+        return;
+      }
+
+      throw new MindError("UNKNOWN_COMMAND", `Unknown import subcommand "${sub ?? ""}"`, {
+        try: "meru-mind import --help",
+      });
     }
 
     if (cmd === "work") {

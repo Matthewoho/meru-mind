@@ -2,7 +2,7 @@
 # IMPORTANT: Always keep replicas = 1. Do NOT mount /var/lib/meru-mind over NFS/SMB.
 services:
   meru-mind:
-    image: ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.4}
+    image: ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.5}
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true

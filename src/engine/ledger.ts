@@ -3,10 +3,12 @@ import { assertSafeIdentifier } from "../adapters/local-drive.js";
 import { buildRecordFtsBody } from "../format/snippet.js";
 import {
   assertAccess,
+  assertWriteAccess,
   findEffectiveArchivedRealm,
   intersectAccessScopes,
   resolveAccess,
   resolveAccessScope,
+  resolveWriteAccess,
 } from "../policy.js";
 import type {
   BlobPort,
@@ -36,6 +38,7 @@ import {
   type SeabedKind,
   type Sensitivity,
   type SupersedeChainResult,
+  type TokenWriteScope,
 } from "../types.js";
 import {
   createVisibilityHelpers,
@@ -1151,7 +1154,7 @@ export class LedgerEngine {
 
   // ---- Seabed (Truth Source 1) ----
 
-  async captureSeabed(params: {
+  captureSeabedSync(params: {
     actor: Actor;
     viewerRealmId: string;
     targetRealmId?: string;
@@ -1167,9 +1170,12 @@ export class LedgerEngine {
     originSessionId?: string | null;
     sensitivity?: Sensitivity;
     idempotencyKey?: string;
+    writeScope?: TokenWriteScope;
+    /** Preserve exact UTF-8 bytes of `text` without trimming (used by lossless seabed import). */
+    preserveExactText?: boolean;
     /** Explicit human-only override to allow writing content matching redacted_blocklist */
     allowRedactedReingest?: boolean;
-  }): Promise<SeabedEntry> {
+  }): SeabedEntry {
     const actor = validateActor(params.actor);
     if (!VALID_SEABED_KINDS.has(params.kind)) {
       throw new MindError(
@@ -1181,8 +1187,9 @@ export class LedgerEngine {
     const idempotencyKey = normalizeIdempotencyKey(params.idempotencyKey);
     const targetRealmId = params.targetRealmId ?? params.viewerRealmId;
 
-    const text = params.text.trim();
-    if (!text && !params.blobContent) {
+    const trimmedText = params.text.trim();
+    const text = params.preserveExactText ? params.text : trimmedText;
+    if (!params.preserveExactText && !trimmedText && !params.blobContent) {
       throw new MindError(
         "INVALID_INPUT",
         "Seabed entry requires non-empty text or blobContent",
@@ -1205,6 +1212,9 @@ export class LedgerEngine {
       typeof params.occurredAt === "string"
         ? params.occurredAt.trim() || null
         : null;
+    const sourceRef = params.sourceRef?.trim()
+      ? params.sourceRef.trim().normalize("NFC")
+      : null;
 
     const payloadHash = idempotencyKey
       ? computePayloadHash({
@@ -1214,7 +1224,7 @@ export class LedgerEngine {
           topicId: params.topicId ?? null,
           text,
           blobSha256: pendingBlobSha256,
-          sourceRef: params.sourceRef ?? null,
+          sourceRef,
           metadata,
           ...(objectIds.length > 0 ? { objectIds } : {}),
           ...(resourceTags.length > 0 ? { resourceTags } : {}),
@@ -1237,6 +1247,19 @@ export class LedgerEngine {
           idempotencyKey,
         );
         if (existingKey) {
+          const canWriteExistingSeabed =
+            existingKey.targetTable === "seabed_entries" &&
+            resolveWriteAccess({
+              realms,
+              mounts,
+              actor,
+              viewerRealmId: params.viewerRealmId,
+              targetRealmId: existingKey.realmId,
+              assetKind: "seabed",
+              orgPolicy,
+              writeScope: params.writeScope ?? "self",
+              category: "content",
+            }) === "write";
           const existingAccess =
             existingKey.targetTable === "seabed_entries"
               ? resolveAccess({
@@ -1246,7 +1269,7 @@ export class LedgerEngine {
                   viewerRealmId: params.viewerRealmId,
                   targetRealmId: existingKey.realmId,
                   assetKind: "seabed",
-                  explicitDescendantDive: false,
+                  explicitDescendantDive: canWriteExistingSeabed,
                   orgPolicy,
                 })
               : (() => {
@@ -1288,15 +1311,16 @@ export class LedgerEngine {
         }
       }
 
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor,
         viewerRealmId: params.viewerRealmId,
         targetRealmId,
         assetKind: "seabed",
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: "content",
       });
 
       const targetRealm = realms.find((r) => r.id === targetRealmId)!;
@@ -1305,7 +1329,8 @@ export class LedgerEngine {
       const allowRedacted =
         params.allowRedactedReingest === true && actor.kind === "human";
       if (!allowRedacted) {
-        const textSha = text ? computeSeabedContentSha256(text) : null;
+        const textSha = trimmedText ? computeSeabedContentSha256(trimmedText) : null;
+        const exactTextSha = text ? sha256Bytes(text) : null;
         const metaSha =
           typeof metadata.contentSha256 === "string" &&
           metadata.contentSha256.trim()
@@ -1314,6 +1339,9 @@ export class LedgerEngine {
         if (
           (textSha !== null &&
             this.db.isContentShaBlocked(targetRealm.orgId, textSha)) ||
+          (exactTextSha !== null &&
+            exactTextSha !== textSha &&
+            this.db.isContentShaBlocked(targetRealm.orgId, exactTextSha)) ||
           (pendingBlobSha256 !== null &&
             this.db.isContentShaBlocked(targetRealm.orgId, pendingBlobSha256)) ||
           (metaSha !== null &&
@@ -1364,7 +1392,7 @@ export class LedgerEngine {
         authorFamily: actor.family ?? null,
         text,
         blobSha256,
-        sourceRef: params.sourceRef ?? null,
+        sourceRef,
         metadata,
         occurredAt: hasExplicitNullOccurredAt
           ? null
@@ -1434,9 +1462,33 @@ export class LedgerEngine {
     });
   }
 
+  async captureSeabed(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    targetRealmId?: string;
+    kind: SeabedKind;
+    topicId?: string | null;
+    text: string;
+    blobContent?: Buffer | string;
+    sourceRef?: string | null;
+    metadata?: Record<string, unknown>;
+    objectIds?: string[];
+    resourceTags?: string[];
+    occurredAt?: string | null;
+    originSessionId?: string | null;
+    sensitivity?: Sensitivity;
+    idempotencyKey?: string;
+    writeScope?: TokenWriteScope;
+    preserveExactText?: boolean;
+    /** Explicit human-only override to allow writing content matching redacted_blocklist */
+    allowRedactedReingest?: boolean;
+  }): Promise<SeabedEntry> {
+    return this.captureSeabedSync(params);
+  }
+
   // ---- Ledger Records (Truth Source 2) ----
 
-  async appendRecord(params: {
+  appendRecordSync(params: {
     actor: Actor;
     viewerRealmId: string;
     targetRealmId?: string;
@@ -1457,9 +1509,10 @@ export class LedgerEngine {
     originSessionId?: string | null;
     sensitivity?: Sensitivity;
     idempotencyKey?: string;
+    writeScope?: TokenWriteScope;
     /** Explicit human-only override to allow writing content matching redacted_blocklist */
     allowRedactedReingest?: boolean;
-  }): Promise<LedgerRecord> {
+  }): LedgerRecord {
     const actor = validateActor(params.actor);
     if (!VALID_RECORD_KINDS.has(params.kind)) {
       throw new MindError(
@@ -1497,11 +1550,12 @@ export class LedgerEngine {
       (typeof payload.externalRef === "string" && payload.externalRef.trim()
         ? payload.externalRef.trim()
         : null);
-    const sourceRef =
+    const rawSourceRef =
       params.sourceRef?.trim() ||
       (typeof payload.sourceRef === "string" && payload.sourceRef.trim()
         ? payload.sourceRef.trim()
         : null);
+    const sourceRef = rawSourceRef ? rawSourceRef.normalize("NFC") : null;
     const supersedesList = Array.from(
       new Set(
         [
@@ -1554,6 +1608,19 @@ export class LedgerEngine {
           idempotencyKey,
         );
         if (existingKey) {
+          const canWriteExistingSeabed =
+            existingKey.targetTable === "seabed_entries" &&
+            resolveWriteAccess({
+              realms,
+              mounts,
+              actor,
+              viewerRealmId: params.viewerRealmId,
+              targetRealmId: existingKey.realmId,
+              assetKind: "seabed",
+              orgPolicy,
+              writeScope: params.writeScope ?? "self",
+              category: "content",
+            }) === "write";
           const existingAccess =
             existingKey.targetTable === "seabed_entries"
               ? resolveAccess({
@@ -1563,7 +1630,7 @@ export class LedgerEngine {
                   viewerRealmId: params.viewerRealmId,
                   targetRealmId: existingKey.realmId,
                   assetKind: "seabed",
-                  explicitDescendantDive: false,
+                  explicitDescendantDive: canWriteExistingSeabed,
                   orgPolicy,
                 })
               : (() => {
@@ -1606,15 +1673,16 @@ export class LedgerEngine {
       }
 
       // 2. Access control & all validations inside BEGIN IMMEDIATE (zero TOCTOU)
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor,
         viewerRealmId: params.viewerRealmId,
         targetRealmId,
         assetKind: params.kind === "rule" ? "rule" : "ledger",
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: params.kind === "rule" ? "admin" : "content",
       });
 
       const targetRealm = realms.find((r) => r.id === targetRealmId)!;
@@ -1855,6 +1923,34 @@ export class LedgerEngine {
 
       return record;
     });
+  }
+
+  async appendRecord(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    targetRealmId?: string;
+    thingId?: string | null;
+    kind: RecordKind;
+    extKind?: string | null;
+    title: string;
+    payload?: Record<string, unknown>;
+    refs?: string[];
+    externalRef?: string | null;
+    sourceRef?: string | null;
+    objectIds?: string[];
+    resourceTags?: string[];
+    supersedesId?: string | null;
+    supersedesIds?: string[];
+    initialStatus?: "active" | "superseded";
+    occurredAt?: string | null;
+    originSessionId?: string | null;
+    sensitivity?: Sensitivity;
+    idempotencyKey?: string;
+    writeScope?: TokenWriteScope;
+    /** Explicit human-only override to allow writing content matching redacted_blocklist */
+    allowRedactedReingest?: boolean;
+  }): Promise<LedgerRecord> {
+    return this.appendRecordSync(params);
   }
 
   // ---- Identity Anchors (Reusing records.kind = 'thing' + external_ref, no separate things table) ----

@@ -32,6 +32,16 @@ export interface SurfaceErrorOptions {
   surface?: "cli" | "mcp";
   boundRealmPath?: string;
   orgPolicy?: "open" | "tree";
+  /** True when formatting responses for a remote HTTP server (strips local-only `--as-human` hints). */
+  remote?: boolean;
+}
+
+function sanitizeRemoteTryHint(hint: string): string {
+  return hint
+    .replace(/\s+--as-human\b/g, "")
+    .replace(/--as-human\s+/g, "")
+    .replace(/\(or pass --as-human on CLI to explicitly override\)/g, "(use a human Bearer token)")
+    .trim();
 }
 
 function safeMcpRealmRef(options?: SurfaceErrorOptions): string {
@@ -141,8 +151,10 @@ function defaultTryHint(
   switch (code) {
     case "RULE_REQUIRES_HUMAN":
       return surface === "cli"
-        ? `meru-mind rule add --in ${realmRef} --title "<title>" --body "<body>" --as-human`
-        : "Rules are human-only and cannot be written over MCP; ask a human to run 'meru-mind rule add --as-human' on CLI";
+        ? options?.remote
+          ? `meru-mind rule add --in ${realmRef} --title "<title>" --body "<body>"`
+          : `meru-mind rule add --in ${realmRef} --title "<title>" --body "<body>" --as-human`
+        : "Rules are human-only and cannot be written over MCP; ask a human to add the rule with a human token or CLI --as-human";
     case "NOT_BOUND":
       return "MERU_MIND_VIEWER_REALM_ID=/team/project meru-mind whoami";
     case "INVALID_REF":
@@ -177,6 +189,9 @@ export function toSurfaceError(
         defaultTryHint(err.code, options);
     } else {
       tryCommand = explicitTry ?? defaultTryHint(err.code, options);
+      if (tryCommand && options?.remote) {
+        tryCommand = sanitizeRemoteTryHint(tryCommand);
+      }
       if (
         tryCommand &&
         options?.orgPolicy === "tree" &&

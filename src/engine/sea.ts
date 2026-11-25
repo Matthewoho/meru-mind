@@ -22,6 +22,7 @@ import {
   getDescendantIds,
   intersectAccessScopes,
   isRealmEffectivelyArchived,
+  normalizeWriteScope,
   resolveAccess,
   resolveAccessScope,
 } from "../policy.js";
@@ -76,6 +77,7 @@ import {
   type ShowSupersedeChainResult,
   type ShowWindow,
   type SyncEmbeddingsResult,
+  type TokenWriteScope,
   type TreeResult,
   type WhoamiResult,
 } from "../types.js";
@@ -3831,6 +3833,7 @@ export class SeaEngine {
     viewerRealmId: string;
     boundSource: string;
     storePath: string;
+    writeScope?: TokenWriteScope;
     scopeCeiling?: AccessScope;
   }): WhoamiResult {
     const realms = this.db.listRealms();
@@ -3938,6 +3941,13 @@ export class SeaEngine {
       ...(actorRec?.displayName ? { displayName: actorRec.displayName } : {}),
     };
 
+    const effectiveWriteScope: TokenWriteScope =
+      org.policy === "tree" &&
+      normalizeWriteScope(params.writeScope) === "subtree" &&
+      viewerRealm.parentId !== null
+        ? "subtree"
+        : "self";
+
     return {
       org: {
         id: org.id,
@@ -3958,10 +3968,13 @@ export class SeaEngine {
         seabedRealms: scope.readableSeabedIds.length,
       },
       write: {
+        scope: effectiveWriteScope,
         allowed:
           org.policy === "open"
             ? "any realm in org (rules human-only)"
-            : `${sanitizedBound.path} (self only; rules human-only)`,
+            : effectiveWriteScope === "subtree"
+              ? `${sanitizedBound.path} (subtree; rules human-only)`
+              : `${sanitizedBound.path} (self only; rules human-only)`,
         canWriteRules: params.actor.kind === "human",
         canRedact: params.actor.kind === "human",
       },

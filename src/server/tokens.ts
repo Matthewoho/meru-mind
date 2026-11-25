@@ -6,6 +6,7 @@ import {
   type AuthTokenPublic,
   type AuthTokenRecord,
   type Principal,
+  type TokenWriteScope,
 } from "../types.js";
 
 export const TOKEN_PREFIX = "mm_live_";
@@ -74,6 +75,7 @@ export function toPublicToken(rec: AuthTokenRecord): AuthTokenPublic {
     actorKind: rec.actorKind,
     actorFamily: rec.actorFamily,
     boundRealmId: rec.boundRealmId,
+    writeScope: rec.writeScope === "subtree" ? "subtree" : "self",
     label: rec.label,
     createdBy: rec.createdBy,
     createdAt: rec.createdAt,
@@ -91,6 +93,7 @@ export interface CreateAuthTokenParams {
   actorFamily?: string | null;
   actorRole?: ActorRole;
   boundRealmId?: string | null;
+  writeScope?: TokenWriteScope;
   label?: string | null;
   createdBy: string;
   expiresAt?: string | null;
@@ -132,6 +135,13 @@ export function createAuthToken(
       'Agent tokens cannot be granted the "admin" organization role',
     );
   }
+  const writeScope: TokenWriteScope = params.writeScope ?? "self";
+  if (writeScope !== "self" && writeScope !== "subtree") {
+    throw new MindError(
+      "INVALID_INPUT",
+      `Token writeScope must be "self" or "subtree", got "${String(writeScope)}"`,
+    );
+  }
   const org = params.db.getOrg(params.orgId);
   if (!org) {
     throw new MindError("NOT_FOUND", `Organization not found: ${params.orgId}`);
@@ -161,6 +171,12 @@ export function createAuthToken(
   }
   const isRootBound =
     boundRealmId === null || (rootRealm !== null && boundRealmId === rootRealm.id);
+  if (writeScope === "subtree" && isRootBound) {
+    throw new MindError(
+      "INVALID_INPUT",
+      'Token --write-scope subtree cannot be bound to root realm "/". Bind to a specific domain realm (e.g. /ops) or use organization --policy open.',
+    );
+  }
 
   const plaintext = generateAuthTokenPlaintext();
   const nowMs = Date.now();
@@ -187,6 +203,7 @@ export function createAuthToken(
     actorKind: params.actorKind,
     actorFamily: params.actorFamily?.trim() || null,
     boundRealmId,
+    writeScope,
     label: params.label?.trim() || null,
     createdBy: params.createdBy,
     createdAt: now,
@@ -353,6 +370,13 @@ export function resolvePrincipalFromToken(params: {
     params.db.touchTokenLastUsed(tokenRec.id, new Date(nowMs).toISOString());
   }
 
+  const resolvedAuthKind = params.authKind ?? "bearer";
+  const resolvedWriteScope: TokenWriteScope =
+    resolvedAuthKind === "cookie"
+      ? "self"
+      : tokenRec.writeScope === "subtree"
+        ? "subtree"
+        : "self";
   const actorRec = params.db.getActor(tokenRec.orgId, tokenRec.actorId);
   return {
     tokenId: tokenRec.id,
@@ -366,7 +390,8 @@ export function resolvePrincipalFromToken(params: {
     },
     boundRealmId,
     boundSource,
-    authKind: params.authKind ?? "bearer",
+    authKind: resolvedAuthKind,
+    writeScope: resolvedWriteScope,
   };
 }
 

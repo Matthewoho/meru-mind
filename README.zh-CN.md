@@ -134,12 +134,13 @@ MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
 - **实验功能面**（已在 `--help` 标注 `[experimental]`，未写入官方 Skill）：`file`（本地共享文件盘）、`raw`（直接写入海床 CLI）、`settle`（蒸馏卡片）及 `thing` 记录类型。
 - **SQLite 唯一核心后端**：SQLite（`node:sqlite` WAL）是唯一核心存储与在线真源；未来迁移至 Postgres 属于由明确容量指标触发的独立迁移项目，不承诺接口层零重写替换。
 
-### 已知局限（`v0.6.4`）
+### 已知局限（`v0.6.5`）
 1. **默认纯字面检索**：未配置外部 Embedding 时仅使用 CJK 双字 + 拉丁 FTS5 与局部窗口覆盖度。
 2. **批量导入不自动建 `supersedes` 链**：导入语料中未声明取代关系的新旧文档会并排保持 `active`（日常写入已提供中性相似条目回显，方便 Agent 显式挂取代链）。
 3. **单写者 SQLite 服务约束**：`meru-mind serve` 持有独占写锁，需部署在带持久本地块存储的单实例节点（避免多副本共享 NFS/SMB）。
 4. **`node:sqlite` 实验接口**：属于 Node.js 当前实验内置 API，CI 已覆盖 Node 22 与 Node 24 矩阵。
-5. **`tree` 模式写权限边界**：在 `--policy tree` 模式下，写操作严格限定在凭据绑定的当前识界自身（祖先与后代域仅可读）。单团队共享写作建议使用 `--policy open`，或按权限墙设立扁平可写识界并用 `--about project:<name>` 组织子项目。
+5. **`tree` 模式写权限边界**：在 `--policy tree` 模式下，凭据默认仅可写所绑定的当前识界（`--write-scope self`）。非根领域 Token 可在签发时显式开启 `--write-scope subtree` 以向后代识界写入内容（规则与管理操作仍严格限于自身/人工；根域 `/` 禁止签发 `subtree`）。单团队共享写作建议使用 `--policy open`。
+6. **`sensitivity: "secret"` 条目只写不读**：标记为 `secret` 的条目在全部读取、发现、写入相似回显与核验通道（`show`、`ls`、`search`、`changes`、`relatedActive`、`import verify`）中无条件隐藏，且重导时不做去重（每次重导均新建条目，避免产生存在性探测口）；将同一 `sourceRef` 从 `secret` 降级为 `internal` 重导时会新建一条非 secret 活跃记录，原封存的 `secret` 记录保持不动。
 
 ---
 
@@ -161,7 +162,7 @@ MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
 
 ---
 
-## 已交付能力演进（`v0.2.0` → `v0.6.4`）
+## 已交付能力演进（`v0.2.0` → `v0.6.5`）
 
 完整云端自托管部署方案、安全模型与自定义前端指南见 [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md)、[`docs/UI_BUILDER_SKILL.md`](./docs/UI_BUILDER_SKILL.md) 与 [`THREAT_MODEL.md`](./THREAT_MODEL.md)：
 
@@ -176,6 +177,7 @@ MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
 - **`v0.6.2`**：GitHub Actions 自动发布多架构 GHCR 镜像（`linux/amd64` + `linux/arm64` + SLSA provenance）、预构建镜像 Compose 栈、`meru-mind upgrade` / `update`（容器内自动防原地升级），以及多 Harness（Antigravity / Claude Code / Codex / OpenCode）`/swarm` 与子 Agent 会话自动透传。
 - **`v0.6.3`**：实测修复 GHCR Docker Compose 首次初始化引导（`admin init` + `--role admin`）、基础 Compose 补齐 `MERU_MIND_PUBLIC_URL`、CLI 新增 `--version` / `-v` 及零组织清晰报错指引。
 - **`v0.6.4`**：内置 Studio UI 大白话与极简交互重构——统一 `VOCAB` 词汇层（识界 / 记录 / 对象 / 规矩 / 待分拣）、取消冗余 Overview 与 4 格统计条默认直出记录流、右侧属性栏自动收放（列表卡去 `rec_xxx`）、Linear 风格「发现 / 决定 / 提议」分段器新建弹窗（替代原生 `<select>`）以及可复制命令的引导空态。
+- **`v0.6.5`**：支持非根领域 Token 显式开启 `--write-scope subtree` 后代内容写入（Schema v14，严格区分 `content` 与 `admin` 写策略，浏览器 Cookie 自动降级为 `self`）、补齐远程 `object` 全生命周期（`/v1/objects/*`、`--if-not-exists` 幂等与漂移报告、`object delete` 仅限人工），以及统一事务化在线/本地批量导入（`POST /v1/import/batch`）与零截断独立 SHA-256 核验（`POST /v1/import/verify`，支持 `--target record|seabed`、NFC 规范化、严格 UTF-8 解码、1.2 MB 单条上限，并封堵 `tree` 模式跨识界 `sourceRef` 存在性泄露）。说明：Seabed 导入按原始 UTF-8 字节精确保存（升级前若存在首尾被裁剪空白的旧 Seabed 记录，首次重导会追加一条字节精确的新版本）；`sensitivity: "secret"` 条目继续在所有发现面（`ls`/`search`/`changes`）与 `import verify` 中排除（导入/核验不可读、不可探测）。
 
 ## 开源协议
 

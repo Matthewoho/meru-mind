@@ -10,6 +10,7 @@ import type {
   CatResult,
   ChangesResult,
   ExportMdResult,
+  ImportBatchResult,
   ImportConsistencyResult,
   ImportDryRunResult,
   ImportJsonlResult,
@@ -759,31 +760,62 @@ export function formatImportJsonlMarkdown(res: ImportJsonlResult): string {
   ].join("\n");
 }
 
+export function formatImportBatchMarkdown(res: ImportBatchResult): string {
+  const lines: string[] = [
+    `# Import Batch${res.dryRun ? " (Dry Run)" : ""}`,
+    `- Total items: ${res.totalItems}`,
+    `- Created: ${res.created}`,
+    `- Superseded: ${res.superseded}`,
+    `- Relocated: ${res.relocated}`,
+    `- Skipped (unchanged): ${res.skippedUnchanged}`,
+    `- Skipped (redacted): ${res.skippedRedacted}`,
+    `- Skipped (secret): ${res.skippedSecret}`,
+    `- Undated: ${res.undatedCount}`,
+    `- Default realm fallback: ${res.defaultRealmCount}`,
+  ];
+  if (res.realmProjections && res.realmProjections.length > 0) {
+    lines.push("", "## Realm Doctor Projections");
+    for (const p of res.realmProjections) {
+      const warn = p.exceedsDoctorThreshold ? " [EXCEEDS THRESHOLD]" : "";
+      lines.push(
+        `- \`${p.realmPath}\`: ${p.existingDirectCount} + ${p.projectedDelta} = ${p.projectedDirectCount} (threshold ${p.doctorThreshold})${warn}`,
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
 export function formatImportVerifyMarkdown(
   res: ImportConsistencyResult,
 ): string {
   const lines: string[] = [
     `# import-verify: ${res.passed ? "PASSED" : "FAILED"}`,
-    `- Checked: ${res.totalChecked}`,
-    `- Missing: ${res.missingCount}`,
-    `- Active/Superseded mismatches: ${res.activeSupersededMismatches.length}`,
-    `- Timestamp mismatches: ${res.timestampMismatches.length}`,
-    `- Undated: ${res.undatedCount}`,
-    `- Default realm fallback: ${res.defaultRealmFallbackCount}`,
+    `- Source files: ${res.totalSourceFiles} (expected: ${res.expectedCount}, excluded: ${res.excludedCount}, unaccounted: ${res.unaccountedCount})`,
+    `- Found: ${res.foundCount} | Missing: ${res.missingCount} | Unexpected: ${res.unexpectedCount}`,
+    `- Content mismatches: ${res.contentMismatchCount} | Realm mismatches: ${res.realmMismatchCount} | Layer mismatches: ${res.layerMismatchCount}`,
+    `- Status mismatches: ${res.statusMismatchCount} | Timestamp mismatches: ${res.timestampMismatchCount}`,
+    `- Skipped: secret=${res.skippedSecretCount}, redacted=${res.skippedRedactedCount} (allowSkips=${res.allowSkips})`,
+    `- Undated: ${res.undatedCount} | Default realm fallback: ${res.defaultRealmFallbackCount}`,
   ];
-  if (res.activeSupersededMismatches.length > 0) {
-    lines.push("", "## Active/Superseded Mismatches");
-    for (const m of res.activeSupersededMismatches.slice(0, 20)) {
+  if (res.unaccountedPaths.length > 0) {
+    lines.push("", "## Unaccounted Source Files");
+    for (const p of res.unaccountedPaths.slice(0, 20)) {
+      lines.push(`- \`${p}\``);
+    }
+  }
+  if (res.mismatches.length > 0) {
+    lines.push("", "## Mismatches");
+    for (const m of res.mismatches.slice(0, 20)) {
       lines.push(
-        `- \`${m.sourceRef}\` (\`${m.recordId ?? "missing"}\`): expected \`${m.expected}\`, got \`${m.actual}\``,
+        `- \`${m.sourceRef}\` (\`${m.recordId ?? "missing"}\`): ${m.reason} (expected \`${m.expected ?? "null"}\`, got \`${m.actual ?? "null"}\`)`,
       );
     }
   }
-  if (res.timestampMismatches.length > 0) {
-    lines.push("", "## Timestamp Mismatches");
-    for (const m of res.timestampMismatches.slice(0, 20)) {
+  if (res.unexpectedEntries.length > 0) {
+    lines.push("", "## Unexpected Imported Entries");
+    for (const u of res.unexpectedEntries.slice(0, 20)) {
       lines.push(
-        `- \`${m.sourceRef}\` (\`${m.recordId ?? "missing"}\`): expected \`${m.expected ?? "null"}\`, got \`${m.actual ?? "null"}\``,
+        `- \`${u.sourceRef}\` (\`${u.entryId}\`, ${u.layer} in \`${u.realmPath}\`)`,
       );
     }
   }

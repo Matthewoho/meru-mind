@@ -18,22 +18,32 @@ import { LocalMindSurface } from "../surface-local.js";
 import type {
   MindSurface,
   SurfaceAddRuleInput,
+  SurfaceCreateObjectInput,
   SurfaceCreateRealmInput,
   SurfaceUpdateRealmInput,
   SurfaceCreateTokenInput,
+  SurfaceDeleteObjectInput,
+  SurfaceLinkObjectInput,
   SurfaceMountRealmInput,
   SurfaceMoveInput,
+  SurfaceMoveObjectInput,
   SurfaceRawAddInput,
   SurfaceRedactInput,
+  SurfaceSetObjectStateInput,
+  SurfaceUnlinkObjectInput,
+  SurfaceUpdateObjectAliasesInput,
   SurfaceWriteInput,
 } from "../surface.js";
 import {
   MindError,
   type ActorRole,
+  type ImportBatchInput,
   type LsOnlyFilter,
   type OidcConfig,
   type OrgPolicy,
   type Principal,
+  type TokenWriteScope,
+  type VerifyImportInput,
 } from "../types.js";
 import { MERU_MIND_VERSION } from "../version.js";
 import { createSurfaceMcpServer } from "./mcp-http.js";
@@ -179,6 +189,7 @@ export interface MindServerHandle {
     actorFamily?: string | null;
     actorRole?: ActorRole;
     boundRealmId?: string | null;
+    writeScope?: TokenWriteScope;
     label?: string | null;
     createdBy?: string;
     ttlDays?: number | null;
@@ -371,6 +382,7 @@ export async function startMindServer(
     const pulseSnapshotPath = path.join(homeDir, "pulse-snapshot.json");
     pulseStore.loadSnapshot(pulseSnapshotPath);
     const touchThrottle = new TokenTouchThrottle();
+    const inFlightImportTokens = new Set<string>();
     const uiSessions = new UiSessionManager();
     const resolvedOidcConfig =
       options.oidc === false ? null : (options.oidc ?? loadOidcConfigFromEnv());
@@ -913,6 +925,357 @@ export async function startMindServer(
               return;
             }
 
+            // ---- v0.6.5 Remote Object Lifecycle (/v1/objects/*) with strict runtime validation ----
+            const reqBodyStr = (
+              body: Record<string, unknown>,
+              field: string,
+            ): string => {
+              const v = body[field];
+              if (typeof v !== "string" || !v.trim()) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  `Field "${field}" must be a non-empty string`,
+                );
+              }
+              return v;
+            };
+            const optBodyStr = (
+              body: Record<string, unknown>,
+              field: string,
+            ): string | undefined => {
+              const v = body[field];
+              if (v === undefined) return undefined;
+              if (typeof v !== "string") {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  `Field "${field}" must be a string`,
+                );
+              }
+              return v;
+            };
+            const optBodyNullableStr = (
+              body: Record<string, unknown>,
+              field: string,
+            ): string | null | undefined => {
+              const v = body[field];
+              if (v === undefined || v === null) return v;
+              if (typeof v !== "string") {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  `Field "${field}" must be a string or null`,
+                );
+              }
+              return v;
+            };
+            const optBodyBool = (
+              body: Record<string, unknown>,
+              field: string,
+            ): boolean | undefined => {
+              const v = body[field];
+              if (v === undefined) return undefined;
+              if (typeof v !== "boolean") {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  `Field "${field}" must be a boolean`,
+                );
+              }
+              return v;
+            };
+            const optBodyStrArray = (
+              body: Record<string, unknown>,
+              field: string,
+            ): string[] | undefined => {
+              const v = body[field];
+              if (v === undefined) return undefined;
+              if (
+                !Array.isArray(v) ||
+                !v.every((item) => typeof item === "string")
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  `Field "${field}" must be an array of strings`,
+                );
+              }
+              return v;
+            };
+            const optBodyNonNegInt = (
+              body: Record<string, unknown>,
+              field: string,
+            ): number | undefined => {
+              const v = body[field];
+              if (v === undefined) return undefined;
+              if (
+                typeof v !== "number" ||
+                !Number.isInteger(v) ||
+                v < 0
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  `Field "${field}" must be a non-negative integer`,
+                );
+              }
+              return v;
+            };
+
+            if (method === "POST" && pathname === "/v1/objects") {
+              const raw = await readJsonBody(req);
+              const validated: SurfaceCreateObjectInput = {
+                in: optBodyStr(raw, "in"),
+                kind: reqBodyStr(raw, "kind"),
+                name: reqBodyStr(raw, "name"),
+                parentRef: optBodyNullableStr(raw, "parentRef"),
+                ifNotExists: optBodyBool(raw, "ifNotExists"),
+              };
+              const out = await surface.createObject(validated);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/objects/move") {
+              const raw = await readJsonBody(req);
+              const ref = reqBodyStr(raw, "ref");
+              if (!("parentRef" in raw)) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "parentRef" is required (string or null)',
+                );
+              }
+              const parentRef = optBodyNullableStr(raw, "parentRef") ?? null;
+              const validated: SurfaceMoveObjectInput = { ref, parentRef };
+              const out = await surface.moveObject(validated);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/objects/delete") {
+              const raw = await readJsonBody(req);
+              const validated: SurfaceDeleteObjectInput = {
+                ref: reqBodyStr(raw, "ref"),
+              };
+              const removed = await surface.deleteObject(validated);
+              sendJson(res, 200, { removed });
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/objects/link") {
+              const raw = await readJsonBody(req);
+              const validated: SurfaceLinkObjectInput = {
+                entryId: reqBodyStr(raw, "entryId"),
+                objectRef: reqBodyStr(raw, "objectRef"),
+              };
+              const out = await surface.linkObject(validated);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/objects/unlink") {
+              const raw = await readJsonBody(req);
+              const validated: SurfaceUnlinkObjectInput = {
+                entryId: reqBodyStr(raw, "entryId"),
+                objectRef: reqBodyStr(raw, "objectRef"),
+              };
+              const removed = await surface.unlinkObject(validated);
+              sendJson(res, 200, { removed });
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/objects/state") {
+              const raw = await readJsonBody(req);
+              const stateRaw = reqBodyStr(raw, "state");
+              if (stateRaw !== "active" && stateRaw !== "inactive") {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "state" must be "active" or "inactive"',
+                );
+              }
+              const validated: SurfaceSetObjectStateInput = {
+                ref: reqBodyStr(raw, "ref"),
+                state: stateRaw,
+                label: optBodyStr(raw, "label"),
+                since: optBodyStr(raw, "since"),
+                because: optBodyStr(raw, "because"),
+              };
+              const out = await surface.setObjectState(validated);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/objects/aliases") {
+              const raw = await readJsonBody(req);
+              const validated: SurfaceUpdateObjectAliasesInput = {
+                ref: reqBodyStr(raw, "ref"),
+                add: optBodyStrArray(raw, "add"),
+                remove: optBodyStrArray(raw, "remove"),
+              };
+              const out = await surface.updateObjectAliases(validated);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            // ---- v0.6.5 Unified Online Batch Import & Verification (/v1/import/*) ----
+            if (method === "POST" && pathname === "/v1/import/batch") {
+              const lockKey =
+                principal.tokenId ??
+                `${principal.authKind}:${principal.orgId}:${principal.actor.id}`;
+              if (inFlightImportTokens.has(lockKey)) {
+                throw new MindError(
+                  "CONFLICT",
+                  "Another import batch is already in flight for this token. Wait for it to finish and retry.",
+                  { reason: "import_in_flight" },
+                );
+              }
+              inFlightImportTokens.add(lockKey);
+              try {
+                const raw = await readJsonBody(req);
+                if (!Array.isArray(raw.items)) {
+                  throw new MindError(
+                    "INVALID_INPUT",
+                    'Field "items" must be an array',
+                  );
+                }
+                const validated: ImportBatchInput = {
+                  items: raw.items as ImportBatchInput["items"],
+                  defaultRealmRef: optBodyStr(raw, "defaultRealmRef"),
+                  skipSecret: optBodyBool(raw, "skipSecret"),
+                  dryRun: optBodyBool(raw, "dryRun"),
+                  relocate: optBodyBool(raw, "relocate"),
+                };
+                const out = await surface.importBatch(validated);
+                sendJson(res, 200, out);
+              } finally {
+                inFlightImportTokens.delete(lockKey);
+              }
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/import/verify") {
+              const raw = await readJsonBody(req);
+              if (!Array.isArray(raw.items)) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "items" must be an array',
+                );
+              }
+              const items: VerifyImportInput["items"] = [];
+              for (let idx = 0; idx < raw.items.length; idx += 1) {
+                const entry = raw.items[idx];
+                if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+                  throw new MindError(
+                    "INVALID_INPUT",
+                    `items[${idx}] must be an object`,
+                  );
+                }
+                const rec = entry as Record<string, unknown>;
+                const sourceRef = reqBodyStr(rec, "sourceRef");
+                const targetRaw = reqBodyStr(rec, "target");
+                if (targetRaw !== "record" && targetRaw !== "seabed") {
+                  throw new MindError(
+                    "INVALID_INPUT",
+                    `items[${idx}].target must be "record" or "seabed"`,
+                  );
+                }
+                const expectedRealmRef = reqBodyStr(rec, "expectedRealmRef");
+                const contentSha256 =
+                  typeof rec.contentSha256 === "string"
+                    ? rec.contentSha256
+                    : (() => {
+                        throw new MindError(
+                          "INVALID_INPUT",
+                          `items[${idx}].contentSha256 must be a string`,
+                        );
+                      })();
+                const byteLength =
+                  typeof rec.byteLength === "number" &&
+                  Number.isFinite(rec.byteLength) &&
+                  rec.byteLength >= 0
+                    ? rec.byteLength
+                    : (() => {
+                        throw new MindError(
+                          "INVALID_INPUT",
+                          `items[${idx}].byteLength must be a non-negative number`,
+                        );
+                      })();
+                const expectedStatusRaw =
+                  rec.expectedStatus === undefined
+                    ? "active"
+                    : rec.expectedStatus;
+                if (
+                  expectedStatusRaw !== "active" &&
+                  expectedStatusRaw !== "superseded"
+                ) {
+                  throw new MindError(
+                    "INVALID_INPUT",
+                    `items[${idx}].expectedStatus must be "active" or "superseded"`,
+                  );
+                }
+                const expectedOccurredAt =
+                  optBodyNullableStr(rec, "expectedOccurredAt") ?? null;
+                items.push({
+                  sourceRef,
+                  target: targetRaw,
+                  expectedRealmRef,
+                  contentSha256,
+                  rawContentSha256: optBodyStr(rec, "rawContentSha256"),
+                  byteLength,
+                  expectedTitle: optBodyStr(rec, "expectedTitle"),
+                  expectedStatus: expectedStatusRaw,
+                  expectedOccurredAt,
+                  secretSkipped: optBodyBool(rec, "secretSkipped"),
+                });
+              }
+
+              let allExpectedEntries: VerifyImportInput["allExpectedEntries"];
+              if (raw.allExpectedEntries !== undefined) {
+                if (!Array.isArray(raw.allExpectedEntries)) {
+                  throw new MindError(
+                    "INVALID_INPUT",
+                    'Field "allExpectedEntries" must be an array',
+                  );
+                }
+                allExpectedEntries = raw.allExpectedEntries.map((e, i) => {
+                  if (!e || typeof e !== "object" || Array.isArray(e)) {
+                    throw new MindError(
+                      "INVALID_INPUT",
+                      `allExpectedEntries[${i}] must be an object`,
+                    );
+                  }
+                  const o = e as Record<string, unknown>;
+                  const t = reqBodyStr(o, "target");
+                  if (t !== "record" && t !== "seabed") {
+                    throw new MindError(
+                      "INVALID_INPUT",
+                      `allExpectedEntries[${i}].target must be "record" or "seabed"`,
+                    );
+                  }
+                  return {
+                    realmRef: reqBodyStr(o, "realmRef"),
+                    target: t,
+                    sourceRef: reqBodyStr(o, "sourceRef"),
+                  };
+                });
+              }
+
+              const validated: VerifyImportInput = {
+                items,
+                checkUnexpectedInRealmRefs: optBodyStrArray(
+                  raw,
+                  "checkUnexpectedInRealmRefs",
+                ),
+                allExpectedSourceRefs: optBodyStrArray(
+                  raw,
+                  "allExpectedSourceRefs",
+                ),
+                allExpectedEntries,
+                allowSkips: optBodyNonNegInt(raw, "allowSkips"),
+                totalSourceFiles: optBodyNonNegInt(raw, "totalSourceFiles"),
+                excludedCount: optBodyNonNegInt(raw, "excludedCount"),
+                unaccountedPaths: optBodyStrArray(raw, "unaccountedPaths"),
+              };
+              const out = await surface.verifyImport(validated);
+              sendJson(res, 200, out);
+              return;
+            }
+
             // ---- v0.6.0/v0.6.1 Invitations, Identities & Actor Lifecycle (Root-Realm Human Admin Bearer ONLY) ----
             const assertHumanBearerAdmin = (cliHint: string) => {
               if (principal.authKind === "cookie") {
@@ -1419,7 +1782,7 @@ export async function startMindServer(
         });
       } catch (err) {
         const status = httpStatusForError(err);
-        const payload = toSurfaceError(err, { surface: "cli" });
+        const payload = toSurfaceError(err, { surface: "cli", remote: true });
         if (status === 403 && !actorId) {
           sendJson(res, 401, payload);
         } else {
@@ -1504,6 +1867,7 @@ export async function startMindServer(
           actorFamily: params.actorFamily,
           actorRole: params.actorRole,
           boundRealmId: params.boundRealmId,
+          writeScope: params.writeScope,
           label: params.label,
           createdBy: params.createdBy ?? "serve-bootstrap",
           ttlDays: params.ttlDays,

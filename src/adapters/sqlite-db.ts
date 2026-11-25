@@ -356,7 +356,7 @@ export class SqliteDb implements DbPort {
 
   private initSchema(): void {
     this.assertMinSqliteVersion(3, 43);
-    this.maybeBackupBeforeMigration(11);
+    this.maybeBackupBeforeMigration(14);
     let reclaimedVecPendingText = false;
     this.transaction(() => {
       const now = new Date().toISOString();
@@ -1512,6 +1512,106 @@ export class SqliteDb implements DbPort {
           .run(nowV13);
       }
 
+      // Migration v14: v0.6.5 opt-in token write_scope ('self' | 'subtree'), conditional object unique index,
+      // and NFC normalization backfill of existing source_ref values.
+      if (!applied.has(14)) {
+        const nowV14 = new Date().toISOString();
+        this.ensureColumn("tokens", "write_scope", "TEXT NOT NULL DEFAULT 'self'");
+        const dupObjRow = this.db
+          .prepare(
+            `SELECT 1 AS has_dup
+             FROM objects
+             GROUP BY org_id, realm_id, LOWER(kind), LOWER(name)
+             HAVING COUNT(*) > 1
+             LIMIT 1`,
+          )
+          .get() as { has_dup?: number } | undefined;
+        if (!dupObjRow?.has_dup) {
+          this.db.exec(`
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_realm_kind_name_unique
+              ON objects(org_id, realm_id, LOWER(kind), LOWER(name));
+          `);
+        }
+
+        // P1-5: Expression index for O(log N) cross-chunk payload.sourceId lookup in records
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_records_org_realm_source_id
+            ON records(org_id, realm_id, json_extract(payload_json, '$.sourceId'))
+            WHERE json_extract(payload_json, '$.sourceId') IS NOT NULL;
+        `);
+
+        // Backfill any pre-existing non-NFC source_ref values in records, seabed_entries, and redacted_blocklist
+        const recRefs = this.db
+          .prepare(
+            `SELECT DISTINCT source_ref FROM records WHERE source_ref IS NOT NULL AND source_ref != ''`,
+          )
+          .all() as Array<{ source_ref: string }>;
+        const updateRecRef = this.db.prepare(
+          `UPDATE records SET source_ref = ? WHERE source_ref = ?`,
+        );
+        for (const row of recRefs) {
+          const nfc = row.source_ref.normalize("NFC");
+          if (nfc !== row.source_ref) {
+            updateRecRef.run(nfc, row.source_ref);
+          }
+        }
+
+        const seaRefs = this.db
+          .prepare(
+            `SELECT DISTINCT source_ref FROM seabed_entries WHERE source_ref IS NOT NULL AND source_ref != ''`,
+          )
+          .all() as Array<{ source_ref: string }>;
+        const updateSeaRef = this.db.prepare(
+          `UPDATE seabed_entries SET source_ref = ? WHERE source_ref = ?`,
+        );
+        for (const row of seaRefs) {
+          const nfc = row.source_ref.normalize("NFC");
+          if (nfc !== row.source_ref) {
+            updateSeaRef.run(nfc, row.source_ref);
+          }
+        }
+
+        const blRows = this.db
+          .prepare(
+            `SELECT org_id, source_ref, content_sha256, reason, redacted_at
+             FROM redacted_blocklist
+             WHERE source_ref IS NOT NULL AND source_ref != ''`,
+          )
+          .all() as Array<{
+          org_id: string;
+          source_ref: string;
+          content_sha256: string;
+          reason: string | null;
+          redacted_at: string;
+        }>;
+        const upsertBl = this.db.prepare(
+          `INSERT OR IGNORE INTO redacted_blocklist (org_id, source_ref, content_sha256, reason, redacted_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        );
+        const delBl = this.db.prepare(
+          `DELETE FROM redacted_blocklist WHERE org_id = ? AND source_ref = ? AND content_sha256 = ?`,
+        );
+        for (const row of blRows) {
+          const nfc = row.source_ref.normalize("NFC");
+          if (nfc !== row.source_ref) {
+            upsertBl.run(
+              row.org_id,
+              nfc,
+              row.content_sha256,
+              row.reason,
+              row.redacted_at,
+            );
+            delBl.run(row.org_id, row.source_ref, row.content_sha256);
+          }
+        }
+
+        this.db
+          .prepare(
+            `INSERT INTO schema_migrations (version, name, applied_at) VALUES (14, 'v14_v065_token_write_scope_and_object_unique', ?)`,
+          )
+          .run(nowV14);
+      }
+
       if (this.vecEnabled && !this.tableExists("vec_items")) {
         this.createVecItemsTable();
       }
@@ -1561,9 +1661,9 @@ export class SqliteDb implements DbPort {
     if (this.inTransaction) {
       return fn();
     }
+    this.db.exec("BEGIN IMMEDIATE;");
     this.inTransaction = true;
     this.pendingCommitEvents = [];
-    this.db.exec("BEGIN IMMEDIATE;");
     let committed = false;
     let flushedEvents: ChangeCommittedEvent[] = [];
     try {
@@ -1585,6 +1685,65 @@ export class SqliteDb implements DbPort {
       this.inTransaction = false;
       if (committed && flushedEvents.length > 0) {
         this.emitCommittedEvents(flushedEvents);
+      }
+    }
+  }
+
+  dryRunTransaction<T>(fn: () => T): T {
+    if (this.inTransaction) {
+      const prevLen = this.pendingCommitEvents.length;
+      this.db.exec("SAVEPOINT meru_dry_run;");
+      let bodyErr: unknown;
+      let hasBodyErr = false;
+      try {
+        return fn();
+      } catch (err) {
+        bodyErr = err;
+        hasBodyErr = true;
+        throw err;
+      } finally {
+        this.pendingCommitEvents.length = prevLen;
+        let rollbackErr: unknown = null;
+        try {
+          this.db.exec("ROLLBACK TO SAVEPOINT meru_dry_run;");
+          this.db.exec("RELEASE SAVEPOINT meru_dry_run;");
+        } catch (err) {
+          rollbackErr = err;
+        }
+        if (rollbackErr && !hasBodyErr) {
+          throw rollbackErr;
+        }
+        if (rollbackErr && hasBodyErr) {
+          // Prefer surfacing fatal rollback error chained with body error
+          void bodyErr;
+          throw rollbackErr;
+        }
+      }
+    }
+    this.db.exec("BEGIN IMMEDIATE;");
+    this.inTransaction = true;
+    this.pendingCommitEvents = [];
+    let bodyErr: unknown;
+    let hasBodyErr = false;
+    try {
+      return fn();
+    } catch (err) {
+      bodyErr = err;
+      hasBodyErr = true;
+      throw err;
+    } finally {
+      this.pendingCommitEvents = [];
+      let rollbackErr: unknown = null;
+      try {
+        this.db.exec("ROLLBACK;");
+      } catch (err) {
+        rollbackErr = err;
+      } finally {
+        this.inTransaction = false;
+      }
+      if (rollbackErr) {
+        void bodyErr;
+        throw rollbackErr;
       }
     }
   }
@@ -2145,6 +2304,220 @@ export class SqliteDb implements DbPort {
           )
           .get(orgId, sourceRef) as Record<string, unknown> | undefined);
     return row ? this.mapRecord(row) : null;
+  }
+
+  findActiveRecordsBySourceRefInRealms(
+    orgId: string,
+    sourceRef: string,
+    realmIds: string[],
+    options?: { excludeSecret?: boolean },
+  ): LedgerRecord[] {
+    if (realmIds.length === 0) return [];
+    const secretClause = options?.excludeSecret
+      ? `AND sensitivity != 'secret'`
+      : ``;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM records
+         WHERE org_id = ? AND source_ref = ? AND status = 'active' AND redacted_at IS NULL ${secretClause}
+           AND realm_id IN (${placeholders(realmIds.length)})
+         ORDER BY created_at DESC, rowid DESC`,
+      )
+      .all(orgId, sourceRef, ...realmIds) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapRecord(r));
+  }
+
+  hasRealmSourceRefMoveOut(
+    orgId: string,
+    realmId: string,
+    sourceRef: string,
+    options?: { excludeSecret?: boolean },
+  ): boolean {
+    const excludeSecret = options?.excludeSecret !== false;
+    const secretClause = excludeSecret ? `AND r.sensitivity != 'secret'` : ``;
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS hit
+         FROM change_log cl
+         INNER JOIN records r ON r.id = cl.entity_id
+         WHERE cl.org_id = ?
+           AND cl.realm_id = ?
+           AND cl.entity_type = 'record'
+           AND cl.op = 'move_out'
+           AND r.org_id = ?
+           AND r.source_ref = ?
+           AND r.redacted_at IS NULL
+           AND r.status != 'retracted'
+           ${secretClause}
+         LIMIT 1`,
+      )
+      .get(orgId, realmId, orgId, sourceRef) as { hit: number } | undefined;
+    return Boolean(row);
+  }
+
+  findLatestRecordsBySourceRefInRealms(
+    orgId: string,
+    sourceRef: string,
+    realmIds: string[],
+    options?: { excludeSecret?: boolean },
+  ): LedgerRecord[] {
+    if (realmIds.length === 0) return [];
+    const secretClause = options?.excludeSecret
+      ? `AND sensitivity != 'secret'`
+      : ``;
+    // Fetch strictly 1 latest non-redacted record per realm (preferring active) to avoid OOM on long histories
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM (
+           SELECT *,
+             ROW_NUMBER() OVER (
+               PARTITION BY realm_id
+               ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END ASC, created_at DESC, rowid DESC
+             ) AS _rn
+           FROM records
+           WHERE org_id = ? AND source_ref = ? AND redacted_at IS NULL AND status != 'retracted' ${secretClause}
+             AND realm_id IN (${placeholders(realmIds.length)})
+         ) WHERE _rn = 1
+         ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END ASC, created_at DESC`,
+      )
+      .all(orgId, sourceRef, ...realmIds) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapRecord(r));
+  }
+
+  findLatestRecordByPayloadSourceIdInRealms(
+    orgId: string,
+    sourceId: string,
+    realmIds: string[],
+    options?: { excludeSecret?: boolean },
+  ): LedgerRecord | null {
+    if (realmIds.length === 0) return null;
+    const secretClause = options?.excludeSecret
+      ? `AND sensitivity != 'secret'`
+      : ``;
+    const row = this.db
+      .prepare(
+        `SELECT * FROM records
+         WHERE org_id = ? AND redacted_at IS NULL AND status != 'retracted' ${secretClause}
+           AND realm_id IN (${placeholders(realmIds.length)})
+           AND json_extract(payload_json, '$.sourceId') IS NOT NULL
+           AND json_extract(payload_json, '$.sourceId') = ?
+         ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END ASC, created_at DESC, rowid DESC
+         LIMIT 1`,
+      )
+      .get(orgId, ...realmIds, sourceId) as Record<string, unknown> | undefined;
+    return row ? this.mapRecord(row) : null;
+  }
+
+  findSeabedBySourceRefInRealms(
+    orgId: string,
+    sourceRef: string,
+    realmIds: string[],
+    options?: { excludeSecret?: boolean; limitPerRealm?: number },
+  ): SeabedEntry[] {
+    if (realmIds.length === 0) return [];
+    const secretClause = options?.excludeSecret
+      ? `AND sensitivity != 'secret'`
+      : ``;
+    const limitPerRealm = Math.max(1, Math.floor(options?.limitPerRealm ?? 20));
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM (
+           SELECT *,
+             ROW_NUMBER() OVER (
+               PARTITION BY realm_id
+               ORDER BY created_at DESC, rowid DESC
+             ) AS _rn
+           FROM seabed_entries
+           WHERE org_id = ? AND source_ref = ? AND redacted_at IS NULL ${secretClause}
+             AND realm_id IN (${placeholders(realmIds.length)})
+         ) WHERE _rn <= ?
+         ORDER BY created_at DESC`,
+      )
+      .all(orgId, sourceRef, ...realmIds, limitPerRealm) as Array<
+      Record<string, unknown>
+    >;
+    return rows.map((r) => this.mapSeabed(r));
+  }
+
+  listImportedSourceRefsInRealms(
+    orgId: string,
+    ledgerRealmIds: string[],
+    seabedRealmIds: string[],
+    options?: { excludeSecret?: boolean },
+  ): Array<{
+    sourceRef: string;
+    realmId: string;
+    layer: "record" | "seabed";
+    entryId: string;
+    status: string;
+  }> {
+    const excludeSecret = options?.excludeSecret !== false;
+    const secretClause = excludeSecret ? `AND sensitivity != 'secret'` : ``;
+    const out: Array<{
+      sourceRef: string;
+      realmId: string;
+      layer: "record" | "seabed";
+      entryId: string;
+      status: string;
+    }> = [];
+    if (ledgerRealmIds.length > 0) {
+      const recRows = this.db
+        .prepare(
+          `SELECT id, realm_id, source_ref, status
+           FROM records
+           WHERE org_id = ?
+             AND source_ref IS NOT NULL
+             AND source_ref != ''
+             AND redacted_at IS NULL
+             AND status != 'retracted' ${secretClause}
+             AND (status = 'active' OR superseded_by_id IS NULL)
+             AND realm_id IN (${placeholders(ledgerRealmIds.length)})
+           ORDER BY created_at DESC, rowid DESC`,
+        )
+        .all(orgId, ...ledgerRealmIds) as Array<{
+        id: string;
+        realm_id: string;
+        source_ref: string;
+        status: string;
+      }>;
+      for (const r of recRows) {
+        out.push({
+          sourceRef: String(r.source_ref),
+          realmId: String(r.realm_id),
+          layer: "record",
+          entryId: String(r.id),
+          status: String(r.status),
+        });
+      }
+    }
+    if (seabedRealmIds.length > 0) {
+      const seaRows = this.db
+        .prepare(
+          `SELECT id, realm_id, source_ref
+           FROM seabed_entries
+           WHERE org_id = ?
+             AND source_ref IS NOT NULL
+             AND source_ref != ''
+             AND redacted_at IS NULL ${secretClause}
+             AND realm_id IN (${placeholders(seabedRealmIds.length)})
+           ORDER BY created_at DESC, rowid DESC`,
+        )
+        .all(orgId, ...seabedRealmIds) as Array<{
+        id: string;
+        realm_id: string;
+        source_ref: string;
+      }>;
+      for (const s of seaRows) {
+        out.push({
+          sourceRef: String(s.source_ref),
+          realmId: String(s.realm_id),
+          layer: "seabed",
+          entryId: String(s.id),
+          status: "evidence",
+        });
+      }
+    }
+    return out;
   }
 
   findRecordsByExternalRef(
@@ -3265,6 +3638,31 @@ export class SqliteDb implements DbPort {
     return results;
   }
 
+  findObjectsByKindName(
+    orgId: string,
+    kind: string,
+    name: string,
+    realmIds?: string[],
+  ): MindObject[] {
+    if (realmIds && realmIds.length === 0) return [];
+    const where: string[] = [
+      `org_id = ?`,
+      `LOWER(kind) = LOWER(?)`,
+      `LOWER(name) = LOWER(?)`,
+    ];
+    const params: SQLInputValue[] = [orgId, kind, name];
+    if (realmIds && realmIds.length > 0) {
+      where.push(`realm_id IN (${placeholders(realmIds.length)})`);
+      params.push(...realmIds);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM objects WHERE ${where.join(" AND ")} ORDER BY created_at ASC, id ASC`,
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.mapObject(r));
+  }
+
   listObjects(filter: {
     orgId: string;
     realmIds?: string[];
@@ -4159,6 +4557,12 @@ export class SqliteDb implements DbPort {
     entryId: string;
     newRealmId: string;
   }): void {
+    if (!this.inTransaction) {
+      throw new MindError(
+        "CONFLICT",
+        "moveEntryRealm must execute inside an active SQLite transaction",
+      );
+    }
     if (params.targetTable === "records") {
       this.db
         .prepare(`UPDATE records SET realm_id = ? WHERE id = ?`)
@@ -4702,14 +5106,15 @@ export class SqliteDb implements DbPort {
     });
   }
 
-  // ---- Auth Tokens (Migration v9 + v12 expires_at) ----
+  // ---- Auth Tokens (Migration v9 + v12 expires_at + v14 write_scope) ----
 
   insertToken(token: AuthTokenRecord): void {
+    const writeScope = token.writeScope === "subtree" ? "subtree" : "self";
     this.db
       .prepare(
         `INSERT INTO tokens
-         (id, org_id, token_hash, actor_id, actor_kind, actor_family, bound_realm_id, label, created_by, created_at, expires_at, revoked_at, last_used_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, org_id, token_hash, actor_id, actor_kind, actor_family, bound_realm_id, write_scope, label, created_by, created_at, expires_at, revoked_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         token.id,
@@ -4719,6 +5124,7 @@ export class SqliteDb implements DbPort {
         token.actorKind,
         token.actorFamily,
         token.boundRealmId,
+        writeScope,
         token.label,
         token.createdBy,
         token.createdAt,
@@ -4737,6 +5143,7 @@ export class SqliteDb implements DbPort {
       actorKind: String(row.actor_kind) as "human" | "agent",
       actorFamily: row.actor_family ? String(row.actor_family) : null,
       boundRealmId: row.bound_realm_id ? String(row.bound_realm_id) : null,
+      writeScope: row.write_scope === "subtree" ? "subtree" : "self",
       label: row.label ? String(row.label) : null,
       createdBy: String(row.created_by),
       createdAt: String(row.created_at),

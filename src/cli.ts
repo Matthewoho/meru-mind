@@ -54,6 +54,7 @@ import {
   type ActorRole,
   type DistillationLayer,
   type ImportMappingConfig,
+  type ImportTargetLayer,
   type LsOnlyFilter,
   type MindEngine,
   type MountScope,
@@ -64,6 +65,7 @@ import {
   type RecordKind,
   type SeabedKind,
   type Sensitivity,
+  type TokenWriteScope,
 } from "./index.js";
 import { runRemoteCliCommand } from "./cli-remote.js";
 import { createVisibilityHelpers } from "./engine/visibility.js";
@@ -117,6 +119,8 @@ const BOOLEAN_FLAGS = new Set([
   "all",
   "dry-run",
   "check",
+  "if-not-exists",
+  "relocate",
   // Legacy boolean flags parsed without swallowing the next token so UNKNOWN_FLAG reports cleanly
   "include-superseded",
   "include-history",
@@ -549,19 +553,19 @@ Examples:
   meru-mind entry move rec_0123456789abcdef --to /ops --as-human
   meru-mind entry move --ids-file ids.txt --from / --to /ops --dry-run --as-human
 `,
-  object: `Risk: write
+  object: `Risk: write (object delete is human-only)
 When to use: Create, reparent, delete, link, unlink, set lifecycle state, or manage aliases on structured objects (kind "file" is reserved).
 Usage:
-  meru-mind object create [--in <realm>] --kind <kind> --name <name> [--parent <objRef>]
+  meru-mind object create [--in <realm>] --kind <kind> --name <name> [--parent <objRef>] [--if-not-exists]
   meru-mind object move <objRef> --parent <parentObjRef|none>
-  meru-mind object delete <objRef>
+  meru-mind object delete <objRef> [--as-human]
   meru-mind object link <entryId> <objRef>
   meru-mind object unlink <entryId> <objRef>
   meru-mind object set <objRef> --state inactive --label <slug> [--since YYYY-MM-DD] [--because <rec_id>]
   meru-mind object set <objRef> --state active
   meru-mind object alias <objRef> [--add <text>]... [--remove <text>]...
 Examples:
-  meru-mind object create --in /ops --kind service --name payment-api
+  meru-mind object create --in /ops --kind service --name payment-api --if-not-exists
   meru-mind object set service:payment-api --state inactive --label deprecated --since 2026-10-26 --because rec_0123456789abcdef
   meru-mind object alias service:payment-api --add "Payment API"
 `,
@@ -603,15 +607,15 @@ Examples:
   meru-mind settle --in /ops --layer card_realm --period 2026-11-22
 `,
   import: `Risk: write
-When to use: Import Markdown or JSONL corpora and verify DB consistency against sources.
+When to use: Import Markdown or JSONL corpora (local or remote HTTP) and independently verify DB content hashes against sources.
 Usage:
-  meru-mind import md <file-or-dir> [--in <realm>] [--map <mapping.json>] [--base-dir <dir>] [--source-ref <ref>] [--kind <kind>] [--sensitivity <level>] [--about <obj>]... [--include-secret] [--sync-embeddings] [--dry-run] [--as-human]
-  meru-mind import jsonl <file.jsonl> --map <mapping.json> [--in <realm>] [--sync-embeddings] [--dry-run] [--as-human]
-  meru-mind import verify --source <file|dir> [--in <realm>] [--map <mapping.json>] [--base-dir <dir>]
+  meru-mind import md <file-or-dir> [--in <realm>] [--target record|seabed] [--map <mapping.json>] [--base-dir <dir>] [--source-ref <ref>] [--kind <kind>] [--sensitivity <level>] [--about <obj>]... [--exclude <glob>]... [--relocate] [--include-secret] [--sync-embeddings] [--dry-run] [--as-human]
+  meru-mind import jsonl <file.jsonl> --map <mapping.json> [--in <realm>] [--target record|seabed] [--relocate] [--sync-embeddings] [--dry-run] [--as-human]
+  meru-mind import verify --source <file|dir> [--in <realm>] [--target record|seabed] [--map <mapping.json>] [--base-dir <dir>] [--exclude <glob>]... [--check-realm <realm>]... [--allow-skips <n>]
 Examples:
   meru-mind import md ./notes --in /ops
-  meru-mind import jsonl ./events.jsonl --map ./map.json --in /ops
-  meru-mind import verify --source ./notes
+  meru-mind import md ./notes --in /ops --target seabed --dry-run
+  meru-mind import verify --source ./notes --in /ops --check-realm /ops
 `,
   org: `Risk: high-risk-write (set-policy requires --as-human)
 When to use: List organizations, create a new organization, or switch policy between open and tree.
@@ -664,11 +668,11 @@ Examples:
   token: `Risk: high-risk-write (human-only)
 When to use: Issue, list, or revoke hashed authentication tokens for meru-mind serve.
 Usage:
-  meru-mind token create --actor-id <id> --kind human|agent [--role member|admin] [--in <realm>] [--family <model>] [--label <text>] [--as-human]
+  meru-mind token create --actor-id <id> --kind human|agent [--role member|admin] [--in <realm>] [--write-scope self|subtree] [--family <model>] [--label <text>] [--as-human]
   meru-mind token list [--all] [--as-human]
   meru-mind token revoke <tokenId> [--as-human]
 Examples:
-  meru-mind token create --actor-id claude-ci --kind agent --in /ops --as-human
+  meru-mind token create --actor-id claude-ci --kind agent --in /ops --write-scope subtree --as-human
   meru-mind token list --as-human
 `,
   login: `Risk: write (authenticates CLI/SSH machine via self-issued OIDC device-code flow; saves 0600 credentials)
@@ -1881,7 +1885,7 @@ async function main(): Promise<void> {
       if (sub === "create") {
         assertAllowedFlags(
           flags,
-          ["actor-id", "kind", "role", "in", "family", "label"],
+          ["actor-id", "kind", "role", "in", "write-scope", "family", "label"],
           "token create",
         );
         const targetActorId = requireFlag(flags, "actor-id", "token create");
@@ -1921,6 +1925,7 @@ async function main(): Promise<void> {
           actorFamily: flagStr(flags, "family"),
           actorRole: resolvedRole,
           boundRealmId: boundRealmInput,
+          writeScope: flagStr(flags, "write-scope") as TokenWriteScope | undefined,
           label: flagStr(flags, "label"),
           createdBy: actor.id,
         });
@@ -2606,7 +2611,7 @@ async function main(): Promise<void> {
       if (sub === "create") {
         assertAllowedFlags(
           flags,
-          ["in", "kind", "name", "parent"],
+          ["in", "kind", "name", "parent", "if-not-exists"],
           "object create",
         );
         const ctx = resolveSessionContext({ engine, flags });
@@ -2619,15 +2624,30 @@ async function main(): Promise<void> {
               rawRef: parentRaw,
             })
           : undefined;
-        const obj = engine.objects.createObject({
+        const ifNotExists = flagBool(flags, "if-not-exists");
+        const createdRes = engine.objects.createObjectWithStatus({
           actor,
           viewerRealmId: ctx.boundViewerRealmId,
           targetRealmRef: flagStr(flags, "in") ?? third,
           parentObjectId,
           kind: requireFlag(flags, "kind", "object create"),
           name: requireFlag(flags, "name", "object create"),
+          ifNotExists,
         });
-        output(obj, formatGenericMarkdown("Object Created", obj));
+        const outObj = ifNotExists
+          ? {
+              ...createdRes.object,
+              created: createdRes.created,
+              ...(createdRes.drift ? { drift: createdRes.drift } : {}),
+            }
+          : createdRes.object;
+        output(
+          outObj,
+          formatGenericMarkdown(
+            createdRes.created ? "Object Created" : "Object Already Exists",
+            outObj,
+          ),
+        );
         return;
       }
       if (sub === "move") {
@@ -3167,6 +3187,7 @@ async function main(): Promise<void> {
           flags,
           [
             "in",
+            "target",
             "map",
             "base-dir",
             "source-ref",
@@ -3174,6 +3195,8 @@ async function main(): Promise<void> {
             "ext-kind",
             "sensitivity",
             "about",
+            "exclude",
+            "relocate",
             "include-secret",
             "sync-embeddings",
             "dry-run",
@@ -3191,6 +3214,7 @@ async function main(): Promise<void> {
         const mapPath = flagStr(flags, "map");
         const mapping = mapPath ? loadMappingFile(mapPath) : undefined;
         const isDryRun = flagBool(flags, "dry-run");
+        const exclude = flagMulti(multiFlags, "exclude");
         const importTarget = resolveCliImportTarget({
           ctx,
           explicitIn: flagStr(flags, "in"),
@@ -3206,7 +3230,10 @@ async function main(): Promise<void> {
             baseDir: flagStr(flags, "base-dir"),
             targetRealmRef: importTarget.targetRealmRef,
             virtualDefaultRealmPath: importTarget.virtualDefaultRealmPath,
-            skipSecret: !flagBool(flags, "include-secret"),
+            skipSecret: flagBool(flags, "include-secret")
+              ? false
+              : undefined,
+            exclude,
           });
           output(preview, formatImportDryRunMarkdown(preview));
           if (!preview.valid) {
@@ -3237,13 +3264,16 @@ async function main(): Promise<void> {
           inputPath: third,
           baseDir: flagStr(flags, "base-dir"),
           sourceRef: flagStr(flags, "source-ref"),
-          kind: flagStr(flags, "kind") as RecordKind | undefined,
+          target: flagStr(flags, "target") as ImportTargetLayer | undefined,
+          kind: flagStr(flags, "kind") as RecordKind | SeabedKind | undefined,
           extKind: flagStr(flags, "ext-kind"),
           sensitivity: flagStr(flags, "sensitivity") as Sensitivity | undefined,
-          skipSecret: !flagBool(flags, "include-secret"),
+          skipSecret: flagBool(flags, "include-secret") ? false : undefined,
           objectIds: resolvedAbout.objectIds,
           resourceTags: resolvedAbout.resourceTags,
           mapping,
+          exclude,
+          relocate: flagBool(flags, "relocate"),
           syncEmbeddings: flagBool(flags, "sync-embeddings"),
         });
         output(res, formatImportMdMarkdown(res));
@@ -3252,7 +3282,7 @@ async function main(): Promise<void> {
       if (sub === "jsonl") {
         assertAllowedFlags(
           flags,
-          ["in", "map", "sync-embeddings", "dry-run"],
+          ["in", "target", "map", "relocate", "sync-embeddings", "dry-run"],
           "import jsonl",
         );
         const ctx = resolveSessionContext({ engine, flags });
@@ -3294,6 +3324,8 @@ async function main(): Promise<void> {
           targetRealmRef: importTarget.targetRealmRef,
           jsonlPath: third,
           mapping,
+          target: flagStr(flags, "target") as ImportTargetLayer | undefined,
+          relocate: flagBool(flags, "relocate"),
           syncEmbeddings: flagBool(flags, "sync-embeddings"),
         });
         output(res, formatImportJsonlMarkdown(res));
@@ -3302,7 +3334,17 @@ async function main(): Promise<void> {
       if (sub === "verify") {
         assertAllowedFlags(
           flags,
-          ["source", "in", "map", "base-dir"],
+          [
+            "source",
+            "in",
+            "target",
+            "map",
+            "base-dir",
+            "exclude",
+            "check-realm",
+            "allow-skips",
+            "include-secret",
+          ],
           "import verify",
         );
         const ctx = resolveSessionContext({ engine, flags });
@@ -3322,12 +3364,20 @@ async function main(): Promise<void> {
           mapping,
           readOnly: true,
         });
+        const checkRealmRefs = flagMulti(multiFlags, "check-realm");
         const res = engine.importer.verifyImportConsistency({
+          actor,
           viewerRealmId: ctx.boundViewerRealmId,
           sourcePath,
           mapping,
           baseDir: flagStr(flags, "base-dir"),
+          target: flagStr(flags, "target") as ImportTargetLayer | undefined,
           targetRealmRef: importTarget.targetRealmRef,
+          exclude: flagMulti(multiFlags, "exclude"),
+          checkUnexpectedInRealmRefs:
+            checkRealmRefs.length > 0 ? checkRealmRefs : undefined,
+          allowSkips: parseIntFlag(flags, "allow-skips", { min: 0 }) ?? 0,
+          skipSecret: flagBool(flags, "include-secret") ? false : undefined,
         });
         output(res, formatImportVerifyMarkdown(res));
         if (!res.passed) {
@@ -3347,9 +3397,15 @@ async function main(): Promise<void> {
 }
 
 const wantsJsonErrors = process.argv.includes("--json");
+const isRemoteCliInvocation =
+  Boolean(process.env.MERU_MIND_URL?.trim()) ||
+  process.argv.some((a) => a === "--url" || a.startsWith("--url="));
 
 main().catch((err: unknown) => {
-  const payload = toSurfaceError(err, { surface: "cli" });
+  const payload = toSurfaceError(err, {
+    surface: "cli",
+    remote: isRemoteCliInvocation,
+  });
   if (wantsJsonErrors) {
     process.stderr.write(`${JSON.stringify(payload)}\n`);
   } else {

@@ -145,12 +145,13 @@ export MERU_MIND_EMBED_DIM="1536"
 - **Experimental surfaces** (marked `[experimental]` in `--help`, excluded from the official Agent Skill): `file` (local shared drive), `raw` (direct seabed CLI capture), `settle` (distillation cards), and the `thing` record kind.
 - **SQLite canonical backend**: SQLite (`node:sqlite` WAL) is the sole core backend and online source of truth. Migrating to Postgres is a future trigger-based project (not a zero-rewrite port swap).
 
-### Known Limitations (`v0.6.4`)
+### Known Limitations (`v0.6.5`)
 1. **Lexical-only by default**: Without an external embedding endpoint configured, recall relies purely on CJK-bigram + Latin FTS5 and windowed coverage.
 2. **Bulk import does not auto-link `supersedes`**: Imported Markdown/JSONL entries without explicit `supersedes` references remain active side-by-side until explicitly linked (live writes return a neutral related-active echo so agents can link them explicitly).
 3. **Single-writer SQLite server model**: `meru-mind serve` takes an exclusive writer lock on `mind.sqlite` and expects persistent local block storage (avoid multi-replica containers over NFS/SMB).
 4. **`node:sqlite` experimental runtime**: Node.js currently marks `node:sqlite` experimental; CI verifies both Node 22 and Node 24.
-5. **`tree` mode self-realm write boundary**: In `--policy tree`, writes target the token's own bound realm (ancestors/descendants are read-only). Single teams sharing one workspace should use `--policy open`, or keep flat writable realms per isolation boundary and organize sub-topics via `--about project:<name>`.
+5. **`tree` mode write boundaries**: In `--policy tree`, writes default to the token's own bound realm (`--write-scope self`). Non-root domain tokens may opt in to `--write-scope subtree` at issuance time for content writes across descendants (rules and admin actions remain strictly self-realm/human-only; root `/` tokens cannot use `subtree`). Single teams sharing one workspace should use `--policy open`.
+6. **`sensitivity: "secret"` entries are write-only**: Secret-classified entries are unconditionally excluded from all read, discovery, echo, and verification paths (`show`, `ls`, `search`, `changes`, write-time related echo, and `import verify`) and do not deduplicate on re-import (each re-import appends a new entry rather than matching sealed rows). Downgrading a `sourceRef` from `secret` to `internal` creates a new active non-secret record while leaving the sealed `secret` record untouched.
 
 ---
 
@@ -172,7 +173,7 @@ We evaluated Meru Mind (lexical-only, `vector_enabled: false`) against a real-wo
 
 ---
 
-## Shipped Capabilities (`v0.2.0` → `v0.6.4`)
+## Shipped Capabilities (`v0.2.0` → `v0.6.5`)
 
 See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md), [`docs/UI_BUILDER_SKILL.md`](./docs/UI_BUILDER_SKILL.md), and [`THREAT_MODEL.md`](./THREAT_MODEL.md) for deployment, security, and custom UI authoring details:
 
@@ -187,6 +188,7 @@ See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md), [`do
 - **`v0.6.2`**: Automated multi-arch GHCR Docker publishing (`linux/amd64`, `linux/arm64` + SLSA provenance), prebuilt-image Compose stacks, `meru-mind upgrade` / `update` (with container self-upgrade guard), and zero-prompt multi-harness `/swarm` & subagent session propagation (`examples/hooks/` + `src/harness-session.ts`).
 - **`v0.6.3`**: Verified GHCR Docker Compose one-shot bootstrap (`admin init` + `--role admin`), `MERU_MIND_PUBLIC_URL` wiring in base Compose, `meru-mind --version` / `-v`, and clear zero-organization guidance errors.
 - **`v0.6.4`**: Studio UI UX & plain-language redesign — single `VOCAB` translation layer (`Entries` / `Objects` / `Rules` / `Inbox` & `记录` / `对象` / `规矩` / `待分拣`), direct-content workspace (removing the redundant Overview tab & 4-cell KPI strip), auto-collapsing right properties rail (moving `rec_xxx` off list cards), Linear-style certainty-circle segmented composer (replacing native `<select>`), and teaching empty states.
+- **`v0.6.5`**: Opt-in non-root `--write-scope subtree` domain tokens (Schema v14, strict `content` vs `admin` write policy separation, automatic Cookie downgrade to `self`), full remote `object` lifecycle (`/v1/objects/*` with `--if-not-exists` drift reporting and human-only `object delete`), and unified transactional online/local batch import (`POST /v1/import/batch`) + independent zero-truncation SHA-256 verification (`POST /v1/import/verify`) with `--target record|seabed`, NFC normalization, fatal UTF-8 decoding, 1.2 MB per-item cap, and sealed tree-mode cross-realm `sourceRef` isolation. Note: seabed imports preserve exact raw UTF-8 bytes (pre-v0.6.5 trimmed seabed rows with leading/trailing whitespace append one byte-exact revision on first re-import), and `sensitivity: "secret"` entries remain excluded from discovery (`ls`/`search`/`changes`) and `import verify` (never readable or oracle-able through import/verify).
 
 ## License
 

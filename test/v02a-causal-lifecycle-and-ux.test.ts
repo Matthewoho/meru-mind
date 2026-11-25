@@ -188,7 +188,7 @@ describe("V0.2a Causal Entity Lifecycle & Round-3 UX Polish", () => {
         try {
           db = new SqliteDb({ dbPath, enableVector: false });
           const vers = db.listSchemaMigrations().map((m) => m.version);
-          if (vers.join(",") !== "1,2,3,4,5,6,7,8,9,10,11,12,13") {
+          if (vers.join(",") !== "1,2,3,4,5,6,7,8,9,10,11,12,13,14") {
             throw new Error("bad versions: " + vers.join(","));
           }
           process.stdout.write(JSON.stringify({ ok: true }) + "\\n");
@@ -240,7 +240,7 @@ describe("V0.2a Causal Entity Lifecycle & Round-3 UX Polish", () => {
     const reopened = await createMindEngine({ homeDir, enableVector: false });
     engines.push(reopened);
     expect(reopened.db.listSchemaMigrations().map((m) => m.version)).toEqual([
-      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
     ]);
     expect(reopened.db.listObjectAliases([objNormal.id])).toHaveLength(1);
     expect(reopened.db.listObjectAliases([objPunctOnly.id])).toHaveLength(0);

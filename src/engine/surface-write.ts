@@ -13,6 +13,7 @@ import {
   type RealmMount,
   type RecordKind,
   type Sensitivity,
+  type TokenWriteScope,
   type WriteRouteSource,
 } from "../types.js";
 import {
@@ -213,6 +214,7 @@ export interface SurfaceWriteParams {
   occurredAt?: string | null;
   sensitivity?: Sensitivity;
   explicitIdempotencyKey?: string;
+  writeScope?: TokenWriteScope;
   /** Human-only CLI override; NEVER exposed in MCP */
   allowRedactedReingest?: boolean;
   /** Optional clock override for deterministic bucket tests */
@@ -405,6 +407,7 @@ export async function writeEverydayConclusion(
     occurredAt: params.occurredAt,
     sensitivity,
     idempotencyKey,
+    writeScope: params.writeScope,
     allowRedactedReingest: allowHumanOverride,
   });
 }

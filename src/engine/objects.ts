@@ -14,8 +14,10 @@ import {
 } from "../format/inactive-badges.js";
 import { extractReadableText } from "../format/snippet.js";
 import {
-  assertAccess,
+  assertWriteAccess,
+  getAncestorIds,
   intersectAccessScopes,
+  normalizeWriteScope,
   resolveAccess,
   resolveAccessScope,
 } from "../policy.js";
@@ -24,16 +26,19 @@ import {
   MindError,
   type AccessScope,
   type Actor,
+  type CreateObjectResult,
   type EntryObjectLink,
   type MindObject,
   type ObjectAlias,
   type ObjectAliasUpdateResult,
+  type ObjectCreateDrift,
   type ObjectState,
   type ObjectStateSetResult,
   type OrgPolicy,
   type Realm,
   type ResourceTag,
   type ResourceTagSummary,
+  type TokenWriteScope,
 } from "../types.js";
 import { createVisibilityHelpers, sanitizeRealmsForScope } from "./visibility.js";
 
@@ -263,7 +268,7 @@ export class ObjectEngine {
     });
   }
 
-  createObject(params: {
+  createObjectWithStatus(params: {
     actor: Actor;
     viewerRealmId: string;
     targetRealmRef?: string;
@@ -271,8 +276,10 @@ export class ObjectEngine {
     kind: string;
     name: string;
     id?: string;
+    ifNotExists?: boolean;
+    writeScope?: TokenWriteScope;
     scopeCeiling?: AccessScope;
-  }): MindObject {
+  }): CreateObjectResult {
     const kind = params.kind.trim().toLowerCase();
     if (!kind) {
       throw new MindError("INVALID_INPUT", "Object kind cannot be empty");
@@ -283,7 +290,7 @@ export class ObjectEngine {
         'Object kind "file" is reserved for file:<path> references',
       );
     }
-    const name = params.name.trim();
+    const name = params.name.trim().normalize("NFC");
     if (!name) {
       throw new MindError("INVALID_INPUT", "Object name cannot be empty");
     }
@@ -308,15 +315,16 @@ export class ObjectEngine {
           })
         : viewerRealm;
 
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor: params.actor,
         viewerRealmId: viewerRealm.id,
         targetRealmId: targetRealm.id,
         assetKind: "ledger",
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: "content",
       });
 
       const id = params.id?.trim() || makeId("obj");
@@ -335,6 +343,80 @@ export class ObjectEngine {
         const orgObjects = this.db.listObjects({ orgId: viewerRealm.orgId });
         const objectsById = new Map(orgObjects.map((o) => [o.id, o]));
         assertNoObjectCycle(objectsById, id, parentObjectId);
+      }
+
+      const vis = createVisibilityHelpers({
+        db: this.db,
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        scope,
+      });
+
+      // Check existing (org_id, lower(kind), lower(name)) strictly within targetRealm + readable realms
+      // (matches in hidden realms are completely ignored -> zero existence oracle).
+      const matchingByKindName = this.db.findObjectsByKindName(
+        viewerRealm.orgId,
+        kind,
+        name,
+      );
+      const sameRealmMatch = matchingByKindName.find(
+        (o) => o.realmId === targetRealm.id,
+      );
+      const otherVisibleMatch = matchingByKindName.find(
+        (o) =>
+          o.realmId !== targetRealm.id &&
+          scope.readableLedgerIds.includes(o.realmId),
+      );
+
+      if (params.ifNotExists) {
+        if (sameRealmMatch) {
+          const sanitizedExisting = vis.sanitizeObject(sameRealmMatch);
+          let drift: ObjectCreateDrift | undefined;
+          if (
+            params.parentObjectId !== undefined &&
+            parentObjectId !== sanitizedExisting.parentObjectId
+          ) {
+            drift = {
+              parentObjectId: {
+                existing: sanitizedExisting.parentObjectId,
+                requested: parentObjectId,
+              },
+            };
+          }
+          return {
+            object: sanitizedExisting,
+            created: false,
+            ...(drift ? { drift } : {}),
+          };
+        }
+        if (otherVisibleMatch) {
+          const otherRealmRaw = realms.find(
+            (r) => r.id === otherVisibleMatch.realmId,
+          );
+          const otherRealmPath = otherRealmRaw
+            ? vis.sanitizeRealm(otherRealmRaw).path
+            : otherVisibleMatch.realmId;
+          throw new MindError(
+            "CONFLICT",
+            `Object "${kind}:${name}" already exists in visible realm "${otherRealmPath}".`,
+            {
+              reason: "object_exists_in_other_realm",
+              existingObjectId: otherVisibleMatch.id,
+              existingRealmPath: otherRealmPath,
+            },
+          );
+        }
+      } else if (sameRealmMatch) {
+        throw new MindError(
+          "CONFLICT",
+          `Object "${kind}:${name}" already exists in realm "${targetRealm.path}".`,
+          {
+            reason: "object_already_exists",
+            existingObjectId: sameRealmMatch.id,
+          },
+        );
       }
 
       const now = new Date().toISOString();
@@ -357,16 +439,26 @@ export class ObjectEngine {
         actorId: params.actor.id,
         createdAt: now,
       });
-      const vis = createVisibilityHelpers({
-        db: this.db,
-        realms,
-        mounts,
-        actor: params.actor,
-        viewerRealmId: viewerRealm.id,
-        scope,
-      });
-      return vis.sanitizeObject(obj);
+      return {
+        object: vis.sanitizeObject(obj),
+        created: true,
+      };
     });
+  }
+
+  createObject(params: {
+    actor: Actor;
+    viewerRealmId: string;
+    targetRealmRef?: string;
+    parentObjectId?: string | null;
+    kind: string;
+    name: string;
+    id?: string;
+    ifNotExists?: boolean;
+    writeScope?: TokenWriteScope;
+    scopeCeiling?: AccessScope;
+  }): MindObject {
+    return this.createObjectWithStatus(params).object;
   }
 
   moveObject(params: {
@@ -374,6 +466,7 @@ export class ObjectEngine {
     viewerRealmId: string;
     objectId: string;
     parentObjectId: string | null;
+    writeScope?: TokenWriteScope;
     scopeCeiling?: AccessScope;
   }): MindObject {
     if (!params.actor?.id?.trim()) {
@@ -395,15 +488,16 @@ export class ObjectEngine {
         throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
       }
 
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor: params.actor,
         viewerRealmId: viewerRealm.id,
         targetRealmId: obj.realmId,
         assetKind: "ledger",
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: "content",
       });
 
       const nextParentId = params.parentObjectId?.trim() || null;
@@ -455,6 +549,7 @@ export class ObjectEngine {
     label?: string;
     since?: string;
     because?: string;
+    writeScope?: TokenWriteScope;
     scopeCeiling?: AccessScope;
   }): ObjectStateSetResult {
     if (!params.actor?.id?.trim()) {
@@ -524,15 +619,16 @@ export class ObjectEngine {
         throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
       }
 
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor: params.actor,
         viewerRealmId: viewerRealm.id,
         targetRealmId: obj.realmId,
         assetKind: "ledger",
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: "content",
       });
 
       const vis = createVisibilityHelpers({
@@ -723,6 +819,7 @@ export class ObjectEngine {
     objectId: string;
     add?: string[];
     remove?: string[];
+    writeScope?: TokenWriteScope;
     scopeCeiling?: AccessScope;
   }): ObjectAliasUpdateResult {
     if (!params.actor?.id?.trim()) {
@@ -769,15 +866,16 @@ export class ObjectEngine {
         throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
       }
 
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor: params.actor,
         viewerRealmId: viewerRealm.id,
         targetRealmId: obj.realmId,
         assetKind: "ledger",
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: "content",
       });
 
       const existingMap = new Map<string, ObjectAlias>(
@@ -955,10 +1053,20 @@ export class ObjectEngine {
     actor: Actor;
     viewerRealmId: string;
     objectId: string;
+    writeScope?: TokenWriteScope;
     scopeCeiling?: AccessScope;
   }): boolean {
     if (!params.actor?.id?.trim()) {
       throw new MindError("INVALID_INPUT", "Actor id cannot be empty");
+    }
+    if (params.actor.kind !== "human") {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Only human actors can delete objects (actor "${params.actor.id}" is "${params.actor.kind}").`,
+        {
+          try: "meru-mind object delete <objRef> --as-human",
+        },
+      );
     }
     return this.db.transaction(() => {
       const { viewerRealm, orgPolicy, realms, scope } = this.resolveScope({
@@ -976,15 +1084,16 @@ export class ObjectEngine {
         throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
       }
 
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor: params.actor,
         viewerRealmId: viewerRealm.id,
         targetRealmId: obj.realmId,
         assetKind: "ledger",
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: "admin",
       });
 
       if (this.db.countChildObjects(obj.id) > 0) {
@@ -1015,6 +1124,7 @@ export class ObjectEngine {
     viewerRealmId: string;
     entryId: string;
     objectId: string;
+    writeScope?: TokenWriteScope;
     scopeCeiling?: AccessScope;
   }): EntryObjectLink {
     if (!params.actor?.id?.trim()) {
@@ -1039,6 +1149,13 @@ export class ObjectEngine {
       if (entryOrgId !== viewerRealm.orgId) {
         throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
       }
+      const realmsById = new Map(realms.map((r) => [r.id, r]));
+      const allowDescendantSeabedDive =
+        assetKind === "seabed" &&
+        orgPolicy === "tree" &&
+        normalizeWriteScope(params.writeScope) === "subtree" &&
+        viewerRealm.parentId !== null &&
+        getAncestorIds(realmsById, entryRealmId).includes(viewerRealm.id);
       const readLevel = resolveAccess({
         realms,
         mounts,
@@ -1046,20 +1163,22 @@ export class ObjectEngine {
         viewerRealmId: viewerRealm.id,
         targetRealmId: entryRealmId,
         assetKind,
+        explicitDescendantDive: allowDescendantSeabedDive,
         orgPolicy,
       });
       if (readLevel === "none") {
         throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
       }
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor: params.actor,
         viewerRealmId: viewerRealm.id,
         targetRealmId: entryRealmId,
         assetKind,
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: assetKind === "rule" ? "admin" : "content",
       });
 
       const obj = this.db.getObject(params.objectId);
@@ -1095,6 +1214,7 @@ export class ObjectEngine {
     viewerRealmId: string;
     entryId: string;
     objectId: string;
+    writeScope?: TokenWriteScope;
     scopeCeiling?: AccessScope;
   }): boolean {
     if (!params.actor?.id?.trim()) {
@@ -1119,6 +1239,13 @@ export class ObjectEngine {
       if (entryOrgId !== viewerRealm.orgId) {
         throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
       }
+      const realmsById = new Map(realms.map((r) => [r.id, r]));
+      const allowDescendantSeabedDive =
+        assetKind === "seabed" &&
+        orgPolicy === "tree" &&
+        normalizeWriteScope(params.writeScope) === "subtree" &&
+        viewerRealm.parentId !== null &&
+        getAncestorIds(realmsById, entryRealmId).includes(viewerRealm.id);
       const readLevel = resolveAccess({
         realms,
         mounts,
@@ -1126,20 +1253,22 @@ export class ObjectEngine {
         viewerRealmId: viewerRealm.id,
         targetRealmId: entryRealmId,
         assetKind,
+        explicitDescendantDive: allowDescendantSeabedDive,
         orgPolicy,
       });
       if (readLevel === "none") {
         throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
       }
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor: params.actor,
         viewerRealmId: viewerRealm.id,
         targetRealmId: entryRealmId,
         assetKind,
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: assetKind === "rule" ? "admin" : "content",
       });
 
       const obj = this.db.getObject(params.objectId);
@@ -1172,6 +1301,7 @@ export class ObjectEngine {
     viewerRealmId: string;
     entryId: string;
     tag: string;
+    writeScope?: TokenWriteScope;
     scopeCeiling?: AccessScope;
   }): ResourceTag {
     if (!params.actor?.id?.trim()) {
@@ -1197,6 +1327,13 @@ export class ObjectEngine {
       if (entryOrgId !== viewerRealm.orgId) {
         throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
       }
+      const realmsById = new Map(realms.map((r) => [r.id, r]));
+      const allowDescendantSeabedDive =
+        assetKind === "seabed" &&
+        orgPolicy === "tree" &&
+        normalizeWriteScope(params.writeScope) === "subtree" &&
+        viewerRealm.parentId !== null &&
+        getAncestorIds(realmsById, entryRealmId).includes(viewerRealm.id);
       const readLevel = resolveAccess({
         realms,
         mounts,
@@ -1204,20 +1341,22 @@ export class ObjectEngine {
         viewerRealmId: viewerRealm.id,
         targetRealmId: entryRealmId,
         assetKind,
+        explicitDescendantDive: allowDescendantSeabedDive,
         orgPolicy,
       });
       if (readLevel === "none") {
         throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
       }
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor: params.actor,
         viewerRealmId: viewerRealm.id,
         targetRealmId: entryRealmId,
         assetKind,
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: assetKind === "rule" ? "admin" : "content",
       });
 
       const resTag: ResourceTag = {

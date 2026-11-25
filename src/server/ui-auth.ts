@@ -81,6 +81,7 @@ export class UiSessionManager {
       principal: {
         ...principal,
         authKind: "cookie",
+        writeScope: "self",
       },
       expiresAtMs,
     });
@@ -122,6 +123,7 @@ export class UiSessionManager {
     const cookiePrincipal: Principal = {
       ...pending.principal,
       authKind: "cookie",
+      writeScope: "self",
     };
     this.sessions.set(sessionId, {
       sessionId,
@@ -195,6 +197,7 @@ export class UiSessionManager {
     const cookiePrincipal: Principal = {
       ...principal,
       authKind: "cookie",
+      writeScope: "self",
     };
     this.sessions.set(sessionId, {
       sessionId,

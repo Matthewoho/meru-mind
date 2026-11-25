@@ -151,6 +151,8 @@ export interface DbPort {
 
   close(): void;
   transaction<T>(fn: () => T): T;
+  /** Runs `fn` inside a BEGIN IMMEDIATE transaction and ALWAYS rolls back (emitting zero committed change events). */
+  dryRunTransaction<T>(fn: () => T): T;
   getQueryCount(): number;
   resetQueryCount(): void;
 
@@ -218,6 +220,48 @@ export interface DbPort {
     sourceRef: string,
     realmId?: string,
   ): LedgerRecord | null;
+  findActiveRecordsBySourceRefInRealms(
+    orgId: string,
+    sourceRef: string,
+    realmIds: string[],
+    options?: { excludeSecret?: boolean },
+  ): LedgerRecord[];
+  hasRealmSourceRefMoveOut(
+    orgId: string,
+    realmId: string,
+    sourceRef: string,
+    options?: { excludeSecret?: boolean },
+  ): boolean;
+  findLatestRecordsBySourceRefInRealms(
+    orgId: string,
+    sourceRef: string,
+    realmIds: string[],
+    options?: { excludeSecret?: boolean },
+  ): LedgerRecord[];
+  findLatestRecordByPayloadSourceIdInRealms(
+    orgId: string,
+    sourceId: string,
+    realmIds: string[],
+    options?: { excludeSecret?: boolean },
+  ): LedgerRecord | null;
+  findSeabedBySourceRefInRealms(
+    orgId: string,
+    sourceRef: string,
+    realmIds: string[],
+    options?: { excludeSecret?: boolean; limitPerRealm?: number },
+  ): SeabedEntry[];
+  listImportedSourceRefsInRealms(
+    orgId: string,
+    ledgerRealmIds: string[],
+    seabedRealmIds: string[],
+    options?: { excludeSecret?: boolean },
+  ): Array<{
+    sourceRef: string;
+    realmId: string;
+    layer: "record" | "seabed";
+    entryId: string;
+    status: string;
+  }>;
   findRecordsByExternalRef(
     orgId: string,
     externalRef: string,
@@ -326,6 +370,12 @@ export interface DbPort {
   insertObject(obj: MindObject): void;
   getObject(id: string): MindObject | null;
   getObjectsByIds(ids: string[]): MindObject[];
+  findObjectsByKindName(
+    orgId: string,
+    kind: string,
+    name: string,
+    realmIds?: string[],
+  ): MindObject[];
   listObjects(filter: {
     orgId: string;
     realmIds?: string[];

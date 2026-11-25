@@ -6,11 +6,19 @@ import type {
   AuthTokenPublic,
   ChangeLogEntry,
   ChangesResult,
+  CreateObjectResult,
+  EntryObjectLink,
+  ImportBatchInput,
+  ImportBatchResult,
   LedgerRecord,
   LsOnlyFilter,
   LsResult,
+  MindObject,
   MountScope,
   MoveEntriesResult,
+  ObjectAliasUpdateResult,
+  ObjectState,
+  ObjectStateSetResult,
   OrgPolicy,
   Organization,
   Principal,
@@ -25,7 +33,10 @@ import type {
   Sensitivity,
   ShowResult,
   ShowSupersedeChainResult,
+  TokenWriteScope,
   TreeResult,
+  VerifyImportInput,
+  VerifyImportResult,
   WhoamiResult,
   WriteRouteSource,
 } from "./types.js";
@@ -171,12 +182,54 @@ export interface SurfaceCreateTokenInput {
   actorFamily?: string | null;
   actorRole?: ActorRole;
   boundRealmRef?: string | null;
+  writeScope?: TokenWriteScope;
   label?: string | null;
 }
 
 export interface SurfaceCreateTokenResult {
   token: string;
   record: AuthTokenPublic;
+}
+
+export interface SurfaceCreateObjectInput {
+  in?: string;
+  kind: string;
+  name: string;
+  parentRef?: string | null;
+  ifNotExists?: boolean;
+}
+
+export interface SurfaceMoveObjectInput {
+  ref: string;
+  parentRef: string | null;
+}
+
+export interface SurfaceDeleteObjectInput {
+  ref: string;
+}
+
+export interface SurfaceLinkObjectInput {
+  entryId: string;
+  objectRef: string;
+}
+
+export interface SurfaceUnlinkObjectInput {
+  entryId: string;
+  objectRef: string;
+}
+
+export interface SurfaceSetObjectStateInput {
+  ref: string;
+  state: ObjectState;
+  label?: string;
+  since?: string;
+  because?: string;
+}
+
+export interface SurfaceUpdateObjectAliasesInput {
+  ref: string;
+  add?: string[];
+  remove?: string[];
 }
 
 /**
@@ -214,6 +267,21 @@ export interface MindSurface {
   createToken(params: SurfaceCreateTokenInput): Promise<SurfaceCreateTokenResult>;
   listTokens(params?: { includeRevoked?: boolean }): Promise<AuthTokenPublic[]>;
   revokeToken(params: { tokenId: string }): Promise<boolean>;
+
+  // Object lifecycle management (v0.6.5 remote & local parity)
+  createObject(params: SurfaceCreateObjectInput): Promise<CreateObjectResult>;
+  moveObject(params: SurfaceMoveObjectInput): Promise<MindObject>;
+  deleteObject(params: SurfaceDeleteObjectInput): Promise<boolean>;
+  linkObject(params: SurfaceLinkObjectInput): Promise<EntryObjectLink>;
+  unlinkObject(params: SurfaceUnlinkObjectInput): Promise<boolean>;
+  setObjectState(params: SurfaceSetObjectStateInput): Promise<ObjectStateSetResult>;
+  updateObjectAliases(
+    params: SurfaceUpdateObjectAliasesInput,
+  ): Promise<ObjectAliasUpdateResult>;
+
+  // Unified online/local batch import & independent verification (v0.6.5)
+  importBatch(params: ImportBatchInput): Promise<ImportBatchResult>;
+  verifyImport(params: VerifyImportInput): Promise<VerifyImportResult>;
 
   // External WorkProvider SSOT bindings & live queries (v0.5; zero task tables in mind-core)
   bindWork(params: {

@@ -1,6 +1,17 @@
-import { assertAccess, getDescendantIds, resolveAccessScope } from "./policy.js";
+import {
+  assertWriteAccess,
+  getDescendantIds,
+  normalizeWriteScope,
+  resolveAccessScope,
+} from "./policy.js";
 import type { MindEngine } from "./index.js";
-import { OPAQUE_ENTRY_NOT_FOUND, resolveVisibleRealm } from "./engine/objects.js";
+import {
+  OPAQUE_ENTRY_NOT_FOUND,
+  OPAQUE_OBJECT_NOT_FOUND,
+  resolveVisibleRealm,
+} from "./engine/objects.js";
+import { parseRefSyntax, resolveUnifiedObjectRead } from "./engine/refs.js";
+import { createVisibilityHelpers } from "./engine/visibility.js";
 import { assertNoAccidentalSecret } from "./engine/secret-guard.js";
 import {
   findRelatedActiveForEcho,
@@ -28,18 +39,25 @@ import type {
   MindSurface,
   SurfaceAddRuleInput,
   SurfaceChangesParams,
+  SurfaceCreateObjectInput,
   SurfaceCreateRealmInput,
   SurfaceUpdateRealmInput,
   SurfaceCreateTokenInput,
   SurfaceCreateTokenResult,
+  SurfaceDeleteObjectInput,
+  SurfaceLinkObjectInput,
   SurfaceLsParams,
   SurfaceMountRealmInput,
   SurfaceMoveInput,
+  SurfaceMoveObjectInput,
   SurfaceRawAddInput,
   SurfaceRedactInput,
   SurfaceSearchParams,
+  SurfaceSetObjectStateInput,
   SurfaceShowParams,
   SurfaceTreeParams,
+  SurfaceUnlinkObjectInput,
+  SurfaceUpdateObjectAliasesInput,
   SurfaceWriteInput,
   SurfaceWriteResult,
 } from "./surface.js";
@@ -49,9 +67,16 @@ import {
   type AuthTokenPublic,
   type ChangeLogEntry,
   type ChangesResult,
+  type CreateObjectResult,
+  type EntryObjectLink,
+  type ImportBatchInput,
+  type ImportBatchResult,
   type LedgerRecord,
   type LsResult,
+  type MindObject,
   type MoveEntriesResult,
+  type ObjectAliasUpdateResult,
+  type ObjectStateSetResult,
   type Organization,
   type Principal,
   type Realm,
@@ -63,7 +88,10 @@ import {
   type SearchResult,
   type ShowResult,
   type ShowSupersedeChainResult,
+  type TokenWriteScope,
   type TreeResult,
+  type VerifyImportInput,
+  type VerifyImportResult,
   type WhoamiResult,
 } from "./types.js";
 
@@ -195,12 +223,67 @@ export class LocalMindSurface implements MindSurface {
     }
   }
 
+  private effectiveWriteScope(): TokenWriteScope {
+    if (this.principal.authKind === "cookie") {
+      return "self";
+    }
+    return normalizeWriteScope(this.principal.writeScope);
+  }
+
+  private isOrgRootPrincipal(realms: Realm[]): boolean {
+    const root = realms.find(
+      (r) =>
+        r.orgId === this.principal.orgId &&
+        r.parentId === null &&
+        r.path === "/",
+    );
+    return Boolean(root && this.principal.boundRealmId === root.id);
+  }
+
+  private resolveObjectIdForSurface(
+    rawRef: string,
+    ctx: { org: Organization; realms: Realm[]; mounts: RealmMount[]; scope: AccessScope },
+  ): string {
+    const parsed = parseRefSyntax(rawRef);
+    if (parsed.kind !== "object") {
+      throw new MindError(
+        "INVALID_REF",
+        `Expected object reference (<kind>:<name>, /<realm>/<kind>:<name>, or obj_...), got "${rawRef}"`,
+        { try: "meru-mind ls --only objects" },
+      );
+    }
+    const vis = createVisibilityHelpers({
+      db: this.engine.db,
+      realms: ctx.realms,
+      mounts: ctx.mounts,
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      scope: ctx.scope,
+    });
+    const resolved = resolveUnifiedObjectRead({
+      db: this.engine.db,
+      realms: ctx.realms,
+      orgId: ctx.org.id,
+      parsed,
+      scope: ctx.scope,
+      vis,
+      verb: "show",
+    });
+    if (!resolved.object) {
+      throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND, {
+        try: `meru-mind object create --kind ${resolved.objectKind} --name ${resolved.objectName}`,
+      });
+    }
+    return resolved.object.id;
+  }
+
   async whoami(): Promise<WhoamiResult> {
     const ctx = this.resolveScopeContext(false);
     const res = this.engine.sea.whoami({
       actor: this.principal.actor,
       viewerRealmId: this.principal.boundRealmId,
       boundSource: this.principal.boundSource,
+      writeScope: this.effectiveWriteScope(),
       storePath: this.storeDescriptor.path,
       scopeCeiling: ctx.scope,
     });
@@ -397,15 +480,17 @@ export class LocalMindSurface implements MindSurface {
           })
         : ctx.scope;
 
-    assertAccess({
+    const writeScope = this.effectiveWriteScope();
+    assertWriteAccess({
       realms: routed.realms,
       mounts: ctx.mounts,
       actor: this.principal.actor,
       viewerRealmId: this.principal.boundRealmId,
       targetRealmId: routed.realm.id,
       assetKind: "ledger",
-      required: "write",
       orgPolicy: ctx.org.policy,
+      writeScope,
+      category: "content",
     });
 
     // Collision hints (v0.3 + v0.5.4): look back to the EARLIER of `baselineSeq` or 10 minutes ago
@@ -439,6 +524,7 @@ export class LocalMindSurface implements MindSurface {
       actor: this.principal.actor,
       viewerRealmId: this.principal.boundRealmId,
       targetRealmId: routed.realm.id,
+      writeScope,
       title: params.title,
       body: params.body,
       kind: params.kind,
@@ -520,6 +606,7 @@ export class LocalMindSurface implements MindSurface {
       occurredAt: params.occurredAt,
       sensitivity: params.sensitivity,
       idempotencyKey: params.idempotencyKey,
+      writeScope: this.effectiveWriteScope(),
     });
   }
 
@@ -675,13 +762,55 @@ export class LocalMindSurface implements MindSurface {
   }
 
   async redact(params: SurfaceRedactInput): Promise<RedactResult> {
-    const cliCmd = `meru-mind redact ${params.entryId}${params.reason ? ` --reason ${JSON.stringify(params.reason)}` : ""} --as-human`;
+    if (typeof params?.entryId !== "string" || !params.entryId.trim()) {
+      throw new MindError(
+        "INVALID_INPUT",
+        "redact requires a non-empty string entryId",
+        { try: "meru-mind redact <entryId> --reason <reason> --as-human" },
+      );
+    }
+    const entryId = params.entryId.trim();
+    const reason =
+      params.reason === undefined
+        ? undefined
+        : typeof params.reason === "string"
+          ? params.reason
+          : (() => {
+              throw new MindError(
+                "INVALID_INPUT",
+                "redact reason must be a string",
+              );
+            })();
+    const cliCmd = `meru-mind redact ${entryId}${reason ? ` --reason ${JSON.stringify(reason)}` : ""} --as-human`;
     this.assertNotWeakenedCookie("redact", cliCmd);
     this.assertHuman("redact entries", cliCmd);
+    const ctx = this.resolveScopeContext(true);
+    if (ctx.org.policy === "tree" && !this.isOrgRootPrincipal(ctx.realms)) {
+      const rec = this.engine.db.getRecord(entryId);
+      const sea = rec ? null : this.engine.db.getSeabedEntry(entryId);
+      const entryOrgId = rec?.orgId ?? sea?.orgId ?? null;
+      const entryRealmId = rec?.realmId ?? sea?.realmId ?? null;
+      const isVisible = rec
+        ? ctx.scope.readableLedgerIds.includes(rec.realmId)
+        : sea
+          ? ctx.scope.readableSeabedIds.includes(sea.realmId)
+          : false;
+      if (!entryRealmId || entryOrgId !== ctx.org.id || !isVisible) {
+        throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+      }
+      const boundSubtree = this.getBoundSubtreeRealmIds(ctx.realms);
+      if (!boundSubtree.has(entryRealmId)) {
+        const entryRealm = ctx.realms.find((r) => r.id === entryRealmId);
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Cannot redact entry in "${entryRealm?.path ?? entryRealmId}": realm is outside your bound subtree.`,
+        );
+      }
+    }
     return this.engine.ledger.redact({
       actor: this.principal.actor,
-      entryId: params.entryId,
-      reason: params.reason,
+      entryId,
+      reason,
       viewerRealmId: this.principal.boundRealmId,
     });
   }
@@ -860,7 +989,7 @@ export class LocalMindSurface implements MindSurface {
   async createToken(
     params: SurfaceCreateTokenInput,
   ): Promise<SurfaceCreateTokenResult> {
-    const cliCmd = `meru-mind token create --actor-id ${params.actorId} --kind ${params.actorKind}${params.boundRealmRef ? ` --in ${params.boundRealmRef}` : ""}`;
+    const cliCmd = `meru-mind token create --actor-id ${params.actorId} --kind ${params.actorKind}${params.boundRealmRef ? ` --in ${params.boundRealmRef}` : ""}${params.writeScope ? ` --write-scope ${params.writeScope}` : ""}`;
     this.assertOrgRootHuman("create authentication tokens", cliCmd);
     return createAuthToken({
       db: this.engine.db,
@@ -870,6 +999,7 @@ export class LocalMindSurface implements MindSurface {
       actorFamily: params.actorFamily,
       actorRole: params.actorRole,
       boundRealmId: params.boundRealmRef,
+      writeScope: params.writeScope,
       label: params.label,
       createdBy: this.principal.actor.id,
     });
@@ -893,6 +1023,162 @@ export class LocalMindSurface implements MindSurface {
       params.tokenId,
       new Date().toISOString(),
     );
+  }
+
+  async createObject(
+    params: SurfaceCreateObjectInput,
+  ): Promise<CreateObjectResult> {
+    const ctx = this.resolveScopeContext(false);
+    const parentObjectId = params.parentRef?.trim()
+      ? this.resolveObjectIdForSurface(params.parentRef.trim(), ctx)
+      : params.parentRef === null
+        ? null
+        : undefined;
+    return this.engine.objects.createObjectWithStatus({
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      targetRealmRef: params.in,
+      parentObjectId,
+      kind: params.kind,
+      name: params.name,
+      ifNotExists: params.ifNotExists,
+      writeScope: this.effectiveWriteScope(),
+      scopeCeiling: ctx.scope,
+    });
+  }
+
+  async moveObject(params: SurfaceMoveObjectInput): Promise<MindObject> {
+    this.assertNotWeakenedCookie(
+      "object move",
+      `meru-mind object move ${params.ref} --parent ${params.parentRef ?? "none"}`,
+    );
+    const ctx = this.resolveScopeContext(false);
+    const objectId = this.resolveObjectIdForSurface(params.ref, ctx);
+    const parentRaw = params.parentRef?.trim() ?? "";
+    const nextParentId =
+      !parentRaw ||
+      parentRaw.toLowerCase() === "none" ||
+      parentRaw.toLowerCase() === "null"
+        ? null
+        : this.resolveObjectIdForSurface(parentRaw, ctx);
+    return this.engine.objects.moveObject({
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      objectId,
+      parentObjectId: nextParentId,
+      writeScope: this.effectiveWriteScope(),
+      scopeCeiling: ctx.scope,
+    });
+  }
+
+  async deleteObject(params: SurfaceDeleteObjectInput): Promise<boolean> {
+    this.assertNotWeakenedCookie(
+      "object delete",
+      `meru-mind object delete ${params.ref}`,
+    );
+    const ctx = this.resolveScopeContext(false);
+    const objectId = this.resolveObjectIdForSurface(params.ref, ctx);
+    return this.engine.objects.deleteObject({
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      objectId,
+      writeScope: this.effectiveWriteScope(),
+      scopeCeiling: ctx.scope,
+    });
+  }
+
+  async linkObject(params: SurfaceLinkObjectInput): Promise<EntryObjectLink> {
+    const ctx = this.resolveScopeContext(false);
+    const objectId = this.resolveObjectIdForSurface(params.objectRef, ctx);
+    return this.engine.objects.linkEntryObject({
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      entryId: params.entryId.trim(),
+      objectId,
+      writeScope: this.effectiveWriteScope(),
+      scopeCeiling: ctx.scope,
+    });
+  }
+
+  async unlinkObject(params: SurfaceUnlinkObjectInput): Promise<boolean> {
+    const ctx = this.resolveScopeContext(false);
+    const objectId = this.resolveObjectIdForSurface(params.objectRef, ctx);
+    return this.engine.objects.unlinkEntryObject({
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      entryId: params.entryId.trim(),
+      objectId,
+      writeScope: this.effectiveWriteScope(),
+      scopeCeiling: ctx.scope,
+    });
+  }
+
+  async setObjectState(
+    params: SurfaceSetObjectStateInput,
+  ): Promise<ObjectStateSetResult> {
+    const ctx = this.resolveScopeContext(false);
+    const objectId = this.resolveObjectIdForSurface(params.ref, ctx);
+    return this.engine.objects.setObjectState({
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      objectId,
+      state: params.state,
+      label: params.label,
+      since: params.since,
+      because: params.because,
+      writeScope: this.effectiveWriteScope(),
+      scopeCeiling: ctx.scope,
+    });
+  }
+
+  async updateObjectAliases(
+    params: SurfaceUpdateObjectAliasesInput,
+  ): Promise<ObjectAliasUpdateResult> {
+    const ctx = this.resolveScopeContext(false);
+    const objectId = this.resolveObjectIdForSurface(params.ref, ctx);
+    return this.engine.objects.updateObjectAliases({
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      objectId,
+      add: params.add,
+      remove: params.remove,
+      writeScope: this.effectiveWriteScope(),
+      scopeCeiling: ctx.scope,
+    });
+  }
+
+  async importBatch(params: ImportBatchInput): Promise<ImportBatchResult> {
+    this.assertNotWeakenedCookie("import", "meru-mind import md <path>");
+    const writeScope = this.effectiveWriteScope();
+    const hasSeabedItems =
+      Array.isArray(params?.items) &&
+      params.items.some((it) => it && it.target === "seabed");
+    const ctx = this.resolveScopeContext(
+      writeScope === "subtree" && hasSeabedItems,
+    );
+    return this.engine.importer.ingestBatch({
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      writeScope,
+      scopeCeiling: ctx.scope,
+      input: params,
+    });
+  }
+
+  async verifyImport(params: VerifyImportInput): Promise<VerifyImportResult> {
+    const writeScope = this.effectiveWriteScope();
+    const hasSeabedItems =
+      Array.isArray(params?.items) &&
+      params.items.some((it) => it && it.target === "seabed");
+    const allowDescendantSeabed = writeScope === "subtree" && hasSeabedItems;
+    const ctx = this.resolveScopeContext(allowDescendantSeabed);
+    return this.engine.importer.verifyImportManifest({
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      writeScope,
+      scopeCeiling: ctx.scope,
+      input: params,
+    });
   }
 
   async bindWork(params: {

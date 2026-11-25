@@ -52,6 +52,13 @@ export type {
   SurfaceMountRealmInput,
   SurfaceCreateTokenInput,
   SurfaceCreateTokenResult,
+  SurfaceCreateObjectInput,
+  SurfaceMoveObjectInput,
+  SurfaceDeleteObjectInput,
+  SurfaceLinkObjectInput,
+  SurfaceUnlinkObjectInput,
+  SurfaceSetObjectStateInput,
+  SurfaceUpdateObjectAliasesInput,
 } from "./surface.js";
 export {
   LocalMindSurface,
@@ -358,10 +365,30 @@ export {
 } from "./engine/objects.js";
 export {
   ImporterEngine,
+  MAX_IMPORT_ITEM_BYTES,
+  MAX_IMPORT_BATCH_ITEMS,
+  MAX_VERIFY_MANIFEST_ITEMS,
+  MAX_IMPORT_ITEM_SUPERSEDES,
+  MAX_IMPORT_ITEM_REFS,
+  MAX_IMPORT_ITEM_OBJECT_REFS,
+  MAX_IMPORT_ITEM_RESOURCE_TAGS,
   MAX_IMPORT_MD_BYTES,
+  normalizeSourceRef,
+  decodeUtf8Strict,
+  resolveImportSkipSecret,
+  matchesExcludePattern,
   parseMarkdownDocument,
   resolveMostPreciseDeclaredTimestamp,
+  planMarkdownImport,
+  planJsonlImport,
+  chunkImportBatchItems,
+  planSourceVerification,
+  chunkVerifyManifestItems,
+  mergeVerifyImportResults,
   type ParsedMarkdownDoc,
+  type PlanMarkdownImportResult,
+  type PlanJsonlImportResult,
+  type PlanSourceVerificationResult,
 } from "./engine/importer.js";
 export { exportRecordsAsMarkdown } from "./engine/export-md.js";
 export {
@@ -396,6 +423,7 @@ export {
   formatDoctorMarkdown,
   formatExportMdMarkdown,
   formatGenericMarkdown,
+  formatImportBatchMarkdown,
   formatImportDryRunMarkdown,
   formatImportJsonlMarkdown,
   formatImportMdMarkdown,
