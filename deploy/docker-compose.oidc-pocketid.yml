@@ -13,17 +13,15 @@
 
 services:
   meru-mind:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    image: ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.2}
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     environment:
       MERU_MIND_HOME: /var/lib/meru-mind
-      MERU_MIND_PUBLIC_URL: https://${MERU_DOMAIN}
-      MERU_OIDC_ISSUER: https://${OIDC_DOMAIN}
-      MERU_OIDC_CLIENT_ID: ${MERU_OIDC_CLIENT_ID}
+      MERU_MIND_PUBLIC_URL: https://${MERU_DOMAIN:?Set MERU_DOMAIN (e.g. mind.example.com)}
+      MERU_OIDC_ISSUER: https://${OIDC_DOMAIN:?Set OIDC_DOMAIN (e.g. id.example.com)}
+      MERU_OIDC_CLIENT_ID: ${MERU_OIDC_CLIENT_ID:?Set MERU_OIDC_CLIENT_ID}
       MERU_OIDC_CLIENT_SECRET: ${MERU_OIDC_CLIENT_SECRET:-}
       MERU_OIDC_TRUST_ISSUER: ${MERU_OIDC_TRUST_ISSUER:-false}
     volumes:
@@ -48,7 +46,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      APP_URL: https://${OIDC_DOMAIN}
+      APP_URL: https://${OIDC_DOMAIN:?Set OIDC_DOMAIN (e.g. id.example.com)}
       ENCRYPTION_KEY: ${POCKET_ID_ENCRYPTION_KEY:?Generate with openssl rand -base64 32}
       TRUST_PROXY: "true"
     volumes:
@@ -76,8 +74,8 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      MERU_DOMAIN: ${MERU_DOMAIN}
-      OIDC_DOMAIN: ${OIDC_DOMAIN}
+      MERU_DOMAIN: ${MERU_DOMAIN:?Set MERU_DOMAIN (e.g. mind.example.com)}
+      OIDC_DOMAIN: ${OIDC_DOMAIN:?Set OIDC_DOMAIN (e.g. id.example.com)}
     command:
       - sh
       - -c

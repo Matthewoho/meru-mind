@@ -1,4 +1,4 @@
-// Meru Mind Official Built-In Studio UI (v0.6.1)
+// Meru Mind Official Built-In Studio UI (v0.6.2)
 // Built strictly on the server-hosted `/_meru/client.js` contract (zero direct /v1/* calls, zero innerHTML, strict CSP).
 import { createMindClient, applyHighlightRanges, loadMarkdownTools } from "/_meru/client.js";
 

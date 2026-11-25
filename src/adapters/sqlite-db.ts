@@ -29,6 +29,7 @@ import type {
   UnifiedFtsSearchResult,
   VectorMatch,
 } from "../ports.js";
+import { sanitizeDisplayName } from "../server/tokens.js";
 import {
   validateWorkBindingConfig,
   type WorkBindingRecord,
@@ -1460,11 +1461,7 @@ export class SqliteDb implements DbPort {
                 (rootRealmId !== null && idRow.bound_realm_id === rootRealmId));
             const rawDn =
               typeof idRow.display_name === "string"
-                ? idRow.display_name
-                    .replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g, "")
-                    .trim()
-                    .slice(0, 64)
-                    .trim() || null
+                ? sanitizeDisplayName(idRow.display_name)
                 : null;
             const cur = actorMap.get(norm);
             if (!cur) {
@@ -5000,23 +4997,19 @@ export class SqliteDb implements DbPort {
         updatedAt: params.nowIso,
       };
       this.insertIdentity(identity);
+      const rootRealmId = this.getRealmByPath(params.orgId, "/")?.id ?? null;
+      const isRootBound =
+        invite.boundRealmId === null ||
+        (rootRealmId !== null && invite.boundRealmId === rootRealmId);
       const inviteRole: ActorRole =
-        invite.actorRole === "admin" && invite.actorKind === "human"
+        invite.actorRole === "admin" &&
+        invite.actorKind === "human" &&
+        isRootBound
           ? "admin"
           : "member";
       const sanitizedDn =
         typeof params.displayName === "string"
-          ? Array.from(
-              params.displayName
-                .replace(
-                  /[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g,
-                  "",
-                )
-                .trim(),
-            )
-              .slice(0, 64)
-              .join("")
-              .trim() || null
+          ? sanitizeDisplayName(params.displayName)
           : null;
       this.upsertActor({
         orgId: params.orgId,
@@ -5297,6 +5290,125 @@ export class SqliteDb implements DbPort {
     });
   }
 
+  private hasActiveRootHumanCredential(
+    orgId: string,
+    actorId: string,
+    nowMs: number,
+  ): boolean {
+    const rootRealmId = this.getRealmByPath(orgId, "/")?.id ?? null;
+    const idRows = this.db
+      .prepare(
+        `SELECT actor_kind, bound_realm_id, disabled_at FROM identities
+         WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)`,
+      )
+      .all(orgId, actorId) as Array<{
+      actor_kind: string;
+      bound_realm_id: string | null;
+      disabled_at: string | null;
+    }>;
+    if (idRows.length > 0 && idRows.every((r) => r.disabled_at !== null)) {
+      return false;
+    }
+    const hasActiveRootHumanIdentity = idRows.some(
+      (r) =>
+        r.actor_kind === "human" &&
+        r.disabled_at === null &&
+        (r.bound_realm_id === null ||
+          (rootRealmId !== null && r.bound_realm_id === rootRealmId)),
+    );
+    if (hasActiveRootHumanIdentity) {
+      return true;
+    }
+    const tokRows = this.db
+      .prepare(
+        `SELECT actor_kind, bound_realm_id, expires_at FROM tokens
+         WHERE org_id = ? AND LOWER(actor_id) = LOWER(?) AND revoked_at IS NULL`,
+      )
+      .all(orgId, actorId) as Array<{
+      actor_kind: string;
+      bound_realm_id: string | null;
+      expires_at: string | null;
+    }>;
+    return tokRows.some((t) => {
+      if (t.actor_kind !== "human") return false;
+      if (
+        t.bound_realm_id !== null &&
+        (rootRealmId === null || t.bound_realm_id !== rootRealmId)
+      ) {
+        return false;
+      }
+      if (t.expires_at === null) return true;
+      const parsed = Date.parse(t.expires_at);
+      return Number.isFinite(parsed) && parsed > nowMs;
+    });
+  }
+
+  private hasHumanCredentialHistory(orgId: string): boolean {
+    return (
+      Boolean(
+        this.db
+          .prepare(
+            `SELECT 1 AS hit FROM tokens WHERE org_id = ? AND actor_kind = 'human' LIMIT 1`,
+          )
+          .get(orgId),
+      ) ||
+      Boolean(
+        this.db
+          .prepare(
+            `SELECT 1 AS hit FROM identities WHERE org_id = ? AND actor_kind = 'human' LIMIT 1`,
+          )
+          .get(orgId),
+      )
+    );
+  }
+
+  private hasNonRootOrAgentCredential(orgId: string, actorId: string): boolean {
+    const rootRealmId = this.getRealmByPath(orgId, "/")?.id ?? null;
+    const tokRows = this.db
+      .prepare(
+        `SELECT actor_kind, bound_realm_id FROM tokens
+         WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)`,
+      )
+      .all(orgId, actorId) as Array<{
+      actor_kind: string;
+      bound_realm_id: string | null;
+    }>;
+    const idRows = this.db
+      .prepare(
+        `SELECT actor_kind, bound_realm_id FROM identities
+         WHERE org_id = ? AND LOWER(actor_id) = LOWER(?)`,
+      )
+      .all(orgId, actorId) as Array<{
+      actor_kind: string;
+      bound_realm_id: string | null;
+    }>;
+    return [...tokRows, ...idRows].some(
+      (r) =>
+        r.actor_kind !== "human" ||
+        (r.bound_realm_id !== null &&
+          (rootRealmId === null || r.bound_realm_id !== rootRealmId)),
+    );
+  }
+
+  private isActorEligibleAdmin(
+    orgId: string,
+    actorId: string,
+    nowMs: number,
+    credentialBacked: boolean,
+  ): boolean {
+    if (this.isActorDisabled(orgId, actorId)) {
+      return false;
+    }
+    if (credentialBacked) {
+      return this.hasActiveRootHumanCredential(orgId, actorId, nowMs);
+    }
+    // Pure local-only org (no human tokens/identities issued yet): actor must exist in actors table
+    // and must not be an agent-only or sub-realm-bound credential actor.
+    const existing = this.getActor(orgId, actorId);
+    if (!existing) return false;
+    return !this.hasNonRootOrAgentCredential(orgId, actorId);
+  }
+
   setActorRole(
     orgId: string,
     actorId: string,
@@ -5313,8 +5425,26 @@ export class SqliteDb implements DbPort {
         `Actor role must be "admin" or "member", got "${String(role)}"`,
       );
     }
-    const now = updatedAt ?? new Date().toISOString();
+    // Always evaluate token expiry against real wall-clock Date.now(), never caller-supplied updatedAt
+    const checkNowMs = Date.now();
+    const now = updatedAt ?? new Date(checkNowMs).toISOString();
     return this.transaction(() => {
+      if (role === "admin") {
+        const credentialBacked = this.hasHumanCredentialHistory(orgId);
+        if (
+          !this.isActorEligibleAdmin(
+            orgId,
+            normalized,
+            checkNowMs,
+            credentialBacked,
+          )
+        ) {
+          throw new MindError(
+            "INVALID_INPUT",
+            `Cannot grant admin role to "${normalized}": target actor must already exist in this organization as an active root-realm human.`,
+          );
+        }
+      }
       const existing = this.getActor(orgId, normalized);
       if (existing) {
         this.db
@@ -5338,17 +5468,7 @@ export class SqliteDb implements DbPort {
         .get(orgId, normalized) as { display_name?: string | null } | undefined;
       const inheritedDn =
         typeof idRow?.display_name === "string"
-          ? Array.from(
-              idRow.display_name
-                .replace(
-                  /[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g,
-                  "",
-                )
-                .trim(),
-            )
-              .slice(0, 64)
-              .join("")
-              .trim() || null
+          ? sanitizeDisplayName(idRow.display_name)
           : null;
       this.db
         .prepare(
@@ -5422,31 +5542,30 @@ export class SqliteDb implements DbPort {
   }
 
   countActiveAdmins(orgId: string): number {
-    const row = this.db
+    const candidates = this.db
       .prepare(
-        `SELECT COUNT(*) AS cnt
+        `SELECT a.actor_id
          FROM actors a
          WHERE a.org_id = ?
            AND a.role = 'admin'
            AND NOT EXISTS (
              SELECT 1 FROM disabled_actors d
              WHERE d.org_id = a.org_id AND LOWER(d.actor_id) = LOWER(a.actor_id)
-           )
-           AND NOT (
-             EXISTS (
-               SELECT 1 FROM identities i
-               WHERE i.org_id = a.org_id AND LOWER(i.actor_id) = LOWER(a.actor_id)
-             )
-             AND NOT EXISTS (
-               SELECT 1 FROM identities i2
-               WHERE i2.org_id = a.org_id
-                 AND LOWER(i2.actor_id) = LOWER(a.actor_id)
-                 AND i2.disabled_at IS NULL
-             )
            )`,
       )
-      .get(orgId) as { cnt?: number } | undefined;
-    return Number(row?.cnt ?? 0);
+      .all(orgId) as Array<{ actor_id: string }>;
+    if (candidates.length === 0) return 0;
+
+    // Shared eligibility invariant with setActorRole(): never diverge between grant and count
+    const credentialBacked = this.hasHumanCredentialHistory(orgId);
+    const nowMs = Date.now();
+    let count = 0;
+    for (const c of candidates) {
+      if (this.isActorEligibleAdmin(orgId, c.actor_id, nowMs, credentialBacked)) {
+        count += 1;
+      }
+    }
+    return count;
   }
 
   // ---- Outbox Consumer Cursors & Deliveries (Migration v9) ----

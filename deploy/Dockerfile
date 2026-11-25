@@ -17,6 +17,7 @@ RUN pnpm build && pnpm prune --prod
 FROM node:22-slim AS runtime
 
 ENV NODE_ENV=production \
+    MERU_MIND_IN_CONTAINER=1 \
     MERU_MIND_HOME=/var/lib/meru-mind \
     MERU_MIND_HOST=0.0.0.0 \
     MERU_MIND_PORT=3800

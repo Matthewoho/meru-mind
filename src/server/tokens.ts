@@ -13,12 +13,15 @@ export const DEFAULT_SSO_TOKEN_TTL_DAYS = 90;
 export const MAX_TOKEN_TTL_DAYS = 365;
 export const MAX_DISPLAY_NAME_CHARS = 64;
 
-const DISPLAY_NAME_STRIP_RE =
-  /[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g;
+// Strip all Unicode Control/Format/Surrogate/Private/Unassigned chars (\p{C}, including
+// ASCII/C1 controls, bidi overrides/isolates, zero-width chars, and Unicode tag chars U+E0000..U+E007F)
+// plus Unicode line/paragraph separators U+2028/U+2029.
+const DISPLAY_NAME_STRIP_RE = /[\p{C}\u2028\u2029]/gu;
 
 /**
  * Sanitizes a user-editable displayName:
- * - Strips ASCII control chars and Unicode bidi override/isolate/mark characters
+ * - Applies Unicode NFKC normalization
+ * - Strips all \p{C} characters (ASCII/C1 controls, bidi, zero-width, Unicode tag chars) and U+2028/U+2029
  * - Trims leading/trailing whitespace
  * - Caps at 64 Unicode codepoints
  * - Normalizes empty string to null
@@ -28,7 +31,7 @@ export function sanitizeDisplayName(raw: unknown): string | null {
   if (typeof raw !== "string") {
     throw new MindError("INVALID_INPUT", "displayName must be a string or null");
   }
-  const stripped = raw.replace(DISPLAY_NAME_STRIP_RE, "").trim();
+  const stripped = raw.normalize("NFKC").replace(DISPLAY_NAME_STRIP_RE, "").trim();
   if (!stripped) return null;
   const capped = Array.from(stripped)
     .slice(0, MAX_DISPLAY_NAME_CHARS)

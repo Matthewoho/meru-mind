@@ -23,6 +23,7 @@ import {
   formatShowMarkdown,
   formatSurfaceErrorText,
   formatTreeMarkdown,
+  formatUpgradeMarkdown,
   formatWhoamiMarkdown,
   isRealmEffectivelyArchived,
   LocalMindSurface,
@@ -39,6 +40,7 @@ import {
   resolveVisibleRealm,
   resolveWriteTargetRealm,
   runRealmDoctor,
+  runUpgrade,
   saveProfileCredential,
   startMindServer,
   toPublicInvite,
@@ -111,6 +113,7 @@ const BOOLEAN_FLAGS = new Set([
   "no-objects",
   "all",
   "dry-run",
+  "check",
   // Legacy boolean flags parsed without swallowing the next token so UNKNOWN_FLAG reports cleanly
   "include-superseded",
   "include-history",
@@ -188,6 +191,10 @@ function parseArgs(argv: string[]): ParsedArgs {
 
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i]!;
+    if (token === "--") {
+      positionals.push(...argv.slice(i + 1));
+      break;
+    }
     if (token === "-L") {
       if (i + 1 < argv.length) {
         recordFlag("depth", argv[i + 1]!);
@@ -403,7 +410,7 @@ RECORD [write]:
         [--occurred-at <iso|none>] [--sensitivity public|internal|confidential|secret]
 
 MANAGE [write / human] (experimental: file, raw, settle):
-  realm | entry | object | file | rule | raw | redact | settle | import | serve | ui | token | work | org | admin
+  realm | entry | object | file | rule | raw | redact | settle | import | serve | ui | token | work | org | admin | upgrade
 
 OUTPUT:
   Markdown capped with next-page --cursor; pass --json for JSON; errors include try:.
@@ -702,6 +709,25 @@ Examples:
   meru-mind work ready --in /ops
   meru-mind work resolve OPS-42 --in /ops
 `,
+  upgrade: `Risk: read (--check) / local-git-update (git checkout only; refuses self-upgrade inside containers)
+When to use: Check for new Meru Mind releases (CLI and optional remote server /v1/health) and safely upgrade local git installs (containers print host docker compose pull steps).
+Usage:
+  meru-mind upgrade [--check] [--url <serverUrl>] [--json]
+  meru-mind update [--check] [--url <serverUrl>] [--json]
+Flags:
+  --check            Check latest release and print recommended upgrade commands without modifying anything
+  --url <serverUrl>  Also query <serverUrl>/v1/health to compare remote server version side-by-side
+  --json             Output structured JSON result
+Examples:
+  meru-mind upgrade --check
+  meru-mind upgrade --check --url https://mind.example.com --json
+  meru-mind upgrade
+`,
+  update: `Alias for "meru-mind upgrade".
+Usage:
+  meru-mind update [--check] [--url <serverUrl>] [--json]
+See: meru-mind upgrade --help
+`,
 };
 
 function printHelp(cmd?: string): void {
@@ -973,6 +999,8 @@ async function main(): Promise<void> {
     "work",
     "org",
     "admin",
+    "upgrade",
+    "update",
   ]);
   if (!KNOWN_COMMANDS.has(cmd)) {
     throw new MindError("UNKNOWN_COMMAND", `Unknown command "${cmd}"`, {
@@ -1150,6 +1178,22 @@ async function main(): Promise<void> {
       );
     }
     throw new MindError("ACCESS_DENIED", "Timed out waiting for device login approval");
+  }
+
+  // `meru-mind upgrade` (alias `update`) works without opening local SQLite directly.
+  if (cmd === "upgrade" || cmd === "update") {
+    assertAllowedFlags(flags, ["check"], cmd);
+    const checkOnly = flagBool(flags, "check");
+    const remoteUrl =
+      flagStr(flags, "url")?.trim() ||
+      process.env.MERU_MIND_URL?.trim() ||
+      null;
+    const res = await runUpgrade({
+      checkOnly,
+      remoteUrl,
+    });
+    output(res, formatUpgradeMarkdown(res));
+    return;
   }
 
   // `meru-mind ui eject <dir>` and `meru-mind ui login` work without opening local SQLite directly.

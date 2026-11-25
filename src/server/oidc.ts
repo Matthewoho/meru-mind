@@ -251,6 +251,15 @@ export function createInvite(params: {
     }
     boundRealmId = realm.id;
   }
+  if (actorRole === "admin" && boundRealmId !== null) {
+    const rootRealm = params.db.getRealmByPath(params.orgId, "/");
+    if (!rootRealm || boundRealmId !== rootRealm.id) {
+      throw new MindError(
+        "INVALID_INPUT",
+        'Admin invites cannot be bound to a sub-realm; omit boundRealmRef or bind to root realm "/".',
+      );
+    }
+  }
 
   const ttlHours =
     typeof params.ttlHours === "number" &&
@@ -429,25 +438,63 @@ export function normalizeIpRateLimitKey(ip: string): string {
   return trimmed || "unknown";
 }
 
-function extractClientIp(req: IncomingMessage): string {
+const TRUSTED_PROXY_NETS = new net.BlockList();
+TRUSTED_PROXY_NETS.addSubnet("127.0.0.0", 8, "ipv4");
+TRUSTED_PROXY_NETS.addSubnet("10.0.0.0", 8, "ipv4");
+TRUSTED_PROXY_NETS.addSubnet("172.16.0.0", 12, "ipv4");
+TRUSTED_PROXY_NETS.addSubnet("192.168.0.0", 16, "ipv4");
+TRUSTED_PROXY_NETS.addAddress("::1", "ipv6");
+TRUSTED_PROXY_NETS.addSubnet("fc00::", 7, "ipv6");
+TRUSTED_PROXY_NETS.addSubnet("fe80::", 10, "ipv6");
+
+/**
+ * Returns true strictly when `rawIp` is a loopback or private reverse-proxy address
+ * (RFC1918 10/8, 172.16/12, 192.168/16, 127/8, ::1, fc00::/7, fe80::/10), unmapping
+ * IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d` or hex form) before checking.
+ */
+export function isTrustedProxyIp(rawIp: string): boolean {
+  const trimmed = rawIp.trim();
+  if (!trimmed) return false;
+  const v4Mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(trimmed);
+  if (v4Mapped && net.isIP(v4Mapped[1]!) === 4) {
+    return TRUSTED_PROXY_NETS.check(v4Mapped[1]!, "ipv4");
+  }
+  const cleanAddr = trimmed.split("%")[0]!;
+  const family = net.isIP(cleanAddr);
+  if (family === 4) {
+    return TRUSTED_PROXY_NETS.check(cleanAddr, "ipv4");
+  }
+  if (family === 6) {
+    const groups = expandIpv6Groups(cleanAddr);
+    if (
+      groups &&
+      groups[0] === "0000" &&
+      groups[1] === "0000" &&
+      groups[2] === "0000" &&
+      groups[3] === "0000" &&
+      groups[4] === "0000" &&
+      groups[5] === "ffff"
+    ) {
+      const hi = Number.parseInt(groups[6]!, 16);
+      const lo = Number.parseInt(groups[7]!, 16);
+      const ipv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+      return TRUSTED_PROXY_NETS.check(ipv4, "ipv4");
+    }
+    return TRUSTED_PROXY_NETS.check(cleanAddr, "ipv6");
+  }
+  return false;
+}
+
+export function extractClientIp(req: IncomingMessage): string {
   const rawRealIp =
     typeof req.headers["x-real-ip"] === "string"
       ? req.headers["x-real-ip"].trim()
       : "";
   const sockIp = req.socket?.remoteAddress?.trim() ?? "";
-  // Only trust X-Real-IP when the direct TCP peer is loopback or RFC1918 reverse proxy (e.g. Caddy)
-  // AND the header value is a strictly valid IPv4/IPv6 address via net.isIP(...) (R2-P1-4)
-  const peerIsProxy =
-    sockIp === "127.0.0.1" ||
-    sockIp === "::1" ||
-    sockIp === "::ffff:127.0.0.1" ||
-    sockIp.startsWith("10.") ||
-    sockIp.startsWith("172.") ||
-    sockIp.startsWith("192.168.") ||
-    sockIp.startsWith("::ffff:10.") ||
-    sockIp.startsWith("::ffff:172.") ||
-    sockIp.startsWith("::ffff:192.168.");
-  if (rawRealIp && peerIsProxy && net.isIP(rawRealIp) !== 0) {
+  // Only trust X-Real-IP when the direct TCP peer is a true loopback or private reverse proxy
+  // (exact CIDR match via net.BlockList; public 172.32+ IPs are NEVER trusted)
+  // AND the header value is a strictly valid IPv4/IPv6 address via net.isIP(...).
+  if (rawRealIp && isTrustedProxyIp(sockIp) && net.isIP(rawRealIp) !== 0) {
     return rawRealIp;
   }
   if (sockIp && net.isIP(sockIp) !== 0) {
@@ -701,7 +748,11 @@ export class OidcManager {
     this.txAeadKey = crypto.randomBytes(32);
     // R2-P1-3: Periodic background pruning instead of O(N) scanning on every request
     this.pruneTimer = setInterval(() => {
-      this.prune(this.lastDb);
+      try {
+        this.prune(this.lastDb);
+      } catch {
+        // Ignore transient SQLite busy/lock errors during background prune so the process never crashes
+      }
     }, PRUNE_INTERVAL_MS);
     this.pruneTimer.unref();
   }

@@ -1,0 +1,43 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/meru-mind/examples/hooks/session-start.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "invoke_subagent|swarm",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/meru-mind/examples/hooks/subagent-link.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/meru-mind/examples/hooks/heartbeat.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/meru-mind/examples/hooks/turn-stop.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

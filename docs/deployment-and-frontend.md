@@ -11,9 +11,20 @@ Meru Mind `v0.3+` runs as a **single Node.js 22+ process owning one SQLite WAL d
 - **Best fit**: Single-instance compute with a **persistent local block volume** (VPS / ECS / GCE / Fly.io Machines / Railway / Render Disk).
 - **Avoid**: Multi-replica stateless containers sharing SQLite over NFS/SMB (breaks WAL locking) or ephemeral disks without persistent volumes.
 
-### Track 1 (Open-Source Self-Hosted Primary): Docker Compose + Caddy / Fly.io
+### Track 1 (Open-Source Self-Hosted Primary): Prebuilt GHCR Docker Compose + Caddy / Fly.io
 
 A 1 vCPU / 1 GB RAM instance handles a small-to-medium human-AI team comfortably with zero heavy middleware (no Kafka, no Elasticsearch, no Neo4j, no CockroachDB).
+
+All Compose files (`deploy/docker-compose.yml`, `deploy/docker-compose.oidc-pocketid.yml`, `deploy/docker-compose.oidc-dex.yml`) pull the multi-arch (`linux/amd64`, `linux/arm64`) prebuilt image `ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.2}` automatically published on release tags by `.github/workflows/docker-publish.yml`. For local source builds during development, layer `deploy/docker-compose.build.yml`:
+
+```bash
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.build.yml up -d --build
+```
+
+Upgrading CLI & Server (`v0.6.2`):
+- **Check both CLI and remote server versions side-by-side**: `meru-mind upgrade --check --url https://mind.example.com`
+- **Host CLI self-upgrade** (local git checkout): `meru-mind upgrade` (alias `meru-mind update`); inside containers, `meru-mind upgrade` refuses in-place self-upgrade and prints the safe host `meru-mind admin backup` + `docker compose pull meru-mind && docker compose up -d meru-mind` sequence.
+- **Multi-harness `/swarm` & subagent session propagation**: `RemoteMindSurface` and `examples/hooks/` automatically detect `ANTIGRAVITY_CONVERSATION_ID`, `CLAUDE_SESSION_ID`, `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, and `~/.cache/meru-mind/parent-map.json` (populated by `examples/hooks/subagent-link.sh` and wired in `examples/hooks/agy-hooks.json`).
 
 ```
 Internet (HTTPS / WSS)

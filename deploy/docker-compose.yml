@@ -2,10 +2,10 @@
 # IMPORTANT: Always keep replicas = 1. Do NOT mount /var/lib/meru-mind over NFS/SMB.
 services:
   meru-mind:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+    image: ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.2}
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     environment:
       MERU_MIND_HOME: /var/lib/meru-mind
       # Optional external provider env vars (referenced as env:LINEAR_API_KEY in work_bindings)
@@ -30,6 +30,8 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       meru-mind:
         condition: service_healthy

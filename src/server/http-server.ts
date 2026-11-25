@@ -631,10 +631,19 @@ export async function startMindServer(
               return;
             }
 
-            // ---- v0.6.1 Editable Profile Display Name (Bearer OR Cookie with CSRF check) ----
+            // ---- v0.6.1 Editable Profile Display Name (Human Bearer OR Cookie with CSRF check) ----
             if (method === "POST" && pathname === "/v1/me/profile") {
+              if (principal.actor.kind !== "human") {
+                throw new MindError(
+                  "ACCESS_DENIED",
+                  "Only human principals can update their profile display name.",
+                );
+              }
               const body = await readJsonBody(req);
               if (
+                !body ||
+                typeof body !== "object" ||
+                Array.isArray(body) ||
                 !("displayName" in body) ||
                 (body.displayName !== null && typeof body.displayName !== "string")
               ) {

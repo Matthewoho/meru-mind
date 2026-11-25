@@ -2163,7 +2163,7 @@ button, input, select, textarea {
   background: var(--meru-surface-control);
   color: var(--meru-fg-secondary);
   font-family: var(--meru-mono);
-  font-size: 10.5px;
+  font-size: 11px;
   line-height: 1.4;
 }
 .profile-role-badge.is-admin {

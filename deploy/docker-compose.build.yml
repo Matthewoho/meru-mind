@@ -1,0 +1,9 @@
+# Developer override: build the Meru Mind image locally from source instead of pulling GHCR.
+# Usage:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.build.yml up -d --build
+#   docker compose -f deploy/docker-compose.oidc-pocketid.yml -f deploy/docker-compose.build.yml up -d --build
+services:
+  meru-mind:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile

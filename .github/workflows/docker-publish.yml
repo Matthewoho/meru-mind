@@ -1,0 +1,131 @@
+name: Publish Docker Image to GHCR
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional preview tag (must start with dev- or preview-; defaults to short SHA; release tags require git tag push)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm test
+      - run: pnpm run check:oss
+
+  publish:
+    needs: verify
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release ref and manual tag guardrails
+        id: guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_NAME_VAL: ${{ github.ref_name }}
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "name=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')" >> "${GITHUB_OUTPUT}"
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "is_stable_release=false" >> "${GITHUB_OUTPUT}"
+            if [[ -n "${MANUAL_TAG}" ]]; then
+              if [[ ! "${MANUAL_TAG}" =~ ^(dev|preview)-[a-z0-9._-]{1,40}$ ]]; then
+                echo "::error::Manual dispatch tag must match ^(dev|preview)-[a-z0-9._-]{1,40}$ (cannot overwrite latest or v* release tags)"
+                exit 1
+              fi
+              echo "manual_tag=${MANUAL_TAG}" >> "${GITHUB_OUTPUT}"
+            else
+              echo "manual_tag=" >> "${GITHUB_OUTPUT}"
+            fi
+          else
+            echo "manual_tag=" >> "${GITHUB_OUTPUT}"
+            if [[ "${GITHUB_REF_NAME_VAL}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "is_stable_release=true" >> "${GITHUB_OUTPUT}"
+            else
+              echo "is_stable_release=false" >> "${GITHUB_OUTPUT}"
+            fi
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags & OCI labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.guard.outputs.name }}
+          flavor: |
+            latest=false
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ steps.guard.outputs.is_stable_release == 'true' }}
+            type=raw,value=${{ steps.guard.outputs.manual_tag }},enable=${{ github.event_name == 'workflow_dispatch' && steps.guard.outputs.manual_tag != '' }}
+            type=sha,enable=${{ github.event_name == 'workflow_dispatch' && steps.guard.outputs.manual_tag == '' }}
+          labels: |
+            org.opencontainers.image.title=Meru Mind
+            org.opencontainers.image.description=Scoped visibility (MindRealm) and layered memory & ledger engine (MindSea) for multi-agent teams.
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push multi-arch image (linux/amd64, linux/arm64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ steps.guard.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

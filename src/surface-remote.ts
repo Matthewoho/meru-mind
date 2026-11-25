@@ -1,3 +1,4 @@
+import { resolveHarnessSessionContext } from "./harness-session.js";
 import type { WorkBindingRecord } from "./work/provider.js";
 import type { SafeListReadyResult, SafeResolveResult } from "./work/registry.js";
 import type {
@@ -94,18 +95,23 @@ export class RemoteMindSurface implements MindSurface {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.token = options.token;
     this.workspaceHint = options.workspaceHint ?? null;
+    const harnessCtx = resolveHarnessSessionContext();
     this.sessionId =
       options.sessionId !== undefined
         ? options.sessionId
-        : (process.env.MERU_MIND_SESSION_ID?.trim() || null);
-    this.parentSessionId =
+        : harnessCtx.sessionTag;
+    const resolvedParent =
       options.parentSessionId !== undefined
         ? options.parentSessionId
-        : (process.env.MERU_MIND_PARENT_SESSION_ID?.trim() || null);
+        : harnessCtx.parentSessionTag;
+    this.parentSessionId =
+      resolvedParent && this.sessionId && resolvedParent === this.sessionId
+        ? null
+        : resolvedParent;
     this.clientHint =
       options.clientHint !== undefined
         ? options.clientHint
-        : (process.env.MERU_MIND_CLIENT?.trim() || null);
+        : harnessCtx.clientHint;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this._principal = initialPrincipal;
   }
