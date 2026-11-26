@@ -6,6 +6,10 @@ import type { MindEngine } from "../index.js";
 import { MindError, type Principal } from "../types.js";
 import { MARKDOWN_JS_SOURCE } from "./markdown-renderer.js";
 import {
+  MERMAID_FRAME_HTML_SOURCE,
+  MERMAID_FRAME_JS_SOURCE,
+} from "./mermaid-frame.js";
+import {
   CLIENT_JS_SOURCE,
   DEFAULT_FAVICON_SVG,
   DEFAULT_SHELL_CSS,
@@ -17,6 +21,7 @@ import type { UiSessionManager } from "./ui-auth.js";
 import { isOriginAllowed } from "./ws-pump.js";
 
 let cachedMarkedVendorSource: string | null = null;
+let cachedMermaidVendorSource: string | null = null;
 
 function loadMarkedVendorSource(): string {
   if (cachedMarkedVendorSource !== null) return cachedMarkedVendorSource;
@@ -36,11 +41,153 @@ function loadMarkedVendorSource(): string {
   );
 }
 
+function loadMermaidVendorSource(): string {
+  if (cachedMermaidVendorSource !== null) return cachedMermaidVendorSource;
+  const candidates = [
+    fileURLToPath(new URL("../vendor/mermaid.min.js", import.meta.url)),
+    fileURLToPath(new URL("../../dist/vendor/mermaid.min.js", import.meta.url)),
+  ];
+  for (const filePath of candidates) {
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      cachedMermaidVendorSource = fs.readFileSync(filePath, "utf8");
+      return cachedMermaidVendorSource;
+    }
+  }
+  throw new MindError(
+    "NOT_FOUND",
+    "Vendored mermaid.min.js not found in dist/vendor/mermaid.min.js. Run 'pnpm build' first.",
+  );
+}
+
 /**
  * Guardrail #3: Strict server-enforced CSP for all UI shells (default and custom --web-dir).
  */
 export const STRICT_UI_CSP =
-  "default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+  "default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+const SAFE_HOST_HEADER_RE = /^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?::\d{1,5})?$/i;
+
+function parseSafeOrigin(raw: string | null | undefined): string | null {
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.username ||
+      parsed.password
+    ) {
+      return null;
+    }
+    const hostLower = parsed.hostname.toLowerCase();
+    if (hostLower === "0.0.0.0" || hostLower === "::" || hostLower === "[::]") {
+      return null;
+    }
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Builds the strict CSP header for `/_meru/mermaid-frame.html`.
+ * Always includes `sandbox allow-scripts` so the frame runs in an opaque `null` origin
+ * even on direct top-level navigation (`window.open`), and constrains `script-src` strictly
+ * to the validated server origin's exact Mermaid bundle paths.
+ */
+export function buildMermaidFrameCsp(params: {
+  req?: IncomingMessage;
+  serverUrl?: string;
+  publicBaseUrl?: string | null;
+  allowedOrigins?: string[];
+}): string {
+  const origins = new Set<string>();
+  const addOrigin = (raw: string | null | undefined) => {
+    const safe = parseSafeOrigin(raw);
+    if (safe) origins.add(safe);
+  };
+
+  const serverOrigin = parseSafeOrigin(params.serverUrl);
+  const serverParsed = serverOrigin ? new URL(serverOrigin) : null;
+  const serverIsLoopback = Boolean(
+    serverParsed && isLoopbackHost(serverParsed.hostname),
+  );
+  const serverPort = serverParsed
+    ? serverParsed.port || (serverParsed.protocol === "https:" ? "443" : "80")
+    : null;
+
+  const isMatchingLoopbackAlias = (candidateOrigin: string): boolean => {
+    if (!serverParsed || !serverIsLoopback) return false;
+    try {
+      const cand = new URL(candidateOrigin);
+      const candPort = cand.port || (cand.protocol === "https:" ? "443" : "80");
+      return (
+        cand.protocol === serverParsed.protocol &&
+        isLoopbackHost(cand.hostname) &&
+        candPort === serverPort
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  addOrigin(serverOrigin);
+  addOrigin(params.publicBaseUrl);
+  const allowedList: string[] = [];
+  for (const o of params.allowedOrigins ?? []) {
+    const safe = parseSafeOrigin(o);
+    if (safe) {
+      origins.add(safe);
+      allowedList.push(safe);
+    }
+  }
+
+  const rawHost =
+    typeof params.req?.headers?.host === "string"
+      ? params.req.headers.host.trim()
+      : "";
+  if (rawHost && SAFE_HOST_HEADER_RE.test(rawHost)) {
+    if (allowedList.length > 0) {
+      const scheme = params.req && isRequestSecure(params.req) ? "https" : "http";
+      const candidate = parseSafeOrigin(`${scheme}://${rawHost}`);
+      if (candidate && allowedList.includes(candidate)) {
+        origins.add(candidate);
+      }
+    } else if (params.publicBaseUrl) {
+      const pubOrigin = parseSafeOrigin(params.publicBaseUrl);
+      const scheme = params.req && isRequestSecure(params.req) ? "https" : "http";
+      const candidate = parseSafeOrigin(`${scheme}://${rawHost}`);
+      if (candidate && (candidate === pubOrigin || isMatchingLoopbackAlias(candidate))) {
+        origins.add(candidate);
+      }
+    } else if (serverParsed && serverIsLoopback) {
+      // Default server without allowedOrigins/publicBaseUrl: never trust X-Forwarded-Proto
+      // or arbitrary Host headers; allow only loopback aliases on the exact bound port.
+      const candidate = parseSafeOrigin(`${serverParsed.protocol}//${rawHost}`);
+      if (candidate && isMatchingLoopbackAlias(candidate)) {
+        origins.add(candidate);
+      }
+    }
+  }
+
+  const scriptSources = ["'self'"];
+  for (const origin of origins) {
+    scriptSources.push(`${origin}/_meru/vendor/mermaid.min.js`);
+    scriptSources.push(`${origin}/_meru/mermaid-frame.js`);
+  }
+
+  return [
+    "sandbox allow-scripts",
+    "default-src 'none'",
+    `script-src ${scriptSources.join(" ")}`,
+    "style-src 'unsafe-inline'",
+    "img-src data:",
+    "connect-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'self'",
+  ].join("; ");
+}
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
@@ -119,6 +266,7 @@ export interface UiRouterOptions {
   allowedOrigins?: string[];
   oidcManager?: OidcManager | null;
   getServerUrl?: () => string;
+  publicBaseUrl?: string | null;
 }
 
 /**
@@ -167,6 +315,44 @@ export function createUiRouteHandler(options: UiRouterOptions) {
     }
     if (pathname === "/_meru/vendor/marked.esm.js" && method === "GET") {
       sendAsset(res, 200, "application/javascript; charset=utf-8", loadMarkedVendorSource());
+      return true;
+    }
+    if (pathname === "/_meru/vendor/mermaid.min.js" && method === "GET") {
+      const vendorSource = loadMermaidVendorSource();
+      res.writeHead(200, {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": "public, max-age=86400",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+      });
+      res.end(vendorSource);
+      return true;
+    }
+    if (pathname === "/_meru/mermaid-frame.js" && method === "GET") {
+      res.writeHead(200, {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+      });
+      res.end(MERMAID_FRAME_JS_SOURCE);
+      return true;
+    }
+    if (pathname === "/_meru/mermaid-frame.html" && method === "GET") {
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Security-Policy": buildMermaidFrameCsp({
+          req,
+          serverUrl: options.getServerUrl?.(),
+          publicBaseUrl: options.publicBaseUrl,
+          allowedOrigins: options.allowedOrigins,
+        }),
+        "X-Frame-Options": "SAMEORIGIN",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "Cache-Control": "no-store",
+      });
+      res.end(MERMAID_FRAME_HTML_SOURCE);
       return true;
     }
     if ((pathname === "/_meru/shell" || pathname === "/_meru/shell/") && method === "GET") {

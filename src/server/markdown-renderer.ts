@@ -1,5 +1,5 @@
 /**
- * Lazy-loaded safe Markdown & sandboxed Static HTML Preview module (/_meru/markdown.js).
+ * Lazy-loaded safe Markdown, Sandboxed Offline Mermaid & Static HTML Preview module (/_meru/markdown.js).
  *
  * Security invariants (zero innerHTML anywhere):
  * 1. Markdown is tokenized via pinned `marked.Lexer.lex()` (/_meru/vendor/marked.esm.js) and built
@@ -9,17 +9,31 @@
  *    external or same-origin URLs (e.g. `/_meru/auth?code=...`) are blocked and rendered as alt text.
  * 4. Links allow ONLY `http:`, `https:`, and `mailto:` with `target="_blank" rel="noopener noreferrer"`.
  * 5. Documents > 256KB default to escaped plain text with an explicit "Render Markdown anyway" button.
- * 6. Static HTML preview uses `<iframe sandbox="" referrerpolicy="no-referrer">` with a mandatory
+ * 6. Mermaid diagrams (main reader only, when `enableMermaid: true`) render exclusively inside
+ *    `<iframe sandbox="allow-scripts" referrerpolicy="no-referrer" src="/_meru/mermaid-frame.html?id=...">`
+ *    served with HTTP `Content-Security-Policy: sandbox allow-scripts; ...` (opaque `null` origin).
+ *    SVG never crosses back to the host document; host enforces 50,000-char & 20-diagram caps,
+ *    lazy `IntersectionObserver` + serial render queue, 8s timeout, and source-first fallback.
+ * 7. Static HTML preview uses `<iframe sandbox="" referrerpolicy="no-referrer">` with a mandatory
  *    inner `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">`,
  *    defaults to escaped text (click-to-render), enforces a 1MB cap, and exposes teardown for redaction.
  */
 
-export const MARKDOWN_JS_SOURCE = `// Meru Mind Safe Markdown & Static HTML Preview Module (/_meru/markdown.js)
-// Zero innerHTML. Token-driven DOM construction + sandboxed static HTML preview.
+export const MARKDOWN_JS_SOURCE = `// Meru Mind Safe Markdown, Sandboxed Offline Mermaid & Static HTML Preview Module (/_meru/markdown.js)
+// Zero innerHTML. Token-driven DOM construction + sandboxed opaque-origin Mermaid & static HTML preview.
 import { Lexer } from "/_meru/vendor/marked.esm.js";
 
 export const MAX_AUTO_MARKDOWN_BYTES = 262_144; // 256 KB
 export const MAX_HTML_PREVIEW_BYTES = 1_048_576; // 1 MB
+export const MAX_MERMAID_CHARS = 50_000;
+export const MAX_MERMAID_DIAGRAMS = 20;
+const MERMAID_RENDER_TIMEOUT_MS = 8_000;
+const MERMAID_MIN_HEIGHT = 80;
+const MERMAID_MAX_HEIGHT = 1400;
+const MERMAID_CHANNEL = "meru-mermaid";
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+let globalMermaidSeq = 0;
 
 const SAFE_HTML_META_CSP =
   "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'";
@@ -46,6 +60,474 @@ export function isSafeImageSrc(rawSrc) {
   if (!trimmed) return false;
   if (trimmed.startsWith("blob:")) return true;
   return SAFE_DATA_IMAGE_RE.test(trimmed);
+}
+
+function makeLinearIcon(elements, size = 14) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.5");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  for (const item of elements) {
+    if (typeof item === "string") {
+      const p = document.createElementNS(SVG_NS, "path");
+      p.setAttribute("d", item);
+      svg.appendChild(p);
+    } else if (item && item.tag) {
+      const el = document.createElementNS(SVG_NS, item.tag);
+      for (const [k, v] of Object.entries(item.attrs || {})) {
+        el.setAttribute(k, String(v));
+      }
+      svg.appendChild(el);
+    }
+  }
+  return svg;
+}
+
+const MM_ICONS = {
+  diagram: () => makeLinearIcon([
+    { tag: "rect", attrs: { x: 3, y: 4, width: 7, height: 5, rx: 1.2 } },
+    { tag: "rect", attrs: { x: 14, y: 15, width: 7, height: 5, rx: 1.2 } },
+    { tag: "rect", attrs: { x: 3, y: 15, width: 7, height: 5, rx: 1.2 } },
+    "M6.5 9v6",
+    "M6.5 12h11v3",
+  ]),
+  source: () => makeLinearIcon(["M16 18l6-6-6-6", "M8 6l-6 6 6 6"]),
+  expand: () => makeLinearIcon(["M15 3h6v6", "M9 21H3v-6", "M21 3l-7 7", "M3 21l7-7"]),
+  fit: () => makeLinearIcon(["M4 14h6v6", "M20 10h-6V4", "M14 10l7-7", "M3 21l7-7"]),
+  copy: () => makeLinearIcon([
+    "M8 8h11a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2Z",
+    "M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3",
+  ]),
+  check: () => makeLinearIcon(["M5 12.5l4.2 4.2L19 7"]),
+};
+
+function clampMermaidHeight(raw) {
+  const n = Math.ceil(Number(raw) || 240);
+  return Math.max(MERMAID_MIN_HEIGHT, Math.min(MERMAID_MAX_HEIGHT, n));
+}
+
+function createMermaidController(opts) {
+  const labels = opts && typeof opts === "object" ? opts : {};
+  const entries = new Map();
+  const queue = [];
+  let count = 0;
+  let expandedCount = 0;
+  let inFlight = null;
+  let tornDown = false;
+  let currentTheme = labels.theme === "dark" ? "dark" : "light";
+
+  function dispatchExpandChange(targetEl) {
+    if (!targetEl) return;
+    try {
+      targetEl.dispatchEvent(new CustomEvent("meru-mermaid-expand-change", {
+        bubbles: true,
+        composed: true,
+        detail: { expandedCount },
+      }));
+    } catch {}
+  }
+
+  function finishInFlight(entry) {
+    if (entry.timeoutId) {
+      clearTimeout(entry.timeoutId);
+      entry.timeoutId = null;
+    }
+    if (inFlight === entry) {
+      inFlight = null;
+      pumpQueue();
+    }
+  }
+
+  function destroyEntryFrame(entry) {
+    if (entry.timeoutId) {
+      clearTimeout(entry.timeoutId);
+      entry.timeoutId = null;
+    }
+    if (entry.frame) {
+      try { entry.frame.src = "about:blank"; } catch {}
+      entry.frame.remove();
+      entry.frame = null;
+    }
+    entry.ready = false;
+    entry.rendered = false;
+    if (entry.stage) {
+      entry.stage.classList.remove("is-visible");
+      entry.stage.classList.add("is-pending");
+      entry.stage.style.height = "";
+    }
+  }
+
+  function failEntry(entry, message) {
+    if (tornDown) return;
+    entry.failed = true;
+    destroyEntryFrame(entry);
+    entry.setView("source", false);
+    entry.diagramBtn.disabled = true;
+    entry.expandBtn.disabled = true;
+    if (entry.expanded) {
+      entry.expanded = false;
+      entry.block.classList.remove("expanded");
+      expandedCount = Math.max(0, expandedCount - 1);
+      dispatchExpandChange(entry.block);
+    }
+    entry.setHint(message);
+    finishInFlight(entry);
+  }
+
+  function pumpQueue() {
+    if (tornDown || inFlight) return;
+    while (queue.length > 0) {
+      const next = queue.shift();
+      if (!next || next.failed || next.started || !next.frame) continue;
+      next.started = true;
+      inFlight = next;
+      next.timeoutId = setTimeout(() => {
+        if (!tornDown && !next.rendered && !next.failed) {
+          failEntry(
+            next,
+            labels.mermaidTimeout || "Mermaid render timed out — showing source.",
+          );
+        }
+      }, MERMAID_RENDER_TIMEOUT_MS);
+      next.frame.src = "/_meru/mermaid-frame.html?id=" + encodeURIComponent(next.frameId);
+      return;
+    }
+  }
+
+  function enqueue(entry) {
+    if (tornDown || entry.queued || entry.failed) return;
+    entry.queued = true;
+    queue.push(entry);
+    pumpQueue();
+  }
+
+  function onMessage(ev) {
+    if (tornDown) return;
+    if (ev.origin !== "null") return;
+    const data = ev.data;
+    if (!data || typeof data !== "object" || data.channel !== MERMAID_CHANNEL) return;
+    if (typeof data.frameId !== "string") return;
+    const entry = entries.get(data.frameId);
+    if (!entry || !entry.frame || ev.source !== entry.frame.contentWindow) return;
+
+    if (data.type === "ready") {
+      entry.ready = true;
+      try {
+        entry.frame.contentWindow.postMessage(
+          {
+            channel: MERMAID_CHANNEL,
+            type: "render",
+            frameId: entry.frameId,
+            source: entry.source,
+            theme: currentTheme,
+          },
+          "*",
+        );
+      } catch {
+        failEntry(entry, (labels.mermaidRenderFailed || "Mermaid render failed — showing source."));
+      }
+      return;
+    }
+
+    if (data.type === "rendered") {
+      const h = clampMermaidHeight(data.height);
+      entry.rendered = true;
+      entry.stage.style.height = h + "px";
+      entry.frame.style.height = h + "px";
+      entry.block.classList.add("is-ready");
+      entry.diagramBtn.disabled = false;
+      entry.expandBtn.disabled = false;
+      entry.setHint("");
+      if (!entry.userForcedSource) {
+        entry.setView("diagram", false);
+      }
+      finishInFlight(entry);
+      return;
+    }
+
+    if (data.type === "resize" && entry.rendered && entry.frame) {
+      const h = clampMermaidHeight(data.height);
+      entry.stage.style.height = h + "px";
+      entry.frame.style.height = h + "px";
+      return;
+    }
+
+    if (data.type === "error") {
+      const detail = typeof data.message === "string" ? data.message.trim().slice(0, 240) : "";
+      const prefix = labels.mermaidRenderFailed || "Mermaid syntax error — showing source: ";
+      failEntry(entry, detail ? (prefix + detail) : prefix.replace(/[:：]\\s*$/, ""));
+    }
+  }
+
+  window.addEventListener("message", onMessage);
+
+  const observer = typeof IntersectionObserver === "function"
+    ? new IntersectionObserver(
+        (ioEntries) => {
+          if (tornDown) return;
+          for (const ioEntry of ioEntries) {
+            if (!ioEntry.isIntersecting) continue;
+            const fid = ioEntry.target?.dataset?.mermaidFrameId;
+            if (!fid) continue;
+            const entry = entries.get(fid);
+            if (entry) {
+              observer.unobserve(ioEntry.target);
+              enqueue(entry);
+            }
+          }
+        },
+        { rootMargin: "240px" },
+      )
+    : null;
+
+  function buildMermaidBlock(source) {
+    const src = String(source ?? "");
+    const block = document.createElement("div");
+    block.className = "md-code-block md-mermaid-block";
+    block.dataset.ui = "mermaid-block";
+
+    const header = document.createElement("div");
+    header.className = "md-mermaid-header";
+
+    const headerLeft = document.createElement("div");
+    headerLeft.className = "md-mermaid-header-left";
+    const langTag = document.createElement("span");
+    langTag.className = "md-mermaid-lang";
+    langTag.textContent = "mermaid";
+    const hintEl = document.createElement("span");
+    hintEl.className = "md-mermaid-hint";
+    hintEl.dataset.ui = "mermaid-hint";
+    headerLeft.appendChild(langTag);
+    headerLeft.appendChild(hintEl);
+
+    const actions = document.createElement("div");
+    actions.className = "md-mermaid-actions";
+
+    const seg = document.createElement("div");
+    seg.className = "md-mermaid-seg";
+    seg.setAttribute("role", "group");
+
+    const diagramBtn = document.createElement("button");
+    diagramBtn.type = "button";
+    diagramBtn.className = "md-mm-btn";
+    diagramBtn.dataset.ui = "mermaid-view-diagram";
+    diagramBtn.title = labels.mermaidDiagramView || "Diagram";
+    diagramBtn.setAttribute("aria-label", diagramBtn.title);
+    diagramBtn.setAttribute("aria-pressed", "false");
+    diagramBtn.disabled = true;
+    diagramBtn.appendChild(MM_ICONS.diagram());
+
+    const sourceBtn = document.createElement("button");
+    sourceBtn.type = "button";
+    sourceBtn.className = "md-mm-btn active";
+    sourceBtn.dataset.ui = "mermaid-view-source";
+    sourceBtn.title = labels.mermaidSourceView || "Source";
+    sourceBtn.setAttribute("aria-label", sourceBtn.title);
+    sourceBtn.setAttribute("aria-pressed", "true");
+    sourceBtn.appendChild(MM_ICONS.source());
+
+    seg.appendChild(diagramBtn);
+    seg.appendChild(sourceBtn);
+    actions.appendChild(seg);
+
+    const expandBtn = document.createElement("button");
+    expandBtn.type = "button";
+    expandBtn.className = "md-mm-btn";
+    expandBtn.dataset.ui = "mermaid-toggle-expand";
+    expandBtn.title = labels.mermaidExpand || "Expand diagram";
+    expandBtn.setAttribute("aria-label", expandBtn.title);
+    expandBtn.setAttribute("aria-pressed", "false");
+    expandBtn.disabled = true;
+    expandBtn.appendChild(MM_ICONS.expand());
+    actions.appendChild(expandBtn);
+
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "md-mm-btn";
+    copyBtn.dataset.ui = "mermaid-copy-source";
+    copyBtn.title = labels.mermaidCopy || "Copy source";
+    copyBtn.setAttribute("aria-label", copyBtn.title);
+    copyBtn.appendChild(MM_ICONS.copy());
+    let copyResetTimer = null;
+    copyBtn.addEventListener("click", async () => {
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          await navigator.clipboard.writeText(src);
+        }
+        copyBtn.dataset.copied = "true";
+        while (copyBtn.firstChild) copyBtn.removeChild(copyBtn.firstChild);
+        copyBtn.appendChild(MM_ICONS.check());
+        copyBtn.title = labels.mermaidCopied || "Copied";
+        if (copyResetTimer) clearTimeout(copyResetTimer);
+        copyResetTimer = setTimeout(() => {
+          copyBtn.dataset.copied = "";
+          while (copyBtn.firstChild) copyBtn.removeChild(copyBtn.firstChild);
+          copyBtn.appendChild(MM_ICONS.copy());
+          copyBtn.title = labels.mermaidCopy || "Copy source";
+        }, 1500);
+      } catch {}
+    });
+    actions.appendChild(copyBtn);
+
+    header.appendChild(headerLeft);
+    header.appendChild(actions);
+    block.appendChild(header);
+
+    const body = document.createElement("div");
+    body.className = "md-mermaid-body";
+
+    const pre = document.createElement("pre");
+    pre.className = "md-mermaid-source";
+    const code = document.createElement("code");
+    code.textContent = src;
+    pre.appendChild(code);
+    body.appendChild(pre);
+    block.appendChild(body);
+
+    const setHint = (msg) => {
+      hintEl.textContent = msg ? String(msg) : "";
+      hintEl.classList.toggle("visible", Boolean(msg));
+    };
+
+    if (src.length > MAX_MERMAID_CHARS) {
+      setHint(labels.mermaidTooLarge || "Diagram exceeds 50,000-character limit; showing source.");
+      return block;
+    }
+
+    if (count >= MAX_MERMAID_DIAGRAMS) {
+      setHint(labels.mermaidTooMany || "Exceeded 20-diagram limit per document; showing source.");
+      return block;
+    }
+
+    count += 1;
+    const frameId = "mm_" + (++globalMermaidSeq) + "_" + Math.random().toString(36).slice(2, 8);
+    block.dataset.mermaidFrameId = frameId;
+
+    const stage = document.createElement("div");
+    stage.className = "md-mermaid-stage is-pending";
+    stage.dataset.ui = "mermaid-stage";
+
+    const frame = document.createElement("iframe");
+    frame.className = "md-mermaid-frame";
+    frame.dataset.ui = "mermaid-frame";
+    frame.setAttribute("sandbox", "allow-scripts");
+    frame.setAttribute("referrerpolicy", "no-referrer");
+    frame.title = "Mermaid diagram";
+    stage.appendChild(frame);
+    body.appendChild(stage);
+
+    const entry = {
+      frameId,
+      source: src,
+      block,
+      stage,
+      frame,
+      pre,
+      diagramBtn,
+      sourceBtn,
+      expandBtn,
+      setHint,
+      queued: false,
+      started: false,
+      ready: false,
+      rendered: false,
+      failed: false,
+      expanded: false,
+      userForcedSource: false,
+      timeoutId: null,
+      setView(mode, byUser) {
+        const showDiagram = mode === "diagram" && entry.rendered && !entry.failed;
+        if (byUser) {
+          entry.userForcedSource = !showDiagram;
+        }
+        pre.hidden = showDiagram;
+        stage.classList.toggle("is-visible", showDiagram);
+        stage.classList.toggle("is-pending", !showDiagram);
+        diagramBtn.classList.toggle("active", showDiagram);
+        diagramBtn.setAttribute("aria-pressed", String(showDiagram));
+        sourceBtn.classList.toggle("active", !showDiagram);
+        sourceBtn.setAttribute("aria-pressed", String(!showDiagram));
+      },
+    };
+
+    diagramBtn.addEventListener("click", () => {
+      if (!entry.rendered || entry.failed) return;
+      entry.setView("diagram", true);
+    });
+    sourceBtn.addEventListener("click", () => {
+      entry.setView("source", true);
+    });
+    expandBtn.addEventListener("click", () => {
+      if (!entry.rendered || entry.failed) return;
+      entry.expanded = !entry.expanded;
+      block.classList.toggle("expanded", entry.expanded);
+      expandBtn.classList.toggle("active", entry.expanded);
+      expandBtn.setAttribute("aria-pressed", String(entry.expanded));
+      while (expandBtn.firstChild) expandBtn.removeChild(expandBtn.firstChild);
+      expandBtn.appendChild(entry.expanded ? MM_ICONS.fit() : MM_ICONS.expand());
+      expandBtn.title = entry.expanded
+        ? (labels.mermaidFit || "Fit to column")
+        : (labels.mermaidExpand || "Expand diagram");
+      expandBtn.setAttribute("aria-label", expandBtn.title);
+      expandedCount = Math.max(0, expandedCount + (entry.expanded ? 1 : -1));
+      dispatchExpandChange(block);
+    });
+
+    entries.set(frameId, entry);
+    if (observer) {
+      observer.observe(block);
+    } else {
+      enqueue(entry);
+    }
+
+    return block;
+  }
+
+  function setTheme(nextTheme) {
+    if (tornDown) return;
+    const normalized = nextTheme === "dark" ? "dark" : "light";
+    if (normalized === currentTheme) return;
+    currentTheme = normalized;
+    for (const entry of entries.values()) {
+      if (entry.ready && entry.frame && entry.frame.contentWindow && !entry.failed) {
+        try {
+          entry.frame.contentWindow.postMessage(
+            {
+              channel: MERMAID_CHANNEL,
+              type: "render",
+              frameId: entry.frameId,
+              source: entry.source,
+              theme: currentTheme,
+            },
+            "*",
+          );
+        } catch {}
+      }
+    }
+  }
+
+  function teardown() {
+    if (tornDown) return;
+    tornDown = true;
+    window.removeEventListener("message", onMessage);
+    if (observer) {
+      try { observer.disconnect(); } catch {}
+    }
+    queue.length = 0;
+    inFlight = null;
+    for (const entry of entries.values()) {
+      destroyEntryFrame(entry);
+    }
+    entries.clear();
+  }
+
+  return { buildMermaidBlock, setTheme, teardown };
 }
 
 function appendInlineTokens(parent, tokens, fallbackText) {
@@ -158,7 +640,7 @@ function appendInlineTokens(parent, tokens, fallbackText) {
   }
 }
 
-function appendBlockTokens(parent, tokens) {
+function appendBlockTokens(parent, tokens, mermaidCtrl = null) {
   if (!Array.isArray(tokens)) return;
   for (const tok of tokens) {
     if (!tok || tok.type === "space") continue;
@@ -188,7 +670,7 @@ function appendBlockTokens(parent, tokens) {
       }
       case "blockquote": {
         const bq = document.createElement("blockquote");
-        appendBlockTokens(bq, tok.tokens);
+        appendBlockTokens(bq, tok.tokens, mermaidCtrl);
         parent.appendChild(bq);
         break;
       }
@@ -216,7 +698,7 @@ function appendBlockTokens(parent, tokens) {
                 if (t.type === "text") appendInlineTokens(li, t.tokens, t.text);
               }
             } else {
-              appendBlockTokens(li, item.tokens);
+              appendBlockTokens(li, item.tokens, mermaidCtrl);
             }
           } else {
             li.appendChild(document.createTextNode(String(item.text ?? "")));
@@ -227,12 +709,17 @@ function appendBlockTokens(parent, tokens) {
         break;
       }
       case "code": {
+        const langStr = String(tok.lang ?? "").trim();
+        if (mermaidCtrl && /^mermaid$/i.test(langStr)) {
+          parent.appendChild(mermaidCtrl.buildMermaidBlock(String(tok.text ?? "")));
+          break;
+        }
         const wrap = document.createElement("div");
         wrap.className = "md-code-block";
-        if (tok.lang) {
+        if (langStr) {
           const lang = document.createElement("div");
           lang.className = "md-code-lang";
-          lang.textContent = String(tok.lang).trim();
+          lang.textContent = langStr;
           wrap.appendChild(lang);
         }
         const pre = document.createElement("pre");
@@ -302,7 +789,7 @@ export function renderMarkdownToFragment(source) {
   const str = String(source ?? "");
   if (!str) return frag;
   const tokens = Lexer.lex(str, { gfm: true, breaks: false });
-  appendBlockTokens(frag, tokens);
+  appendBlockTokens(frag, tokens, null);
   return frag;
 }
 
@@ -369,6 +856,121 @@ export const MARKDOWN_SHADOW_STYLES = \`
     line-height: 1.5;
     color: var(--meru-fg, #14171f);
   }
+  .md-mermaid-block {
+    position: relative;
+    transition: border-color 140ms ease, box-shadow 140ms ease;
+  }
+  .md-mermaid-block.expanded {
+    border-color: var(--meru-border-strong, rgba(20, 23, 31, 0.22));
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+  }
+  .md-mermaid-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 8px 4px 10px;
+    border-bottom: 1px solid var(--meru-border, rgba(20, 23, 31, 0.08));
+    background: var(--meru-surface-subtle, #f5f7fa);
+    min-height: 32px;
+  }
+  .md-mermaid-header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .md-mermaid-lang {
+    font-family: var(--meru-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 11px;
+    color: var(--meru-fg-muted, #636b78);
+    flex-shrink: 0;
+  }
+  .md-mermaid-hint {
+    display: none;
+    font-size: 11px;
+    color: var(--meru-fg-muted, #636b78);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .md-mermaid-hint.visible {
+    display: inline;
+  }
+  .md-mermaid-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .md-mermaid-seg {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+    padding: 1px;
+    border-radius: 6px;
+    background: var(--meru-surface-control, rgba(20, 23, 31, 0.045));
+    border: 1px solid var(--meru-border, rgba(20, 23, 31, 0.09));
+  }
+  .md-mm-btn {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--meru-fg-muted, #636b78);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background 110ms ease, color 110ms ease;
+  }
+  .md-mm-btn:hover:not(:disabled) {
+    background: var(--meru-surface-hover, rgba(20, 23, 31, 0.075));
+    color: var(--meru-fg, #14171f);
+  }
+  .md-mm-btn.active {
+    background: var(--meru-surface, #ffffff);
+    color: var(--meru-fg, #14171f);
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+  }
+  .md-mm-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  .md-mm-btn:focus-visible {
+    outline: 2px solid var(--meru-data-hue, #2e66b8);
+    outline-offset: 1px;
+  }
+  .md-mermaid-body {
+    position: relative;
+  }
+  .md-mermaid-stage {
+    width: 100%;
+    overflow: hidden;
+  }
+  .md-mermaid-stage.is-pending {
+    visibility: hidden;
+    height: 0;
+    position: absolute;
+    left: 0;
+    top: 0;
+    pointer-events: none;
+  }
+  .md-mermaid-stage.is-visible {
+    visibility: visible;
+    position: relative;
+    pointer-events: auto;
+  }
+  .md-mermaid-frame {
+    display: block;
+    width: 100%;
+    border: none;
+    background: transparent;
+  }
   .md-table-wrap { overflow-x: auto; margin: 0.75em 0; }
   table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
   th, td {
@@ -426,44 +1028,85 @@ export const MARKDOWN_SHADOW_STYLES = \`
 \`;
 
 export function mountMarkdownIntoShadow(shadowRoot, source, opts = {}) {
-  while (shadowRoot.firstChild) shadowRoot.removeChild(shadowRoot.firstChild);
+  let activeCtrl = null;
+  let currentTheme = opts.theme === "dark" ? "dark" : "light";
 
-  const style = document.createElement("style");
-  style.textContent = MARKDOWN_SHADOW_STYLES;
-  shadowRoot.appendChild(style);
+  function renderIntoShadow(forceRender) {
+    if (activeCtrl) {
+      activeCtrl.teardown();
+      activeCtrl = null;
+    }
+    while (shadowRoot.firstChild) shadowRoot.removeChild(shadowRoot.firstChild);
 
-  const root = document.createElement("div");
-  root.className = "md-root";
-  const str = String(source ?? "");
-  const force = Boolean(opts.force);
+    const style = document.createElement("style");
+    style.textContent = MARKDOWN_SHADOW_STYLES;
+    shadowRoot.appendChild(style);
 
-  if (!force && str.length > MAX_AUTO_MARKDOWN_BYTES) {
-    const guard = document.createElement("div");
-    guard.className = "md-large-guard";
-    const info = document.createElement("span");
-    info.textContent =
-      (opts.largeWarningText || "Large document (>256KB) shown as plain text.");
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "md-guard-btn";
-    btn.textContent = opts.renderAnywayLabel || "Render anyway";
-    btn.addEventListener("click", () => {
-      mountMarkdownIntoShadow(shadowRoot, str, { ...opts, force: true });
-    });
-    guard.appendChild(info);
-    guard.appendChild(btn);
-    root.appendChild(guard);
+    const root = document.createElement("div");
+    root.className = "md-root";
+    const str = String(source ?? "");
 
-    const pre = document.createElement("pre");
-    pre.className = "md-plain-fallback";
-    pre.textContent = str;
-    root.appendChild(pre);
+    if (!forceRender && str.length > MAX_AUTO_MARKDOWN_BYTES) {
+      const guard = document.createElement("div");
+      guard.className = "md-large-guard";
+      const info = document.createElement("span");
+      info.textContent =
+        (opts.largeWarningText || "Large document (>256KB) shown as plain text.");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "md-guard-btn";
+      btn.textContent = opts.renderAnywayLabel || "Render anyway";
+      btn.addEventListener("click", () => {
+        renderIntoShadow(true);
+      });
+      guard.appendChild(info);
+      guard.appendChild(btn);
+      root.appendChild(guard);
+
+      const pre = document.createElement("pre");
+      pre.className = "md-plain-fallback";
+      pre.textContent = str;
+      root.appendChild(pre);
+      shadowRoot.appendChild(root);
+      return;
+    }
+
+    const mermaidCtrl = opts.enableMermaid
+      ? createMermaidController({ ...opts, theme: currentTheme })
+      : null;
+    activeCtrl = mermaidCtrl;
+    if (str) {
+      const tokens = Lexer.lex(str, { gfm: true, breaks: false });
+      appendBlockTokens(root, tokens, mermaidCtrl);
+    }
     shadowRoot.appendChild(root);
-    return;
   }
 
-  root.appendChild(renderMarkdownToFragment(str));
-  shadowRoot.appendChild(root);
+  renderIntoShadow(Boolean(opts.force));
+
+  return {
+    setTheme(nextTheme) {
+      currentTheme = nextTheme === "dark" ? "dark" : "light";
+      if (activeCtrl) activeCtrl.setTheme(currentTheme);
+    },
+    teardown() {
+      if (activeCtrl) {
+        activeCtrl.teardown();
+        activeCtrl = null;
+      }
+    },
+  };
+}
+
+export function mountSafeMarkdown(container, source, opts = {}) {
+  if (!container) {
+    return { setTheme() {}, teardown() {} };
+  }
+  const targetShadow =
+    typeof ShadowRoot !== "undefined" && container instanceof ShadowRoot
+      ? container
+      : (container.shadowRoot || container.attachShadow({ mode: "open" }));
+  return mountMarkdownIntoShadow(targetShadow, source, opts);
 }
 
 /**

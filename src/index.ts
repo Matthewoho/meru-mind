@@ -210,6 +210,7 @@ export {
 } from "./server/ui-auth.js";
 export {
   STRICT_UI_CSP,
+  buildMermaidFrameCsp,
   isLoopbackHost,
   assertWebDirAllowed,
   createUiRouteHandler,
@@ -223,6 +224,10 @@ export {
   DEFAULT_SHELL_JS,
 } from "./server/ui-assets.js";
 export { MARKDOWN_JS_SOURCE } from "./server/markdown-renderer.js";
+export {
+  MERMAID_FRAME_HTML_SOURCE,
+  MERMAID_FRAME_JS_SOURCE,
+} from "./server/mermaid-frame.js";
 export { MERU_MIND_VERSION } from "./version.js";
 export { seedDemoOrg, type DemoSeedSummary } from "./server/demo-seed.js";
 export {

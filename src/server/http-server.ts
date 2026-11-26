@@ -413,6 +413,7 @@ export async function startMindServer(
       allowedOrigins: options.allowedOrigins,
       oidcManager,
       getServerUrl: () => serverUrlRef.value,
+      publicBaseUrl: configuredPublicBaseUrl,
     });
 
     unsubChangeLog = engine.db.onChangeCommitted((events) =>

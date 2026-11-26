@@ -641,13 +641,16 @@ export class MeruMarkdownElement extends HTMLElement {
     super();
     this._source = "";
     this._labels = {};
+    this._enableMermaid = false;
+    this._theme = document.documentElement?.dataset?.theme === "dark" ? "dark" : "light";
     this._renderToken = 0;
+    this._mountHandle = null;
     this.attachShadow({ mode: "open" });
   }
 
   set source(val) {
     this._source = String(val ?? "");
-    this.render();
+    if (this.isConnected) this.render();
   }
 
   get source() {
@@ -656,20 +659,63 @@ export class MeruMarkdownElement extends HTMLElement {
 
   set labels(val) {
     this._labels = val && typeof val === "object" ? val : {};
-    if (this._source) this.render();
+    if (this.isConnected && this._source) this.render();
   }
 
   get labels() {
     return this._labels;
   }
 
+  set enableMermaid(val) {
+    const next = Boolean(val);
+    if (this._enableMermaid === next) return;
+    this._enableMermaid = next;
+    if (this.isConnected && this._source) this.render();
+  }
+
+  get enableMermaid() {
+    return this._enableMermaid;
+  }
+
+  set theme(val) {
+    this.setTheme(val);
+  }
+
+  get theme() {
+    return this._theme;
+  }
+
+  setTheme(nextTheme) {
+    const normalized = nextTheme === "dark" ? "dark" : "light";
+    this._theme = normalized;
+    if (this._mountHandle && typeof this._mountHandle.setTheme === "function") {
+      this._mountHandle.setTheme(normalized);
+    }
+  }
+
+  teardown() {
+    this._renderToken += 1;
+    if (this._mountHandle && typeof this._mountHandle.teardown === "function") {
+      try { this._mountHandle.teardown(); } catch {}
+    }
+    this._mountHandle = null;
+  }
+
   connectedCallback() {
     this.render();
+  }
+
+  disconnectedCallback() {
+    this.teardown();
   }
 
   render() {
     const root = this.shadowRoot;
     if (!root) return;
+    if (this._mountHandle && typeof this._mountHandle.teardown === "function") {
+      try { this._mountHandle.teardown(); } catch {}
+      this._mountHandle = null;
+    }
     const token = ++this._renderToken;
     const text = this._source;
 
@@ -687,8 +733,12 @@ export class MeruMarkdownElement extends HTMLElement {
 
     loadMarkdownTools()
       .then((mod) => {
-        if (token !== this._renderToken) return;
-        mod.mountMarkdownIntoShadow(root, text, this._labels);
+        if (token !== this._renderToken || !this.isConnected) return;
+        this._mountHandle = mod.mountMarkdownIntoShadow(root, text, {
+          ...this._labels,
+          enableMermaid: this._enableMermaid,
+          theme: this._theme,
+        });
       })
       .catch(() => {
         // Keep safe plain-text fallback on offline/load failure
