@@ -294,6 +294,38 @@ const VOCAB = {
     objKindRepo: "Repo",
     objKindEnv: "Environment",
 
+    // Center Object Page (v0.7.0)
+    signalRules: "Rules",
+    signalPending: "Pending",
+    signalPeers: "Active peers",
+    ruleGroupWall: "Wall · Realm",
+    ruleGroupObject: "Object & ancestors",
+    ruleGroupWith: "Linked (--with)",
+    objSecPending: "Pending Decisions",
+    objSecActiveDecisions: "Active Decisions",
+    objSecNarrative: "Summary",
+    objSecChildren: "Children",
+    objSecCoOccurring: "Co-occurring",
+    objSecRecordStream: "Record Stream",
+    objEmptyStream: "No records linked to this object yet.",
+    showMoreDecisions: (n) => "Show more (+" + n + ")",
+    showFewerDecisions: "Show top 5",
+    narrativeNonBinding: "Agent summary · non-binding",
+    freshnessFresh: "Fresh",
+    freshnessSoftStale: "Updates since settled",
+    freshnessHardStale: "Outdated summary",
+    hardStaleExpand: "Show outdated text",
+    hardStaleCollapse: "Hide outdated text",
+    hardStaleLoading: "Loading historic text...",
+    hardStaleUnavailable: "Historic text unavailable.",
+    propParent: "Parent",
+    propAliases: "Aliases",
+    propState: "State",
+    objStateActive: "Active",
+    objStateInactive: "Inactive",
+    objStateArchived: "Archived",
+    objStateSuperseded: "Superseded",
+
     // Generic errors
     loadEntryFailed: "Failed to load entry",
     loadObjectFailed: "Failed to load object",
@@ -566,6 +598,38 @@ const VOCAB = {
     objKindRepo: "代码库",
     objKindEnv: "环境",
 
+    // Center Object Page (v0.7.0)
+    signalRules: "规矩",
+    signalPending: "待拍板",
+    signalPeers: "活跃协作",
+    ruleGroupWall: "墙规矩 · 识界",
+    ruleGroupObject: "对象及上级",
+    ruleGroupWith: "联动对象 (--with)",
+    objSecPending: "待拍板",
+    objSecActiveDecisions: "现行决定",
+    objSecNarrative: "简介",
+    objSecChildren: "下级对象",
+    objSecCoOccurring: "关联对象",
+    objSecRecordStream: "记录流",
+    objEmptyStream: "该对象下暂无关联记录。",
+    showMoreDecisions: (n) => "展开更多 +" + n,
+    showFewerDecisions: "仅看前 5 条",
+    narrativeNonBinding: "Agent 摘要 · 非规矩",
+    freshnessFresh: "最新",
+    freshnessSoftStale: "其后有新增",
+    freshnessHardStale: "摘要已过时",
+    hardStaleExpand: "展开历史文本",
+    hardStaleCollapse: "收起历史文本",
+    hardStaleLoading: "正在加载历史文本…",
+    hardStaleUnavailable: "暂无可查看的历史文本。",
+    propParent: "上级对象",
+    propAliases: "别名",
+    propState: "状态",
+    objStateActive: "活跃",
+    objStateInactive: "非活跃",
+    objStateArchived: "已归档",
+    objStateSuperseded: "已被取代",
+
     // Generic errors
     loadEntryFailed: "加载记录失败",
     loadObjectFailed: "加载对象失败",
@@ -681,6 +745,11 @@ const ICONS = {
   bookOpen: () => makeSvg(["M2 4h6a4 4 0 0 1 4 4v12a3 3 0 0 0-3-3H2z", "M22 4h-6a4 4 0 0 0-4 4v12a3 3 0 0 1 3-3h7z"], 14),
   code: () => makeSvg(["M16 18l6-6-6-6", "M8 6l-6 6 6 6"], 14),
   eye: () => makeSvg(["M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z", "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"], 14),
+  alertTriangle: (size = 14) => makeSvg([
+    "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z",
+    "M12 9v4",
+    "M12 17h.01",
+  ], size),
 };
 
 function kindMeta(rawKind) {
@@ -721,6 +790,41 @@ function objectKindLabel(rawKind) {
   if (k === "repo") return st("objKindRepo");
   if (k === "env") return st("objKindEnv");
   return rawKind ? String(rawKind) : st("tabObjects");
+}
+
+function objectStateLabel(rawState) {
+  const s = String(rawState || "").trim().toLowerCase();
+  if (s === "inactive") return st("objStateInactive");
+  if (s === "archived") return st("objStateArchived");
+  if (s === "superseded") return st("objStateSuperseded");
+  return st("objStateActive");
+}
+
+const OBJECT_TAG_CHIP_RE = /^[a-z][a-z0-9_-]*:[^\s]+$/i;
+
+function getEntryObjectChips(item) {
+  const chips = [];
+  const seen = new Set();
+  if (Array.isArray(item?.objectRefs)) {
+    for (const o of item.objectRefs) {
+      if (!o || !o.ref) continue;
+      const key = String(o.ref).toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      chips.push({ ref: String(o.ref), label: String(o.ref), kind: o.kind || "", name: o.name || "" });
+    }
+  }
+  if (Array.isArray(item?.resourceTags)) {
+    for (const tag of item.resourceTags) {
+      const t = String(tag || "").trim();
+      if (!t || !OBJECT_TAG_CHIP_RE.test(t)) continue;
+      const key = t.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      chips.push({ ref: t, label: t, kind: t.split(":")[0] || "", name: t.slice(t.indexOf(":") + 1) });
+    }
+  }
+  return chips;
 }
 
 function realtimeStatusLabel(status) {
@@ -867,11 +971,21 @@ function looksLikeHtmlDoc(text, sourceRef) {
 
 let activeStudioHtmlPreview = null;
 let activeStudioMarkdownEl = null;
+let activeObjectNarrativeMarkdownEl = null;
 
 function teardownStudioHtmlPreview() {
   if (activeStudioHtmlPreview) {
     try { activeStudioHtmlPreview.teardown(); } catch {}
     activeStudioHtmlPreview = null;
+  }
+}
+
+function teardownObjectNarrativeMarkdown() {
+  if (activeObjectNarrativeMarkdownEl) {
+    if (typeof activeObjectNarrativeMarkdownEl.teardown === "function") {
+      try { activeObjectNarrativeMarkdownEl.teardown(); } catch {}
+    }
+    activeObjectNarrativeMarkdownEl = null;
   }
 }
 
@@ -883,6 +997,7 @@ function teardownStudioReader() {
     }
     activeStudioMarkdownEl = null;
   }
+  teardownObjectNarrativeMarkdown();
 }
 
 /**
@@ -1027,10 +1142,25 @@ const state = {
   openEntry: null, // entry opened full-width in Center Document Reader
   focusedEntryId: null, // list row focused via J/K (or matching openEntry)
   focusedEntry: null, // entry shown in Right Properties Rail
-  focusedObjectRef: null, // ref of selected object in Right Properties Rail
+  focusedObjectRef: null, // ref of selected object
   selectedChain: null,
   selectedObject: null,
+  selectedObjectActivePeers: [],
   previousObject: null,
+  objectRulesExpanded: false,
+  objectPeersExpanded: false,
+  objectDecisionsExpanded: false,
+  objectStaleCardExpanded: false,
+  objectStaleCardLoading: false,
+  objectStaleCardHistoricMd: null,
+  objectEntries: [],
+  objectEntriesTotal: null,
+  objectEntriesHasMore: false,
+  objectEntriesCursor: null,
+  objectEntriesLoadingMore: false,
+  objectEntriesReqSeq: 0,
+  selectObjectSeq: 0,
+  objectShowHistory: false,
   railCliCommand: null,
   savedListScrollTop: 0,
   restoreListScrollPending: false,
@@ -1418,17 +1548,19 @@ function buildUrlFromState() {
   if (onShell && state.activeRealmPath && state.activeRealmPath !== "/") {
     sp.set("realm", state.activeRealmPath);
   }
+  const activeObjRef = state.selectedObject?.ref || state.previousObject?.ref || null;
   const defaultTab = state.activeRealmPath === "/inbox" ? "inbox" : "entries";
-  if (state.activeTab && state.activeTab !== defaultTab) {
+  if (!activeObjRef && state.activeTab && state.activeTab !== defaultTab) {
     sp.set("tab", state.activeTab);
+  }
+  if (activeObjRef) {
+    sp.set("object", activeObjRef);
   }
   if (state.openEntry?.id) {
     sp.set("entry", state.openEntry.id);
     if (state.readerView && state.readerView !== "md") {
       sp.set("view", state.readerView);
     }
-  } else if (state.selectedObject?.ref) {
-    sp.set("object", state.selectedObject.ref);
   }
   const qs = sp.toString();
   return qs ? (basePath + "?" + qs) : basePath;
@@ -1469,6 +1601,9 @@ function getFilteredRealmEntries() {
 }
 
 function getVisibleListEntries() {
+  if (state.selectedObject || state.previousObject) {
+    return state.objectEntries || [];
+  }
   if (state.activeTab === "entries") {
     return getFilteredRealmEntries();
   }
@@ -1545,6 +1680,13 @@ async function loadRealmEntries(realmPath, reset = true, opts = {}) {
   return { ok: true, stale: false };
 }
 
+function getWritablePulseRealm(preferredPath) {
+  const boundPath = state.whoami?.bound?.realmPath || "/";
+  if (boundPath === "/") return preferredPath || "/";
+  if (preferredPath === boundPath) return boundPath;
+  return boundPath;
+}
+
 async function selectRealm(realmPath, preferredTab, opts = {}) {
   const mySeq = ++state.selectRealmSeq;
   const isBg = Boolean(opts.background);
@@ -1567,12 +1709,32 @@ async function selectRealm(realmPath, preferredTab, opts = {}) {
     teardownStudioReader();
     state.openEntry = null;
     state.railCliCommand = null;
-    if (prevRealm !== realmPath) {
+    if (!opts.keepObject && !isBg) {
       state.focusedEntryId = null;
       state.focusedEntry = null;
       state.focusedObjectRef = null;
       state.selectedChain = null;
       state.selectedObject = null;
+      state.selectedObjectActivePeers = [];
+      state.previousObject = null;
+      state.objectEntries = [];
+      state.objectEntriesTotal = null;
+      state.objectEntriesHasMore = false;
+      state.objectEntriesCursor = null;
+      state.objectEntriesLoadingMore = false;
+      if (prevRealm !== realmPath) {
+        state.savedListScrollTop = 0;
+      }
+      if (!state.inspectorPinned) {
+        state.inspectorOpen = false;
+      }
+    } else if (prevRealm !== realmPath) {
+      state.focusedEntryId = null;
+      state.focusedEntry = null;
+      state.focusedObjectRef = null;
+      state.selectedChain = null;
+      state.selectedObject = null;
+      state.selectedObjectActivePeers = [];
       state.previousObject = null;
       state.savedListScrollTop = 0;
       if (!state.inspectorPinned) {
@@ -1613,7 +1775,8 @@ async function selectRealm(realmPath, preferredTab, opts = {}) {
   if (inboxRes) state.inboxEntries = inboxRes.items || [];
   state.lastSyncedAt = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
-  const selfPulse = await client.pulse.setFocus([realmPath], null, realmPath, "browser").catch(() => null);
+  const pulseRealm = getWritablePulseRealm(realmPath);
+  const selfPulse = await client.pulse.setFocus([realmPath], null, pulseRealm, "browser").catch(() => null);
   if (mySeq !== state.selectRealmSeq) return;
   if (selfPulse?.sessionId) state.selfPulseSessionId = selfPulse.sessionId;
   const pulseRes = await client.pulse.list().catch(() => null);
@@ -1653,26 +1816,113 @@ async function selectRealm(realmPath, preferredTab, opts = {}) {
   render();
 }
 
-async function selectObjectByRef(objRef, openInspector = true, opts = {}) {
+async function loadObjectEntries(objRef, reset = true, opts = {}) {
+  const reqToken = ++state.objectEntriesReqSeq;
+  const limit = opts.preserveLoadedCount
+    ? Math.min(200, Math.max(25, state.objectEntries.length))
+    : 25;
+  let res;
   try {
-    const res = await client.show(objRef);
+    res = await client.ls({
+      ref: objRef,
+      limit,
+      cursor: reset ? undefined : (state.objectEntriesCursor || undefined),
+      history: state.objectShowHistory ? "true" : undefined,
+    });
+  } catch (err) {
+    if (reqToken !== state.objectEntriesReqSeq) {
+      return { ok: false, stale: true, error: err };
+    }
+    if (reset && opts.clearOnFailure) {
+      state.objectEntries = [];
+      state.objectEntriesTotal = null;
+      state.objectEntriesCursor = null;
+      state.objectEntriesHasMore = false;
+    }
+    return { ok: false, stale: false, error: err };
+  }
+  if (reqToken !== state.objectEntriesReqSeq) {
+    return { ok: false, stale: true };
+  }
+  const batch = Array.isArray(res?.items) ? res.items : [];
+  if (reset) {
+    state.objectEntries = batch;
+  } else {
+    const seen = new Set(state.objectEntries.map((x) => x.id));
+    for (const item of batch) {
+      if (!seen.has(item.id)) state.objectEntries.push(item);
+    }
+  }
+  state.objectEntriesTotal = typeof res?.totalMatched === "number"
+    ? res.totalMatched
+    : (typeof res?.total === "number" ? res.total : null);
+  state.objectEntriesCursor = res?.nextCursor || null;
+  state.objectEntriesHasMore = Boolean(state.objectEntriesCursor);
+  return { ok: true, stale: false };
+}
+
+async function selectObjectByRef(objRef, openInspector = false, opts = {}) {
+  const mySeq = ++state.selectObjectSeq;
+  const prevRef = state.selectedObject?.ref || null;
+  const isSameObject = Boolean(prevRef && prevRef === objRef);
+  try {
+    const [res, streamRes] = await Promise.all([
+      client.show(objRef),
+      loadObjectEntries(objRef, true, {
+        preserveLoadedCount: Boolean(opts.preserveLoadedCount && isSameObject),
+        clearOnFailure: !isSameObject,
+      }),
+    ]);
+    if (mySeq !== state.selectObjectSeq) return false;
     if (res?.refType === "object" && res.card) {
-      teardownStudioReader();
+      const canonicalChanged = !prevRef || prevRef !== res.card.ref;
+      if (!opts.keepReader) {
+        teardownStudioReader();
+        state.openEntry = null;
+        state.focusedEntryId = null;
+        state.focusedEntry = null;
+        state.selectedChain = null;
+        state.previousObject = null;
+      } else {
+        teardownObjectNarrativeMarkdown();
+      }
       state.selectedObject = res.card;
+      state.selectedObjectActivePeers = Array.isArray(res.activePeers) ? res.activePeers : [];
       state.focusedObjectRef = res.card.ref || objRef;
-      state.previousObject = null;
-      state.openEntry = null;
-      state.focusedEntryId = null;
-      state.focusedEntry = null;
-      state.selectedChain = null;
       state.railCliCommand = null;
-      if (openInspector) state.inspectorOpen = true;
+      if (canonicalChanged) {
+        state.objectRulesExpanded = false;
+        state.objectPeersExpanded = false;
+        state.objectDecisionsExpanded = false;
+        state.objectStaleCardExpanded = false;
+        state.objectStaleCardLoading = false;
+        state.objectStaleCardHistoricMd = null;
+        state.objectEntriesLoadingMore = false;
+        state.objectShowHistory = false;
+      } else if (res.card.cardFreshness?.status !== "hard_stale") {
+        state.objectStaleCardExpanded = false;
+        state.objectStaleCardHistoricMd = null;
+      }
+      // If initial loadObjectEntries failed or used a non-canonical ref and returned empty while counts.total > 0, retry with canonical ref
+      if (streamRes && !streamRes.ok && res.card.ref && res.card.ref !== objRef) {
+        await loadObjectEntries(res.card.ref, true, { clearOnFailure: true });
+        if (mySeq !== state.selectObjectSeq) return false;
+      }
+      if (openInspector) {
+        state.inspectorOpen = true;
+      } else if (!state.inspectorPinned) {
+        state.inspectorOpen = false;
+      }
       if (!opts.skipUrlSync) syncUrlFromState(Boolean(opts.replaceUrl));
-      render();
+      if (!opts.skipRender) render();
+      return true;
     }
   } catch (err) {
-    showToast(err?.message || st("loadObjectFailed"));
+    if (mySeq === state.selectObjectSeq && !opts.silent) {
+      showToast(err?.message || st("loadObjectFailed"));
+    }
   }
+  return false;
 }
 
 async function fetchFlatEntry(entryId) {
@@ -1682,11 +1932,16 @@ async function fetchFlatEntry(entryId) {
   ]);
   if (showRes?.refType !== "entry") return null;
   const e = showRes.entry;
+  const linkedMeta = {
+    objectIds: Array.isArray(e.objectIds) ? e.objectIds : [],
+    objectRefs: Array.isArray(e.objectRefs) ? e.objectRefs : [],
+    resourceTags: Array.isArray(e.resourceTags) ? e.resourceTags : [],
+  };
   const flat = e.kind === "record"
-    ? { ...e.record, realmPath: e.realmPath, body: showRes.content }
+    ? { ...e.record, ...linkedMeta, realmPath: e.realmPath, body: showRes.content }
     : e.kind === "seabed"
-      ? { ...e.seabed, realmPath: e.realmPath, title: e.seabed.kind + ":" + e.seabed.id, body: showRes.content }
-      : { id: entryId, title: entryId, body: showRes.content };
+      ? { ...e.seabed, ...linkedMeta, realmPath: e.realmPath, title: e.seabed.kind + ":" + e.seabed.id, body: showRes.content }
+      : { id: entryId, title: entryId, ...linkedMeta, body: showRes.content };
   return { flat, chainRes };
 }
 
@@ -1710,9 +1965,12 @@ async function openEntryInCenter(entryId, opts = {}) {
     const fetched = await fetchFlatEntry(entryId);
     if (!fetched) return;
     const { flat, chainRes } = fetched;
-    if (opts.fromObject && state.selectedObject) {
-      state.previousObject = state.selectedObject;
-    } else if (!opts.fromObject) {
+    const activeObj = state.selectedObject || state.previousObject;
+    if (opts.fromObject === false) {
+      state.previousObject = null;
+    } else if ((opts.fromObject || state.selectedObject) && activeObj) {
+      state.previousObject = activeObj;
+    } else if (!state.previousObject) {
       state.previousObject = null;
     }
     state.selectedObject = null;
@@ -1741,11 +1999,17 @@ async function openEntryInCenter(entryId, opts = {}) {
 function closeReaderToList(opts = {}) {
   if (!state.openEntry) return;
   teardownStudioReader();
+  const returnObj = opts.ignorePreviousObject ? null : state.previousObject;
+  state.previousObject = null;
   state.openEntry = null;
   state.focusedEntryId = null;
   state.focusedEntry = null;
   state.selectedChain = null;
   state.railCliCommand = null;
+  if (returnObj) {
+    state.selectedObject = returnObj;
+    state.focusedObjectRef = returnObj.ref || null;
+  }
   state.restoreListScrollPending = true;
   if (!state.inspectorPinned) {
     state.inspectorOpen = false;
@@ -1813,16 +2077,25 @@ async function refreshAll(opts = {}) {
   const targetPath = state.realms.some((r) => r.path === desiredRealm)
     ? desiredRealm
     : (state.realms[0]?.path || "/");
+  const activeObjRef = state.selectedObject?.ref || null;
   const keepCount = Boolean(
     opts.preserveLoadedCount ?? (targetPath === state.activeRealmPath && state.realmEntries.length > 25),
   );
   await selectRealm(targetPath, opts.tab || state.activeTab, {
     keepReader: Boolean(opts.keepReader ?? state.openEntry),
+    keepObject: Boolean(opts.keepObject ?? activeObjRef),
     preserveLoadedCount: keepCount,
     skipUrlSync: Boolean(opts.skipUrlSync),
     replaceUrl: Boolean(opts.replaceUrl),
     background: Boolean(opts.background),
   });
+  if (activeObjRef && state.selectedObject?.ref === activeObjRef && !state.openEntry) {
+    await selectObjectByRef(activeObjRef, false, {
+      skipUrlSync: true,
+      preserveLoadedCount: state.objectEntries.length > 25,
+      silent: Boolean(opts.background),
+    });
+  }
 }
 
 function openWriteModal() {
@@ -1842,8 +2115,9 @@ function buildStudioEntryRow(item, opts = {}) {
   const sm = statusMeta(item.status, isRedacted);
   const isSelected = state.focusedEntryId === item.id;
 
-  const row = document.createElement("button");
-  row.type = "button";
+  const row = document.createElement("div");
+  row.setAttribute("role", "button");
+  row.tabIndex = 0;
   row.className = "studio-entry-row" +
     (isSelected ? " selected" : "") +
     (isRedacted ? " redacted" : "") +
@@ -1920,13 +2194,42 @@ function buildStudioEntryRow(item, opts = {}) {
     metaLine.appendChild(timeEl);
   }
 
+  const objChips = !isRedacted ? getEntryObjectChips(item) : [];
+  if (objChips.length > 0) {
+    const chipsWrap = document.createElement("span");
+    chipsWrap.className = "entry-object-chips";
+    for (const chip of objChips.slice(0, 4)) {
+      const chipBtn = document.createElement("button");
+      chipBtn.type = "button";
+      chipBtn.className = "entry-object-chip";
+      chipBtn.dataset.ui = "entry-object-chip";
+      chipBtn.dataset.objectRef = chip.ref;
+      chipBtn.textContent = chip.label;
+      chipBtn.title = chip.ref;
+      chipBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        void selectObjectByRef(chip.ref, false);
+      });
+      chipsWrap.appendChild(chipBtn);
+    }
+    metaLine.appendChild(chipsWrap);
+  }
+
   mainCol.appendChild(metaLine);
   row.appendChild(mainCol);
 
-  row.addEventListener("click", () => {
+  const openRow = () => {
     const sel = typeof window !== "undefined" && window.getSelection ? window.getSelection() : null;
     if (sel && String(sel).trim().length > 0) return;
-    void openEntryInCenter(item.id);
+    void openEntryInCenter(item.id, { fromObject: Boolean(opts.fromObject) });
+  };
+  row.addEventListener("click", openRow);
+  row.addEventListener("keydown", (ev) => {
+    if (ev.target !== row) return;
+    if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      openRow();
+    }
   });
 
   return row;
@@ -3094,7 +3397,7 @@ function buildObjectsSection() {
 
       btn.appendChild(main);
       btn.appendChild(ICONS.arrowRight());
-      btn.addEventListener("click", () => { void selectObjectByRef(obj.ref, true); });
+      btn.addEventListener("click", () => { void selectObjectByRef(obj.ref, false); });
       grid.appendChild(btn);
     }
     listWrap.appendChild(grid);
@@ -3396,20 +3699,7 @@ function buildDocumentReader() {
     : (e.realmPath || state.activeRealmPath || "/");
   backBtn.appendChild(backLbl);
   backBtn.addEventListener("click", () => {
-    if (state.previousObject) {
-      const obj = state.previousObject;
-      state.previousObject = null;
-      teardownStudioReader();
-      state.openEntry = null;
-      state.focusedEntryId = null;
-      state.focusedEntry = null;
-      state.selectedObject = obj;
-      state.focusedObjectRef = obj.ref || null;
-      syncUrlFromState(false);
-      render();
-    } else {
-      closeReaderToList();
-    }
+    closeReaderToList();
   });
   toolbar.appendChild(backBtn);
 
@@ -3514,12 +3804,12 @@ function buildDocumentReader() {
   const navGroup = document.createElement("div");
   navGroup.className = "reader-nav-group";
   const prevBtn = makeIconBtn(ICONS.chevronUp(), st("prevEntry"), () => {
-    if (prevItem) void openEntryInCenter(prevItem.id);
+    if (prevItem) void openEntryInCenter(prevItem.id, { fromObject: Boolean(state.previousObject) });
   });
   prevBtn.dataset.ui = "reader-prev";
   prevBtn.disabled = !prevItem;
   const nextBtn = makeIconBtn(ICONS.chevronDown(), st("nextEntry"), () => {
-    if (nextItem) void openEntryInCenter(nextItem.id);
+    if (nextItem) void openEntryInCenter(nextItem.id, { fromObject: Boolean(state.previousObject) });
   });
   nextBtn.dataset.ui = "reader-next";
   nextBtn.disabled = !nextItem;
@@ -3576,6 +3866,25 @@ function buildDocumentReader() {
     tsSpan.textContent = formatRelativeTime(tsIso);
     submeta.appendChild(tsSpan);
   }
+  const readerObjChips = !isRedacted ? getEntryObjectChips(e) : [];
+  if (readerObjChips.length > 0) {
+    const chipsWrap = document.createElement("span");
+    chipsWrap.className = "entry-object-chips reader-object-chips";
+    for (const chip of readerObjChips) {
+      const chipBtn = document.createElement("button");
+      chipBtn.type = "button";
+      chipBtn.className = "entry-object-chip";
+      chipBtn.dataset.ui = "entry-object-chip";
+      chipBtn.dataset.objectRef = chip.ref;
+      chipBtn.textContent = chip.label;
+      chipBtn.title = chip.ref;
+      chipBtn.addEventListener("click", () => {
+        void selectObjectByRef(chip.ref, false);
+      });
+      chipsWrap.appendChild(chipBtn);
+    }
+    submeta.appendChild(chipsWrap);
+  }
   canvas.appendChild(submeta);
 
   populateReaderBody(false);
@@ -3599,11 +3908,777 @@ function buildDocumentReader() {
   return main;
 }
 
+/* ==================== Center Object Page (v0.7.0) ==================== */
+
+function getObjectActivePeers(card) {
+  const bySession = new Map();
+  for (const p of state.selectedObjectActivePeers || []) {
+    if (p && p.sessionId && p.sessionId !== state.selfPulseSessionId) {
+      bySession.set(p.sessionId, p);
+    }
+  }
+  const keyLower = (String(card.kind || "") + ":" + String(card.name || "")).toLowerCase();
+  const refLower = String(card.ref || "").toLowerCase();
+  for (const p of state.pulses || []) {
+    if (!p || !p.active || !p.sessionId || p.sessionId === state.selfPulseSessionId) continue;
+    const keysMatch = Array.isArray(p.keys) && p.keys.some((k) => String(k).toLowerCase() === keyLower || String(k).toLowerCase() === refLower);
+    const focusMatch = Array.isArray(p.focus) && p.focus.some((f) => String(f).toLowerCase() === keyLower || String(f).toLowerCase() === refLower);
+    if ((keysMatch || focusMatch) && !bySession.has(p.sessionId)) {
+      bySession.set(p.sessionId, p);
+    }
+  }
+  return Array.from(bySession.values());
+}
+
+function buildObjectBriefSummaryRow(item, kindFallback) {
+  const km = kindMeta(item.kind || kindFallback);
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "object-brief-row";
+  row.dataset.ui = "object-brief-row";
+  row.dataset.entryId = item.id;
+
+  const iconWrap = document.createElement("span");
+  iconWrap.className = "studio-entry-icon kind-" + km.key;
+  iconWrap.appendChild(km.icon(14));
+  row.appendChild(iconWrap);
+
+  const main = document.createElement("div");
+  main.className = "object-brief-row-main";
+
+  const title = document.createElement("div");
+  title.className = "object-brief-row-title";
+  title.textContent = String(item.title || item.id);
+  main.appendChild(title);
+
+  const snippet = String(item.snippet || "").replace(/\s+/g, " ").trim();
+  if (snippet && snippet !== String(item.title || "").trim()) {
+    const snipEl = document.createElement("p");
+    snipEl.className = "object-brief-row-snippet";
+    snipEl.textContent = snippet;
+    main.appendChild(snipEl);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "object-brief-row-meta";
+  const metaParts = [];
+  if (item.authorId) metaParts.push("@" + item.authorId);
+  const tsIso = item.occurredAt || item.createdAt;
+  if (tsIso) metaParts.push(formatRelativeTime(tsIso));
+  if (item.realmPath) metaParts.push(item.realmPath);
+  meta.textContent = metaParts.join(" · ");
+  main.appendChild(meta);
+
+  row.appendChild(main);
+  row.addEventListener("click", () => {
+    void openEntryInCenter(item.id, { fromObject: true });
+  });
+  return row;
+}
+
+function buildObjectPage() {
+  teardownObjectNarrativeMarkdown();
+  const card = state.selectedObject;
+  const main = document.createElement("main");
+  main.className = "workspace-col object-page-col";
+  main.dataset.ui = "center-object-page";
+  main.dataset.objectRef = card.ref || "";
+
+  const scroll = document.createElement("div");
+  scroll.className = "workspace-scroll object-page-scroll";
+
+  const canvas = document.createElement("div");
+  canvas.className = "object-page-canvas";
+
+  // 1. Header: Breadcrumb (/<realm> › <kind> › <name>) + Title + State Badge + Inspector Toggle
+  const header = document.createElement("header");
+  header.className = "object-page-header";
+  header.dataset.ui = "object-page-header";
+
+  const headTop = document.createElement("div");
+  headTop.className = "object-page-head-top";
+
+  const crumbNav = document.createElement("nav");
+  crumbNav.className = "object-breadcrumb";
+  crumbNav.setAttribute("aria-label", "Breadcrumb");
+
+  const realmLinkPath = card.realmPath || state.activeRealmPath || "/";
+  const realmBtn = document.createElement("button");
+  realmBtn.type = "button";
+  realmBtn.className = "object-crumb-btn";
+  realmBtn.dataset.ui = "object-crumb-realm";
+  realmBtn.textContent = realmLinkPath;
+  realmBtn.addEventListener("click", () => {
+    void selectRealm(realmLinkPath, "entries");
+  });
+  crumbNav.appendChild(realmBtn);
+
+  const sep1 = document.createElement("span");
+  sep1.className = "object-crumb-sep";
+  sep1.setAttribute("aria-hidden", "true");
+  sep1.textContent = "›";
+  crumbNav.appendChild(sep1);
+
+  const kindCrumb = document.createElement("span");
+  kindCrumb.className = "object-crumb-kind";
+  kindCrumb.textContent = objectKindLabel(card.kind);
+  crumbNav.appendChild(kindCrumb);
+
+  const sep2 = document.createElement("span");
+  sep2.className = "object-crumb-sep";
+  sep2.setAttribute("aria-hidden", "true");
+  sep2.textContent = "›";
+  crumbNav.appendChild(sep2);
+
+  const nameCrumb = document.createElement("span");
+  nameCrumb.className = "object-crumb-name";
+  nameCrumb.textContent = String(card.name || card.ref);
+  crumbNav.appendChild(nameCrumb);
+
+  headTop.appendChild(crumbNav);
+
+  const objInspectorBtn = makeIconBtn(
+    ICONS.panelRight(),
+    state.inspectorOpen ? st("hideInspectorTooltip") : st("showInspectorTooltip"),
+    () => {
+      state.inspectorOpen = !state.inspectorOpen;
+      state.inspectorPinned = state.inspectorOpen;
+      render();
+    },
+    state.inspectorOpen ? "active" : "",
+  );
+  objInspectorBtn.dataset.ui = "object-inspector-toggle";
+  headTop.appendChild(objInspectorBtn);
+  header.appendChild(headTop);
+
+  const titleRow = document.createElement("div");
+  titleRow.className = "object-page-title-row";
+
+  const h1 = document.createElement("h1");
+  h1.className = "object-page-title";
+  h1.dataset.ui = "object-page-title";
+  h1.textContent = String(card.name || card.ref);
+  titleRow.appendChild(h1);
+
+  if (card.object?.state && card.object.state !== "active") {
+    const stBadge = document.createElement("span");
+    stBadge.className = "object-state-badge state-" + String(card.object.state);
+    stBadge.dataset.ui = "object-state-badge";
+    stBadge.textContent = String(card.object.stateLabel || objectStateLabel(card.object.state));
+    titleRow.appendChild(stBadge);
+  }
+  header.appendChild(titleRow);
+  canvas.appendChild(header);
+
+  // 2. Single-Row Linear SVG Signal Bar (V5: zero count-0 items, V6: zero inventory numbers, V7: exact untruncated rules)
+  const rules = Array.isArray(card.rules) ? card.rules : [];
+  const pendingItems = Array.isArray(card.pendingDecisions?.items) ? card.pendingDecisions.items : [];
+  const pendingTotal = typeof card.pendingDecisions?.totalCount === "number"
+    ? card.pendingDecisions.totalCount
+    : pendingItems.length;
+  const activeDecItems = Array.isArray(card.activeDecisions?.items) ? card.activeDecisions.items : [];
+  const activeDecTotal = typeof card.activeDecisions?.totalCount === "number"
+    ? card.activeDecisions.totalCount
+    : activeDecItems.length;
+  const objectPeers = getObjectActivePeers(card);
+
+  if (rules.length > 0 || pendingTotal > 0 || objectPeers.length > 0) {
+    const signalBar = document.createElement("div");
+    signalBar.className = "object-signal-bar";
+    signalBar.dataset.ui = "object-signal-bar";
+    signalBar.setAttribute("role", "toolbar");
+
+    if (rules.length > 0) {
+      const rulesBtn = document.createElement("button");
+      rulesBtn.type = "button";
+      rulesBtn.className = "signal-pill" + (state.objectRulesExpanded ? " active" : "");
+      rulesBtn.dataset.ui = "signal-rules-btn";
+      rulesBtn.setAttribute("aria-expanded", String(state.objectRulesExpanded));
+      rulesBtn.appendChild(ICONS.kindRule(14));
+      const lbl = document.createElement("span");
+      lbl.className = "signal-pill-label";
+      lbl.textContent = st("signalRules");
+      rulesBtn.appendChild(lbl);
+      const cnt = document.createElement("span");
+      cnt.className = "signal-pill-count";
+      cnt.dataset.ui = "signal-rules-count";
+      cnt.textContent = fmtNum(rules.length);
+      rulesBtn.appendChild(cnt);
+      const chev = document.createElement("span");
+      chev.className = "signal-pill-chev";
+      chev.appendChild(state.objectRulesExpanded ? ICONS.chevronDown() : ICONS.chevronRight());
+      rulesBtn.appendChild(chev);
+      rulesBtn.addEventListener("click", () => {
+        state.objectRulesExpanded = !state.objectRulesExpanded;
+        render();
+      });
+      signalBar.appendChild(rulesBtn);
+    }
+
+    if (pendingTotal > 0) {
+      const pendBtn = document.createElement("button");
+      pendBtn.type = "button";
+      pendBtn.className = "signal-pill signal-warn";
+      pendBtn.dataset.ui = "signal-pending-btn";
+      pendBtn.appendChild(ICONS.kindProposal(14));
+      const lbl = document.createElement("span");
+      lbl.className = "signal-pill-label";
+      lbl.textContent = st("signalPending");
+      pendBtn.appendChild(lbl);
+      const cnt = document.createElement("span");
+      cnt.className = "signal-pill-count";
+      cnt.textContent = fmtNum(pendingTotal);
+      pendBtn.appendChild(cnt);
+      pendBtn.addEventListener("click", () => {
+        const targetSec = canvas.querySelector('[data-section="object-pending-decisions"]');
+        if (targetSec && typeof targetSec.scrollIntoView === "function") {
+          targetSec.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      });
+      signalBar.appendChild(pendBtn);
+    }
+
+    if (objectPeers.length > 0) {
+      const peersBtn = document.createElement("button");
+      peersBtn.type = "button";
+      peersBtn.className = "signal-pill signal-live" + (state.objectPeersExpanded ? " active" : "");
+      peersBtn.dataset.ui = "signal-peers-btn";
+      peersBtn.setAttribute("aria-expanded", String(state.objectPeersExpanded));
+      peersBtn.appendChild(ICONS.users());
+      const lbl = document.createElement("span");
+      lbl.className = "signal-pill-label";
+      lbl.textContent = st("signalPeers");
+      peersBtn.appendChild(lbl);
+      const cnt = document.createElement("span");
+      cnt.className = "signal-pill-count";
+      cnt.textContent = fmtNum(objectPeers.length);
+      peersBtn.appendChild(cnt);
+      peersBtn.addEventListener("click", () => {
+        state.objectPeersExpanded = !state.objectPeersExpanded;
+        render();
+      });
+      signalBar.appendChild(peersBtn);
+    }
+
+    canvas.appendChild(signalBar);
+  }
+
+  // Expandable Untruncated Rules Drawer (grouped: Wall / Object & ancestors / --with)
+  if (state.objectRulesExpanded && rules.length > 0) {
+    const rulesPanel = document.createElement("section");
+    rulesPanel.className = "object-rules-panel";
+    rulesPanel.dataset.ui = "object-rules-panel";
+
+    const groups = [
+      { key: "realm", label: st("ruleGroupWall"), items: rules.filter((r) => r.scopeSource === "realm") },
+      { key: "object", label: st("ruleGroupObject"), items: rules.filter((r) => r.scopeSource === "object") },
+      { key: "with", label: st("ruleGroupWith"), items: rules.filter((r) => r.scopeSource === "with") },
+    ];
+    let ruleIdx = 0;
+    for (const grp of groups) {
+      if (grp.items.length === 0) continue;
+      const gWrap = document.createElement("div");
+      gWrap.className = "object-rules-group";
+      gWrap.dataset.ruleGroup = grp.key;
+
+      const gHead = document.createElement("div");
+      gHead.className = "object-rules-group-head";
+      gHead.textContent = grp.label + " (" + grp.items.length + ")";
+      gWrap.appendChild(gHead);
+
+      const gList = document.createElement("div");
+      gList.className = "object-rules-group-list";
+      for (const rule of grp.items) {
+        ruleIdx += 1;
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "rule-row compact";
+        row.dataset.ruleId = rule.id;
+
+        const num = document.createElement("span");
+        num.className = "rule-idx";
+        num.textContent = String(ruleIdx);
+
+        const title = document.createElement("span");
+        title.className = "rule-title";
+        title.textContent = rule.title;
+
+        const src = document.createElement("span");
+        src.className = "origin-tag";
+        src.textContent = rule.sourceRef || rule.realmPath || "";
+
+        row.appendChild(num);
+        row.appendChild(title);
+        row.appendChild(src);
+        row.addEventListener("click", () => {
+          void openEntryInCenter(rule.id, { fromObject: true });
+        });
+        gList.appendChild(row);
+      }
+      gWrap.appendChild(gList);
+      rulesPanel.appendChild(gWrap);
+    }
+    canvas.appendChild(rulesPanel);
+  }
+
+  // Expandable Active Peers Drawer
+  if (state.objectPeersExpanded && objectPeers.length > 0) {
+    const peersPanel = document.createElement("div");
+    peersPanel.className = "object-peers-panel";
+    peersPanel.dataset.ui = "object-peers-panel";
+    const groupsByActor = new Map(groupPulsesByActor(state.pulses).map((g) => [g.actorId, g]));
+    for (const peer of objectPeers) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "peer-chip";
+      const dot = document.createElement("span");
+      dot.className = "status-dot" + (peer.online ? "" : " active");
+      const who = document.createElement("span");
+      who.className = "peer-chip-who";
+      who.textContent = peer.clientHint ? (peer.actorId + " · " + peer.clientHint) : peer.actorId;
+      chip.appendChild(dot);
+      chip.appendChild(who);
+      const summary = peer.activity || peer.note || "";
+      if (summary) {
+        const ctx = document.createElement("span");
+        ctx.className = "peer-chip-ctx";
+        ctx.textContent = summary;
+        chip.appendChild(ctx);
+      }
+      const age = document.createElement("span");
+      age.className = "peer-chip-age";
+      age.textContent = peer.online ? st("nowTag") : formatPulseAge(peer.ageSeconds);
+      chip.appendChild(age);
+      chip.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const group = groupsByActor.get(peer.actorId) || {
+          actorId: peer.actorId,
+          actorKind: peer.actorKind,
+          online: peer.online,
+          active: peer.active,
+          sessions: [peer],
+        };
+        state.popover = {
+          kind: "member-card",
+          anchorRect: rectOf(chip),
+          placement: "below",
+          group,
+          pulse: peer,
+        };
+        renderPopoverLayer();
+      });
+      peersPanel.appendChild(chip);
+    }
+    canvas.appendChild(peersPanel);
+  }
+
+  // 3. Pending Decisions (pinned; omitted if 0)
+  if (pendingTotal > 0 && pendingItems.length > 0) {
+    const sec = document.createElement("section");
+    sec.className = "object-section";
+    sec.dataset.section = "object-pending-decisions";
+
+    const secHead = document.createElement("div");
+    secHead.className = "object-section-head";
+    const secTitle = document.createElement("h2");
+    secTitle.className = "object-section-title";
+    secTitle.textContent = st("objSecPending");
+    const secCount = document.createElement("span");
+    secCount.className = "object-section-count";
+    secCount.textContent = fmtNum(pendingTotal);
+    secHead.appendChild(secTitle);
+    secHead.appendChild(secCount);
+    sec.appendChild(secHead);
+
+    const list = document.createElement("div");
+    list.className = "object-brief-list";
+    for (const item of pendingItems) {
+      list.appendChild(buildObjectBriefSummaryRow(item, "proposal"));
+    }
+    sec.appendChild(list);
+    canvas.appendChild(sec);
+  }
+
+  // 4. Active Decisions (pinned top 5 + expand-more toggle; omitted if 0)
+  if (activeDecTotal > 0 && activeDecItems.length > 0) {
+    const sec = document.createElement("section");
+    sec.className = "object-section";
+    sec.dataset.section = "object-active-decisions";
+
+    const secHead = document.createElement("div");
+    secHead.className = "object-section-head";
+    const secTitle = document.createElement("h2");
+    secTitle.className = "object-section-title";
+    secTitle.textContent = st("objSecActiveDecisions");
+    const secCount = document.createElement("span");
+    secCount.className = "object-section-count";
+    secCount.textContent = fmtNum(activeDecTotal);
+    secHead.appendChild(secTitle);
+    secHead.appendChild(secCount);
+    sec.appendChild(secHead);
+
+    const visibleDecs = state.objectDecisionsExpanded ? activeDecItems : activeDecItems.slice(0, 5);
+    const list = document.createElement("div");
+    list.className = "object-brief-list";
+    for (const item of visibleDecs) {
+      list.appendChild(buildObjectBriefSummaryRow(item, "decision"));
+    }
+    sec.appendChild(list);
+
+    if (activeDecItems.length > 5 || activeDecTotal > 5) {
+      const moreCount = Math.max(activeDecItems.length, activeDecTotal) - 5;
+      const moreBtn = document.createElement("button");
+      moreBtn.type = "button";
+      moreBtn.className = "object-expand-btn";
+      moreBtn.dataset.ui = "object-decisions-expand";
+      moreBtn.setAttribute("aria-expanded", String(state.objectDecisionsExpanded));
+      moreBtn.textContent = state.objectDecisionsExpanded
+        ? st("showFewerDecisions")
+        : st("showMoreDecisions", moreCount);
+      moreBtn.addEventListener("click", () => {
+        state.objectDecisionsExpanded = !state.objectDecisionsExpanded;
+        render();
+      });
+      sec.appendChild(moreBtn);
+    }
+
+    canvas.appendChild(sec);
+  }
+
+  // 5. L3 Narrative Card (`card_object`) with V3 Freshness UI & XSS-Safe <meru-markdown>
+  if (card.narrativeCard) {
+    const nc = card.narrativeCard;
+    const freshness = card.cardFreshness || nc.freshness || { status: "fresh", summaryLine: null, reasons: [] };
+    const status = freshness.status || "fresh";
+
+    const sec = document.createElement("section");
+    sec.className = "object-section object-narrative-section is-" + status;
+    sec.dataset.section = "object-narrative-card";
+    sec.dataset.freshness = status;
+
+    const secHead = document.createElement("div");
+    secHead.className = "object-narrative-head";
+
+    const headLeft = document.createElement("div");
+    headLeft.className = "object-narrative-head-left";
+    const secTitle = document.createElement("h2");
+    secTitle.className = "object-section-title";
+    secTitle.textContent = st("objSecNarrative");
+    headLeft.appendChild(secTitle);
+
+    const nonBinding = document.createElement("span");
+    nonBinding.className = "narrative-nonbinding-tag";
+    nonBinding.dataset.ui = "narrative-nonbinding-tag";
+    nonBinding.textContent = st("narrativeNonBinding");
+    headLeft.appendChild(nonBinding);
+    secHead.appendChild(headLeft);
+
+    const freshBadge = document.createElement("span");
+    freshBadge.className = "freshness-badge is-" + status;
+    freshBadge.dataset.ui = "card-freshness-badge";
+    freshBadge.dataset.freshness = status;
+    if (status === "fresh") {
+      freshBadge.textContent = st("freshnessFresh");
+    } else if (status === "soft_stale") {
+      freshBadge.textContent = freshness.summaryLine || st("freshnessSoftStale");
+    } else {
+      freshBadge.textContent = st("freshnessHardStale");
+    }
+    secHead.appendChild(freshBadge);
+    sec.appendChild(secHead);
+
+    const mountNarrativeMarkdown = (sourceMd, isHistoric = false) => {
+      const bodyBox = document.createElement("div");
+      bodyBox.className = "object-narrative-body" + (isHistoric ? " is-historic" : "");
+      bodyBox.dataset.ui = "object-narrative-body";
+      const mdEl = document.createElement("meru-markdown");
+      mdEl.className = "object-narrative-markdown";
+      mdEl.dataset.ui = "object-narrative-markdown";
+      mdEl.enableMermaid = false;
+      mdEl.theme = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+      mdEl.source = String(sourceMd || "");
+      activeObjectNarrativeMarkdownEl = mdEl;
+      bodyBox.appendChild(mdEl);
+      return bodyBox;
+    };
+
+    if (status === "hard_stale") {
+      // Collapsed by default to a 1-line warning banner; historic text fetched strictly on demand
+      const banner = document.createElement("div");
+      banner.className = "hard-stale-banner";
+      banner.dataset.ui = "hard-stale-banner";
+
+      const bannerLeft = document.createElement("div");
+      bannerLeft.className = "hard-stale-banner-left";
+      bannerLeft.appendChild(ICONS.alertTriangle(14));
+      const bannerText = document.createElement("span");
+      bannerText.className = "hard-stale-banner-text";
+      bannerText.textContent = freshness.summaryLine || st("freshnessHardStale");
+      bannerLeft.appendChild(bannerText);
+      banner.appendChild(bannerLeft);
+
+      const toggleBtn = document.createElement("button");
+      toggleBtn.type = "button";
+      toggleBtn.className = "hard-stale-toggle-btn";
+      toggleBtn.dataset.ui = "hard-stale-expand-btn";
+      toggleBtn.setAttribute("aria-expanded", String(state.objectStaleCardExpanded));
+      toggleBtn.disabled = state.objectStaleCardLoading;
+      toggleBtn.textContent = state.objectStaleCardLoading
+        ? st("hardStaleLoading")
+        : (state.objectStaleCardExpanded ? st("hardStaleCollapse") : st("hardStaleExpand"));
+      toggleBtn.addEventListener("click", async () => {
+        if (state.objectStaleCardLoading) return;
+        if (state.objectStaleCardExpanded) {
+          state.objectStaleCardExpanded = false;
+          render();
+          return;
+        }
+        state.objectStaleCardExpanded = true;
+        if (state.objectStaleCardHistoricMd !== null) {
+          render();
+          return;
+        }
+        const targetRef = card.ref;
+        state.objectStaleCardLoading = true;
+        render();
+        try {
+          const staleRes = await client.show(targetRef, { include_stale_narrative: 1 });
+          if (state.selectedObject?.ref !== targetRef) return;
+          state.objectStaleCardHistoricMd = staleRes?.card?.narrativeCard?.historicNarrativeMd ?? "";
+        } catch (err) {
+          if (state.selectedObject?.ref !== targetRef) return;
+          state.objectStaleCardHistoricMd = "";
+          showToast(err?.message || st("loadObjectFailed"));
+        } finally {
+          if (state.selectedObject?.ref === targetRef) {
+            state.objectStaleCardLoading = false;
+            render();
+          }
+        }
+      });
+      banner.appendChild(toggleBtn);
+      sec.appendChild(banner);
+
+      if (state.objectStaleCardExpanded && !state.objectStaleCardLoading) {
+        if (state.objectStaleCardHistoricMd) {
+          sec.appendChild(mountNarrativeMarkdown(state.objectStaleCardHistoricMd, true));
+        } else {
+          const unavail = document.createElement("div");
+          unavail.className = "hard-stale-unavail";
+          unavail.textContent = st("hardStaleUnavailable");
+          sec.appendChild(unavail);
+        }
+      }
+    } else if (nc.narrativeMd) {
+      sec.appendChild(mountNarrativeMarkdown(nc.narrativeMd, false));
+    }
+
+    if (nc.settledBy || nc.createdAt) {
+      const foot = document.createElement("div");
+      foot.className = "object-narrative-meta";
+      foot.textContent = [
+        nc.settledBy ? ("@" + nc.settledBy) : "",
+        nc.createdAt ? formatRelativeTime(nc.createdAt) : "",
+      ].filter(Boolean).join(" · ");
+      sec.appendChild(foot);
+    }
+
+    canvas.appendChild(sec);
+  }
+
+  // 6. Children & Co-occurring Objects (omitted if both empty)
+  const children = Array.isArray(card.children) ? card.children : [];
+  const coOccurring = Array.isArray(card.coOccurring) ? card.coOccurring : [];
+  if (children.length > 0 || coOccurring.length > 0) {
+    const sec = document.createElement("section");
+    sec.className = "object-section object-relations-section";
+    sec.dataset.section = "object-relations";
+
+    if (children.length > 0) {
+      const row = document.createElement("div");
+      row.className = "object-rel-row";
+      const lbl = document.createElement("span");
+      lbl.className = "object-rel-label";
+      lbl.textContent = st("objSecChildren");
+      row.appendChild(lbl);
+      const wrap = document.createElement("div");
+      wrap.className = "object-rel-chips";
+      for (const ch of children) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "object-rel-chip";
+        btn.dataset.ui = "object-rel-chip";
+        btn.dataset.objectRef = ch.ref;
+        btn.textContent = ch.ref;
+        btn.addEventListener("click", () => { void selectObjectByRef(ch.ref, false); });
+        wrap.appendChild(btn);
+      }
+      row.appendChild(wrap);
+      sec.appendChild(row);
+    }
+
+    if (coOccurring.length > 0) {
+      const row = document.createElement("div");
+      row.className = "object-rel-row";
+      const lbl = document.createElement("span");
+      lbl.className = "object-rel-label";
+      lbl.textContent = st("objSecCoOccurring");
+      row.appendChild(lbl);
+      const wrap = document.createElement("div");
+      wrap.className = "object-rel-chips";
+      for (const co of coOccurring) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "object-rel-chip";
+        btn.dataset.ui = "object-rel-chip";
+        btn.dataset.objectRef = co.ref;
+        btn.textContent = co.ref;
+        btn.title = co.ref + " (" + co.sharedCount + ")";
+        btn.addEventListener("click", () => { void selectObjectByRef(co.ref, false); });
+        wrap.appendChild(btn);
+      }
+      row.appendChild(wrap);
+      sec.appendChild(row);
+    }
+
+    canvas.appendChild(sec);
+  }
+
+  // 7. Record Stream (chronological entries + v0.6.6 scroll-preserving Load More pagination)
+  const streamSec = document.createElement("section");
+  streamSec.className = "object-section object-stream-section";
+  streamSec.dataset.section = "object-record-stream";
+
+  const streamHead = document.createElement("div");
+  streamHead.className = "object-section-head";
+
+  const streamHeadLeft = document.createElement("div");
+  streamHeadLeft.className = "object-section-head-left";
+  const streamTitle = document.createElement("h2");
+  streamTitle.className = "object-section-title";
+  streamTitle.textContent = st("objSecRecordStream");
+  streamHeadLeft.appendChild(streamTitle);
+  streamHead.appendChild(streamHeadLeft);
+
+  const histToggle = document.createElement("label");
+  histToggle.className = "history-toggle";
+  const histCb = document.createElement("input");
+  histCb.type = "checkbox";
+  histCb.dataset.ui = "object-history-toggle";
+  histCb.checked = state.objectShowHistory;
+  histCb.addEventListener("change", async () => {
+    state.objectShowHistory = histCb.checked;
+    await loadObjectEntries(card.ref, true);
+    renderObjectStreamList(false);
+  });
+  const histLbl = document.createElement("span");
+  histLbl.textContent = st("showHistory");
+  histToggle.appendChild(histCb);
+  histToggle.appendChild(histLbl);
+  streamHead.appendChild(histToggle);
+  streamSec.appendChild(streamHead);
+
+  const streamWrap = document.createElement("div");
+  streamWrap.dataset.ui = "object-stream-wrap";
+
+  function renderObjectStreamList(restoreFocus = false) {
+    const prevScrollTop = scroll.scrollTop;
+    clearEl(streamWrap);
+    const items = state.objectEntries || [];
+
+    if (items.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty-state";
+      empty.dataset.ui = "object-empty-stream";
+      empty.textContent = st("objEmptyStream");
+      streamWrap.appendChild(empty);
+      return;
+    }
+
+    const list = document.createElement("div");
+    list.className = "entry-list";
+    for (const item of items) {
+      list.appendChild(buildStudioEntryRow(item, { fromObject: true, currentObjectRef: card.ref }));
+    }
+    streamWrap.appendChild(list);
+
+    const effectiveTotal = typeof state.objectEntriesTotal === "number"
+      ? Math.max(items.length, state.objectEntriesTotal)
+      : null;
+
+    if (state.objectEntriesHasMore) {
+      const foot = document.createElement("div");
+      foot.className = "entries-pagination-footer";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "load-more-pill";
+      btn.dataset.ui = "object-load-more-entries";
+      btn.disabled = Boolean(state.objectEntriesLoadingMore);
+      btn.textContent = state.objectEntriesLoadingMore
+        ? st("loadingMoreEntries")
+        : (effectiveTotal !== null
+          ? st("loadMoreWithTotal", fmtNum(items.length), fmtNum(effectiveTotal))
+          : st("loadMoreShownOnly", fmtNum(items.length)));
+      btn.addEventListener("click", async () => {
+        if (state.objectEntriesLoadingMore) return;
+        const lockedScrollTop = scroll.scrollTop;
+        state.objectEntriesLoadingMore = true;
+        btn.disabled = true;
+        btn.textContent = st("loadingMoreEntries");
+        const loadRes = await loadObjectEntries(card.ref, false);
+        state.objectEntriesLoadingMore = false;
+        if (!loadRes || loadRes.stale) return;
+        if (!loadRes.ok) {
+          state.objectEntriesHasMore = true;
+          renderObjectStreamList(false);
+          scroll.scrollTop = lockedScrollTop;
+          showToast(loadRes.error?.message || st("loadMoreFailed"));
+          return;
+        }
+        renderObjectStreamList(true);
+        scroll.scrollTop = lockedScrollTop;
+      });
+      foot.appendChild(btn);
+      streamWrap.appendChild(foot);
+      if (restoreFocus && typeof btn.focus === "function") {
+        btn.focus({ preventScroll: true });
+      }
+    } else if (items.length > 25) {
+      const foot = document.createElement("div");
+      foot.className = "entries-pagination-footer";
+      const endEl = document.createElement("div");
+      endEl.className = "entries-pagination-end";
+      endEl.dataset.ui = "object-entries-all-shown";
+      endEl.tabIndex = -1;
+      endEl.textContent = st("allEntriesShown", fmtNum(items.length));
+      foot.appendChild(endEl);
+      streamWrap.appendChild(foot);
+      if (restoreFocus && typeof endEl.focus === "function") {
+        endEl.focus({ preventScroll: true });
+      }
+    }
+    if (restoreFocus) {
+      scroll.scrollTop = prevScrollTop;
+    }
+  }
+
+  renderObjectStreamList(false);
+  streamSec.appendChild(streamWrap);
+  canvas.appendChild(streamSec);
+
+  scroll.appendChild(canvas);
+  main.appendChild(scroll);
+  return main;
+}
+
 /* ==================== Main Workspace ==================== */
 
 function buildWorkspace() {
   if (state.openEntry) {
     return buildDocumentReader();
+  }
+  if (state.selectedObject) {
+    return buildObjectPage();
   }
   const main = document.createElement("main");
   main.className = "workspace-col";
@@ -3870,7 +4945,7 @@ function buildInspector() {
   const scroll = document.createElement("div");
   scroll.className = "inspector-scroll";
 
-  // Mode 1: Object focus
+  // Mode 1: Object focus (optional metadata drawer — read-only, zero settle/rule mutation controls)
   if (state.selectedObject) {
     const card = state.selectedObject;
     const title = document.createElement("h3");
@@ -3878,46 +4953,52 @@ function buildInspector() {
     title.textContent = card.name || card.ref;
     scroll.appendChild(title);
 
+    const objMeta = card.object || null;
+    const rawAliases = Array.isArray(card.aliases)
+      ? card.aliases
+      : (Array.isArray(objMeta?.aliases) ? objMeta.aliases : []);
+    const aliases = rawAliases.filter(Boolean);
+    const stateVal = objMeta?.state
+      ? (objMeta.stateLabel ? (objectStateLabel(objMeta.state) + " · " + objMeta.stateLabel) : objectStateLabel(objMeta.state))
+      : null;
+
     scroll.appendChild(buildPropList([
       { label: st("propRef"), value: card.ref, mono: true, copyValue: card.ref, copyLabel: st("copyRef") },
+      objMeta?.id ? { label: st("propId"), value: objMeta.id, mono: true, copyValue: objMeta.id, copyLabel: st("copyId") } : null,
       { label: st("propKind"), value: objectKindLabel(card.kind) },
       {
         label: st("propRealm"),
         value: card.realmPath,
         mono: true,
-        onClick: card.realmPath ? () => { void selectRealm(card.realmPath); } : null,
+        onClick: card.realmPath ? () => { void selectRealm(card.realmPath, "entries"); } : null,
       },
-      { label: st("propLinked"), value: fmtNum(card.counts?.total ?? card.recentEntries?.length ?? 0) },
+      card.parentRef ? {
+        label: st("propParent"),
+        value: card.parentRef,
+        mono: true,
+        onClick: () => { void selectObjectByRef(card.parentRef, false); },
+      } : null,
+      stateVal ? { label: st("propState"), value: stateVal } : null,
+      objMeta?.stateSince ? { label: st("propRecorded"), value: formatStamp(objMeta.stateSince), mono: true } : null,
     ]));
 
-    if (Array.isArray(card.recentEntries) && card.recentEntries.length > 0) {
+    if (aliases.length > 0) {
       const sec = document.createElement("div");
       sec.className = "rail-section";
       const lbl = document.createElement("div");
       lbl.className = "rail-section-head";
-      lbl.textContent = st("linkedContext", card.recentEntries.length);
+      lbl.textContent = st("propAliases");
       sec.appendChild(lbl);
 
-      const list = document.createElement("div");
-      list.className = "object-entries-list";
-      for (const item of card.recentEntries) {
-        const km = kindMeta(item.extKind || item.kind);
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "object-entry-mini";
-        const t = document.createElement("div");
-        t.className = "object-entry-mini-title";
-        t.textContent = item.title || st("kindEntry");
-        const m = document.createElement("div");
-        m.className = "object-entry-mini-meta";
-        const tsIso = item.occurredAt || item.createdAt;
-        m.textContent = [km.label, tsIso ? formatRelativeTime(tsIso) : ""].filter(Boolean).join(" · ");
-        btn.appendChild(t);
-        btn.appendChild(m);
-        btn.addEventListener("click", () => { void openEntryInCenter(item.id, { fromObject: true }); });
-        list.appendChild(btn);
+      const chipWrap = document.createElement("div");
+      chipWrap.className = "rail-chip-wrap";
+      for (const alias of aliases) {
+        const chip = document.createElement("span");
+        chip.className = "rail-alias-chip";
+        chip.textContent = String(alias);
+        chipWrap.appendChild(chip);
       }
-      sec.appendChild(list);
+      sec.appendChild(chipWrap);
       scroll.appendChild(sec);
     }
 
@@ -3978,8 +5059,11 @@ function buildInspector() {
     ]));
 
     // Linked Objects & Resource Tags — hidden when empty
+    const objRefItems = Array.isArray(e.objectRefs) && e.objectRefs.length > 0
+      ? e.objectRefs.map((o) => o.ref).filter(Boolean)
+      : (Array.isArray(e.objectIds) ? e.objectIds : []);
     const linkedRefs = [
-      ...(Array.isArray(e.objectIds) ? e.objectIds : []),
+      ...objRefItems,
       ...(Array.isArray(e.refs) ? e.refs : []),
       ...(Array.isArray(e.resourceTags) ? e.resourceTags.map((t) => "#" + t) : []),
     ].filter(Boolean);
@@ -4001,9 +5085,14 @@ function buildInspector() {
         chip.textContent = ref;
         chip.addEventListener("click", () => {
           if (ref.startsWith("#")) {
-            void copyText(ref, st("copiedToast", ref));
+            const rawTag = ref.slice(1);
+            if (OBJECT_TAG_CHIP_RE.test(rawTag)) {
+              void selectObjectByRef(rawTag, false);
+            } else {
+              void copyText(ref, st("copiedToast", ref));
+            }
           } else {
-            void selectObjectByRef(ref, true);
+            void selectObjectByRef(ref, false);
           }
         });
         chipWrap.appendChild(chip);
@@ -4382,6 +5471,12 @@ function renderPopover() {
     } else if (obj) {
       addAction(ICONS.copy(), st("copyRef"), () => {
         void copyText(obj.ref, st("copiedToast", obj.ref));
+      });
+      addAction(ICONS.link(), st("copyLink"), () => {
+        const u = new URL(window.location.href);
+        u.pathname = obj.realmPath || state.activeRealmPath || "/";
+        u.search = "?object=" + encodeURIComponent(obj.ref);
+        void copyText(u.toString(), st("copiedLinkToast"));
       });
     }
     return pop;
@@ -5037,7 +6132,7 @@ function render() {
   }
   const prevViewKey = state.lastWorkspaceViewKey;
   const nextViewKey =
-    (state.activeRealmPath || "/") + "|" + (state.activeTab || "entries") + "|" + (state.openEntry?.id || "");
+    (state.activeRealmPath || "/") + "|" + (state.activeTab || "entries") + "|" + (state.openEntry?.id || "") + "|" + (state.selectedObject?.ref || "");
   const viewKeyChanged = prevViewKey !== nextViewKey;
   state.lastWorkspaceViewKey = nextViewKey;
 
@@ -5203,25 +6298,44 @@ async function applyUrlStateFromLocation() {
   const targetRealm = state.realms.some((r) => r.path === parsed.realmPath)
     ? parsed.realmPath
     : (state.realms[0]?.path || "/");
-  if (targetRealm !== state.activeRealmPath || (parsed.tab && parsed.tab !== state.activeTab)) {
+  if (targetRealm !== state.activeRealmPath || (!parsed.objectRef && parsed.tab && parsed.tab !== state.activeTab)) {
     await selectRealm(targetRealm, parsed.tab || undefined, {
       keepReader: Boolean(parsed.entryId),
+      keepObject: Boolean(parsed.objectRef),
       skipUrlSync: true,
     });
   }
   if (parsed.entryId) {
+    if (parsed.objectRef && state.previousObject?.ref !== parsed.objectRef && state.selectedObject?.ref !== parsed.objectRef) {
+      await selectObjectByRef(parsed.objectRef, false, {
+        skipUrlSync: true,
+        skipRender: true,
+        silent: true,
+      });
+    }
     if (state.openEntry?.id !== parsed.entryId || (parsed.view && parsed.view !== state.readerView)) {
       await openEntryInCenter(parsed.entryId, {
+        fromObject: Boolean(parsed.objectRef),
         requestedView: parsed.view,
         skipUrlSync: true,
       });
     }
   } else if (parsed.objectRef) {
-    await selectObjectByRef(parsed.objectRef, true, { skipUrlSync: true });
+    if (state.openEntry && state.previousObject?.ref === parsed.objectRef) {
+      closeReaderToList({ skipUrlSync: true });
+    } else if (state.selectedObject?.ref === parsed.objectRef && !state.openEntry) {
+      if (!state.inspectorPinned) state.inspectorOpen = false;
+      render();
+    } else {
+      await selectObjectByRef(parsed.objectRef, false, { skipUrlSync: true });
+    }
   } else if (state.openEntry) {
-    closeReaderToList({ skipUrlSync: true });
-  } else if (state.selectedObject) {
+    closeReaderToList({ skipUrlSync: true, ignorePreviousObject: true });
+  } else if (state.selectedObject || state.previousObject) {
+    teardownObjectNarrativeMarkdown();
     state.selectedObject = null;
+    state.selectedObjectActivePeers = [];
+    state.previousObject = null;
     state.focusedObjectRef = null;
     if (!state.inspectorPinned) state.inspectorOpen = false;
     render();
@@ -5253,7 +6367,9 @@ client.pump.subscribe((snap) => {
 async function studioPulseKeepaliveTick() {
   if (!state.whoami || document.visibilityState !== "visible") return;
   try {
-    const selfPulse = await client.pulse.setFocus([state.activeRealmPath], null, state.activeRealmPath, "browser").catch(() => null);
+    const focusTarget = state.selectedObject?.ref || state.activeRealmPath;
+    const pulseRealm = getWritablePulseRealm(state.activeRealmPath);
+    const selfPulse = await client.pulse.setFocus([focusTarget], null, pulseRealm, "browser").catch(() => null);
     if (selfPulse?.sessionId) state.selfPulseSessionId = selfPulse.sessionId;
     const pulseRes = await client.pulse.list().catch(() => null);
     if (pulseRes?.pulses) {
@@ -5297,12 +6413,20 @@ async function boot() {
       skipUrlSync: true,
     });
     if (initialUrl.entryId) {
+      if (initialUrl.objectRef) {
+        await selectObjectByRef(initialUrl.objectRef, false, {
+          skipUrlSync: true,
+          skipRender: true,
+          silent: true,
+        });
+      }
       await openEntryInCenter(initialUrl.entryId, {
+        fromObject: Boolean(initialUrl.objectRef),
         requestedView: initialUrl.view,
         replaceUrl: true,
       });
     } else if (initialUrl.objectRef) {
-      await selectObjectByRef(initialUrl.objectRef, true, { replaceUrl: true });
+      await selectObjectByRef(initialUrl.objectRef, false, { replaceUrl: true });
     } else {
       syncUrlFromState(true);
     }

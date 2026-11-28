@@ -47,6 +47,7 @@ import {
   type ChildRealmSummary,
   type Distillation,
   type DistillationLayer,
+  type EntryLinkedObjectRef,
   type LedgerRecord,
   type LedgerRecordSummary,
   type LsDriveFileItem,
@@ -2551,16 +2552,39 @@ export class SeaEngine {
     const allLinkedObjIds = Array.from(
       new Set(Array.from(objIdsByEntry.values()).flat()),
     );
-    const visibleObjSet = new Set(
-      this.db
-        .getObjectsByIds(allLinkedObjIds)
-        .filter(
-          (o) =>
-            o.orgId === params.orgId &&
-            params.readableLedgerSet.has(o.realmId),
-        )
-        .map((o) => o.id),
-    );
+    const visibleObjs =
+      allLinkedObjIds.length > 0
+        ? params.vis.sanitizeObjects(
+            this.db
+              .getObjectsByIds(allLinkedObjIds)
+              .filter(
+                (o) =>
+                  o.orgId === params.orgId &&
+                  params.readableLedgerSet.has(o.realmId),
+              ),
+          )
+        : [];
+    const visibleObjSet = new Set(visibleObjs.map((o) => o.id));
+    const visibleObjRefById = new Map<string, EntryLinkedObjectRef>();
+    if (visibleObjs.length > 0) {
+      const scopeObjects = params.vis.sanitizeObjects(
+        this.db.listObjects({
+          orgId: params.orgId,
+          realmIds: Array.from(params.readableLedgerSet),
+        }),
+      );
+      const dupKeys = computeDuplicateObjectKeys(scopeObjects);
+      for (const o of visibleObjs) {
+        const rPath = params.vis.getSanitizedRealmPath(o.realmId);
+        visibleObjRefById.set(o.id, {
+          id: o.id,
+          ref: formatCanonicalObjectRef(o, rPath, dupKeys),
+          kind: o.kind,
+          name: o.name,
+          realmPath: rPath,
+        });
+      }
+    }
 
     const refsToPreload: string[] = [];
     for (const r of recsMap.values()) {
@@ -2585,6 +2609,9 @@ export class SeaEngine {
       const objectIds = (objIdsByEntry.get(ref.id) ?? []).filter((oid) =>
         visibleObjSet.has(oid),
       );
+      const objectRefs = objectIds
+        .map((oid) => visibleObjRefById.get(oid))
+        .filter((x): x is EntryLinkedObjectRef => Boolean(x));
       const resourceTags = tagsByEntry.get(ref.id) ?? [];
 
       if (ref.sourceType === "record") {
@@ -2627,6 +2654,7 @@ export class SeaEngine {
           supersedesIds: clean.supersedesIds,
           supersededById: clean.supersededById,
           objectIds,
+          ...(objectRefs.length > 0 ? { objectRefs } : {}),
           resourceTags,
           ...(inactive.length > 0 ? { inactive } : {}),
         });
@@ -2671,6 +2699,7 @@ export class SeaEngine {
           supersedesIds: [],
           supersededById: null,
           objectIds,
+          ...(objectRefs.length > 0 ? { objectRefs } : {}),
           resourceTags,
           ...(inactive.length > 0 ? { inactive } : {}),
         });
@@ -3429,13 +3458,38 @@ export class SeaEngine {
       includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
     });
 
-    const visibleObjectIds = (entryId: string, orgId: string): string[] => {
+    const resolveVisibleLinkedObjects = (
+      entryId: string,
+      orgId: string,
+    ): { objectIds: string[]; objectRefs: EntryLinkedObjectRef[] } => {
       const ids = this.db.listObjectIdsForEntry(entryId, orgId);
-      if (ids.length === 0) return [];
-      return this.db
-        .getObjectsByIds(ids)
-        .filter((o) => o.orgId === orgId && readableLedgerSet.has(o.realmId))
-        .map((o) => o.id);
+      if (ids.length === 0) return { objectIds: [], objectRefs: [] };
+      const objs = vis.sanitizeObjects(
+        this.db
+          .getObjectsByIds(ids)
+          .filter((o) => o.orgId === orgId && readableLedgerSet.has(o.realmId)),
+      );
+      if (objs.length === 0) return { objectIds: [], objectRefs: [] };
+      const scopeObjects = vis.sanitizeObjects(
+        this.db.listObjects({
+          orgId,
+          realmIds: Array.from(readableLedgerSet),
+        }),
+      );
+      const dupKeys = computeDuplicateObjectKeys(scopeObjects);
+      return {
+        objectIds: objs.map((o) => o.id),
+        objectRefs: objs.map((o) => {
+          const rPath = vis.getSanitizedRealmPath(o.realmId);
+          return {
+            id: o.id,
+            ref: formatCanonicalObjectRef(o, rPath, dupKeys),
+            kind: o.kind,
+            name: o.name,
+            realmPath: rPath,
+          };
+        }),
+      };
     };
 
     // 1. drive://<realmId>/<relPath> URI
@@ -3472,12 +3526,14 @@ export class SeaEngine {
         ...(rec.supersededById ? [rec.supersededById] : []),
       ]);
       const clean = vis.sanitizeRecord(rec);
+      const linked = resolveVisibleLinkedObjects(clean.id, clean.orgId);
       return {
         kind: "record",
         behaviorClass: clean.kind === "rule" ? "rule" : "conclusion",
         record: clean,
         realmPath: vis.getSanitizedRealmPath(clean.realmId),
-        objectIds: visibleObjectIds(clean.id, clean.orgId),
+        objectIds: linked.objectIds,
+        ...(linked.objectRefs.length > 0 ? { objectRefs: linked.objectRefs } : {}),
         resourceTags: this.db.listResourceTagsForEntry(clean.id, clean.orgId),
         currentHeadId: vis.resolveCurrentHeadId(rec),
         orphanSuperseded: vis.isOrphanSuperseded(rec),
@@ -3541,12 +3597,14 @@ export class SeaEngine {
       }
       if (sea.sourceRef) vis.preloadRefs([sea.sourceRef]);
       const clean = vis.sanitizeSeabed(sea);
+      const linked = resolveVisibleLinkedObjects(clean.id, clean.orgId);
       return {
         kind: "seabed",
         behaviorClass: "raw",
         seabed: clean,
         realmPath: vis.getSanitizedRealmPath(clean.realmId),
-        objectIds: visibleObjectIds(clean.id, clean.orgId),
+        objectIds: linked.objectIds,
+        ...(linked.objectRefs.length > 0 ? { objectRefs: linked.objectRefs } : {}),
         resourceTags: this.db.listResourceTagsForEntry(clean.id, clean.orgId),
       };
     }
@@ -4652,11 +4710,37 @@ export class SeaEngine {
         }
       }
 
+      const parentObj = resolved.object?.parentObjectId
+        ? visibleObjectsById.get(resolved.object.parentObjectId) ?? null
+        : null;
+      const parentRef = parentObj
+        ? formatCanonicalObjectRef(
+            parentObj,
+            vis.getSanitizedRealmPath(parentObj.realmId),
+            dupKeys,
+          )
+        : null;
+      const objAliases = resolved.object
+        ? Array.from(
+            new Set(
+              this.db
+                .listObjectAliases([resolved.object.id])
+                .filter(
+                  (a) =>
+                    a.isExplicit ||
+                    !a.isName,
+                )
+                .map((a) => a.alias),
+            ),
+          )
+        : [];
       const card: ObjectCard = {
         ref: resolved.canonicalRef,
         kind: resolved.objectKind,
         name: resolved.objectName,
         object: resolved.object,
+        ...(parentRef ? { parentRef } : {}),
+        ...(objAliases.length > 0 ? { aliases: objAliases } : {}),
         realmPath: resolved.realmPath,
         ...(resolvedWithList.length > 0
           ? { withRefs: resolvedWithList.map((w) => w.canonicalRef) }

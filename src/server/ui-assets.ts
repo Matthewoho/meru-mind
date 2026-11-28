@@ -120,7 +120,13 @@ export function createMindClient(options = {}) {
     const url = new URL((baseUrl || window.location.origin) + path);
     if (opts.query) {
       for (const [k, v] of Object.entries(opts.query)) {
-        if (v !== undefined && v !== null && v !== "") {
+        if (Array.isArray(v)) {
+          for (const item of v) {
+            if (item !== undefined && item !== null && item !== "") {
+              url.searchParams.append(k, String(item));
+            }
+          }
+        } else if (v !== undefined && v !== null && v !== "") {
           url.searchParams.set(k, String(v));
         }
       }

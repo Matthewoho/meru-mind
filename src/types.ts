@@ -859,6 +859,14 @@ export interface TreeResult {
 
 export type LsTargetType = "realm" | "object" | "thing" | "resource";
 
+export interface EntryLinkedObjectRef {
+  id: string;
+  ref: string;
+  kind: string;
+  name: string;
+  realmPath: string;
+}
+
 export interface LsEntry {
   id: string;
   behaviorClass: BehaviorClass;
@@ -882,6 +890,7 @@ export interface LsEntry {
   supersedesIds?: string[];
   supersededById: string | null;
   objectIds: string[];
+  objectRefs?: EntryLinkedObjectRef[];
   resourceTags: string[];
   inactive?: string[];
 }
@@ -1082,6 +1091,8 @@ export interface ObjectCard {
   kind: string;
   name: string;
   object: MindObject | null;
+  parentRef?: string | null;
+  aliases?: string[];
   realmPath: string | null;
   withRefs?: string[];
   counts: {
@@ -1183,6 +1194,7 @@ export type CatResult =
       record: LedgerRecord;
       realmPath: string;
       objectIds: string[];
+      objectRefs?: EntryLinkedObjectRef[];
       resourceTags: string[];
       currentHeadId: string | null;
       orphanSuperseded: boolean;
@@ -1193,6 +1205,7 @@ export type CatResult =
       seabed: SeabedEntry;
       realmPath: string;
       objectIds: string[];
+      objectRefs?: EntryLinkedObjectRef[];
       resourceTags: string[];
     }
   | {
