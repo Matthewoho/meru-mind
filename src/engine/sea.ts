@@ -100,6 +100,13 @@ import {
   resolveUnifiedObjectRead,
 } from "./refs.js";
 import {
+  classifyRulesForViewer,
+  collectActiveDecisionHeads,
+  collectObjectScopedRules,
+  collectWallRules,
+  compareEntriesDesc,
+} from "./object-rules.js";
+import {
   createVisibilityHelpers,
   filterVisibleChangeFrames,
   parseDriveSourceRef,
@@ -406,12 +413,55 @@ export class SeaEngine {
       excludeSensitivities,
       limit: maxRules,
     });
-    const ruleSummaries = rulesRes.items.map((r) => ({
+    const allVisibleBriefObjects = vis.sanitizeObjects(
+      this.db.listObjects({
+        orgId: targetRealm.orgId,
+        realmIds: scope.readableLedgerIds,
+      }),
+    );
+    const visibleBriefObjectsById = new Map(
+      allVisibleBriefObjects.map((o) => [o.id, o]),
+    );
+    const briefDupKeys = computeDuplicateObjectKeys(allVisibleBriefObjects);
+    const classifiedBriefRules = classifyRulesForViewer({
+      db: this.db,
+      orgId: targetRealm.orgId,
+      rules: rulesRes.items,
+      visibleObjectsById: visibleBriefObjectsById,
+      duplicateObjectKeys: briefDupKeys,
+      vis,
+    });
+    const scopedRefsByRuleId = new Map<string, string[]>();
+    for (const s of classifiedBriefRules.scopedRules) {
+      scopedRefsByRuleId.set(s.rule.id, s.objectRefs);
+    }
+    const ruleSummaries = rulesRes.items.map((r) => {
+      const refs = scopedRefsByRuleId.get(r.id);
+      return {
+        id: r.id,
+        realmId: r.realmId,
+        inherited: r.realmId !== targetRealm.id,
+        title: r.title,
+        ...(refs && refs.length > 0 ? { scopedObjectRefs: refs } : {}),
+      };
+    });
+    const realmRules = classifiedBriefRules.wallRules.map((r) => ({
       id: r.id,
       realmId: r.realmId,
+      realmPath: vis.getSanitizedRealmPath(r.realmId),
       inherited: r.realmId !== targetRealm.id,
       title: r.title,
     }));
+    const scopedObjectRules = classifiedBriefRules.scopedRules.map(
+      ({ rule: r, objectRefs }) => ({
+        id: r.id,
+        realmId: r.realmId,
+        realmPath: vis.getSanitizedRealmPath(r.realmId),
+        inherited: r.realmId !== targetRealm.id,
+        title: r.title,
+        objectRefs,
+      }),
+    );
 
     // 3. Batch fetch cognitive cards for self + ancestors + capped visible descendants (1 query!)
     const visibleDescendants = centerScope.descendantIds.filter((id) =>
@@ -646,6 +696,8 @@ export class SeaEngine {
           totalCount: rulesRes.total,
           omittedCount: Math.max(0, rulesRes.total - ruleSummaries.length),
         },
+        realmRules,
+        scopedObjectRules,
         ancestorSummaries,
         childSummaries: {
           items: childSlice,
@@ -4028,6 +4080,7 @@ export class SeaEngine {
     actor: Actor;
     viewerRealmId: string;
     ref: string;
+    with?: string[];
     history?: boolean;
     context?: number;
     around?: string;
@@ -4037,6 +4090,13 @@ export class SeaEngine {
     includeDescendantSeabed?: boolean;
     scopeCeiling?: AccessScope;
   }): Promise<ShowResult> {
+    const rawWith = params.with ?? [];
+    if (rawWith.length > 10) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Too many --with references: received ${rawWith.length}, maximum is 10`,
+      );
+    }
     if (
       params.context !== undefined &&
       (!Number.isInteger(params.context) || params.context < 0)
@@ -4072,6 +4132,29 @@ export class SeaEngine {
         "INVALID_INPUT",
         "--around/--cursor/--chars/--full are only supported when showing an entry (rec_/sea_) or file (file:...)",
       );
+    }
+    if (rawWith.length > 0 && parsed.kind !== "object") {
+      throw new MindError(
+        "INVALID_INPUT",
+        "--with is only supported when showing an object ref (<kind>:<name>, /<realm>/<kind>:<name>, or obj_...)",
+      );
+    }
+    const parsedWithRefs: Array<Extract<ReturnType<typeof parseRefSyntax>, { kind: "object" }>> = [];
+    for (const rawW of rawWith) {
+      if (typeof rawW !== "string" || !rawW.trim()) {
+        throw new MindError(
+          "INVALID_INPUT",
+          'Invalid --with reference: expected a non-empty object ref (<kind>:<name>, /<realm>/<kind>:<name>, or obj_...)',
+        );
+      }
+      const pw = parseRefSyntax(rawW.trim());
+      if (pw.kind !== "object") {
+        throw new MindError(
+          "INVALID_INPUT",
+          `Invalid --with reference "${rawW}": expected an object ref (<kind>:<name>, /<realm>/<kind>:<name>, or obj_...)`,
+        );
+      }
+      parsedWithRefs.push(pw);
     }
     if (aroundTrimmed && params.cursor !== undefined) {
       throw new MindError(
@@ -4126,7 +4209,7 @@ export class SeaEngine {
       };
     }
 
-    // 2. Unified Object -> object card with top 5 recent entries
+    // 2. Unified Object -> full on-the-fly Object Brief (Spec 3.3, V1/V2/V4/V5/V6/V7)
     if (parsed.kind === "object") {
       const resolved = resolveUnifiedObjectRead({
         db: this.db,
@@ -4137,6 +4220,270 @@ export class SeaEngine {
         vis,
         verb: "show",
       });
+
+      const readableLedgerSet = new Set(scope.readableLedgerIds);
+      const allVisibleObjects = vis.sanitizeObjects(
+        this.db.listObjects({
+          orgId: viewerRealm.orgId,
+          realmIds: scope.readableLedgerIds,
+        }),
+      );
+      const visibleObjectsById = new Map(
+        allVisibleObjects.map((o) => [o.id, o]),
+      );
+      const dupKeys = computeDuplicateObjectKeys(allVisibleObjects);
+
+      // Resolve, normalize, and deduplicate --with object refs (never implies include_descendant_seabed)
+      const primaryNormKey = resolved.object
+        ? resolved.object.id
+        : resolved.canonicalRef;
+      const seenWithKeys = new Set<string>([primaryNormKey]);
+      const resolvedWithList: Array<ReturnType<typeof resolveUnifiedObjectRead>> =
+        [];
+      for (const pw of parsedWithRefs) {
+        const wRes = resolveUnifiedObjectRead({
+          db: this.db,
+          realms,
+          orgId: viewerRealm.orgId,
+          parsed: pw,
+          scope,
+          vis,
+          verb: "show",
+        });
+        const normKey = wRes.object ? wRes.object.id : wRes.canonicalRef;
+        if (seenWithKeys.has(normKey)) continue;
+        seenWithKeys.add(normKey);
+        resolvedWithList.push(wRes);
+      }
+
+      // Untruncated deterministic rule union with precedence: realm (wall) > object > with
+      const wallTargetRealmId =
+        resolved.object?.realmId ?? resolved.scopedRealmId ?? viewerRealm.id;
+      const wallRules = collectWallRules({
+        db: this.db,
+        realms,
+        orgId: viewerRealm.orgId,
+        targetRealmId: wallTargetRealmId,
+        scope,
+        vis,
+        sanitizedVisibleObjects: allVisibleObjects,
+      });
+      const primaryObjRules = collectObjectScopedRules({
+        db: this.db,
+        realms,
+        orgId: viewerRealm.orgId,
+        object: resolved.object,
+        objectKind: resolved.objectKind,
+        objectName: resolved.objectName,
+        scopedRealmId: resolved.scopedRealmId,
+        scope,
+        vis,
+        sanitizedVisibleObjects: allVisibleObjects,
+        scopeSource: "object",
+      });
+      const withObjRules = resolvedWithList.flatMap((wRes) =>
+        collectObjectScopedRules({
+          db: this.db,
+          realms,
+          orgId: viewerRealm.orgId,
+          object: wRes.object,
+          objectKind: wRes.objectKind,
+          objectName: wRes.objectName,
+          scopedRealmId: wRes.scopedRealmId,
+          scope,
+          vis,
+          sanitizedVisibleObjects: allVisibleObjects,
+          scopeSource: "with",
+        }),
+      );
+
+      const seenRuleIds = new Set<string>();
+      const mergedRules: ObjectCard["rules"] = [];
+      for (const r of [...wallRules, ...primaryObjRules, ...withObjRules]) {
+        if (seenRuleIds.has(r.id)) continue;
+        seenRuleIds.add(r.id);
+        mergedRules.push(r);
+      }
+
+      // Hydrate visible records attached to primary object for Pending / Active Decisions / Recent Findings
+      const primaryRecords =
+        resolved.entryIds.length > 0
+          ? this.db
+              .getRecordsByIds(resolved.entryIds)
+              .filter(
+                (r) =>
+                  r.orgId === viewerRealm.orgId &&
+                  r.status === "active" &&
+                  r.redactedAt === null &&
+                  r.sensitivity !== "secret" &&
+                  readableLedgerSet.has(r.realmId) &&
+                  vis.canSeeRecord(r),
+              )
+          : [];
+
+      const toSummary = (r: LedgerRecord) => {
+        const bodyText =
+          typeof r.payload.body === "string"
+            ? r.payload.body
+            : typeof r.payload.summary === "string"
+              ? r.payload.summary
+              : JSON.stringify(r.payload);
+        return {
+          id: r.id,
+          kind: r.kind,
+          title: r.title,
+          snippet: buildSnippet({ text: bodyText, maxLen: 180 }),
+          realmId: r.realmId,
+          realmPath: vis.getSanitizedRealmPath(r.realmId),
+          authorId: r.authorId,
+          occurredAt: r.occurredAt,
+          createdAt: r.createdAt,
+          status: r.status,
+        };
+      };
+
+      // Pending Decisions: active unresolved proposals (exclude proposals settled by an active verdict)
+      const activeProposals = primaryRecords
+        .filter((r) => r.kind === "proposal" && r.supersededById === null)
+        .sort(compareEntriesDesc);
+      let unresolvedProposals = activeProposals;
+      if (activeProposals.length > 0) {
+        const proposalRealmIds = Array.from(
+          new Set(activeProposals.map((p) => p.realmId)),
+        );
+        const verdictsInRealms = this.db
+          .listRecords({
+            realmIds: proposalRealmIds,
+            kinds: ["verdict"],
+            includeSuperseded: false,
+            excludeSensitivities: ["secret"],
+            limit: 2000,
+          })
+          .items.filter(
+            (v) =>
+              v.status === "active" &&
+              v.redactedAt === null &&
+              v.sensitivity !== "secret",
+          );
+        const settledProposalIds = new Set<string>();
+        for (const v of verdictsInRealms) {
+          if (typeof v.payload.proposalId === "string") {
+            settledProposalIds.add(v.payload.proposalId);
+          }
+          for (const refId of v.refs) {
+            settledProposalIds.add(refId);
+          }
+        }
+        unresolvedProposals = activeProposals.filter(
+          (p) => !settledProposalIds.has(p.id),
+        );
+      }
+
+      // Active Decisions: shared authoritative collector (cap 20 + totalCount)
+      const allActiveDecisions = collectActiveDecisionHeads({
+        db: this.db,
+        orgId: viewerRealm.orgId,
+        entryIds: resolved.entryIds,
+        vis,
+        allowedRealmIds: readableLedgerSet,
+      });
+
+      // Recent Findings: active findings sorted desc (cap 10 + totalCount)
+      const allFindings = primaryRecords
+        .filter((r) => r.kind === "finding" && r.supersededById === null)
+        .sort(compareEntriesDesc);
+
+      // Direct visible `within` children
+      const children: ObjectCard["children"] = resolved.object
+        ? allVisibleObjects
+            .filter((o) => o.parentObjectId === resolved.object!.id)
+            .sort(
+              (a, b) =>
+                a.kind.localeCompare(b.kind) ||
+                a.name.localeCompare(b.name) ||
+                a.id.localeCompare(b.id),
+            )
+            .map((o) => {
+              const rPath = vis.getSanitizedRealmPath(o.realmId);
+              return {
+                id: o.id,
+                ref: formatCanonicalObjectRef(o, rPath, dupKeys),
+                kind: o.kind,
+                name: o.name,
+                realmId: o.realmId,
+                realmPath: rPath,
+                ...(o.state && o.state !== "active"
+                  ? { state: o.state, stateLabel: o.stateLabel ?? null }
+                  : {}),
+              };
+            })
+        : [];
+
+      // Live-computed visible co-occurring objects on the same visible entries (top 10; exclude self & within subtree)
+      const selfSubtreeIds = new Set<string>(
+        resolved.object
+          ? [
+              resolved.object.id,
+              ...getDescendantObjectIds(allVisibleObjects, resolved.object.id),
+            ]
+          : [],
+      );
+      const coCounts = new Map<string, number>();
+      if (resolved.entryIds.length > 0) {
+        const objIdsByEntry = this.db.listObjectIdsByEntryIds(
+          viewerRealm.orgId,
+          resolved.entryIds,
+        );
+        for (const linkedObjIds of objIdsByEntry.values()) {
+          const uniqueInEntry = new Set(linkedObjIds);
+          for (const oid of uniqueInEntry) {
+            if (selfSubtreeIds.has(oid)) continue;
+            if (!visibleObjectsById.has(oid)) continue;
+            coCounts.set(oid, (coCounts.get(oid) ?? 0) + 1);
+          }
+        }
+      }
+      const topCoEntries = Array.from(coCounts.entries())
+        .map(([oid, sharedCount]) => {
+          const obj = visibleObjectsById.get(oid)!;
+          const rPath = vis.getSanitizedRealmPath(obj.realmId);
+          const coRef = formatCanonicalObjectRef(obj, rPath, dupKeys);
+          return { obj, rPath, coRef, sharedCount };
+        })
+        .sort(
+          (a, b) =>
+            b.sharedCount - a.sharedCount || a.coRef.localeCompare(b.coRef),
+        )
+        .slice(0, 10);
+
+      const coOccurring: ObjectCard["coOccurring"] = topCoEntries.map(
+        ({ obj, rPath, coRef, sharedCount }) => {
+          const coRules = collectObjectScopedRules({
+            db: this.db,
+            realms,
+            orgId: viewerRealm.orgId,
+            object: obj,
+            objectKind: obj.kind,
+            objectName: obj.name,
+            scopedRealmId: obj.realmId,
+            scope,
+            vis,
+            sanitizedVisibleObjects: allVisibleObjects,
+            scopeSource: "with",
+          });
+          return {
+            id: obj.id,
+            ref: coRef,
+            kind: obj.kind,
+            name: obj.name,
+            realmPath: rPath,
+            sharedCount,
+            ruleCount: coRules.length,
+            tryCommand: `meru-mind show ${resolved.canonicalRef} --with ${coRef}`,
+          };
+        },
+      );
+
       const unifiedRes = this.db.lsEntriesByIdsUnified({
         orgId: viewerRealm.orgId,
         entryIds: resolved.entryIds,
@@ -4151,20 +4498,46 @@ export class SeaEngine {
         orgId: viewerRealm.orgId,
         refs: unifiedRes.rows,
         vis,
-        readableLedgerSet: new Set(scope.readableLedgerIds),
+        readableLedgerSet,
       });
+      const latestSeq = this.db.getLatestVisibleChangeLogSeq({
+        orgId: viewerRealm.orgId,
+        ledgerRealmIds: scope.readableLedgerIds,
+        seabedRealmIds: scope.readableSeabedIds,
+        includeSecret: false,
+      });
+
       const card: ObjectCard = {
         ref: resolved.canonicalRef,
         kind: resolved.objectKind,
         name: resolved.objectName,
         object: resolved.object,
         realmPath: resolved.realmPath,
+        ...(resolvedWithList.length > 0
+          ? { withRefs: resolvedWithList.map((w) => w.canonicalRef) }
+          : {}),
         counts: {
           total: unifiedRes.total,
           viaObject: resolved.countsBySource.viaObject,
           viaTag: resolved.countsBySource.viaTag,
           viaThing: resolved.countsBySource.viaThing,
         },
+        rules: mergedRules,
+        pendingDecisions: {
+          items: unresolvedProposals.slice(0, 5).map(toSummary),
+          totalCount: unresolvedProposals.length,
+        },
+        activeDecisions: {
+          items: allActiveDecisions.slice(0, 20).map(toSummary),
+          totalCount: allActiveDecisions.length,
+        },
+        recentFindings: {
+          items: allFindings.slice(0, 10).map(toSummary),
+          totalCount: allFindings.length,
+        },
+        children,
+        coOccurring,
+        latestSeq,
         recentEntries,
         try: `meru-mind ls ${resolved.canonicalRef}`,
       };

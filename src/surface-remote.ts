@@ -169,7 +169,10 @@ export class RemoteMindSurface implements MindSurface {
     method: "GET" | "POST",
     endpoint: string,
     options?: {
-      query?: Record<string, string | number | boolean | undefined>;
+      query?: Record<
+        string,
+        string | number | boolean | string[] | undefined
+      >;
       body?: unknown;
       signal?: AbortSignal;
       extraHeaders?: Record<string, string>;
@@ -178,7 +181,12 @@ export class RemoteMindSurface implements MindSurface {
     const url = new URL(`${this.baseUrl}${endpoint}`);
     if (options?.query) {
       for (const [k, v] of Object.entries(options.query)) {
-        if (v !== undefined && v !== null) {
+        if (v === undefined || v === null) continue;
+        if (Array.isArray(v)) {
+          for (const item of v) {
+            url.searchParams.append(k, String(item));
+          }
+        } else {
           url.searchParams.set(k, String(v));
         }
       }
@@ -305,6 +313,7 @@ export class RemoteMindSurface implements MindSurface {
     return this.request<ShowResult>("GET", "/v1/show", {
       query: {
         ref: params.ref,
+        with: params.with,
         around: params.around,
         cursor: params.cursor,
         chars: params.chars,

@@ -9,6 +9,7 @@ import {
   discoverWorkspaceRealmMarker,
   ejectDefaultUiShell,
   exportRecordsAsMarkdown,
+  findBoundRulesForEcho,
   findRelatedActiveForEcho,
   formatChangesMarkdown,
   formatDoctorMarkdown,
@@ -467,9 +468,10 @@ Examples:
   meru-mind ls /ops/service:api --history
 `,
   show: `Risk: read
-When to use: Inspect any ref verbatim: /realm (brief), kind:name (object card), rec_/sea_ (entry), or file:/realm/path.
-Usage: meru-mind show <ref> [--around "<words>"] [--cursor <cursor>] [--chars <N>] [--full] [--history] [--context <N>] [--include-descendant-seabed]
+When to use: Inspect any ref verbatim: /realm (brief), kind:name (object brief), rec_/sea_ (entry), or file:/realm/path.
+Usage: meru-mind show <ref> [--with <objRef>]... [--around "<words>"] [--cursor <cursor>] [--chars <N>] [--full] [--history] [--context <N>] [--include-descendant-seabed]
 Flags:
+  --with <objRef>        Repeatable object ref to merge rules with (max 10; object refs only)
   --chars <N>            Character window size (default: 3500, max: 200000)
   --around "<words>"     Center window around matching query words
   --cursor <cursor>      Pagination cursor from previous window footer
@@ -479,7 +481,7 @@ Flags:
   --include-descendant-seabed  Include descendant raw seabed in context
 Examples:
   meru-mind show /ops/cicd
-  meru-mind show service:payment-api
+  meru-mind show service:payment-api --with service:auth
   meru-mind show rec_0123456789abcdef --chars 1200 --history --context 5
   meru-mind show file:/ops/cicd/sop.md
 `,
@@ -1520,6 +1522,7 @@ async function main(): Promise<void> {
       assertAllowedFlags(
         flags,
         [
+          "with",
           "around",
           "cursor",
           "chars",
@@ -1546,10 +1549,12 @@ async function main(): Promise<void> {
           { try: "meru-mind show /" },
         );
       }
+      const rawWith = multiFlags["with"];
       const res = await engine.sea.show({
         actor,
         viewerRealmId: ctx.boundViewerRealmId,
         ref: sub,
+        with: rawWith && rawWith.length > 0 ? rawWith : undefined,
         around: flagStr(flags, "around"),
         cursor: flagStr(flags, "cursor"),
         chars: parseIntFlag(flags, "chars", { min: 1 }),
@@ -1725,16 +1730,37 @@ async function main(): Promise<void> {
         newRecord: rec,
         scopeCeiling: effectiveScope,
       });
+      const boundRules = findBoundRulesForEcho({
+        db: engine.db,
+        realms: routed.realms,
+        mounts,
+        actor,
+        viewerRealmId: ctx.boundViewerRealmId,
+        scope: effectiveScope,
+        newRecord: rec,
+        about: aboutRefs,
+      });
       const payloadOut = {
         ...rec,
         realmPath: routed.realm.path,
         routedBy: routed.routedBy,
         ...(relatedActive.length > 0 ? { relatedActive } : {}),
+        ...(boundRules.length > 0 ? { boundRules } : {}),
       };
       const baseMd = formatGenericMarkdown(
         `Written [${rec.kind}] -> \`${routed.realm.path}\` (routed: ${routed.routedBy})`,
         payloadOut,
       );
+      const ruleFooter =
+        boundRules.length > 0
+          ? "\n\nBound rules in scope:\n" +
+            boundRules
+              .map(
+                (r) =>
+                  `- [rule] \`${r.id}\` ${r.title} (${r.scopeSource}: \`${r.sourceRef}\`, realm \`${r.realmPath}\`)`,
+              )
+              .join("\n")
+          : "";
       const echoFooter =
         relatedActive.length > 0
           ? "\n\nRelated active entries (context only; if this supersedes one, re-run with `--supersedes <id>`):\n" +
@@ -1745,7 +1771,7 @@ async function main(): Promise<void> {
               )
               .join("\n")
           : "";
-      output(payloadOut, `${baseMd}${echoFooter}`);
+      output(payloadOut, `${baseMd}${ruleFooter}${echoFooter}`);
       return;
     }
 

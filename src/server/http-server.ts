@@ -738,8 +738,10 @@ export async function startMindServer(
               if (!ref) {
                 throw new MindError("INVALID_INPUT", 'Query parameter "ref" is required');
               }
+              const withRefs = sp.getAll("with");
               const out = await surface.show({
                 ref,
+                with: withRefs.length > 0 ? withRefs : undefined,
                 around: sp.get("around") ?? undefined,
                 cursor: sp.get("cursor") ?? undefined,
                 chars: parseOptionalInt(sp.get("chars")),

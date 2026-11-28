@@ -1,4 +1,7 @@
-import type { RelatedActiveEcho } from "./engine/surface-write.js";
+import type {
+  BoundRuleEcho,
+  RelatedActiveEcho,
+} from "./engine/surface-write.js";
 import type { WorkBindingRecord } from "./work/provider.js";
 import type { SafeListReadyResult, SafeResolveResult } from "./work/registry.js";
 import type {
@@ -63,6 +66,7 @@ export interface SurfaceLsParams {
 
 export interface SurfaceShowParams {
   ref: string;
+  with?: string[];
   around?: string;
   cursor?: string;
   chars?: number;
@@ -118,6 +122,7 @@ export interface SurfaceWriteResult {
   record: LedgerRecord;
   routedBy: WriteRouteSource;
   relatedActive?: RelatedActiveEcho[];
+  boundRules?: BoundRuleEcho[];
   /** Recent same-realm changes by other actors since the session's lastReadSeq (advisory, never blocks writes) */
   collisionHints?: ChangeLogEntry[];
 }

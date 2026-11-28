@@ -1065,8 +1065,23 @@ describe("Meru Mind v0.6.5 — Subtree WriteScope, Remote Objects & Unified Impo
       }),
     ).rejects.toThrow(/already exists in visible realm "\/ops\/infra"/i);
 
-    // 5c. move, link, unlink, set, alias via Remote CLI + Surface
-    const moved = await agentSurf.moveObject({
+    // 5c. move (v0.7.0 I4: human-only admin!), link, unlink, set, alias via Remote CLI + Surface
+    await expect(
+      agentSurf.moveObject({
+        ref: svcFirst.object.id,
+        parentRef: parent2.object.id,
+      }),
+    ).rejects.toThrow(/Only human actors can move objects/i);
+    const infraHumanTok = srv.createToken({
+      actorId: "infra-human",
+      actorKind: "human",
+      boundRealmId: "/ops/infra",
+    });
+    const infraHumanSurf = await RemoteMindSurface.connect({
+      baseUrl: srv.url,
+      token: infraHumanTok.token,
+    });
+    const moved = await infraHumanSurf.moveObject({
       ref: svcFirst.object.id,
       parentRef: parent2.object.id,
     });

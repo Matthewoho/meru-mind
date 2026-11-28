@@ -441,9 +441,20 @@ describe("Slice 2a: Migration v3, object single-parent tree, multi-valued realms
       name: "Deployer",
     });
 
+    // v0.7.0 (I4): object move is human-only; agents cannot move objects to escape inherited rules
     expect(() =>
       engine.objects.moveObject({
         actor: agentBot,
+        viewerRealmId: alpha.id,
+        objectId: objInfra.id,
+        parentObjectId: objPipeline.id,
+      }),
+    ).toThrow(/Only human actors can move objects/);
+
+    // Human actor still hits cycle guard
+    expect(() =>
+      engine.objects.moveObject({
+        actor: humanAlice,
         viewerRealmId: alpha.id,
         objectId: objInfra.id,
         parentObjectId: objPipeline.id,

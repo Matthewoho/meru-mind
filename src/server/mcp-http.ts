@@ -108,9 +108,10 @@ export function createSurfaceMcpServer(surface: MindSurface): McpServer {
 
   server.tool(
     "mind_show",
-    "[read] Inspect any ref: /realm (brief), kind:name (object card), rec_/sea_ (bounded window + optional history/context), or file:/realm/path.",
+    "[read] Inspect any ref: /realm (brief), kind:name (object brief + optional with), rec_/sea_ (bounded window), or file:/realm/path.",
     {
       ref: z.string(),
+      with: z.array(z.string()).optional(),
       around: z.string().optional(),
       cursor: z.string().optional(),
       chars: z.number().int().positive().max(200000).optional(),
@@ -124,6 +125,7 @@ export function createSurfaceMcpServer(surface: MindSurface): McpServer {
         return okResult(
           await surface.show({
             ref: args.ref,
+            with: args.with,
             around: args.around,
             cursor: args.cursor,
             chars: args.chars,
@@ -236,6 +238,7 @@ export function createSurfaceMcpServer(surface: MindSurface): McpServer {
           ...res.record,
           routedBy: res.routedBy,
           ...(res.relatedActive ? { relatedActive: res.relatedActive } : {}),
+          ...(res.boundRules ? { boundRules: res.boundRules } : {}),
           ...(res.collisionHints ? { collisionHints: res.collisionHints } : {}),
         });
       } catch (err) {

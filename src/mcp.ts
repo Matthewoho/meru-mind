@@ -8,6 +8,7 @@ import {
   assertAccess,
   createMindEngine,
   discoverWorkspaceRealmMarker,
+  findBoundRulesForEcho,
   findRelatedActiveForEcho,
   MindError,
   resolveAccessScope,
@@ -380,9 +381,10 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
 
   server.tool(
     "mind_show",
-    "[read] Inspect any ref: /realm (brief), kind:name (object card), rec_/sea_ (bounded window + optional history/context), or file:/realm/path.",
+    "[read] Inspect any ref: /realm (brief), kind:name (object brief + optional with), rec_/sea_ (bounded window), or file:/realm/path.",
     {
       ref: z.string(),
+      with: z.array(z.string()).optional(),
       around: z.string().optional(),
       cursor: z.string().optional(),
       chars: z.number().int().positive().max(200000).optional(),
@@ -400,6 +402,7 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
             actor: boundActor,
             viewerRealmId: boundViewerRealmId,
             ref: args.ref,
+            with: args.with,
             around: args.around,
             cursor: args.cursor,
             chars: args.chars,
@@ -591,11 +594,22 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
           newRecord: rec,
           scopeCeiling: writeScope,
         });
+        const boundRules = findBoundRulesForEcho({
+          db: engine.db,
+          realms: writeRealms,
+          mounts: ctx.mounts,
+          actor: boundActor,
+          viewerRealmId: boundViewerRealmId,
+          scope: writeScope,
+          newRecord: rec,
+          about: args.about,
+        });
         return okResult({
           ...rec,
           realmPath: targetRealmPath,
           routedBy,
           ...(relatedActive.length > 0 ? { relatedActive } : {}),
+          ...(boundRules.length > 0 ? { boundRules } : {}),
         });
       } catch (err) {
         return errResult(err, cachedErrorCtx);

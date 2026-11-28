@@ -319,9 +319,11 @@ export {
 } from "./engine/refs.js";
 export {
   writeEverydayConclusion,
+  findBoundRulesForEcho,
   findRelatedActiveForEcho,
   resolveWriteTargetRealm,
   EVERYDAY_WRITE_KINDS,
+  type BoundRuleEcho,
   type RelatedActiveEcho,
   type SurfaceWriteParams,
   type ResolveWriteTargetParams,
@@ -396,6 +398,16 @@ export {
   type PlanSourceVerificationResult,
 } from "./engine/importer.js";
 export { exportRecordsAsMarkdown } from "./engine/export-md.js";
+export {
+  classifyRulesForViewer,
+  collectActiveDecisionHeads,
+  collectObjectScopedRules,
+  collectWallRules,
+  computeGoverningRealmIds,
+  extractRuleBodyText,
+  hasActiveRulesOnObjectHierarchy,
+  walkVisibleWithinAncestors,
+} from "./engine/object-rules.js";
 export {
   createVisibilityHelpers,
   filterVisibleChangeFrames,

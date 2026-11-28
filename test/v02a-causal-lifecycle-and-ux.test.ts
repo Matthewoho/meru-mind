@@ -478,12 +478,24 @@ describe("V0.2a Causal Entity Lifecycle & Round-3 UX Polish", () => {
       expect(JSON.parse(f.stderr).error).toBe("invalid_input");
     }
 
+    // v0.7.0 (I4): alias --remove is human-only; human trying to remove object's own name alias gets invalid_input
+    const failAgentRemove = runCliFail(homeDir, [
+      "object",
+      "alias",
+      "person:alex-chen",
+      "--remove",
+      "alex-chen",
+      "--json",
+    ]);
+    expect(JSON.parse(failAgentRemove.stderr).error).toBe("forbidden");
+
     const failRemoveName = runCliFail(homeDir, [
       "object",
       "alias",
       "person:alex-chen",
       "--remove",
       "alex-chen",
+      "--as-human",
       "--json",
     ]);
     expect(JSON.parse(failRemoveName.stderr).error).toBe("invalid_input");
@@ -873,7 +885,7 @@ describe("V0.2a Causal Entity Lifecycle & Round-3 UX Polish", () => {
       "⚠ person:alex-chen departed 2026-10-26",
     );
 
-    // show <object> displays State line
+    // show <object> displays inactive state badge in Object Brief header (Spec 3.3)
     const showObj = await eng.sea.show({
       actor: agentWorker,
       viewerRealmId: rootRealm.id,
@@ -881,7 +893,7 @@ describe("V0.2a Causal Entity Lifecycle & Round-3 UX Polish", () => {
     });
     const showObjMd = formatShowMarkdown(showObj);
     expect(showObjMd).toContain(
-      `State**: inactive (departed, since 2026-10-26, evidence: ${evAlex.id})`,
+      `[inactive: departed, since 2026-10-26, evidence: ${evAlex.id}]`,
     );
 
     // tree & ls --only objects append [departed] ONLY on inactive objects
@@ -1138,7 +1150,7 @@ describe("V0.2a Causal Entity Lifecycle & Round-3 UX Polish", () => {
     expect(JSON.stringify(fromListObjs)).not.toContain(alphaHiddenObj.id);
 
     const fromMove = eng.objects.moveObject({
-      actor: agentWorker,
+      actor: humanAdmin,
       viewerRealmId: beta.id,
       objectId: betaObj.id,
       parentObjectId: betaParent.id,

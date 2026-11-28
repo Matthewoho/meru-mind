@@ -162,8 +162,10 @@ export async function runRemoteCliCommand(
       if (!sub?.trim()) {
         throw new MindError("INVALID_REF", "show requires a <ref> argument");
       }
+      const rawWith = multiFlags["with"];
       const res = await surface.show({
         ref: sub.trim(),
+        with: rawWith && rawWith.length > 0 ? rawWith : undefined,
         around: str(flags, "around"),
         cursor: str(flags, "cursor"),
         chars: intFlag(flags, "chars"),
@@ -235,6 +237,7 @@ export async function runRemoteCliCommand(
           ...res.record,
           routedBy: res.routedBy,
           ...(res.relatedActive ? { relatedActive: res.relatedActive } : {}),
+          ...(res.boundRules ? { boundRules: res.boundRules } : {}),
           ...(res.collisionHints ? { collisionHints: res.collisionHints } : {}),
         },
         formatGenericMarkdown(

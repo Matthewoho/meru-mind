@@ -389,29 +389,35 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
   const lines: string[] = [
     `# Brief: ${brief.realm.name}${archivedTag} (\`${brief.realm.path}\`, \`${brief.realm.id}\`)`,
     ...(brief.realm.scope ? [`Scope: ${brief.realm.scope}`] : []),
-    `Generated: ${brief.generatedAt}`,
   ];
-  if (brief.buckets) {
-    lines.push(
-      `Buckets: **rules**=${brief.buckets.rules}, **conclusions**=${brief.buckets.conclusions}, **raw**=${brief.buckets.raw}`,
-    );
-  }
-  const histEntries = Object.entries(brief.kindHistogram ?? {}).sort(([a], [b]) =>
-    a.localeCompare(b),
-  );
-  if (histEntries.length > 0) {
-    lines.push(
-      `Kinds: ${histEntries.map(([k, c]) => `${k}=${c}`).join(", ")}`,
-    );
-  }
 
-  // L1 Section 1: Rules (self + ancestors, NEVER silently truncated)
+  // L1 Section 1: Rules (self + ancestors, NEVER silently truncated; grouped into realm wall vs object-scoped)
   lines.push(
     "",
     `## Rules (${brief.middleMind.rules.items.length}/${brief.middleMind.rules.totalCount}, omitted: ${brief.middleMind.rules.omittedCount})`,
   );
   if (brief.middleMind.rules.items.length === 0) {
     lines.push("- _(none)_");
+  } else if (
+    brief.middleMind.realmRules !== undefined ||
+    brief.middleMind.scopedObjectRules !== undefined
+  ) {
+    const wall = brief.middleMind.realmRules ?? [];
+    const scoped = brief.middleMind.scopedObjectRules ?? [];
+    for (const r of wall) {
+      lines.push(
+        `- [rule] \`${r.id}\` ${r.title}${r.inherited ? " _(inherited)_" : ""}`,
+      );
+    }
+    if (scoped.length > 0) {
+      lines.push("", `### Object-Scoped Rules (${scoped.length})`);
+      for (const r of scoped) {
+        const refsLabel = r.objectRefs.map((ref) => `\`${ref}\``).join(", ");
+        lines.push(
+          `- [rule] \`${r.id}\` ${r.title} [${refsLabel}]${r.inherited ? " _(inherited)_" : ""}`,
+        );
+      }
+    }
   } else {
     for (const r of brief.middleMind.rules.items) {
       lines.push(
@@ -540,6 +546,23 @@ export function formatBriefMarkdown(brief: BriefOutput): string {
       );
     }
   }
+
+  // Spec 3.3: Move metadata (Generated / Buckets / Kinds) to footer
+  const footerMeta: string[] = [`Generated: ${brief.generatedAt}`];
+  if (brief.buckets) {
+    footerMeta.push(
+      `Buckets: **rules**=${brief.buckets.rules}, **conclusions**=${brief.buckets.conclusions}, **raw**=${brief.buckets.raw}`,
+    );
+  }
+  const histEntries = Object.entries(brief.kindHistogram ?? {}).sort(([a], [b]) =>
+    a.localeCompare(b),
+  );
+  if (histEntries.length > 0) {
+    footerMeta.push(
+      `Kinds: ${histEntries.map(([k, c]) => `${k}=${c}`).join(", ")}`,
+    );
+  }
+  lines.push("", "---", ...footerMeta);
 
   return lines.join("\n");
 }
@@ -1018,17 +1041,10 @@ export function formatShowMarkdown(res: ShowResult): string {
   }
   if (res.refType === "object") {
     const c = res.card;
-    const lines: string[] = [
-      `# Object: \`${c.ref}\``,
-      `- **Kind**: \`${c.kind}\``,
-      `- **Name**: ${c.name}`,
-    ];
-    if (c.object) {
-      lines.push(`- **ID**: \`${c.object.id}\``);
-    }
-    if (c.realmPath) {
-      lines.push(`- **Realm**: \`${c.realmPath}\``);
-    }
+    const breadcrumb = c.realmPath
+      ? `${c.realmPath} › ${c.kind} › ${c.name}`
+      : `${c.kind} › ${c.name}`;
+    let stateBadge = "";
     if (c.object && c.object.state && c.object.state !== "active") {
       const stateParts: string[] = [];
       if (c.object.stateLabel) stateParts.push(c.object.stateLabel);
@@ -1036,26 +1052,123 @@ export function formatShowMarkdown(res: ShowResult): string {
       if (c.object.stateEvidenceId) {
         stateParts.push(`evidence: ${c.object.stateEvidenceId}`);
       }
-      const detail = stateParts.length > 0 ? ` (${stateParts.join(", ")})` : "";
-      lines.push(`- **State**: ${c.object.state}${detail}`);
+      const detail =
+        stateParts.length > 0 ? `: ${stateParts.join(", ")}` : "";
+      stateBadge = ` [${c.object.state}${detail}]`;
     }
-    lines.push(
-      `- **Entries**: total=${c.counts.total} (object=${c.counts.viaObject}, tag=${c.counts.viaTag}, thing=${c.counts.viaThing})`,
-      "",
-      `## Recent Entries (${c.recentEntries.length}/${c.counts.total})`,
-    );
-    if (c.recentEntries.length === 0) {
-      lines.push("_(none)_");
-    } else {
-      for (const item of c.recentEntries) {
-        lines.push(formatLsEntryLine(item));
+    const withBadge =
+      c.withRefs && c.withRefs.length > 0
+        ? ` (+with: ${c.withRefs.join(", ")})`
+        : "";
+    const lines: string[] = [
+      `# ${c.kind}:${c.name}   ${breadcrumb}${stateBadge}${withBadge}`,
+    ];
+
+    // Section 2: Rules (untruncated, grouped: 墙 / 本对象及上级 / --with; omit if 0 — V5)
+    if (c.rules.length > 0) {
+      lines.push("", `## 规矩 (${c.rules.length})`);
+      const wallRules = c.rules.filter((r) => r.scopeSource === "realm");
+      const objRules = c.rules.filter((r) => r.scopeSource === "object");
+      const withRules = c.rules.filter((r) => r.scopeSource === "with");
+      const emitRuleGroup = (label: string, items: typeof c.rules) => {
+        if (items.length === 0) return;
+        lines.push(`### ${label}`);
+        for (const r of items) {
+          lines.push(
+            `- [rule] \`${r.id}\` **${r.title}** (\`${r.sourceRef}\`) — ${r.body}`,
+          );
+        }
+      };
+      emitRuleGroup("墙", wallRules);
+      emitRuleGroup("本对象及上级", objRules);
+      emitRuleGroup("--with", withRules);
+    }
+
+    // Section 3: Pending Decisions (omit if 0 — V5)
+    if (c.pendingDecisions.totalCount > 0) {
+      lines.push(
+        "",
+        `## 待拍板 (${c.pendingDecisions.items.length}/${c.pendingDecisions.totalCount})`,
+      );
+      for (const p of c.pendingDecisions.items) {
+        lines.push(
+          `- [proposal] \`${p.id}\` **${p.title}** (${p.realmPath} @ ${formatDateLabel(p.occurredAt)})`,
+        );
       }
     }
+
+    // Section 4: Active Decisions (omit if 0 — V5)
+    if (c.activeDecisions.totalCount > 0) {
+      lines.push(
+        "",
+        `## 现行决定 (${c.activeDecisions.items.length}/${c.activeDecisions.totalCount})`,
+      );
+      for (const d of c.activeDecisions.items) {
+        lines.push(
+          `- [decision] \`${d.id}\` **${d.title}** (${d.realmPath} @ ${formatDateLabel(d.occurredAt)})`,
+        );
+      }
+      if (c.activeDecisions.totalCount > c.activeDecisions.items.length) {
+        const extra = c.activeDecisions.totalCount - c.activeDecisions.items.length;
+        lines.push(
+          `... (+${extra} more; inspect: \`meru-mind ls ${c.ref} --kind decision\`)`,
+        );
+      }
+    }
+
+    // Section 5: Recent Findings (omit if 0 — V5)
+    if (c.recentFindings.totalCount > 0) {
+      lines.push(
+        "",
+        `## 近期发现 (${c.recentFindings.items.length}/${c.recentFindings.totalCount})`,
+      );
+      for (const f of c.recentFindings.items) {
+        lines.push(
+          `- [finding] \`${f.id}\` **${f.title}** (${f.realmPath} @ ${formatDateLabel(f.occurredAt)})`,
+        );
+      }
+    }
+
+    // Section 6: Children · Co-occurring (omit if both 0 — V5)
+    if (c.children.length > 0 || c.coOccurring.length > 0) {
+      lines.push(
+        "",
+        `## 下级 (${c.children.length}) · 同现 (${c.coOccurring.length})`,
+      );
+      for (const ch of c.children) {
+        const chState =
+          ch.state && ch.state !== "active"
+            ? ` [${ch.stateLabel || ch.state}]`
+            : "";
+        lines.push(`- [child] \`${ch.ref}\` (\`${ch.id}\`)${chState}`);
+      }
+      for (const co of c.coOccurring) {
+        const ruleTag = co.ruleCount > 0 ? `, rules=${co.ruleCount}` : "";
+        lines.push(
+          `- [co] \`${co.ref}\` (shared=${co.sharedCount}${ruleTag}) · \`${co.tryCommand}\``,
+        );
+      }
+    }
+
     const peerLines = formatActivePeersBlock(res.activePeers);
     if (peerLines.length > 0) {
       lines.push(...peerLines);
     }
-    lines.push("", `Next: \`${c.try}\``);
+
+    // Section 8: Footer (Metadata + Next)
+    const metaParts: string[] = [`Kind: \`${c.kind}\``];
+    if (c.object) metaParts.push(`ID: \`${c.object.id}\``);
+    if (c.realmPath) metaParts.push(`Realm: \`${c.realmPath}\``);
+    metaParts.push(
+      `Entries: total=${c.counts.total} (object=${c.counts.viaObject}, tag=${c.counts.viaTag}, thing=${c.counts.viaThing})`,
+    );
+    metaParts.push(`seq=${c.latestSeq}`);
+    lines.push(
+      "",
+      "---",
+      metaParts.join(" · "),
+      `Next: \`meru-mind changes --since ${c.latestSeq} --about ${c.ref}\` · \`${c.try}\``,
+    );
     return lines.join("\n");
   }
   if (res.refType === "file") {

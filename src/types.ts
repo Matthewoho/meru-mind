@@ -454,6 +454,22 @@ export interface BriefOutput {
       realmId: string;
       inherited: boolean;
       title: string;
+      scopedObjectRefs?: string[];
+    }>;
+    realmRules?: Array<{
+      id: string;
+      realmId: string;
+      realmPath: string;
+      inherited: boolean;
+      title: string;
+    }>;
+    scopedObjectRules?: Array<{
+      id: string;
+      realmId: string;
+      realmPath: string;
+      inherited: boolean;
+      title: string;
+      objectRefs: string[];
     }>;
     ancestorSummaries: Array<{
       realmId: string;
@@ -960,18 +976,80 @@ export interface WhoamiResult {
   next: string;
 }
 
+export type ScopedRuleSource = "realm" | "object" | "with";
+
+export interface ObjectBriefRule {
+  id: string;
+  realmId: string;
+  realmPath: string;
+  title: string;
+  body: string;
+  scopeSource: ScopedRuleSource;
+  sourceRef: string;
+  occurredAt: string | null;
+  createdAt: string;
+}
+
+export interface ObjectBriefEntrySummary {
+  id: string;
+  kind: RecordKind;
+  title: string;
+  snippet: string;
+  realmId: string;
+  realmPath: string;
+  authorId: string;
+  occurredAt: string | null;
+  createdAt: string;
+  status: RecordStatus;
+}
+
+export interface ObjectBriefSection<T> {
+  items: T[];
+  totalCount: number;
+}
+
+export interface ObjectBriefChild {
+  id: string;
+  ref: string;
+  kind: string;
+  name: string;
+  realmId: string;
+  realmPath: string;
+  state?: ObjectState;
+  stateLabel?: string | null;
+}
+
+export interface ObjectBriefCoOccurring {
+  id: string;
+  ref: string;
+  kind: string;
+  name: string;
+  realmPath: string;
+  sharedCount: number;
+  ruleCount: number;
+  tryCommand: string;
+}
+
 export interface ObjectCard {
   ref: string;
   kind: string;
   name: string;
   object: MindObject | null;
   realmPath: string | null;
+  withRefs?: string[];
   counts: {
     total: number;
     viaObject: number;
     viaTag: number;
     viaThing: number;
   };
+  rules: ObjectBriefRule[];
+  pendingDecisions: ObjectBriefSection<ObjectBriefEntrySummary>;
+  activeDecisions: ObjectBriefSection<ObjectBriefEntrySummary>;
+  recentFindings: ObjectBriefSection<ObjectBriefEntrySummary>;
+  children: ObjectBriefChild[];
+  coOccurring: ObjectBriefCoOccurring[];
+  latestSeq: number;
   recentEntries: LsEntry[];
   try: string;
 }

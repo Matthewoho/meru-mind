@@ -41,6 +41,7 @@ import {
   type TokenWriteScope,
 } from "../types.js";
 import { createVisibilityHelpers, sanitizeRealmsForScope } from "./visibility.js";
+import { hasActiveRulesOnObjectHierarchy } from "./object-rules.js";
 
 export const OPAQUE_REALM_NOT_FOUND = "Realm not found in visible scope";
 export const OPAQUE_OBJECT_NOT_FOUND = "Object not found in visible scope";
@@ -472,6 +473,15 @@ export class ObjectEngine {
     if (!params.actor?.id?.trim()) {
       throw new MindError("INVALID_INPUT", "Actor id cannot be empty");
     }
+    if (params.actor.kind !== "human") {
+      throw new MindError(
+        "ACCESS_DENIED",
+        `Only human actors can move objects (actor "${params.actor.id}" is "${params.actor.kind}").`,
+        {
+          try: "meru-mind object move <objRef> --parent <parentRef|none> --as-human",
+        },
+      );
+    }
     return this.db.transaction(() => {
       const { viewerRealm, orgPolicy, realms, scope } = this.resolveScope({
         viewerRealmId: params.viewerRealmId,
@@ -497,7 +507,7 @@ export class ObjectEngine {
         assetKind: "ledger",
         orgPolicy,
         writeScope: params.writeScope ?? "self",
-        category: "content",
+        category: "admin",
       });
 
       const nextParentId = params.parentObjectId?.trim() || null;
@@ -619,6 +629,24 @@ export class ObjectEngine {
         throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
       }
 
+      const requiresAdminForActiveRules =
+        params.state !== "active" &&
+        hasActiveRulesOnObjectHierarchy({
+          db: this.db,
+          orgId: viewerRealm.orgId,
+          objectId: obj.id,
+          includeAncestors: true,
+        });
+      if (requiresAdminForActiveRules && params.actor.kind !== "human") {
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Only human actors can mark object "${obj.id}" inactive while active rules apply to it or its hierarchy.`,
+          {
+            try: "meru-mind object set <objRef> --state inactive --label <label> --as-human",
+          },
+        );
+      }
+
       assertWriteAccess({
         realms,
         mounts,
@@ -628,7 +656,7 @@ export class ObjectEngine {
         assetKind: "ledger",
         orgPolicy,
         writeScope: params.writeScope ?? "self",
-        category: "content",
+        category: requiresAdminForActiveRules ? "admin" : "content",
       });
 
       const vis = createVisibilityHelpers({
@@ -866,6 +894,17 @@ export class ObjectEngine {
         throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
       }
 
+      const hasAliasRemoval = validatedRemoves.length > 0;
+      if (hasAliasRemoval && params.actor.kind !== "human") {
+        throw new MindError(
+          "ACCESS_DENIED",
+          `Only human actors can remove object aliases (actor "${params.actor.id}" is "${params.actor.kind}").`,
+          {
+            try: "meru-mind object alias <objRef> --remove <alias> --as-human",
+          },
+        );
+      }
+
       assertWriteAccess({
         realms,
         mounts,
@@ -875,7 +914,7 @@ export class ObjectEngine {
         assetKind: "ledger",
         orgPolicy,
         writeScope: params.writeScope ?? "self",
-        category: "content",
+        category: hasAliasRemoval ? "admin" : "content",
       });
 
       const existingMap = new Map<string, ObjectAlias>(
@@ -1100,6 +1139,20 @@ export class ObjectEngine {
         throw new MindError(
           "CONFLICT",
           `Cannot delete object "${obj.id}" while child objects still exist`,
+        );
+      }
+
+      if (
+        hasActiveRulesOnObjectHierarchy({
+          db: this.db,
+          orgId: viewerRealm.orgId,
+          objectId: obj.id,
+          includeAncestors: false,
+        })
+      ) {
+        throw new MindError(
+          "CONFLICT",
+          `Cannot delete object "${obj.id}" while active rule(s) are bound to it`,
         );
       }
 

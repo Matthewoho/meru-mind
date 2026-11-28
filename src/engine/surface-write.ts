@@ -23,8 +23,17 @@ import {
   REDACTED_CONTENT_TRY_HINT,
 } from "./content-hash.js";
 import type { LedgerEngine } from "./ledger.js";
-import { resolveRealmByPath, resolveVisibleRealm } from "./objects.js";
-import { resolveAboutRefsForWrite } from "./refs.js";
+import {
+  resolveRealmByPath,
+  resolveVisibleRealm,
+} from "./objects.js";
+import {
+  collectObjectScopedRules,
+  collectWallRules,
+  computeGoverningRealmIds,
+  tryNormalizeResourceTag,
+} from "./object-rules.js";
+import { parseRefSyntax, resolveAboutRefsForWrite } from "./refs.js";
 import type { SeaEngine } from "./sea.js";
 import { assertNoAccidentalSecret } from "./secret-guard.js";
 import { createVisibilityHelpers } from "./visibility.js";
@@ -35,6 +44,14 @@ export interface RelatedActiveEcho {
   realmPath: string;
   title: string;
   occurredAt: string | null;
+}
+
+export interface BoundRuleEcho {
+  id: string;
+  title: string;
+  realmPath: string;
+  scopeSource: "realm" | "object";
+  sourceRef: string;
 }
 
 export interface ResolveWriteTargetParams {
@@ -460,6 +477,234 @@ export async function findRelatedActiveForEcho(params: {
     return out;
   } catch {
     // Non-blocking best-effort echo: never fail a committed write
+    return [];
+  }
+}
+
+/**
+ * I3 write-time bound-rules echo (non-blocking, never runs on `secret` writes):
+ * Collects visible active rules binding the new record via:
+ * 1. Target realm & its visible realm ancestors (wall rules), PLUS
+ * 2. Union of `object ∪ tag ∪ thing` and same-`kind:name` visible objects (L8/L9),
+ *    walking `within` ancestors upward, strictly filtered to rules whose realm is
+ *    the target realm or its visible ancestors (NEVER leaks sibling rules, ZERO hidden counts).
+ */
+export function findBoundRulesForEcho(params: {
+  db: DbPort;
+  realms: Realm[];
+  mounts: RealmMount[];
+  actor: Actor;
+  viewerRealmId: string;
+  scope: AccessScope;
+  newRecord: LedgerRecord;
+  about?: string[];
+}): BoundRuleEcho[] {
+  if (params.newRecord.sensitivity === "secret") {
+    return [];
+  }
+  try {
+    const { db, realms, mounts, actor, viewerRealmId, scope, newRecord } = params;
+    const orgId = newRecord.orgId;
+    const governing = computeGoverningRealmIds({
+      realms,
+      orgId,
+      targetRealmId: newRecord.realmId,
+      scope,
+    });
+    if (governing.size === 0) return [];
+
+    const vis = createVisibilityHelpers({
+      db,
+      realms,
+      mounts,
+      actor,
+      viewerRealmId,
+      scope,
+    });
+    const allVisibleObjects = vis.sanitizeObjects(
+      db.listObjects({
+        orgId,
+        realmIds: scope.readableLedgerIds,
+      }),
+    );
+    const visibleObjectsById = new Map(allVisibleObjects.map((o) => [o.id, o]));
+
+    const wallRules = collectWallRules({
+      db,
+      realms,
+      orgId,
+      targetRealmId: newRecord.realmId,
+      scope,
+      vis,
+      sanitizedVisibleObjects: allVisibleObjects,
+      allowedRealmIds: governing,
+    });
+
+    // Gather all object / tag / thing targets attached to the new record (L8/L9 union)
+    const linkedObjIds = db.listObjectIdsForEntry(newRecord.id, orgId);
+    const linkedTags = db.listResourceTagsForEntry(newRecord.id, orgId);
+
+    const targetObjects = new Map<string, (typeof allVisibleObjects)[number]>();
+    const targetTagPairs = new Set<string>();
+
+    const addKindNameMatches = (kind: string, name: string) => {
+      const kLower = kind.toLowerCase();
+      const nLower = name.toLowerCase();
+      const norm = tryNormalizeResourceTag(`${kLower}:${nLower}`);
+      if (norm) targetTagPairs.add(norm);
+      for (const o of allVisibleObjects) {
+        if (
+          o.kind.toLowerCase() === kLower &&
+          o.name.toLowerCase() === nLower
+        ) {
+          targetObjects.set(o.id, o);
+        }
+      }
+    };
+
+    for (const oid of linkedObjIds) {
+      const obj = visibleObjectsById.get(oid);
+      if (obj) {
+        targetObjects.set(obj.id, obj);
+        addKindNameMatches(obj.kind, obj.name);
+      }
+    }
+
+    for (const tag of linkedTags) {
+      const colonIdx = tag.indexOf(":");
+      if (colonIdx > 0 && colonIdx < tag.length - 1) {
+        addKindNameMatches(tag.slice(0, colonIdx), tag.slice(colonIdx + 1));
+      } else {
+        const norm = tryNormalizeResourceTag(tag);
+        if (norm) targetTagPairs.add(norm);
+      }
+    }
+
+    if (newRecord.thingId) {
+      const thingRec = db.getRecord(newRecord.thingId);
+      if (
+        thingRec &&
+        thingRec.orgId === orgId &&
+        thingRec.sensitivity !== "secret" &&
+        thingRec.redactedAt === null &&
+        vis.canSeeRecord(thingRec) &&
+        thingRec.externalRef
+      ) {
+        const ext = thingRec.externalRef.trim();
+        const colonIdx = ext.indexOf(":");
+        if (colonIdx > 0 && colonIdx < ext.length - 1) {
+          addKindNameMatches(ext.slice(0, colonIdx), ext.slice(colonIdx + 1));
+        } else if (ext) {
+          addKindNameMatches("thing", ext);
+        }
+      }
+    }
+
+    for (const rawAbout of params.about ?? []) {
+      const trimmed = rawAbout.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed = parseRefSyntax(trimmed);
+        if (parsed.kind !== "object") continue;
+        if (parsed.objectId) {
+          const obj = visibleObjectsById.get(parsed.objectId);
+          if (obj) {
+            targetObjects.set(obj.id, obj);
+            addKindNameMatches(obj.kind, obj.name);
+          }
+        } else if (parsed.objectKind && parsed.objectName) {
+          addKindNameMatches(parsed.objectKind, parsed.objectName);
+        }
+      } catch {
+        // Ignore unparseable hints during non-blocking echo
+      }
+    }
+
+    const objectScopedRules: Array<{
+      id: string;
+      title: string;
+      realmPath: string;
+      scopeSource: "realm" | "object";
+      sourceRef: string;
+    }> = [];
+
+    for (const obj of targetObjects.values()) {
+      const rules = collectObjectScopedRules({
+        db,
+        realms,
+        orgId,
+        object: obj,
+        objectKind: obj.kind,
+        objectName: obj.name,
+        scopedRealmId: newRecord.realmId,
+        scope,
+        vis,
+        sanitizedVisibleObjects: allVisibleObjects,
+        scopeSource: "object",
+        allowedRealmIds: governing,
+        governingRealmOverride: governing,
+      });
+      for (const r of rules) {
+        objectScopedRules.push({
+          id: r.id,
+          title: r.title,
+          realmPath: r.realmPath,
+          scopeSource: "object",
+          sourceRef: r.sourceRef,
+        });
+      }
+    }
+
+    for (const normTag of targetTagPairs) {
+      const colonIdx = normTag.indexOf(":");
+      if (colonIdx <= 0 || colonIdx >= normTag.length - 1) continue;
+      const rules = collectObjectScopedRules({
+        db,
+        realms,
+        orgId,
+        object: null,
+        objectKind: normTag.slice(0, colonIdx),
+        objectName: normTag.slice(colonIdx + 1),
+        scopedRealmId: newRecord.realmId,
+        scope,
+        vis,
+        sanitizedVisibleObjects: allVisibleObjects,
+        scopeSource: "object",
+        allowedRealmIds: governing,
+        governingRealmOverride: governing,
+      });
+      for (const r of rules) {
+        objectScopedRules.push({
+          id: r.id,
+          title: r.title,
+          realmPath: r.realmPath,
+          scopeSource: "object",
+          sourceRef: r.sourceRef,
+        });
+      }
+    }
+
+    // Merge & deduplicate by rule ID (wall rules first, then object-scoped rules)
+    const seen = new Set<string>();
+    const out: BoundRuleEcho[] = [];
+    for (const r of wallRules) {
+      if (r.id === newRecord.id || seen.has(r.id)) continue;
+      seen.add(r.id);
+      out.push({
+        id: r.id,
+        title: r.title,
+        realmPath: r.realmPath,
+        scopeSource: "realm",
+        sourceRef: r.sourceRef,
+      });
+    }
+    for (const r of objectScopedRules) {
+      if (r.id === newRecord.id || seen.has(r.id)) continue;
+      seen.add(r.id);
+      out.push(r);
+    }
+    return out;
+  } catch {
     return [];
   }
 }

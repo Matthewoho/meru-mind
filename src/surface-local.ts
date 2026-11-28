@@ -17,7 +17,9 @@ import {
 } from "./engine/refs.js";
 import { createVisibilityHelpers } from "./engine/visibility.js";
 import { assertNoAccidentalSecret } from "./engine/secret-guard.js";
+import { hasActiveRulesOnObjectHierarchy } from "./engine/object-rules.js";
 import {
+  findBoundRulesForEcho,
   findRelatedActiveForEcho,
   resolveWriteTargetRealm,
   writeEverydayConclusion,
@@ -357,6 +359,7 @@ export class LocalMindSurface implements MindSurface {
       actor: this.principal.actor,
       viewerRealmId: this.principal.boundRealmId,
       ref: params.ref,
+      with: params.with,
       around: params.around,
       cursor: params.cursor,
       chars: params.chars,
@@ -550,6 +553,17 @@ export class LocalMindSurface implements MindSurface {
       scopeCeiling: refreshedScope,
     });
 
+    const boundRules = findBoundRulesForEcho({
+      db: this.engine.db,
+      realms: routed.realms,
+      mounts: ctx.mounts,
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      scope: refreshedScope,
+      newRecord: record,
+      about: params.about,
+    });
+
     const seqAfter = this.engine.db.getLatestVisibleChangeLogSeq({
       orgId: ctx.org.id,
       ledgerRealmIds: refreshedScope.readableLedgerIds,
@@ -564,6 +578,7 @@ export class LocalMindSurface implements MindSurface {
       record,
       routedBy: routed.routedBy,
       ...(relatedActive.length > 0 ? { relatedActive } : {}),
+      ...(boundRules.length > 0 ? { boundRules } : {}),
       ...(collisionHints.length > 0 ? { collisionHints } : {}),
     };
   }
@@ -1131,11 +1146,23 @@ export class LocalMindSurface implements MindSurface {
 
   async linkObject(params: SurfaceLinkObjectInput): Promise<EntryObjectLink> {
     const ctx = this.resolveScopeContext(false);
+    const entryId = params.entryId.trim();
+    const rec = this.engine.db.getRecord(entryId);
+    if (
+      rec &&
+      rec.orgId === ctx.org.id &&
+      ctx.scope.readableLedgerIds.includes(rec.realmId) &&
+      rec.kind === "rule"
+    ) {
+      const cliCmd = `meru-mind object link ${entryId} --to ${params.objectRef} --as-human`;
+      this.assertNotWeakenedCookie("object link on rule", cliCmd);
+      this.assertHuman("link rules to objects", cliCmd);
+    }
     const objectId = this.resolveObjectIdForSurface(params.objectRef, ctx);
     return this.engine.objects.linkEntryObject({
       actor: this.principal.actor,
       viewerRealmId: this.principal.boundRealmId,
-      entryId: params.entryId.trim(),
+      entryId,
       objectId,
       writeScope: this.effectiveWriteScope(),
       scopeCeiling: ctx.scope,
@@ -1144,11 +1171,23 @@ export class LocalMindSurface implements MindSurface {
 
   async unlinkObject(params: SurfaceUnlinkObjectInput): Promise<boolean> {
     const ctx = this.resolveScopeContext(false);
+    const entryId = params.entryId.trim();
+    const rec = this.engine.db.getRecord(entryId);
+    if (
+      rec &&
+      rec.orgId === ctx.org.id &&
+      ctx.scope.readableLedgerIds.includes(rec.realmId) &&
+      rec.kind === "rule"
+    ) {
+      const cliCmd = `meru-mind object unlink ${entryId} --from ${params.objectRef} --as-human`;
+      this.assertNotWeakenedCookie("object unlink on rule", cliCmd);
+      this.assertHuman("unlink rules from objects", cliCmd);
+    }
     const objectId = this.resolveObjectIdForSurface(params.objectRef, ctx);
     return this.engine.objects.unlinkEntryObject({
       actor: this.principal.actor,
       viewerRealmId: this.principal.boundRealmId,
-      entryId: params.entryId.trim(),
+      entryId,
       objectId,
       writeScope: this.effectiveWriteScope(),
       scopeCeiling: ctx.scope,
@@ -1160,6 +1199,18 @@ export class LocalMindSurface implements MindSurface {
   ): Promise<ObjectStateSetResult> {
     const ctx = this.resolveScopeContext(false);
     const objectId = this.resolveObjectIdForSurface(params.ref, ctx);
+    if (
+      params.state !== "active" &&
+      hasActiveRulesOnObjectHierarchy({
+        db: this.engine.db,
+        orgId: ctx.org.id,
+        objectId,
+        includeAncestors: true,
+      })
+    ) {
+      const cliCmd = `meru-mind object set ${params.ref} --state ${params.state}${params.label ? ` --label ${params.label}` : ""} --as-human`;
+      this.assertNotWeakenedCookie("object set inactive (active rules)", cliCmd);
+    }
     return this.engine.objects.setObjectState({
       actor: this.principal.actor,
       viewerRealmId: this.principal.boundRealmId,
@@ -1176,6 +1227,10 @@ export class LocalMindSurface implements MindSurface {
   async updateObjectAliases(
     params: SurfaceUpdateObjectAliasesInput,
   ): Promise<ObjectAliasUpdateResult> {
+    if (params.remove && params.remove.length > 0) {
+      const cliCmd = `meru-mind object alias ${params.ref} ${params.remove.map((r) => `--remove ${JSON.stringify(r)}`).join(" ")} --as-human`;
+      this.assertNotWeakenedCookie("object alias remove", cliCmd);
+    }
     const ctx = this.resolveScopeContext(false);
     const objectId = this.resolveObjectIdForSurface(params.ref, ctx);
     return this.engine.objects.updateObjectAliases({
