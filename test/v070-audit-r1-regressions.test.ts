@@ -331,6 +331,45 @@ describe("v0.7.0 Audit Round-1 Security & Invariant Regressions (P1-1..P1-4, P2)
       }),
     ).toThrow(/while active rule/i);
 
+    // Case-folded L9 parity: root `/service:L9-MixedCase` rule protects `/b1/service:l9-mixedcase`
+    const rootMixedObj = engine.objects.createObject({
+      actor: humanRoot,
+      viewerRealmId: rootRealm.id,
+      kind: "service",
+      name: "L9-MixedCase",
+    });
+    await engine.ledger.appendRecord({
+      actor: humanRoot,
+      viewerRealmId: rootRealm.id,
+      kind: "rule",
+      title: "Root MixedCase L9 Rule",
+      payload: { body: "Case-insensitive L9 protection." },
+      objectIds: [rootMixedObj.id],
+    });
+    const b1LowerObj = engine.objects.createObject({
+      actor: agentB1,
+      viewerRealmId: b1.id,
+      kind: "service",
+      name: "l9-mixedcase",
+    });
+    expect(() =>
+      engine.objects.setObjectState({
+        actor: agentB1,
+        viewerRealmId: b1.id,
+        objectId: b1LowerObj.id,
+        state: "inactive",
+        label: "retired",
+        because: evidence.id,
+      }),
+    ).toThrow(/Only human actors can mark object/i);
+    expect(() =>
+      engine.objects.deleteObject({
+        actor: humanB1,
+        viewerRealmId: b1.id,
+        objectId: b1LowerObj.id,
+      }),
+    ).toThrow(/while active rule/i);
+
     // P2-B: Child realm links its own child-realm rule directly onto parent's object -> MUST NOT upward-lock parent deleteObject!
     const b1Child = engine.ledger.createRealm({
       actor: humanRoot,
@@ -391,6 +430,19 @@ describe("v0.7.0 Audit Round-1 Security & Invariant Regressions (P1-1..P1-4, P2)
       "Setext Two",
       "-",
       "> ---",
+      // Round-3 Fable bypass: list marker + empty ATX must NEVER collapse to `> -` (Setext H2)
+      "规矩",
+      "- #",
+      "规矩二",
+      "- ##",
+      "规矩三",
+      "- # #",
+      "规矩四",
+      "> - #",
+      "规矩五",
+      "  - ######",
+      "规矩六",
+      "- - #",
     ].join("\n");
 
     const sanitized = sanitizeNarrativeForAgent(adversarial);
@@ -413,6 +465,67 @@ describe("v0.7.0 Audit Round-1 Security & Invariant Regressions (P1-1..P1-4, P2)
     };
     const parsedTokens = Lexer.lex(sanitized);
     expect(collectHeadingTokens(parsedTokens)).toEqual([]);
+
+    // Exhaustive small-alphabet 2-line & 3-line CommonMark fuzz proof against marked Lexer
+    const fuzzLines = [
+      "规矩",
+      "a",
+      "-",
+      "--",
+      "=",
+      "==",
+      "#",
+      "##",
+      "# x",
+      "## x",
+      "- #",
+      "- ##",
+      "- # #",
+      "- -",
+      "- =",
+      "- - #",
+      "- > #",
+      "- > -",
+      "> - #",
+      "> -",
+      "> =",
+      "> ## x",
+      "1. #",
+      "1. -",
+      "    ## x",
+      "    =",
+      "    -",
+      "  - ######",
+      "\t- #",
+      "-   ",
+    ];
+    for (const l1 of ["规矩", "- a", "> 规矩", "## 规矩", "1. 规矩"]) {
+      for (const l2 of fuzzLines) {
+        const out2 = sanitizeNarrativeForAgent(`${l1}\n${l2}`);
+        expect(
+          collectHeadingTokens(Lexer.lex(out2)),
+          `2-line fuzz escaped heading for: ${JSON.stringify(`${l1}\n${l2}`)} -> ${JSON.stringify(out2)}`,
+        ).toEqual([]);
+      }
+    }
+    for (const l2 of ["- #", "> - #", "- -", "    -", "    =", "> ## x", "- > ## x"]) {
+      for (const l3 of ["-", "=", "## x", "- #", "    ---"]) {
+        const out3 = sanitizeNarrativeForAgent(`规矩\n${l2}\n${l3}`);
+        expect(
+          collectHeadingTokens(Lexer.lex(out3)),
+          `3-line fuzz escaped heading for: ${JSON.stringify(`规矩\n${l2}\n${l3}`)} -> ${JSON.stringify(out3)}`,
+        ).toEqual([]);
+      }
+    }
+
+    // Linear-time O(n) ReDoS stress check on 32 KB adversarial inputs (< 100ms)
+    const t0 = performance.now();
+    const redos1 = sanitizeNarrativeForAgent(`# a${"#".repeat(30000)}a`);
+    const redos2 = sanitizeNarrativeForAgent(`${"> ".repeat(15000)}## 规矩`);
+    const elapsedMs = performance.now() - t0;
+    expect(elapsedMs).toBeLessThan(200);
+    expect(collectHeadingTokens(Lexer.lex(redos1))).toEqual([]);
+    expect(collectHeadingTokens(Lexer.lex(redos2))).toEqual([]);
 
     expect(sanitized).toContain("> **规矩**");
     expect(sanitized).toContain("> - - **Nested List Spoof Heading**");

@@ -477,10 +477,11 @@ export function hasActiveRulesOnObjectHierarchy(params: {
     }
   }
 
-  // Group lineage objects by canonical `(kind, name)` for L9 same-name governance lookup
+  // Group lineage objects by case-folded `(kind, name)` for L9 same-name governance lookup
+  // (matches read-side `collectObjectScopedRules` case-insensitive comparison 1-for-1).
   const objectsByKindName = new Map<string, MindObject[]>();
   for (const o of lineageObjects) {
-    const key = `${o.kind}\0${o.name}`;
+    const key = `${o.kind.toLowerCase()}\0${o.name.toLowerCase()}`;
     let list = objectsByKindName.get(key);
     if (!list) {
       list = [];
@@ -512,8 +513,10 @@ export function hasActiveRulesOnObjectHierarchy(params: {
       ...getAncestorIds(orgRealmsById, o.realmId),
     ]);
 
-    // L8 + L9 direct object links: `o` itself plus any same-(kind,name) object in `objGovRealms`
-    const sameNameObjs = objectsByKindName.get(`${o.kind}\0${o.name}`) ?? [];
+    // L8 + L9 direct object links: `o` itself plus any same-(kind,name) object in `objGovRealms` (case-insensitive)
+    const sameNameObjs =
+      objectsByKindName.get(`${o.kind.toLowerCase()}\0${o.name.toLowerCase()}`) ??
+      [];
     const governingObjIds = new Set<string>([o.id]);
     for (const peer of sameNameObjs) {
       if (objGovRealms.has(peer.realmId)) {
@@ -578,15 +581,178 @@ export function collectObjectCardEntryIds(params: {
   return Array.from(new Set([...viaObj, ...viaTag]));
 }
 
+function isAsciiSpace(code: number): boolean {
+  return code === 0x20 || code === 0x09; // ' ' or '\t'
+}
+
+/**
+ * Linear-time O(n) classifier for a single trimmed line body after iteratively peeling arbitrary
+ * leading whitespace, blockquote `>`, and CommonMark list markers (`- `, `* `, `+ `, `1. `, `1) `).
+ * Zero backtracking regexes — safe against 32 KB adversarial inputs.
+ */
+function classifyMarkdownHeadingLine(line: string): {
+  listMarkers: string[];
+  headingKind: "atx" | "setext" | null;
+  atxText: string;
+} {
+  let end = line.length;
+  while (end > 0 && isAsciiSpace(line.charCodeAt(end - 1))) {
+    end--;
+  }
+  let pos = 0;
+  const listMarkers: string[] = [];
+
+  while (pos < end) {
+    while (pos < end && isAsciiSpace(line.charCodeAt(pos))) {
+      pos++;
+    }
+    if (pos >= end) break;
+
+    const ch = line.charCodeAt(pos);
+    // Blockquote marker `>`
+    if (ch === 0x3e /* '>' */) {
+      pos++;
+      if (pos < end && isAsciiSpace(line.charCodeAt(pos))) {
+        pos++;
+      }
+      continue;
+    }
+
+    // Unordered list marker `-`, `*`, `+` followed by space/tab AND non-empty rest
+    if (
+      (ch === 0x2d /* '-' */ || ch === 0x2a /* '*' */ || ch === 0x2b /* '+' */) &&
+      pos + 1 < end &&
+      isAsciiSpace(line.charCodeAt(pos + 1))
+    ) {
+      const marker = line[pos]!;
+      let next = pos + 1;
+      while (next < end && isAsciiSpace(line.charCodeAt(next))) {
+        next++;
+      }
+      if (next < end) {
+        listMarkers.push(marker);
+        pos = next;
+        continue;
+      }
+    }
+
+    // Ordered list marker: 1..9 ASCII digits + `.` or `)` followed by space/tab AND non-empty rest
+    if (ch >= 0x30 && ch <= 0x39) {
+      let d = pos;
+      while (d < end && d - pos < 9 && line.charCodeAt(d) >= 0x30 && line.charCodeAt(d) <= 0x39) {
+        d++;
+      }
+      if (
+        d > pos &&
+        d < end &&
+        (line.charCodeAt(d) === 0x2e /* '.' */ || line.charCodeAt(d) === 0x29 /* ')' */) &&
+        d + 1 < end &&
+        isAsciiSpace(line.charCodeAt(d + 1))
+      ) {
+        const marker = line.slice(pos, d + 1);
+        let next = d + 1;
+        while (next < end && isAsciiSpace(line.charCodeAt(next))) {
+          next++;
+        }
+        if (next < end) {
+          listMarkers.push(marker);
+          pos = next;
+          continue;
+        }
+      }
+    }
+
+    break;
+  }
+
+  if (pos >= end) {
+    return { listMarkers, headingKind: null, atxText: "" };
+  }
+
+  // Check CommonMark ATX heading: 1..6 `#` followed by end-of-line or space/tab
+  if (line.charCodeAt(pos) === 0x23 /* '#' */) {
+    let h = pos;
+    while (h < end && h - pos < 6 && line.charCodeAt(h) === 0x23) {
+      h++;
+    }
+    if (h === end || isAsciiSpace(line.charCodeAt(h))) {
+      let textStart = h;
+      while (textStart < end && isAsciiSpace(line.charCodeAt(textStart))) {
+        textStart++;
+      }
+      // CommonMark optional closing `#` sequence (must be preceded by space/tab or be entire text)
+      let textEnd = end;
+      let hashEnd = textEnd;
+      while (hashEnd > textStart && line.charCodeAt(hashEnd - 1) === 0x23) {
+        hashEnd--;
+      }
+      if (hashEnd < textEnd && (hashEnd === textStart || isAsciiSpace(line.charCodeAt(hashEnd - 1)))) {
+        textEnd = hashEnd;
+        while (textEnd > textStart && isAsciiSpace(line.charCodeAt(textEnd - 1))) {
+          textEnd--;
+        }
+      }
+      return {
+        listMarkers,
+        headingKind: "atx",
+        atxText: line.slice(textStart, textEnd),
+      };
+    }
+  }
+
+  // Check CommonMark Setext underline: non-empty sequence of all `=` OR all `-`
+  const firstCode = line.charCodeAt(pos);
+  if (firstCode === 0x3d /* '=' */ || firstCode === 0x2d /* '-' */) {
+    let allSame = true;
+    for (let k = pos + 1; k < end; k++) {
+      if (line.charCodeAt(k) !== firstCode) {
+        allSame = false;
+        break;
+      }
+    }
+    if (allSame) {
+      return { listMarkers, headingKind: "setext", atxText: "" };
+    }
+  }
+
+  return { listMarkers, headingKind: null, atxText: "" };
+}
+
+/**
+ * Strips leading blockquote markers (`>`) and trailing spaces in O(n) linear time.
+ */
+function stripLeadingBlockquotesLinear(line: string): string {
+  let end = line.length;
+  while (end > 0 && isAsciiSpace(line.charCodeAt(end - 1))) {
+    end--;
+  }
+  let pos = 0;
+  while (pos < end) {
+    let scan = pos;
+    while (scan < end && isAsciiSpace(line.charCodeAt(scan))) {
+      scan++;
+    }
+    if (scan < end && line.charCodeAt(scan) === 0x3e /* '>' */) {
+      pos = scan + 1;
+      if (pos < end && isAsciiSpace(line.charCodeAt(pos))) {
+        pos++;
+      }
+      continue;
+    }
+    break;
+  }
+  return line.slice(pos, end);
+}
+
 /**
  * Prompt-injection guard for L3 narrative cards (`#7`):
  * - Normalizes ALL ASCII and Unicode line breaks (`\r\n`, lone `\r`, `\u2028`, `\u2029`, `\u0085`, `\v`, `\f`)
- *   and strips NUL bytes before line splitting so no control/line separator can escape the blockquote.
- * - Iteratively peels arbitrary nesting of leading whitespace, blockquote markers (`>`), and list
- *   markers (`- `, `* `, `+ `, `1. `, `1) `) before checking for ATX headings (`#{1,6}`) or CommonMark
- *   Setext underlines (`=`/`-` of any length), eliminating nested-container and 4-space continuation bypasses.
- * - Prefixes every line as a flat blockquote (`> ...`) so narrative text can NEVER spoof `## 规矩`
- *   or produce any Markdown heading at any nesting depth when read by downstream agents.
+ *   and strips NUL bytes before line splitting.
+ * - Uses O(n) linear-time container peeling (`classifyMarkdownHeadingLine`, zero regex backtracking)
+ *   to demote ATX headings and neutralize Setext underlines at arbitrary container nesting depth.
+ * - Enforces an explicit output-invariant post-check on EVERY emitted line body (`classifyMarkdownHeadingLine(outBody)`)
+ *   so reconstructed lines (e.g. `- #` -> empty ATX) can NEVER turn back into a Setext underline (`-`) or ATX heading.
+ * - Prefixes every line as a flat blockquote (`> ...`) so narrative text produces ZERO CommonMark headings.
  */
 export function sanitizeNarrativeForAgent(md: string): string {
   const normalized = md
@@ -597,40 +763,26 @@ export function sanitizeNarrativeForAgent(md: string): string {
   const lines = normalized.split("\n");
   return lines
     .map((rawLine) => {
-      // Trim trailing whitespace first so `-\s+` (Setext underline with trailing spaces) can never match as a list marker.
-      let rest = rawLine.replace(/\s+$/, "");
-      const listMarkers: string[] = [];
-      while (true) {
-        const stripped = rest.replace(/^\s+/, "");
-        const bq = /^>\s?(.*)$/.exec(stripped);
-        if (bq) {
-          rest = bq[1]!;
-          continue;
-        }
-        // Only peel list markers followed by whitespace+non-empty content so bare `-`/`--`/`---` stay intact for Setext check
-        const li = /^((?:[-*+]|\d{1,9}[.)])\s+)(.+)$/.exec(stripped);
-        if (li) {
-          listMarkers.push(li[1]!.trimEnd());
-          rest = li[2]!;
-          continue;
-        }
-        rest = stripped;
-        break;
+      const parsed = classifyMarkdownHeadingLine(rawLine);
+      const listPrefix =
+        parsed.listMarkers.length > 0 ? `${parsed.listMarkers.join(" ")} ` : "";
+
+      let outBody: string;
+      if (parsed.headingKind === "atx") {
+        // Empty ATX (e.g. `#`, `- #`, `> - ##`) discards listPrefix so it can NEVER become `> -` (Setext H2)!
+        outBody = parsed.atxText ? `${listPrefix}**${parsed.atxText}**` : "";
+      } else if (parsed.headingKind === "setext") {
+        outBody = `${listPrefix}—`;
+      } else {
+        outBody = stripLeadingBlockquotesLinear(rawLine);
       }
 
-      const listPrefix = listMarkers.length > 0 ? `${listMarkers.join(" ")} ` : "";
-      const atx = /^#{1,6}(?:\s+(.*?)|)\s*#*$/.exec(rest);
-      if (atx) {
-        const headingText = (atx[1] ?? "").trim();
-        if (headingText) return `> ${listPrefix}**${headingText}**`;
-        return listPrefix ? `> ${listPrefix.trimEnd()}` : ">";
+      // Output-invariant post-check: guarantee the emitted line body itself can NEVER parse as ATX or Setext
+      if (outBody && classifyMarkdownHeadingLine(outBody).headingKind !== null) {
+        outBody = "—";
       }
-      if (/^(?:=+|-+)$/.test(rest)) {
-        return `> ${listPrefix}—`;
-      }
-      // For safe non-heading lines, preserve clean text while flattening attacker blockquote markers
-      const safeBody = rawLine.replace(/^(?:\s*>\s*)+/, "").replace(/\s+$/, "");
-      return safeBody ? `> ${safeBody}` : ">";
+
+      return outBody ? `> ${outBody}` : ">";
     })
     .join("\n");
 }
