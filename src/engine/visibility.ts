@@ -3,6 +3,7 @@ import type { DbPort } from "../ports.js";
 import type {
   AccessScope,
   Actor,
+  ChangeAssetClass,
   Distillation,
   LedgerRecord,
   MindObject,
@@ -599,4 +600,189 @@ export function createVisibilityHelpers(params: {
     resolveCurrentHeadId,
     traverseSupersedeDag,
   };
+}
+
+export interface FilterableChangeFrame {
+  seq: number;
+  realmId: string;
+  entityType: string;
+  entityId: string;
+  op: string;
+  assetClass?: ChangeAssetClass;
+}
+
+/**
+ * Single authoritative visibility filter for `change_log` frames, shared by local `sea.changes`
+ * and remote/pump `MindPump.readBatch`.
+ *
+ * Enforces ALL L2 security invariants:
+ * 1. Filters `entry_object` and `resource_tag` frames referencing any `secret` entry.
+ * 2. Filters `entry_object` and `resource_tag` frames referencing a `seabed` entry whose realm
+ *    is not in `seabedRealmIds` / not visible via `vis.canSeeSeabed` (e.g. descendant seabed without dive).
+ * 3. Filters `object` and `entry_object` frames referencing an object outside `scope.readableLedgerIds`.
+ * 4. Filters `distillation` frames through `vis.canSeeDistillation` (enforcing L5 source closure).
+ * 5. Enforces the `__org__` invariant (`realmId === "__org__"` only visible when `entityType === "org"`).
+ */
+export function filterVisibleChangeFrames<T extends FilterableChangeFrame>(params: {
+  db: DbPort;
+  frames: T[];
+  vis: VisibilityHelpers;
+  scope: AccessScope;
+  ledgerRealmIds: string[];
+  seabedRealmIds: string[];
+  driveRealmIds?: string[];
+  includeOrgLevel?: boolean;
+  includeSecret?: boolean;
+  limit?: number;
+}): T[] {
+  const {
+    db,
+    frames,
+    vis,
+    scope,
+    ledgerRealmIds,
+    seabedRealmIds,
+    limit,
+  } = params;
+  if (frames.length === 0) return [];
+
+  const includeOrgLevel = params.includeOrgLevel !== false;
+  const includeSecret = Boolean(params.includeSecret);
+  const ledgerSet = new Set(ledgerRealmIds);
+  const seabedSet = new Set(seabedRealmIds);
+  const driveSet = new Set(params.driveRealmIds ?? scope.readableDriveIds);
+  const fullReadableLedgerSet = new Set(scope.readableLedgerIds);
+
+  // Batch preload referenced records, seabed entries, objects, and distillations (O(1) SQL queries)
+  const checkEntryIds: string[] = [];
+  const checkObjectIds: string[] = [];
+  const checkDistIds: string[] = [];
+  for (const entry of frames) {
+    if (entry.entityType === "record" || entry.entityType === "seabed") {
+      checkEntryIds.push(entry.entityId);
+    } else if (entry.entityType === "resource_tag") {
+      const colonIdx = entry.entityId.indexOf(":");
+      checkEntryIds.push(
+        colonIdx === -1 ? entry.entityId : entry.entityId.slice(0, colonIdx),
+      );
+    } else if (entry.entityType === "entry_object") {
+      const colonIdx = entry.entityId.indexOf(":");
+      const eid =
+        colonIdx === -1 ? entry.entityId : entry.entityId.slice(0, colonIdx);
+      const oid = colonIdx === -1 ? "" : entry.entityId.slice(colonIdx + 1);
+      if (eid) checkEntryIds.push(eid);
+      if (oid) checkObjectIds.push(oid);
+    } else if (entry.entityType === "object") {
+      checkObjectIds.push(entry.entityId);
+    } else if (entry.entityType === "distillation") {
+      checkDistIds.push(entry.entityId);
+    }
+  }
+
+  const uniqueEntryIds = Array.from(new Set(checkEntryIds));
+  const uniqueObjIds = Array.from(new Set(checkObjectIds));
+  const uniqueDistIds = Array.from(new Set(checkDistIds));
+
+  const recsMap = new Map(
+    uniqueEntryIds.length > 0
+      ? db.getRecordsByIds(uniqueEntryIds).map((r) => [r.id, r])
+      : [],
+  );
+  const remainingSeaIds = uniqueEntryIds.filter((id) => !recsMap.has(id));
+  const seasMap = new Map(
+    remainingSeaIds.length > 0
+      ? db.getSeabedEntriesByIds(remainingSeaIds).map((s) => [s.id, s])
+      : [],
+  );
+  const objsMap = new Map(
+    uniqueObjIds.length > 0
+      ? db.getObjectsByIds(uniqueObjIds).map((o) => [o.id, o])
+      : [],
+  );
+  const distsMap = new Map(
+    uniqueDistIds.length > 0
+      ? db.getDistillationsByIds(uniqueDistIds).map((d) => [d.id, d])
+      : [],
+  );
+
+  const out: T[] = [];
+  for (const entry of frames) {
+    if (entry.realmId === "__org__") {
+      if (!includeOrgLevel || entry.entityType !== "org") continue;
+    } else if (entry.entityType === "seabed") {
+      if (!seabedSet.has(entry.realmId)) continue;
+      const sea = seasMap.get(entry.entityId);
+      if (sea && ((!includeSecret && sea.sensitivity === "secret") || !vis.canSeeSeabed(sea))) {
+        continue;
+      }
+    } else if (entry.entityType === "record") {
+      if (!ledgerSet.has(entry.realmId)) continue;
+      const rec = recsMap.get(entry.entityId);
+      if (rec && ((!includeSecret && rec.sensitivity === "secret") || !vis.canSeeRecord(rec))) {
+        continue;
+      }
+    } else if (entry.entityType === "distillation") {
+      if (!ledgerSet.has(entry.realmId)) continue;
+      const dist = distsMap.get(entry.entityId);
+      if (dist && !vis.canSeeDistillation(dist)) {
+        continue;
+      }
+    } else if (entry.entityType === "drive") {
+      if (!driveSet.has(entry.realmId) || !vis.canSeeDriveRealm(entry.realmId)) {
+        continue;
+      }
+    } else if (entry.entityType === "object") {
+      if (!ledgerSet.has(entry.realmId)) continue;
+      const obj = objsMap.get(entry.entityId);
+      if (obj && (obj.orgId !== scope.orgId || !fullReadableLedgerSet.has(obj.realmId))) {
+        continue;
+      }
+    } else if (
+      entry.entityType === "entry_object" ||
+      entry.entityType === "resource_tag"
+    ) {
+      const colonIdx = entry.entityId.indexOf(":");
+      const entryId =
+        colonIdx === -1 ? entry.entityId : entry.entityId.slice(0, colonIdx);
+      const objId =
+        entry.entityType === "entry_object" && colonIdx !== -1
+          ? entry.entityId.slice(colonIdx + 1)
+          : undefined;
+
+      const rec = recsMap.get(entryId);
+      const sea = rec ? undefined : seasMap.get(entryId);
+      if (rec) {
+        if (!ledgerSet.has(entry.realmId)) continue;
+        if ((!includeSecret && rec.sensitivity === "secret") || !vis.canSeeRecord(rec)) {
+          continue;
+        }
+      } else if (sea) {
+        if (!seabedSet.has(entry.realmId)) continue;
+        if ((!includeSecret && sea.sensitivity === "secret") || !vis.canSeeSeabed(sea)) {
+          continue;
+        }
+      } else if (entryId.startsWith("sea_")) {
+        if (!seabedSet.has(entry.realmId)) continue;
+      } else {
+        if (!ledgerSet.has(entry.realmId)) continue;
+      }
+
+      if (entry.entityType === "entry_object" && objId) {
+        const obj = objsMap.get(objId);
+        if (
+          obj &&
+          (obj.orgId !== scope.orgId || !fullReadableLedgerSet.has(obj.realmId))
+        ) {
+          continue;
+        }
+      }
+    } else if (!ledgerSet.has(entry.realmId)) {
+      continue;
+    }
+
+    out.push(entry);
+    if (limit !== undefined && out.length >= limit) break;
+  }
+
+  return out;
 }

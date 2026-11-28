@@ -551,6 +551,47 @@ export function resolveUnifiedObjectRead(params: {
     }),
   );
 
+  const filterVisibleEntryIds = (
+    rawIds: string[],
+    restrictRealmId: string | null,
+  ): string[] => {
+    const unique = Array.from(new Set(rawIds));
+    if (unique.length === 0) return [];
+    const recs = db.getRecordsByIds(unique);
+    const foundRecIds = new Set(recs.map((r) => r.id));
+    const remainingForSea = unique.filter((id) => !foundRecIds.has(id));
+    const seas =
+      remainingForSea.length > 0 ? db.getSeabedEntriesByIds(remainingForSea) : [];
+
+    const visible = new Set<string>();
+    for (const r of recs) {
+      if (
+        r.orgId === orgId &&
+        (!restrictRealmId || r.realmId === restrictRealmId) &&
+        readableLedgerSet.has(r.realmId) &&
+        r.sensitivity !== "secret" &&
+        r.redactedAt === null &&
+        r.status !== "retracted" &&
+        vis.canSeeRecord(r)
+      ) {
+        visible.add(r.id);
+      }
+    }
+    for (const s of seas) {
+      if (
+        s.orgId === orgId &&
+        (!restrictRealmId || s.realmId === restrictRealmId) &&
+        readableSeabedSet.has(s.realmId) &&
+        s.sensitivity !== "secret" &&
+        s.redactedAt === null &&
+        vis.canSeeSeabed(s)
+      ) {
+        visible.add(s.id);
+      }
+    }
+    return Array.from(visible);
+  };
+
   // Case 1: Exact obj_... ID
   if (parsed.objectId) {
     const obj = allVisibleObjects.find((o) => o.id === parsed.objectId) ?? null;
@@ -558,7 +599,10 @@ export function resolveUnifiedObjectRead(params: {
       throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
     }
     const objIds = [obj.id, ...getDescendantObjectIds(allVisibleObjects, obj.id)];
-    const linkedEntryIds = db.listEntryIdsForObjects(orgId, objIds);
+    const visibleObjectEntryIds = filterVisibleEntryIds(
+      db.listEntryIdsForObjects(orgId, objIds),
+      null,
+    );
     const dupKeys = computeDuplicateObjectKeys(allVisibleObjects);
     const rPath = vis.getSanitizedRealmPath(obj.realmId);
     const canonicalRef = formatCanonicalObjectRef(obj, rPath, dupKeys);
@@ -571,9 +615,9 @@ export function resolveUnifiedObjectRead(params: {
       scopedRealmId: null,
       ledgerRealmIds: scope.readableLedgerIds,
       seabedRealmIds: scope.readableSeabedIds,
-      entryIds: Array.from(new Set(linkedEntryIds)),
+      entryIds: visibleObjectEntryIds,
       countsBySource: {
-        viaObject: linkedEntryIds.length,
+        viaObject: visibleObjectEntryIds.length,
         viaTag: 0,
         viaThing: 0,
       },
@@ -633,18 +677,25 @@ export function resolveUnifiedObjectRead(params: {
 
   const matchedObject = matchingObjects[0] ?? null;
 
-  // 1. Entries via entry_objects (visible object + visible descendants)
+  // 1. Entries via entry_objects (visible object + visible descendants), filtered strictly to caller's visible scope
   let objectEntryIds: string[] = [];
   if (matchedObject) {
     const objIds = [
       matchedObject.id,
       ...getDescendantObjectIds(allVisibleObjects, matchedObject.id),
     ];
-    objectEntryIds = db.listEntryIdsForObjects(orgId, objIds);
+    objectEntryIds = filterVisibleEntryIds(
+      db.listEntryIdsForObjects(orgId, objIds),
+      null,
+    );
   }
 
-  // 2. Entries via resource_tags
+  // 2. Entries via resource_tags, filtered strictly to caller's visible scope (and scopedRealm when qualified)
   const rawTagEntryIds = db.listEntryIdsByResourceTag(orgId, normalizedTag);
+  const filteredTagEntryIds = filterVisibleEntryIds(
+    rawTagEntryIds,
+    scopedRealm ? scopedRealm.id : null,
+  );
 
   // 3. Entries via records WHERE kind='thing' matching external_ref
   const thingLedgerRealmIds = scopedRealm
@@ -670,10 +721,12 @@ export function resolveUnifiedObjectRead(params: {
       : []),
   ].filter(
     (r) =>
+      r.orgId === orgId &&
       r.kind === "thing" &&
       r.status === "active" &&
       r.redactedAt === null &&
       r.sensitivity !== "secret" &&
+      readableLedgerSet.has(r.realmId) &&
       vis.canSeeRecord(r),
   );
 
@@ -693,49 +746,18 @@ export function resolveUnifiedObjectRead(params: {
         offset: 0,
       });
       for (const r of linked.items) {
-        if (r.sensitivity !== "secret" && r.redactedAt === null && vis.canSeeRecord(r)) {
+        if (
+          r.orgId === orgId &&
+          r.sensitivity !== "secret" &&
+          r.redactedAt === null &&
+          r.status !== "retracted" &&
+          readableLedgerSet.has(r.realmId) &&
+          vis.canSeeRecord(r)
+        ) {
           thingEntryIdSet.add(r.id);
         }
       }
     }
-  }
-
-  // When realm-qualified:
-  // - objectEntryIds are allowed across readable scope (anchored to object in scopedRealm)
-  // - tagEntryIds and thingEntryIds MUST be physically stored in scopedRealm.id
-  let filteredTagEntryIds = rawTagEntryIds;
-  if (scopedRealm && rawTagEntryIds.length > 0) {
-    const tagRecs = db.getRecordsByIds(rawTagEntryIds);
-    const tagRecIds = new Set(tagRecs.map((r) => r.id));
-    const remainingForSea = rawTagEntryIds.filter((id) => !tagRecIds.has(id));
-    const tagSeas =
-      remainingForSea.length > 0 ? db.getSeabedEntriesByIds(remainingForSea) : [];
-
-    const inRealm = new Set<string>();
-    for (const r of tagRecs) {
-      if (
-        r.realmId === scopedRealm.id &&
-        readableLedgerSet.has(r.realmId) &&
-        r.sensitivity !== "secret" &&
-        r.redactedAt === null &&
-        r.status !== "retracted" &&
-        vis.canSeeRecord(r)
-      ) {
-        inRealm.add(r.id);
-      }
-    }
-    for (const s of tagSeas) {
-      if (
-        s.realmId === scopedRealm.id &&
-        readableSeabedSet.has(s.realmId) &&
-        s.sensitivity !== "secret" &&
-        s.redactedAt === null &&
-        vis.canSeeSeabed(s)
-      ) {
-        inRealm.add(s.id);
-      }
-    }
-    filteredTagEntryIds = Array.from(inRealm);
   }
 
   const combinedEntryIds = Array.from(

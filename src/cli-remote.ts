@@ -325,12 +325,22 @@ export async function runRemoteCliCommand(
     }
 
     if (cmd === "rule" && sub === "add") {
+      const rawOcc = str(flags, "occurred-at");
+      const occurredAt =
+        rawOcc === undefined
+          ? undefined
+          : rawOcc === "none" || rawOcc === "null"
+            ? null
+            : rawOcc;
       const res = await surface.addRule({
         in: reqStr(flags, "in", "rule add"),
         title: reqStr(flags, "title", "rule add"),
         body: reqStr(flags, "body", "rule add"),
+        about: multi(multiFlags, "about"),
         supersedes: multi(multiFlags, "supersedes"),
         because: multi(multiFlags, "because"),
+        occurredAt,
+        sensitivity: str(flags, "sensitivity") as Sensitivity | undefined,
         idempotencyKey: str(flags, "idempotency-key"),
       });
       output(res, formatGenericMarkdown("Rule Added", res));
@@ -780,11 +790,14 @@ export async function runRemoteCliCommand(
         }
         const mapping = loadRemoteMapping(str(flags, "map"));
         const whoami = await surface.whoami();
+        const explicitTarget = str(flags, "target") as
+          | ImportTargetLayer
+          | undefined;
         const planned = planSourceVerification({
           sourcePath,
           mapping,
           baseDir: str(flags, "base-dir"),
-          target: str(flags, "target") as ImportTargetLayer | undefined,
+          target: explicitTarget,
           targetRealmRef: str(flags, "in"),
           defaultRealmRef: whoami.bound.realmPath,
           skipSecret: bool(flags, "include-secret")
@@ -804,6 +817,7 @@ export async function runRemoteCliCommand(
           parts.push(
             await surface.verifyImport({
               items: [],
+              target: explicitTarget,
               checkUnexpectedInRealmRefs:
                 checkRealmRefs.length > 0 ? checkRealmRefs : undefined,
               allExpectedSourceRefs: planned.allExpectedSourceRefs,
@@ -819,6 +833,7 @@ export async function runRemoteCliCommand(
             parts.push(
               await surface.verifyImport({
                 items: chunks[i]!,
+                target: explicitTarget,
                 checkUnexpectedInRealmRefs:
                   i === 0 && checkRealmRefs.length > 0
                     ? checkRealmRefs
@@ -837,6 +852,9 @@ export async function runRemoteCliCommand(
           excludedCount: planned.excludedCount,
           unaccountedPaths: planned.unaccountedPaths,
           allowSkips,
+          checkedLayers: explicitTarget
+            ? [explicitTarget]
+            : ["record", "seabed"],
           undatedCount: planned.undatedCount,
           defaultRealmFallbackCount: planned.defaultRealmFallbackCount,
         });

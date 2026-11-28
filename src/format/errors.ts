@@ -117,6 +117,10 @@ function adaptTryHintForMcp(
   }
   if (explicitTry.startsWith("meru-mind show ")) {
     let ref = explicitTry.slice("meru-mind show ".length).trim();
+    if (ref.endsWith(" --include-descendant-seabed")) {
+      const bareRef = ref.slice(0, -" --include-descendant-seabed".length).trim();
+      return `mind_show({ ref: ${JSON.stringify(bareRef)}, include_descendant_seabed: true })`;
+    }
     if (options?.orgPolicy === "tree" && ref === "file:/readme.md" && realmRef !== "/") {
       ref = `file:${realmRef}/readme.md`;
     }

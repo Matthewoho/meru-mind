@@ -1327,6 +1327,7 @@ export interface VerifyImportExpectedKey {
 
 export interface VerifyImportInput {
   items: VerifyImportManifestItem[];
+  target?: ImportTargetLayer;
   checkUnexpectedInRealmRefs?: string[];
   allExpectedSourceRefs?: string[];
   allExpectedEntries?: VerifyImportExpectedKey[];
@@ -1369,6 +1370,7 @@ export interface VerifyImportResult {
   skippedSecretCount: number;
   skippedRedactedCount: number;
   allowSkips: number;
+  checkedLayers?: ImportTargetLayer[];
   mismatches: ImportConsistencyMismatch[];
   unexpectedEntries: VerifyImportUnexpectedEntry[];
   // Backward-compatible summary fields

@@ -10,7 +10,11 @@ import {
   OPAQUE_OBJECT_NOT_FOUND,
   resolveVisibleRealm,
 } from "./engine/objects.js";
-import { parseRefSyntax, resolveUnifiedObjectRead } from "./engine/refs.js";
+import {
+  parseRefSyntax,
+  resolveAboutRefsForWrite,
+  resolveUnifiedObjectRead,
+} from "./engine/refs.js";
 import { createVisibilityHelpers } from "./engine/visibility.js";
 import { assertNoAccidentalSecret } from "./engine/secret-guard.js";
 import {
@@ -86,6 +90,7 @@ import {
   type RedactResult,
   type SeabedEntry,
   type SearchResult,
+  type Sensitivity,
   type ShowResult,
   type ShowSupersedeChainResult,
   type TokenWriteScope,
@@ -733,7 +738,12 @@ export class LocalMindSurface implements MindSurface {
   }
 
   async addRule(params: SurfaceAddRuleInput): Promise<LedgerRecord> {
-    const cliCmd = `meru-mind rule add --in ${params.in} --title ${JSON.stringify(params.title)} --body ${JSON.stringify(params.body)} --as-human`;
+    const aboutList = (params.about ?? []).map((a) => a.trim()).filter(Boolean);
+    const aboutHint =
+      aboutList.length > 0
+        ? ` ${aboutList.map((a) => `--about ${a}`).join(" ")}`
+        : "";
+    const cliCmd = `meru-mind rule add --in ${params.in} --title ${JSON.stringify(params.title)} --body ${JSON.stringify(params.body)}${aboutHint} --as-human`;
     this.assertNotWeakenedCookie("rule add", cliCmd);
     this.assertHuman("add rules", cliCmd);
     const ctx = this.resolveScopeContext(false);
@@ -743,21 +753,53 @@ export class LocalMindSurface implements MindSurface {
       ref: params.in,
       scope: ctx.scope,
     });
+    const sensitivity: Sensitivity = params.sensitivity ?? "internal";
     assertNoAccidentalSecret({
       texts: [params.title, params.body],
-      sensitivity: "internal",
+      sensitivity,
       surfaceHint: "Remove plaintext credentials before adding a rule.",
     });
+    const vis = createVisibilityHelpers({
+      db: this.engine.db,
+      realms: ctx.realms,
+      mounts: ctx.mounts,
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      scope: ctx.scope,
+    });
+    const resolvedAbout = resolveAboutRefsForWrite({
+      db: this.engine.db,
+      realms: ctx.realms,
+      orgId: ctx.org.id,
+      about: aboutList,
+      scope: ctx.scope,
+      vis,
+    });
+    const supersedesList = (params.supersedes ?? [])
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const becauseList = (params.because ?? [])
+      .map((s) => s.trim())
+      .filter(Boolean);
     return this.engine.ledger.appendRecord({
       actor: this.principal.actor,
       viewerRealmId: this.principal.boundRealmId,
       targetRealmId: targetRealm.id,
+      thingId: resolvedAbout.thingId,
       kind: "rule",
       title: params.title.trim(),
       payload: buildWriteRecordPayload(params.body.trim()),
-      refs: params.because,
-      supersedesIds: params.supersedes,
+      refs: becauseList,
+      objectIds: resolvedAbout.objectIds,
+      resourceTags: resolvedAbout.resourceTags,
+      supersedesIds: supersedesList.length > 0 ? supersedesList : undefined,
+      occurredAt: params.occurredAt,
+      sensitivity: params.sensitivity,
       idempotencyKey: params.idempotencyKey,
+      writeScope: this.effectiveWriteScope(),
+      allowRedactedReingest:
+        this.principal.authKind === "local" &&
+        this.principal.actor.kind === "human",
     });
   }
 

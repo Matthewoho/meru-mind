@@ -795,6 +795,9 @@ export function formatImportVerifyMarkdown(
     `- Content mismatches: ${res.contentMismatchCount} | Realm mismatches: ${res.realmMismatchCount} | Layer mismatches: ${res.layerMismatchCount}`,
     `- Status mismatches: ${res.statusMismatchCount} | Timestamp mismatches: ${res.timestampMismatchCount}`,
     `- Skipped: secret=${res.skippedSecretCount}, redacted=${res.skippedRedactedCount} (allowSkips=${res.allowSkips})`,
+    ...(res.checkedLayers && res.checkedLayers.length > 0
+      ? [`- Checked layers: ${res.checkedLayers.join(", ")}`]
+      : []),
     `- Undated: ${res.undatedCount} | Default realm fallback: ${res.defaultRealmFallbackCount}`,
   ];
   if (res.unaccountedPaths.length > 0) {

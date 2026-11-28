@@ -2908,49 +2908,39 @@ async function main(): Promise<void> {
         );
         const ctx = resolveSessionContext({ engine, flags });
         const inRef = requireFlag(flags, "in", "rule add");
-        const targetRealm = resolveVisibleRealm({
-          realms: ctx.realms,
-          orgId: ctx.org.id,
-          ref: inRef,
-          scope: ctx.boundScope,
-        });
-        const vis = createVisibilityHelpers({
-          db: engine.db,
-          realms: ctx.realms,
-          mounts: engine.db.listMounts(),
-          actor,
-          viewerRealmId: ctx.boundViewerRealmId,
-          scope: ctx.boundScope,
-        });
-        const resolvedAbout = resolveAboutRefsForWrite({
-          db: engine.db,
-          realms: ctx.realms,
-          orgId: ctx.org.id,
-          about: flagMulti(multiFlags, "about"),
-          scope: ctx.boundScope,
-          vis,
-        });
+        const title = requireFlag(flags, "title", "rule add");
         const body = requireFlag(flags, "body", "rule add");
-        const supersedesList = flagMulti(multiFlags, "supersedes");
-        const rec = await engine.ledger.appendRecord({
-          actor,
-          viewerRealmId: ctx.boundViewerRealmId,
-          targetRealmId: targetRealm.id,
-          thingId: resolvedAbout.thingId,
-          kind: "rule",
-          title: requireFlag(flags, "title", "rule add"),
-          payload: buildWriteRecordPayload(body),
-          refs: flagMulti(multiFlags, "because"),
-          objectIds: resolvedAbout.objectIds,
-          resourceTags: resolvedAbout.resourceTags,
-          supersedesIds: supersedesList.length > 0 ? supersedesList : undefined,
-          occurredAt: parseOccurredAtFlag(flags),
-          sensitivity: flagStr(flags, "sensitivity") as Sensitivity | undefined,
-          idempotencyKey: flagStr(flags, "idempotency-key"),
-          allowRedactedReingest: flagBool(flags, "as-human"),
+        const surface = new LocalMindSurface({
+          engine,
+          principal: {
+            tokenId: null,
+            orgId: ctx.org.id,
+            actor,
+            boundRealmId: ctx.boundViewerRealmId,
+            boundSource: ctx.boundSource,
+            authKind: "local",
+          },
+          ownsEngine: false,
         });
-        output(rec, formatGenericMarkdown("Rule Added", rec));
-        return;
+        try {
+          const rec = await surface.addRule({
+            in: inRef,
+            title,
+            body,
+            about: flagMulti(multiFlags, "about"),
+            supersedes: flagMulti(multiFlags, "supersedes"),
+            because: flagMulti(multiFlags, "because"),
+            occurredAt: parseOccurredAtFlag(flags),
+            sensitivity: flagStr(flags, "sensitivity") as
+              | Sensitivity
+              | undefined,
+            idempotencyKey: flagStr(flags, "idempotency-key"),
+          });
+          output(rec, formatGenericMarkdown("Rule Added", rec));
+          return;
+        } finally {
+          await surface.close();
+        }
       }
       throw new MindError(
         "UNKNOWN_COMMAND",

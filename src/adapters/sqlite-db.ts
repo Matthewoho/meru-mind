@@ -4701,6 +4701,41 @@ export class SqliteDb implements DbPort {
       `cl.org_id = ?`,
       `(${visClauses.join(" OR ")})`,
     ];
+    // Exclude entry_object/resource_tag frames targeting seabed entries outside seabedRealmIds
+    if (params.seabedRealmIds.length > 0) {
+      where.push(`NOT (
+        cl.entity_type IN ('entry_object', 'resource_tag')
+        AND EXISTS (
+          SELECT 1 FROM seabed_entries s
+          WHERE s.id = CASE WHEN instr(cl.entity_id, ':') > 0 THEN substr(cl.entity_id, 1, instr(cl.entity_id, ':') - 1) ELSE cl.entity_id END
+            AND s.realm_id NOT IN (${placeholders(params.seabedRealmIds.length)})
+        )
+      )`);
+      sqlParams.push(...params.seabedRealmIds);
+    } else {
+      where.push(`NOT (
+        cl.entity_type IN ('entry_object', 'resource_tag')
+        AND EXISTS (
+          SELECT 1 FROM seabed_entries s
+          WHERE s.id = CASE WHEN instr(cl.entity_id, ':') > 0 THEN substr(cl.entity_id, 1, instr(cl.entity_id, ':') - 1) ELSE cl.entity_id END
+        )
+      )`);
+    }
+    // Exclude entry_object frames targeting objects outside ledgerRealmIds
+    if (params.ledgerRealmIds.length > 0) {
+      where.push(`NOT (
+        cl.entity_type = 'entry_object'
+        AND instr(cl.entity_id, ':') > 0
+        AND EXISTS (
+          SELECT 1 FROM objects o
+          WHERE o.id = substr(cl.entity_id, instr(cl.entity_id, ':') + 1)
+            AND o.realm_id NOT IN (${placeholders(params.ledgerRealmIds.length)})
+        )
+      )`);
+      sqlParams.push(...params.ledgerRealmIds);
+    } else {
+      where.push(`NOT (cl.entity_type = 'entry_object' AND instr(cl.entity_id, ':') > 0)`);
+    }
     if (!params.includeSecret) {
       where.push(`NOT (
         cl.entity_type = 'record'
@@ -4714,6 +4749,21 @@ export class SqliteDb implements DbPort {
         AND EXISTS (
           SELECT 1 FROM seabed_entries s
           WHERE s.id = cl.entity_id AND s.sensitivity = 'secret'
+        )
+      )`);
+      where.push(`NOT (
+        cl.entity_type IN ('entry_object', 'resource_tag')
+        AND (
+          EXISTS (
+            SELECT 1 FROM records r
+            WHERE r.id = CASE WHEN instr(cl.entity_id, ':') > 0 THEN substr(cl.entity_id, 1, instr(cl.entity_id, ':') - 1) ELSE cl.entity_id END
+              AND r.sensitivity = 'secret'
+          )
+          OR EXISTS (
+            SELECT 1 FROM seabed_entries s
+            WHERE s.id = CASE WHEN instr(cl.entity_id, ':') > 0 THEN substr(cl.entity_id, 1, instr(cl.entity_id, ':') - 1) ELSE cl.entity_id END
+              AND s.sensitivity = 'secret'
+          )
         )
       )`);
     }
@@ -4817,6 +4867,21 @@ export class SqliteDb implements DbPort {
           WHERE s.id = cl.entity_id AND s.sensitivity = 'secret'
         )
       )`);
+      where.push(`NOT (
+        cl.entity_type IN ('entry_object', 'resource_tag')
+        AND (
+          EXISTS (
+            SELECT 1 FROM records r
+            WHERE r.id = CASE WHEN instr(cl.entity_id, ':') > 0 THEN substr(cl.entity_id, 1, instr(cl.entity_id, ':') - 1) ELSE cl.entity_id END
+              AND r.sensitivity = 'secret'
+          )
+          OR EXISTS (
+            SELECT 1 FROM seabed_entries s
+            WHERE s.id = CASE WHEN instr(cl.entity_id, ':') > 0 THEN substr(cl.entity_id, 1, instr(cl.entity_id, ':') - 1) ELSE cl.entity_id END
+              AND s.sensitivity = 'secret'
+          )
+        )
+      )`);
     }
     const row = this.db
       .prepare(`SELECT COUNT(*) AS c FROM change_log cl WHERE ${where.join(" AND ")}`)
@@ -4833,6 +4898,24 @@ export class SqliteDb implements DbPort {
     if (entry.entityType === "org" || entry.realmId === "__org__") return "org";
     if (entry.entityType === "seabed") return "seabed";
     if (entry.entityType === "drive") return "drive";
+    if (
+      entry.entityType === "entry_object" ||
+      entry.entityType === "resource_tag"
+    ) {
+      const colonIdx = entry.entityId.indexOf(":");
+      const entryId =
+        colonIdx === -1 ? entry.entityId : entry.entityId.slice(0, colonIdx);
+      if (entryId.startsWith("sea_")) return "seabed";
+      const seaRow = this.db
+        .prepare(`SELECT 1 AS hit FROM seabed_entries WHERE id = ?`)
+        .get(entryId) as { hit: number } | undefined;
+      if (seaRow) return "seabed";
+      const recRow = this.db
+        .prepare(`SELECT kind FROM records WHERE id = ?`)
+        .get(entryId) as { kind: string } | undefined;
+      if (recRow?.kind === "rule") return "rule";
+      return "ledger";
+    }
     if (entry.entityType === "record") {
       const row = this.db
         .prepare(`SELECT kind FROM records WHERE id = ?`)
@@ -5046,6 +5129,21 @@ export class SqliteDb implements DbPort {
         AND EXISTS (
           SELECT 1 FROM seabed_entries s
           WHERE s.id = cl.entity_id AND s.sensitivity = 'secret'
+        )
+      )`);
+      where.push(`NOT (
+        cl.entity_type IN ('entry_object', 'resource_tag')
+        AND (
+          EXISTS (
+            SELECT 1 FROM records r
+            WHERE r.id = CASE WHEN instr(cl.entity_id, ':') > 0 THEN substr(cl.entity_id, 1, instr(cl.entity_id, ':') - 1) ELSE cl.entity_id END
+              AND r.sensitivity = 'secret'
+          )
+          OR EXISTS (
+            SELECT 1 FROM seabed_entries s
+            WHERE s.id = CASE WHEN instr(cl.entity_id, ':') > 0 THEN substr(cl.entity_id, 1, instr(cl.entity_id, ':') - 1) ELSE cl.entity_id END
+              AND s.sensitivity = 'secret'
+          )
         )
       )`);
     }

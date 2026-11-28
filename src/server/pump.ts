@@ -1,4 +1,4 @@
-import { resolveAccessScope } from "../policy.js";
+import { getDescendantIds, resolveAccessScope } from "../policy.js";
 import type { DbPort } from "../ports.js";
 import {
   MindError,
@@ -8,6 +8,10 @@ import {
   type PumpChangeFrame,
 } from "../types.js";
 import { resolveVisibleRealm } from "../engine/objects.js";
+import {
+  createVisibilityHelpers,
+  filterVisibleChangeFrames,
+} from "../engine/visibility.js";
 import { isPrincipalTokenActive } from "./tokens.js";
 
 /**
@@ -183,46 +187,104 @@ export class MindPump {
       };
     }
 
+    const realms = this.db.listRealms();
+    const mounts = this.db.listMounts();
     let filterRealmIds: string[] | undefined;
+    let effectiveLedgerIds = scope.readableLedgerIds;
+    let effectiveSeabedIds = scope.readableSeabedIds;
+    let effectiveDriveIds = scope.readableDriveIds;
+    let includeOrgLevel = true;
+
     if (params.realmRef?.trim()) {
-      const realms = this.db.listRealms();
       const target = resolveVisibleRealm({
         realms,
         orgId: this.principal.orgId,
         ref: params.realmRef.trim(),
         scope,
       });
-      filterRealmIds = [target.id];
+      const orgRealms = realms.filter((r) => r.orgId === this.principal.orgId);
+      const subtreeIds = [target.id, ...getDescendantIds(orgRealms, target.id)];
+      const subtreeSet = new Set(subtreeIds);
+      filterRealmIds = subtreeIds;
+      effectiveLedgerIds = scope.readableLedgerIds.filter((id) =>
+        subtreeSet.has(id),
+      );
+      effectiveSeabedIds = scope.readableSeabedIds.filter((id) =>
+        subtreeSet.has(id),
+      );
+      effectiveDriveIds = scope.readableDriveIds.filter((id) =>
+        subtreeSet.has(id),
+      );
+      includeOrgLevel = false;
     }
 
-    const res = this.db.listChangeLogForPump({
-      orgId: this.principal.orgId,
-      ledgerRealmIds: scope.readableLedgerIds,
-      seabedRealmIds: scope.readableSeabedIds,
-      driveRealmIds: scope.readableDriveIds,
-      sinceSeq,
-      limit,
-      includeSecret: false,
-      filterRealmIds,
+    const vis = createVisibilityHelpers({
+      db: this.db,
+      realms,
+      mounts,
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      scope,
+      ledgerRealmIds: effectiveLedgerIds,
+      seabedRealmIds: effectiveSeabedIds,
+      includeDescendantSeabed,
     });
 
+    const batchSize = Math.min(500, Math.max(limit * 2, 100));
+    const collected: PumpChangeFrame[] = [];
+    let scanSeq = sinceSeq;
+    let resGen = currentGen;
+    let resTopoVer = topoVer;
+
+    while (collected.length < limit) {
+      const raw = this.db.listChangeLogForPump({
+        orgId: this.principal.orgId,
+        ledgerRealmIds: scope.readableLedgerIds,
+        seabedRealmIds: scope.readableSeabedIds,
+        driveRealmIds: scope.readableDriveIds,
+        sinceSeq: scanSeq,
+        limit: batchSize,
+        includeSecret: false,
+        filterRealmIds,
+      });
+      resGen = raw.generation;
+      resTopoVer = raw.topologyVersion;
+      if (raw.frames.length === 0) break;
+
+      const remaining = limit - collected.length;
+      const visibleBatch = filterVisibleChangeFrames({
+        db: this.db,
+        frames: raw.frames,
+        vis,
+        scope,
+        ledgerRealmIds: effectiveLedgerIds,
+        seabedRealmIds: effectiveSeabedIds,
+        driveRealmIds: effectiveDriveIds,
+        includeOrgLevel,
+        includeSecret: false,
+        limit: remaining,
+      });
+      collected.push(...visibleBatch);
+
+      const lastRawSeq = raw.frames[raw.frames.length - 1]!.seq;
+      if (lastRawSeq <= scanSeq || raw.frames.length < batchSize) {
+        break;
+      }
+      scanSeq = lastRawSeq;
+    }
+
     const latestSeq =
-      res.frames.length > 0
-        ? res.frames[res.frames.length - 1]!.seq
-        : this.db.getLatestVisibleChangeLogSeq({
-            orgId: this.principal.orgId,
-            ledgerRealmIds: scope.readableLedgerIds,
-            seabedRealmIds: scope.readableSeabedIds,
-            includeSecret: false,
-          });
+      collected.length > 0
+        ? collected[collected.length - 1]!.seq
+        : sinceSeq;
 
     return {
-      generation: res.generation,
-      topologyVersion: res.topologyVersion,
+      generation: resGen,
+      topologyVersion: resTopoVer,
       sinceSeq,
       latestSeq: Math.max(latestSeq, sinceSeq),
       resetRequired: false,
-      frames: res.frames,
+      frames: collected,
     };
   }
 

@@ -1931,6 +1931,7 @@ export function mergeVerifyImportResults(
     excludedCount: number;
     unaccountedPaths: string[];
     allowSkips: number;
+    checkedLayers?: ImportTargetLayer[];
     undatedCount?: number;
     defaultRealmFallbackCount?: number;
   },
@@ -1987,6 +1988,11 @@ export function mergeVerifyImportResults(
     unexpectedCount === 0 &&
     skippedSecretCount + skippedRedactedCount <= allowSkips;
 
+  const checkedLayers =
+    meta.checkedLayers ??
+    parts.find((p) => p.checkedLayers && p.checkedLayers.length > 0)
+      ?.checkedLayers;
+
   return {
     passed,
     totalSourceFiles: meta.totalSourceFiles,
@@ -2005,6 +2011,7 @@ export function mergeVerifyImportResults(
     skippedSecretCount,
     skippedRedactedCount,
     allowSkips,
+    ...(checkedLayers ? { checkedLayers } : {}),
     mismatches,
     unexpectedEntries,
     totalChecked,
@@ -4202,6 +4209,20 @@ export class ImporterEngine {
       }
     }
 
+    if (
+      input.target !== undefined &&
+      input.target !== "record" &&
+      input.target !== "seabed"
+    ) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `Invalid verify target "${String(input.target)}": expected "record" or "seabed"`,
+      );
+    }
+    const checkedLayers: ImportTargetLayer[] = input.target
+      ? [input.target]
+      : ["record", "seabed"];
+
     // P1-5: Check unexpected imported entries keyed by composite (realmId, layer, sourceRef)!
     const unexpectedEntries: VerifyImportUnexpectedEntry[] = [];
     if (
@@ -4212,6 +4233,8 @@ export class ImporterEngine {
       const checkSeabedIds: string[] = [];
       const readableLedgerSet = new Set(scope.readableLedgerIds);
       const readableSeabedSet = new Set(scope.readableSeabedIds);
+      const checkRecordLayer = checkedLayers.includes("record");
+      const checkSeabedLayer = checkedLayers.includes("seabed");
 
       for (const ref of input.checkUnexpectedInRealmRefs) {
         if (!ref?.trim()) continue;
@@ -4222,8 +4245,13 @@ export class ImporterEngine {
           scope,
         });
         // P0 Option A: Determine readable realms strictly from `scope` (zero raw resolveAccess fallbacks!)
-        if (readableLedgerSet.has(realm.id)) checkLedgerIds.push(realm.id);
-        if (readableSeabedSet.has(realm.id)) checkSeabedIds.push(realm.id);
+        // Dogfood (a): Respect explicit --target layer so seabed entries don't false-positive on record verify (and vice versa).
+        if (checkRecordLayer && readableLedgerSet.has(realm.id)) {
+          checkLedgerIds.push(realm.id);
+        }
+        if (checkSeabedLayer && readableSeabedSet.has(realm.id)) {
+          checkSeabedIds.push(realm.id);
+        }
       }
 
       const expectedCompositeKeys = new Set<string>();
@@ -4323,6 +4351,7 @@ export class ImporterEngine {
       skippedSecretCount,
       skippedRedactedCount,
       allowSkips,
+      checkedLayers,
       mismatches,
       unexpectedEntries,
       totalChecked,
@@ -4623,6 +4652,7 @@ export class ImporterEngine {
           writeScope: params.writeScope,
           input: {
             items: [],
+            target: params.target,
             checkUnexpectedInRealmRefs: params.checkUnexpectedInRealmRefs,
             allExpectedSourceRefs: planned.allExpectedSourceRefs,
             allExpectedEntries: planned.allExpectedEntries,
@@ -4642,6 +4672,7 @@ export class ImporterEngine {
             writeScope: params.writeScope,
             input: {
               items: chunks[i]!,
+              target: params.target,
               checkUnexpectedInRealmRefs:
                 i === 0 ? params.checkUnexpectedInRealmRefs : undefined,
               allExpectedSourceRefs:
@@ -4660,6 +4691,7 @@ export class ImporterEngine {
       excludedCount: planned.excludedCount,
       unaccountedPaths: planned.unaccountedPaths,
       allowSkips,
+      checkedLayers: params.target ? [params.target] : ["record", "seabed"],
       undatedCount: planned.undatedCount,
       defaultRealmFallbackCount: planned.defaultRealmFallbackCount,
     });

@@ -398,8 +398,10 @@ export {
 export { exportRecordsAsMarkdown } from "./engine/export-md.js";
 export {
   createVisibilityHelpers,
+  filterVisibleChangeFrames,
   parseDriveSourceRef,
   sanitizeRealmsForScope,
+  type FilterableChangeFrame,
   type VisibilityHelpers,
 } from "./engine/visibility.js";
 export {

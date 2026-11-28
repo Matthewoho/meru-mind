@@ -147,8 +147,11 @@ export interface SurfaceAddRuleInput {
   in: string;
   title: string;
   body: string;
+  about?: string[];
   supersedes?: string[];
   because?: string[];
+  occurredAt?: string | null;
+  sensitivity?: Sensitivity;
   idempotencyKey?: string;
 }
 

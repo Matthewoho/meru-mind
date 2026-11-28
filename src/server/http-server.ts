@@ -42,6 +42,7 @@ import {
   type OidcConfig,
   type OrgPolicy,
   type Principal,
+  type Sensitivity,
   type TokenWriteScope,
   type VerifyImportInput,
 } from "../types.js";
@@ -839,7 +840,70 @@ export async function startMindServer(
             }
 
             if (method === "POST" && pathname === "/v1/rules") {
-              const body = (await readJsonBody(req)) as unknown as SurfaceAddRuleInput;
+              const raw = await readJsonBody(req);
+              if (
+                raw.about !== undefined &&
+                (!Array.isArray(raw.about) ||
+                  !raw.about.every((item) => typeof item === "string"))
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "about" must be an array of strings',
+                );
+              }
+              if (
+                raw.supersedes !== undefined &&
+                (!Array.isArray(raw.supersedes) ||
+                  !raw.supersedes.every((item) => typeof item === "string"))
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "supersedes" must be an array of strings',
+                );
+              }
+              if (
+                raw.because !== undefined &&
+                (!Array.isArray(raw.because) ||
+                  !raw.because.every((item) => typeof item === "string"))
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "because" must be an array of strings',
+                );
+              }
+              if (
+                typeof raw.in !== "string" ||
+                !raw.in.trim() ||
+                typeof raw.title !== "string" ||
+                !raw.title.trim() ||
+                typeof raw.body !== "string" ||
+                !raw.body.trim()
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Fields "in", "title", and "body" must be non-empty strings',
+                );
+              }
+              const body: SurfaceAddRuleInput = {
+                in: raw.in,
+                title: raw.title,
+                body: raw.body,
+                about: raw.about as string[] | undefined,
+                supersedes: raw.supersedes as string[] | undefined,
+                because: raw.because as string[] | undefined,
+                occurredAt:
+                  raw.occurredAt === null || typeof raw.occurredAt === "string"
+                    ? raw.occurredAt
+                    : undefined,
+                sensitivity:
+                  typeof raw.sensitivity === "string"
+                    ? (raw.sensitivity as Sensitivity)
+                    : undefined,
+                idempotencyKey:
+                  typeof raw.idempotencyKey === "string"
+                    ? raw.idempotencyKey
+                    : undefined,
+              };
               const out = await surface.addRule(body);
               sendJson(res, 200, out);
               return;
@@ -1256,8 +1320,21 @@ export async function startMindServer(
                 });
               }
 
+              const rawTarget = optBodyStr(raw, "target");
+              if (
+                rawTarget !== undefined &&
+                rawTarget !== "record" &&
+                rawTarget !== "seabed"
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "target" must be "record" or "seabed"',
+                );
+              }
+
               const validated: VerifyImportInput = {
                 items,
+                target: rawTarget,
                 checkUnexpectedInRealmRefs: optBodyStrArray(
                   raw,
                   "checkUnexpectedInRealmRefs",

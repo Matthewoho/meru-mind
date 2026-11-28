@@ -101,6 +101,7 @@ import {
 } from "./refs.js";
 import {
   createVisibilityHelpers,
+  filterVisibleChangeFrames,
   parseDriveSourceRef,
   type VisibilityHelpers,
 } from "./visibility.js";
@@ -3389,6 +3390,56 @@ export class SeaEngine {
     const sea = this.db.getSeabedEntry(target);
     if (sea) {
       if (sea.orgId !== viewerRealm.orgId || !vis.canSeeSeabed(sea)) {
+        // Dogfood (b): Only emit a descendant-seabed dive hint when:
+        // 1. Caller did NOT already pass --include-descendant-seabed,
+        // 2. Entry is in the same org, non-secret, and non-redacted,
+        // 3. Entry's realm is ALREADY in the caller's readableLedgerIds (no new realm/sibling info!),
+        // 4. Entry becomes readable under the principal's dive-enabled scope ceiling (never ledger-only mounts/ancestors).
+        if (
+          !params.includeDescendantSeabed &&
+          sea.orgId === viewerRealm.orgId &&
+          sea.sensitivity !== "secret" &&
+          sea.redactedAt === null &&
+          readableLedgerSet.has(sea.realmId)
+        ) {
+          const diveBaseScope = resolveAccessScope({
+            realms,
+            mounts,
+            viewerRealmId: viewerRealm.id,
+            orgPolicy,
+            includeDescendantSeabed: true,
+          });
+          const diveCeilingScope = params.scopeCeiling
+            ? resolveAccessScope({
+                realms,
+                mounts,
+                viewerRealmId: params.scopeCeiling.viewerRealmId,
+                orgPolicy,
+                includeDescendantSeabed: true,
+              })
+            : null;
+          const effectiveDiveScope = diveCeilingScope
+            ? intersectAccessScopes(diveBaseScope, diveCeilingScope)
+            : diveBaseScope;
+          const diveAccess = resolveAccess({
+            realms,
+            mounts,
+            actor: params.actor,
+            viewerRealmId: viewerRealm.id,
+            targetRealmId: sea.realmId,
+            assetKind: "seabed",
+            explicitDescendantDive: true,
+            orgPolicy,
+          });
+          if (
+            effectiveDiveScope.readableSeabedIds.includes(sea.realmId) &&
+            diveAccess !== "none"
+          ) {
+            throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND, {
+              try: `meru-mind show ${sea.id} --include-descendant-seabed`,
+            });
+          }
+        }
         throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
       }
       if (sea.sourceRef) vis.preloadRefs([sea.sourceRef]);
@@ -3687,6 +3738,8 @@ export class SeaEngine {
 
     let ledgerRealmIds = scope.readableLedgerIds;
     let seabedRealmIds = scope.readableSeabedIds;
+    let driveRealmIds = scope.readableDriveIds;
+    let filterRealmIds: string[] | undefined;
     let includeOrgLevel = true;
     const realmFilterRef = (params.in ?? params.target)?.trim();
     if (realmFilterRef) {
@@ -3697,28 +3750,23 @@ export class SeaEngine {
         scope,
       });
       const orgRealms = realms.filter((r) => r.orgId === viewerRealm.orgId);
-      const subtreeSet = new Set<string>([
+      const subtreeIds = [
         targetRealm.id,
         ...getDescendantIds(orgRealms, targetRealm.id),
-      ]);
+      ];
+      const subtreeSet = new Set<string>(subtreeIds);
+      filterRealmIds = subtreeIds;
       ledgerRealmIds = scope.readableLedgerIds.filter((id) =>
         subtreeSet.has(id),
       );
       seabedRealmIds = scope.readableSeabedIds.filter((id) =>
         subtreeSet.has(id),
       );
+      driveRealmIds = scope.readableDriveIds.filter((id) =>
+        subtreeSet.has(id),
+      );
       includeOrgLevel = false;
     }
-
-    const ledgerSet = new Set(ledgerRealmIds);
-    const seabedSet = new Set(seabedRealmIds);
-    const candidateRealms = Array.from(
-      new Set([
-        ...ledgerRealmIds,
-        ...seabedRealmIds,
-        ...(includeOrgLevel ? ["__org__"] : []),
-      ]),
-    );
 
     const sinceSeq = Math.max(0, params.sinceSeq ?? 0);
     const limit = Math.max(1, Math.min(params.limit ?? 50, 500));
@@ -3734,92 +3782,67 @@ export class SeaEngine {
       includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
     });
 
-    const raw = this.db.listChangeLog({
-      orgId: viewerRealm.orgId,
-      realmIds: candidateRealms,
-      sinceSeq,
-      limit: limit * 2,
-      includeSecret: false,
-    });
-
-    // Batch preload records, seabed, and objects referenced in raw change_log entries
-    const checkEntryIds: string[] = [];
-    const checkObjectIds: string[] = [];
-    for (const entry of raw.entries) {
-      if (entry.entityType === "record" || entry.entityType === "seabed") {
-        checkEntryIds.push(entry.entityId);
-      } else if (entry.entityType === "resource_tag") {
-        checkEntryIds.push(entry.entityId.split(":")[0] ?? entry.entityId);
-      } else if (entry.entityType === "entry_object") {
-        const [eid, oid] = entry.entityId.split(":");
-        if (eid) checkEntryIds.push(eid);
-        if (oid) checkObjectIds.push(oid);
-      }
-    }
-    const recsMap = new Map(
-      this.db.getRecordsByIds(checkEntryIds).map((r) => [r.id, r]),
-    );
-    const seasMap = new Map(
-      this.db.getSeabedEntriesByIds(checkEntryIds).map((s) => [s.id, s]),
-    );
-    const objsMap = new Map(
-      this.db.getObjectsByIds(checkObjectIds).map((o) => [o.id, o]),
-    );
-
+    const batchSize = Math.min(500, Math.max(limit * 2, 100));
     const filtered: ChangeLogEntry[] = [];
-    let scannedSeq = sinceSeq;
-    for (const entry of raw.entries) {
-      scannedSeq = entry.seq;
-      if (entry.entityType === "seabed") {
-        if (!seabedSet.has(entry.realmId)) continue;
-        const sea = seasMap.get(entry.entityId);
-        if (sea && (sea.sensitivity === "secret" || !vis.canSeeSeabed(sea))) {
-          continue;
-        }
-      } else if (entry.entityType === "record") {
-        if (!ledgerSet.has(entry.realmId)) continue;
-        const rec = recsMap.get(entry.entityId);
-        if (rec && (rec.sensitivity === "secret" || !vis.canSeeRecord(rec))) {
-          continue;
-        }
-      } else if (
-        entry.entityType === "entry_object" ||
-        entry.entityType === "resource_tag"
-      ) {
-        if (!ledgerSet.has(entry.realmId) && !seabedSet.has(entry.realmId)) {
-          continue;
-        }
-        const [entryId = "", objId] = entry.entityId.split(":");
-        const rec = recsMap.get(entryId);
-        if (rec && (rec.sensitivity === "secret" || !vis.canSeeRecord(rec))) {
-          continue;
-        }
-        const sea = rec ? undefined : seasMap.get(entryId);
-        if (sea && (sea.sensitivity === "secret" || !vis.canSeeSeabed(sea))) {
-          continue;
-        }
-        if (entry.entityType === "entry_object" && objId) {
-          const obj = objsMap.get(objId);
-          if (obj && !scope.readableLedgerIds.includes(obj.realmId)) {
-            continue;
-          }
-        }
-      } else if (entry.realmId !== "__org__" && !ledgerSet.has(entry.realmId)) {
-        continue;
+    let scanSeq = sinceSeq;
+    let generation = this.db.getChangeLogGeneration();
+
+    while (filtered.length < limit) {
+      const raw = this.db.listChangeLogForPump({
+        orgId: viewerRealm.orgId,
+        ledgerRealmIds: scope.readableLedgerIds,
+        seabedRealmIds: scope.readableSeabedIds,
+        driveRealmIds: scope.readableDriveIds,
+        sinceSeq: scanSeq,
+        limit: batchSize,
+        includeSecret: false,
+        filterRealmIds,
+      });
+      generation = raw.generation;
+      if (raw.frames.length === 0) break;
+
+      const remaining = limit - filtered.length;
+      const visibleBatch = filterVisibleChangeFrames({
+        db: this.db,
+        frames: raw.frames,
+        vis,
+        scope,
+        ledgerRealmIds,
+        seabedRealmIds,
+        driveRealmIds,
+        includeOrgLevel,
+        includeSecret: false,
+        limit: remaining,
+      });
+      for (const f of visibleBatch) {
+        filtered.push({
+          seq: f.seq,
+          generation: f.generation,
+          orgId: viewerRealm.orgId,
+          realmId: f.realmId,
+          entityType: f.entityType,
+          entityId: f.entityId,
+          op: f.op,
+          assetClass: f.assetClass,
+          actorId: f.actorId,
+          createdAt: f.createdAt,
+        });
       }
 
-      filtered.push(entry);
-      if (filtered.length >= limit) break;
+      const lastRawSeq = raw.frames[raw.frames.length - 1]!.seq;
+      if (lastRawSeq <= scanSeq || raw.frames.length < batchSize) {
+        break;
+      }
+      scanSeq = lastRawSeq;
     }
 
-    // Cursor semantics:
-    // - When raw batch had rows, advance strictly to the last scanned row in this batch
-    //   (never jumping to org-wide maxSeq, which would skip subsequent visible changes or leak hidden activity).
-    // - When raw batch was empty, keep sinceSeq unchanged.
-    const latestSeq = raw.entries.length > 0 ? scannedSeq : sinceSeq;
+    // Cursor semantics: advance strictly to the last visible frame returned
+    // (never advancing on hidden frames or jumping to org-wide maxSeq).
+    const latestSeq =
+      filtered.length > 0 ? filtered[filtered.length - 1]!.seq : sinceSeq;
 
     return {
-      generation: raw.generation,
+      generation,
       sinceSeq,
       latestSeq,
       entries: filtered,
@@ -4251,7 +4274,7 @@ export class SeaEngine {
       viewerRealmId: viewerRealm.id,
       target: parsed.entryId,
       includeDescendantSeabed,
-      scopeCeiling: scope,
+      scopeCeiling: params.scopeCeiling,
     });
 
     // Normalize drive:// sourceRef to canonical file:... for verbatim round-trip
