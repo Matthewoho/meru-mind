@@ -581,8 +581,24 @@ export function collectObjectCardEntryIds(params: {
   return Array.from(new Set([...viaObj, ...viaTag]));
 }
 
-function isAsciiSpace(code: number): boolean {
-  return code === 0x20 || code === 0x09; // ' ' or '\t'
+/**
+ * Matches the EXACT full ECMA-262 horizontal `\s` whitespace set (all non-line-terminator
+ * code points matched by JS `/\s/`): ASCII space/tab, NBSP, Ogham space, U+2000..U+200A,
+ * narrow NBSP, medium mathematical space, CJK full-width space, and BOM/ZWNBSP.
+ * (All line-breaking `\s` characters are normalized to `\n` before per-line classification.)
+ */
+function isMarkdownSpace(code: number): boolean {
+  return (
+    code === 0x20 ||
+    code === 0x09 ||
+    code === 0x00a0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000 ||
+    code === 0xfeff
+  );
 }
 
 /**
@@ -596,14 +612,14 @@ function classifyMarkdownHeadingLine(line: string): {
   atxText: string;
 } {
   let end = line.length;
-  while (end > 0 && isAsciiSpace(line.charCodeAt(end - 1))) {
+  while (end > 0 && isMarkdownSpace(line.charCodeAt(end - 1))) {
     end--;
   }
   let pos = 0;
   const listMarkers: string[] = [];
 
   while (pos < end) {
-    while (pos < end && isAsciiSpace(line.charCodeAt(pos))) {
+    while (pos < end && isMarkdownSpace(line.charCodeAt(pos))) {
       pos++;
     }
     if (pos >= end) break;
@@ -612,7 +628,7 @@ function classifyMarkdownHeadingLine(line: string): {
     // Blockquote marker `>`
     if (ch === 0x3e /* '>' */) {
       pos++;
-      if (pos < end && isAsciiSpace(line.charCodeAt(pos))) {
+      if (pos < end && isMarkdownSpace(line.charCodeAt(pos))) {
         pos++;
       }
       continue;
@@ -622,11 +638,11 @@ function classifyMarkdownHeadingLine(line: string): {
     if (
       (ch === 0x2d /* '-' */ || ch === 0x2a /* '*' */ || ch === 0x2b /* '+' */) &&
       pos + 1 < end &&
-      isAsciiSpace(line.charCodeAt(pos + 1))
+      isMarkdownSpace(line.charCodeAt(pos + 1))
     ) {
       const marker = line[pos]!;
       let next = pos + 1;
-      while (next < end && isAsciiSpace(line.charCodeAt(next))) {
+      while (next < end && isMarkdownSpace(line.charCodeAt(next))) {
         next++;
       }
       if (next < end) {
@@ -647,11 +663,11 @@ function classifyMarkdownHeadingLine(line: string): {
         d < end &&
         (line.charCodeAt(d) === 0x2e /* '.' */ || line.charCodeAt(d) === 0x29 /* ')' */) &&
         d + 1 < end &&
-        isAsciiSpace(line.charCodeAt(d + 1))
+        isMarkdownSpace(line.charCodeAt(d + 1))
       ) {
         const marker = line.slice(pos, d + 1);
         let next = d + 1;
-        while (next < end && isAsciiSpace(line.charCodeAt(next))) {
+        while (next < end && isMarkdownSpace(line.charCodeAt(next))) {
           next++;
         }
         if (next < end) {
@@ -675,9 +691,9 @@ function classifyMarkdownHeadingLine(line: string): {
     while (h < end && h - pos < 6 && line.charCodeAt(h) === 0x23) {
       h++;
     }
-    if (h === end || isAsciiSpace(line.charCodeAt(h))) {
+    if (h === end || isMarkdownSpace(line.charCodeAt(h))) {
       let textStart = h;
-      while (textStart < end && isAsciiSpace(line.charCodeAt(textStart))) {
+      while (textStart < end && isMarkdownSpace(line.charCodeAt(textStart))) {
         textStart++;
       }
       // CommonMark optional closing `#` sequence (must be preceded by space/tab or be entire text)
@@ -686,9 +702,9 @@ function classifyMarkdownHeadingLine(line: string): {
       while (hashEnd > textStart && line.charCodeAt(hashEnd - 1) === 0x23) {
         hashEnd--;
       }
-      if (hashEnd < textEnd && (hashEnd === textStart || isAsciiSpace(line.charCodeAt(hashEnd - 1)))) {
+      if (hashEnd < textEnd && (hashEnd === textStart || isMarkdownSpace(line.charCodeAt(hashEnd - 1)))) {
         textEnd = hashEnd;
-        while (textEnd > textStart && isAsciiSpace(line.charCodeAt(textEnd - 1))) {
+        while (textEnd > textStart && isMarkdownSpace(line.charCodeAt(textEnd - 1))) {
           textEnd--;
         }
       }
@@ -723,18 +739,18 @@ function classifyMarkdownHeadingLine(line: string): {
  */
 function stripLeadingBlockquotesLinear(line: string): string {
   let end = line.length;
-  while (end > 0 && isAsciiSpace(line.charCodeAt(end - 1))) {
+  while (end > 0 && isMarkdownSpace(line.charCodeAt(end - 1))) {
     end--;
   }
   let pos = 0;
   while (pos < end) {
     let scan = pos;
-    while (scan < end && isAsciiSpace(line.charCodeAt(scan))) {
+    while (scan < end && isMarkdownSpace(line.charCodeAt(scan))) {
       scan++;
     }
     if (scan < end && line.charCodeAt(scan) === 0x3e /* '>' */) {
       pos = scan + 1;
-      if (pos < end && isAsciiSpace(line.charCodeAt(pos))) {
+      if (pos < end && isMarkdownSpace(line.charCodeAt(pos))) {
         pos++;
       }
       continue;
