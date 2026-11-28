@@ -247,14 +247,16 @@ export class MindPump {
       includeOrgLevel = false;
     }
 
-    const batchSize = Math.min(500, Math.max(limit * 2, 100));
-    const MAX_SCAN_BATCHES = 20;
+    const initialBatchSize = Math.min(500, Math.max(limit * 2, 100));
     const collected: PumpChangeFrame[] = [];
     let scanSeq = sinceSeq;
     let resGen = currentGen;
     let resTopoVer = topoVer;
+    let batchIndex = 0;
 
-    for (let batch = 0; batch < MAX_SCAN_BATCHES && collected.length < limit; batch++) {
+    while (collected.length < limit) {
+      const batchSize = batchIndex === 0 ? initialBatchSize : 500;
+      batchIndex++;
       const raw = this.db.listChangeLogForPump({
         orgId: this.principal.orgId,
         ledgerRealmIds: scope.readableLedgerIds,

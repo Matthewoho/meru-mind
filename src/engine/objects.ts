@@ -561,6 +561,8 @@ export class ObjectEngine {
     because?: string;
     writeScope?: TokenWriteScope;
     scopeCeiling?: AccessScope;
+    /** Optional surface-level guard invoked strictly AFTER content write access passes and active rules are detected (e.g. Cookie session rejection without leaking rule existence to non-writers). */
+    onActiveRulesGuard?: () => void;
   }): ObjectStateSetResult {
     if (!params.actor?.id?.trim()) {
       throw new MindError("INVALID_INPUT", "Actor id cannot be empty");
@@ -652,6 +654,9 @@ export class ObjectEngine {
           objectId: obj.id,
           includeAncestors: true,
         });
+      if (requiresAdminForActiveRules) {
+        params.onActiveRulesGuard?.();
+      }
       if (requiresAdminForActiveRules && params.actor.kind !== "human") {
         throw new MindError(
           "ACCESS_DENIED",

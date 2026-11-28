@@ -423,12 +423,15 @@ export function collectActiveDecisionHeads(params: {
 
 /**
  * Checks whether an object (or any of its `within` descendants, and optionally `within` ancestors)
- * carries ANY active non-redacted non-secret rule within the object's governance domain
- * (`ancestors(obj.realmId) ∪ {obj.realmId} ∪ descendants(obj.realmId)`).
+ * is governed by ANY active non-redacted non-secret rule, using the exact same governance
+ * definition as read-side `collectObjectScopedRules` (L8 object ∪ tag + L9 same-`kind:name`
+ * objects inside each target object's governing realms `ancestors(o.realmId) ∪ {o.realmId}`).
  *
  * Used strictly by I4 subtractive write guards (`setObjectState` to inactive, `deleteObject`).
- * Restricting to the object's vertical realm lineage prevents cross-sibling existence probing
- * and cross-sibling tag DoS locks while preserving complete I4 rule enforcement.
+ * - Strictly excludes sibling realms and `secret` rules (zero cross-wall probe or sibling DoS).
+ * - Strictly requires governing rules of object `o` to reside in `ancestors(o.realmId) ∪ {o.realmId}`
+ *   (prevents child realms from linking a descendant rule directly onto a parent object to DoS-lock it).
+ * - Includes L9 same-`kind:name` ancestor objects so `/service:api` rules protect `/b1/service:api`.
  */
 export function hasActiveRulesOnObjectHierarchy(params: {
   db: DbPort;
@@ -442,7 +445,7 @@ export function hasActiveRulesOnObjectHierarchy(params: {
 
   const orgRealms = params.realms.filter((r) => r.orgId === params.orgId);
   const orgRealmsById = new Map(orgRealms.map((r) => [r.id, r]));
-  const candidateRealms = new Set<string>([
+  const lineageRealms = new Set<string>([
     root.realmId,
     ...getAncestorIds(orgRealmsById, root.realmId),
     ...getDescendantIds(orgRealms, root.realmId),
@@ -450,7 +453,7 @@ export function hasActiveRulesOnObjectHierarchy(params: {
 
   const lineageObjects = params.db.listObjects({
     orgId: params.orgId,
-    realmIds: Array.from(candidateRealms),
+    realmIds: Array.from(lineageRealms),
   });
   const byId = new Map(lineageObjects.map((o) => [o.id, o]));
   if (!byId.has(root.id)) {
@@ -474,59 +477,74 @@ export function hasActiveRulesOnObjectHierarchy(params: {
     }
   }
 
-  const directEntryIds = new Set<string>(
-    params.db.listEntryIdsForObjects(params.orgId, Array.from(targetObjIds)),
-  );
-  if (directEntryIds.size > 0) {
-    const directRecs = params.db.getRecordsByIds(Array.from(directEntryIds));
-    if (
-      directRecs.some(
-        (r) =>
-          r.orgId === params.orgId &&
-          r.kind === "rule" &&
-          r.status === "active" &&
-          r.redactedAt === null &&
-          r.sensitivity !== "secret" &&
-          candidateRealms.has(r.realmId),
-      )
-    ) {
-      return true;
+  // Group lineage objects by canonical `(kind, name)` for L9 same-name governance lookup
+  const objectsByKindName = new Map<string, MindObject[]>();
+  for (const o of lineageObjects) {
+    const key = `${o.kind}\0${o.name}`;
+    let list = objectsByKindName.get(key);
+    if (!list) {
+      list = [];
+      objectsByKindName.set(key, list);
     }
+    list.push(o);
   }
 
-  // Tag-matched rules only govern an object `o` when they reside in `o.realmId` or an ancestor realm of `o`.
-  const tagRealmsByEntryId = new Map<string, Set<string>>();
-  for (const oid of targetObjIds) {
-    const o = byId.get(oid);
-    if (!o) continue;
-    const normTag = tryNormalizeResourceTag(`${o.kind}:${o.name}`);
-    if (!normTag) continue;
-    const objGoverningRealms = new Set<string>([
-      o.realmId,
-      ...getAncestorIds(orgRealmsById, o.realmId),
-    ]);
-    for (const eid of params.db.listEntryIdsByResourceTag(params.orgId, normTag)) {
-      let allowed = tagRealmsByEntryId.get(eid);
+  // Map each candidate entryId -> union of governing realms in which a rule would govern at least one target object `o`.
+  const allowedRealmsByEntryId = new Map<string, Set<string>>();
+  const addCandidates = (entryIds: string[], govRealms: Set<string>): void => {
+    for (const eid of entryIds) {
+      let allowed = allowedRealmsByEntryId.get(eid);
       if (!allowed) {
         allowed = new Set<string>();
-        tagRealmsByEntryId.set(eid, allowed);
+        allowedRealmsByEntryId.set(eid, allowed);
       }
-      for (const rid of objGoverningRealms) {
+      for (const rid of govRealms) {
         allowed.add(rid);
       }
     }
+  };
+
+  for (const oid of targetObjIds) {
+    const o = byId.get(oid);
+    if (!o) continue;
+    const objGovRealms = new Set<string>([
+      o.realmId,
+      ...getAncestorIds(orgRealmsById, o.realmId),
+    ]);
+
+    // L8 + L9 direct object links: `o` itself plus any same-(kind,name) object in `objGovRealms`
+    const sameNameObjs = objectsByKindName.get(`${o.kind}\0${o.name}`) ?? [];
+    const governingObjIds = new Set<string>([o.id]);
+    for (const peer of sameNameObjs) {
+      if (objGovRealms.has(peer.realmId)) {
+        governingObjIds.add(peer.id);
+      }
+    }
+    addCandidates(
+      params.db.listEntryIdsForObjects(params.orgId, Array.from(governingObjIds)),
+      objGovRealms,
+    );
+
+    // L8 resource-tag matches in `objGovRealms`
+    const normTag = tryNormalizeResourceTag(`${o.kind}:${o.name}`);
+    if (normTag) {
+      addCandidates(
+        params.db.listEntryIdsByResourceTag(params.orgId, normTag),
+        objGovRealms,
+      );
+    }
   }
 
-  if (tagRealmsByEntryId.size === 0) return false;
-  const tagRecs = params.db.getRecordsByIds(Array.from(tagRealmsByEntryId.keys()));
-  return tagRecs.some(
+  if (allowedRealmsByEntryId.size === 0) return false;
+  const recs = params.db.getRecordsByIds(Array.from(allowedRealmsByEntryId.keys()));
+  return recs.some(
     (r) =>
       r.orgId === params.orgId &&
       r.kind === "rule" &&
       r.status === "active" &&
       r.redactedAt === null &&
       r.sensitivity !== "secret" &&
-      Boolean(tagRealmsByEntryId.get(r.id)?.has(r.realmId)),
+      Boolean(allowedRealmsByEntryId.get(r.id)?.has(r.realmId)),
   );
 }
 
@@ -563,12 +581,12 @@ export function collectObjectCardEntryIds(params: {
 /**
  * Prompt-injection guard for L3 narrative cards (`#7`):
  * - Normalizes ALL ASCII and Unicode line breaks (`\r\n`, lone `\r`, `\u2028`, `\u2029`, `\u0085`, `\v`, `\f`)
- *   before line splitting so lone CR or Unicode separators cannot escape the blockquote.
- * - Strips leading blockquote prefixes (`>`) before demoting ATX headings (`# ...` -> `**...**`),
- *   list-nested ATX headings (`- ## ...` -> `- **...**`), and CommonMark Setext heading underlines
- *   (`=`/`-` of any length -> `—`).
+ *   and strips NUL bytes before line splitting so no control/line separator can escape the blockquote.
+ * - Iteratively peels arbitrary nesting of leading whitespace, blockquote markers (`>`), and list
+ *   markers (`- `, `* `, `+ `, `1. `, `1) `) before checking for ATX headings (`#{1,6}`) or CommonMark
+ *   Setext underlines (`=`/`-` of any length), eliminating nested-container and 4-space continuation bypasses.
  * - Prefixes every line as a flat blockquote (`> ...`) so narrative text can NEVER spoof `## 规矩`
- *   or top-level sections when read by downstream agents.
+ *   or produce any Markdown heading at any nesting depth when read by downstream agents.
  */
 export function sanitizeNarrativeForAgent(md: string): string {
   const normalized = md
@@ -579,27 +597,40 @@ export function sanitizeNarrativeForAgent(md: string): string {
   const lines = normalized.split("\n");
   return lines
     .map((rawLine) => {
-      // Strip any attacker-supplied leading blockquote prefixes before inspecting for headings
-      const inner = rawLine.replace(/^(?:\s*>\s*)+/, "");
-      const atx = /^\s{0,3}#{1,6}(?:\s+(.*?)|)\s*#*\s*$/.exec(inner);
+      // Trim trailing whitespace first so `-\s+` (Setext underline with trailing spaces) can never match as a list marker.
+      let rest = rawLine.replace(/\s+$/, "");
+      const listMarkers: string[] = [];
+      while (true) {
+        const stripped = rest.replace(/^\s+/, "");
+        const bq = /^>\s?(.*)$/.exec(stripped);
+        if (bq) {
+          rest = bq[1]!;
+          continue;
+        }
+        // Only peel list markers followed by whitespace+non-empty content so bare `-`/`--`/`---` stay intact for Setext check
+        const li = /^((?:[-*+]|\d{1,9}[.)])\s+)(.+)$/.exec(stripped);
+        if (li) {
+          listMarkers.push(li[1]!.trimEnd());
+          rest = li[2]!;
+          continue;
+        }
+        rest = stripped;
+        break;
+      }
+
+      const listPrefix = listMarkers.length > 0 ? `${listMarkers.join(" ")} ` : "";
+      const atx = /^#{1,6}(?:\s+(.*?)|)\s*#*$/.exec(rest);
       if (atx) {
         const headingText = (atx[1] ?? "").trim();
-        return headingText ? `> **${headingText}**` : ">";
+        if (headingText) return `> ${listPrefix}**${headingText}**`;
+        return listPrefix ? `> ${listPrefix.trimEnd()}` : ">";
       }
-      const listAtx =
-        /^(\s{0,3}(?:[-*+]|\d{1,9}[.)])\s+)\s{0,3}#{1,6}(?:\s+(.*?)|)\s*#*\s*$/.exec(
-          inner,
-        );
-      if (listAtx) {
-        const listPrefix = listAtx[1]!;
-        const headingText = (listAtx[2] ?? "").trim();
-        return headingText ? `> ${listPrefix}**${headingText}**` : `> ${listPrefix.trimEnd()}`;
+      if (/^(?:=+|-+)$/.test(rest)) {
+        return `> ${listPrefix}—`;
       }
-      if (/^\s{0,3}(?:=+|-+)\s*$/.test(inner)) {
-        return "> —";
-      }
-      const trimmedRight = inner.replace(/\s+$/, "");
-      return trimmedRight ? `> ${trimmedRight}` : ">";
+      // For safe non-heading lines, preserve clean text while flattening attacker blockquote markers
+      const safeBody = rawLine.replace(/^(?:\s*>\s*)+/, "").replace(/\s+$/, "");
+      return safeBody ? `> ${safeBody}` : ">";
     })
     .join("\n");
 }

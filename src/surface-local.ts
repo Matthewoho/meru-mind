@@ -20,7 +20,6 @@ import {
   filterVisibleChangeFrames,
 } from "./engine/visibility.js";
 import { assertNoAccidentalSecret } from "./engine/secret-guard.js";
-import { hasActiveRulesOnObjectHierarchy } from "./engine/object-rules.js";
 import {
   findBoundRulesForEcho,
   findRelatedActiveForEcho,
@@ -1271,19 +1270,7 @@ export class LocalMindSurface implements MindSurface {
   ): Promise<ObjectStateSetResult> {
     const ctx = this.resolveScopeContext(false);
     const objectId = this.resolveObjectIdForSurface(params.ref, ctx);
-    if (
-      params.state !== "active" &&
-      hasActiveRulesOnObjectHierarchy({
-        db: this.engine.db,
-        realms: ctx.realms,
-        orgId: ctx.org.id,
-        objectId,
-        includeAncestors: true,
-      })
-    ) {
-      const cliCmd = `meru-mind object set ${params.ref} --state ${params.state}${params.label ? ` --label ${params.label}` : ""} --as-human`;
-      this.assertNotWeakenedCookie("object set inactive (active rules)", cliCmd);
-    }
+    const cliCmd = `meru-mind object set ${params.ref} --state ${params.state}${params.label ? ` --label ${params.label}` : ""} --as-human`;
     return this.engine.objects.setObjectState({
       actor: this.principal.actor,
       viewerRealmId: this.principal.boundRealmId,
@@ -1294,6 +1281,9 @@ export class LocalMindSurface implements MindSurface {
       because: params.because,
       writeScope: this.effectiveWriteScope(),
       scopeCeiling: ctx.scope,
+      onActiveRulesGuard: () => {
+        this.assertNotWeakenedCookie("object set inactive (active rules)", cliCmd);
+      },
     });
   }
 

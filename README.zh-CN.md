@@ -134,7 +134,7 @@ MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
 - **实验功能面**（已在 `--help` 标注 `[experimental]`，未写入官方 Skill）：`file`（本地共享文件盘）、`raw`（直接写入海床 CLI）、`settle`（蒸馏卡片）及 `thing` 记录类型。
 - **SQLite 唯一核心后端**：SQLite（`node:sqlite` WAL）是唯一核心存储与在线真源；未来迁移至 Postgres 属于由明确容量指标触发的独立迁移项目，不承诺接口层零重写替换。
 
-### 已知局限（`v0.6.6`）
+### 已知局限（`v0.7.0`）
 1. **默认纯字面检索**：未配置外部 Embedding 时仅使用 CJK 双字 + 拉丁 FTS5 与局部窗口覆盖度。
 2. **批量导入不自动建 `supersedes` 链**：导入语料中未声明取代关系的新旧文档会并排保持 `active`（日常写入已提供中性相似条目回显，方便 Agent 显式挂取代链）。
 3. **单写者 SQLite 服务约束**：`meru-mind serve` 持有独占写锁，需部署在带持久本地块存储的单实例节点（避免多副本共享 NFS/SMB）。
