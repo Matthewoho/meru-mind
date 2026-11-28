@@ -143,8 +143,8 @@ describe("v0.6.2 Upgrade CLI, GHCR/Compose, Multi-Harness Session Propagation & 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
-          tag_name: "v0.7.0",
-          html_url: "https://github.com/Matthewoho/meru-mind/releases/tag/v0.7.0",
+          tag_name: "v9.9.0",
+          html_url: "https://github.com/Matthewoho/meru-mind/releases/tag/v9.9.0",
           published_at: "2026-11-26T00:00:00Z",
         }),
       );
@@ -185,7 +185,7 @@ describe("v0.6.2 Upgrade CLI, GHCR/Compose, Multi-Harness Session Propagation & 
     expect(upgradeJson.upgraded).toBe(false);
     expect(upgradeJson.checkOnly).toBe(true);
     expect(upgradeJson.previousVersion).toBe(MERU_MIND_VERSION);
-    expect(upgradeJson.latestVersion).toBe("0.7.0");
+    expect(upgradeJson.latestVersion).toBe("9.9.0");
     expect(upgradeJson.remoteServer?.url).toBe(srv.url);
     expect(upgradeJson.remoteServer?.version).toBe(MERU_MIND_VERSION);
     expect(upgradeJson.remoteServer?.updateAvailable).toBe(true);
@@ -201,7 +201,7 @@ describe("v0.6.2 Upgrade CLI, GHCR/Compose, Multi-Harness Session Propagation & 
         },
       },
     );
-    expect(JSON.parse(aliasOut).latestVersion).toBe("0.7.0");
+    expect(JSON.parse(aliasOut).latestVersion).toBe("9.9.0");
 
     // 1d. Container mode MUST refuse self-upgrade and print `docker compose pull`
     const containerCalls: string[] = [];
@@ -257,10 +257,10 @@ describe("v0.6.2 Upgrade CLI, GHCR/Compose, Multi-Harness Session Propagation & 
         cleanCalls.push(`${bin} ${args.join(" ")}`);
         return { stdout: "", stderr: "" };
       },
-      readFile: () => JSON.stringify({ name: "@meru-mind/core", version: "0.7.0" }),
+      readFile: () => JSON.stringify({ name: "@meru-mind/core", version: "9.9.0" }),
     });
     expect(cleanRes.upgraded).toBe(true);
-    expect(cleanRes.newVersion).toBe("0.7.0");
+    expect(cleanRes.newVersion).toBe("9.9.0");
     expect(cleanCalls).toEqual([
       "git status --porcelain",
       "git fetch --tags",
@@ -321,7 +321,7 @@ describe("v0.6.2 Upgrade CLI, GHCR/Compose, Multi-Harness Session Propagation & 
     // 1h. Already up to date -> no commands run
     const upToDateCalls: string[] = [];
     const upToDateRes = await runUpgrade({
-      currentVersion: "0.7.0",
+      currentVersion: "9.9.0",
       releasesApiUrl: `${mockRelease.url}/releases/latest`,
       installInfo: { mode: "git", rootDir: "/tmp/fake-repo", scriptPath: "/tmp/fake-repo/dist/cli.js" },
       execFileImpl: async (bin, args) => {

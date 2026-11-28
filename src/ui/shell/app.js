@@ -1153,6 +1153,7 @@ const state = {
   objectStaleCardExpanded: false,
   objectStaleCardLoading: false,
   objectStaleCardHistoricMd: null,
+  objectStaleCardHistoricCardId: null,
   objectEntries: [],
   objectEntriesTotal: null,
   objectEntriesHasMore: false,
@@ -1897,11 +1898,16 @@ async function selectObjectByRef(objRef, openInspector = false, opts = {}) {
         state.objectStaleCardExpanded = false;
         state.objectStaleCardLoading = false;
         state.objectStaleCardHistoricMd = null;
+        state.objectStaleCardHistoricCardId = null;
         state.objectEntriesLoadingMore = false;
         state.objectShowHistory = false;
-      } else if (res.card.cardFreshness?.status !== "hard_stale") {
+      } else if (
+        res.card.cardFreshness?.status !== "hard_stale" ||
+        (res.card.narrativeCard?.id || null) !== state.objectStaleCardHistoricCardId
+      ) {
         state.objectStaleCardExpanded = false;
         state.objectStaleCardHistoricMd = null;
+        state.objectStaleCardHistoricCardId = null;
       }
       // If initial loadObjectEntries failed or used a non-canonical ref and returned empty while counts.total > 0, retry with canonical ref
       if (streamRes && !streamRes.ok && res.card.ref && res.card.ref !== objRef) {
@@ -4434,7 +4440,11 @@ function buildObjectPage() {
           return;
         }
         state.objectStaleCardExpanded = true;
-        if (state.objectStaleCardHistoricMd !== null) {
+        const targetCardId = nc.id || null;
+        if (
+          state.objectStaleCardHistoricMd !== null &&
+          state.objectStaleCardHistoricCardId === targetCardId
+        ) {
           render();
           return;
         }
@@ -4445,9 +4455,11 @@ function buildObjectPage() {
           const staleRes = await client.show(targetRef, { include_stale_narrative: 1 });
           if (state.selectedObject?.ref !== targetRef) return;
           state.objectStaleCardHistoricMd = staleRes?.card?.narrativeCard?.historicNarrativeMd ?? "";
+          state.objectStaleCardHistoricCardId = staleRes?.card?.narrativeCard?.id || targetCardId;
         } catch (err) {
           if (state.selectedObject?.ref !== targetRef) return;
           state.objectStaleCardHistoricMd = "";
+          state.objectStaleCardHistoricCardId = null;
           showToast(err?.message || st("loadObjectFailed"));
         } finally {
           if (state.selectedObject?.ref === targetRef) {
@@ -4469,8 +4481,8 @@ function buildObjectPage() {
           sec.appendChild(unavail);
         }
       }
-    } else if (nc.narrativeMd) {
-      sec.appendChild(mountNarrativeMarkdown(nc.narrativeMd, false));
+    } else if (nc.narrativeMd || nc.safeNarrativeMd) {
+      sec.appendChild(mountNarrativeMarkdown(nc.narrativeMd || nc.safeNarrativeMd, false));
     }
 
     if (nc.settledBy || nc.createdAt) {

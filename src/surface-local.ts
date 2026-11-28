@@ -15,7 +15,10 @@ import {
   resolveAboutRefsForWrite,
   resolveUnifiedObjectRead,
 } from "./engine/refs.js";
-import { createVisibilityHelpers } from "./engine/visibility.js";
+import {
+  createVisibilityHelpers,
+  filterVisibleChangeFrames,
+} from "./engine/visibility.js";
 import { assertNoAccidentalSecret } from "./engine/secret-guard.js";
 import { hasActiveRulesOnObjectHierarchy } from "./engine/object-rules.js";
 import {
@@ -505,9 +508,10 @@ export class LocalMindSurface implements MindSurface {
       category: "content",
     });
 
-    // Collision hints (v0.3 + v0.5.4): look back to the EARLIER of `baselineSeq` or 10 minutes ago
-    // so stateless `/mcp` calls (baselineSeq=0) and one-shot CLI calls (fresh whoami cursor)
-    // both receive recent same-realm peer activity without requiring stateful server sessions.
+    // Collision hints (v0.3 + v0.5.4 + v0.7.0 L2): look back to the EARLIER of `baselineSeq` or 10 minutes ago
+    // and route EVERY candidate frame through the single shared `filterVisibleChangeFrames` boundary
+    // so secret entry_object/resource_tag frames, non-readable object refs, descendant seabed frames
+    // without dive, and L5-filtered distillations can NEVER leak into `write` responses.
     const COLLISION_LOOKBACK_MS = 10 * 60_000;
     const baselineSeq =
       params.lastReadSeq !== undefined ? params.lastReadSeq : this.lastReadSeq;
@@ -519,13 +523,38 @@ export class LocalMindSurface implements MindSurface {
         ? { sinceSeq: baselineSeq, sinceCreatedAt: lookbackIso, combineSinceWithOr: true }
         : { sinceCreatedAt: lookbackIso }),
       order: "desc",
-      limit: 30,
+      limit: 80,
       includeSecret: false,
     });
-    const collisionHints: ChangeLogEntry[] = recent.entries
-      .filter((e) => e.actorId !== this.principal.actor.id)
-      .slice(0, 10)
-      .reverse();
+    const peerRawFrames = recent.entries.filter(
+      (e) => e.actorId !== this.principal.actor.id,
+    );
+    const collisionVis = createVisibilityHelpers({
+      db: this.engine.db,
+      realms: routed.realms,
+      mounts: ctx.mounts,
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      scope: refreshedScope,
+    });
+    const collisionHints: ChangeLogEntry[] = filterVisibleChangeFrames({
+      db: this.engine.db,
+      frames: peerRawFrames,
+      vis: collisionVis,
+      scope: refreshedScope,
+      ledgerRealmIds: refreshedScope.readableLedgerIds.includes(routed.realm.id)
+        ? [routed.realm.id]
+        : [],
+      seabedRealmIds: refreshedScope.readableSeabedIds.includes(routed.realm.id)
+        ? [routed.realm.id]
+        : [],
+      driveRealmIds: refreshedScope.readableDriveIds.includes(routed.realm.id)
+        ? [routed.realm.id]
+        : [],
+      includeOrgLevel: false,
+      includeSecret: false,
+      limit: 10,
+    }).reverse();
 
     const record = await writeEverydayConclusion({
       db: this.engine.db,
@@ -892,10 +921,18 @@ export class LocalMindSurface implements MindSurface {
       }
       const boundSubtree = this.getBoundSubtreeRealmIds(ctx.realms);
       if (!boundSubtree.has(entryRealmId)) {
-        const entryRealm = ctx.realms.find((r) => r.id === entryRealmId);
+        const redactVis = createVisibilityHelpers({
+          db: this.engine.db,
+          realms: ctx.realms,
+          mounts: ctx.mounts,
+          actor: this.principal.actor,
+          viewerRealmId: this.principal.boundRealmId,
+          scope: ctx.scope,
+        });
+        const safePath = redactVis.getSanitizedRealmPath(entryRealmId);
         throw new MindError(
           "ACCESS_DENIED",
-          `Cannot redact entry in "${entryRealm?.path ?? entryRealmId}": realm is outside your bound subtree.`,
+          `Cannot redact entry in "${safePath}": realm is outside your bound subtree.`,
         );
       }
     }
@@ -1238,6 +1275,7 @@ export class LocalMindSurface implements MindSurface {
       params.state !== "active" &&
       hasActiveRulesOnObjectHierarchy({
         db: this.engine.db,
+        realms: ctx.realms,
         orgId: ctx.org.id,
         objectId,
         includeAncestors: true,

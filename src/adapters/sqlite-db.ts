@@ -5035,6 +5035,21 @@ export class SqliteDb implements DbPort {
           WHERE s.id = cl.entity_id AND s.sensitivity = 'secret'
         )
       )`);
+      where.push(`NOT (
+        cl.entity_type IN ('entry_object', 'resource_tag')
+        AND (
+          EXISTS (
+            SELECT 1 FROM records r
+            WHERE r.id = CASE WHEN instr(cl.entity_id, ':') > 0 THEN substr(cl.entity_id, 1, instr(cl.entity_id, ':') - 1) ELSE cl.entity_id END
+              AND r.sensitivity = 'secret'
+          )
+          OR EXISTS (
+            SELECT 1 FROM seabed_entries s
+            WHERE s.id = CASE WHEN instr(cl.entity_id, ':') > 0 THEN substr(cl.entity_id, 1, instr(cl.entity_id, ':') - 1) ELSE cl.entity_id END
+              AND s.sensitivity = 'secret'
+          )
+        )
+      )`);
     }
     const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
     const orderSql = params?.order === "desc" ? "DESC" : "ASC";

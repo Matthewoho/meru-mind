@@ -16,7 +16,7 @@
 
 services:
   meru-mind:
-    image: ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.6}
+    image: ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.7.0}
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true

@@ -1,4 +1,4 @@
-import { getAncestorIds } from "../policy.js";
+import { getAncestorIds, getDescendantIds } from "../policy.js";
 import type { DbPort } from "../ports.js";
 import type {
   AccessScope,
@@ -193,24 +193,35 @@ export function collectWallRules(params: {
   if (governing.size === 0) return [];
 
   const governingList = Array.from(governing);
-  const allRules = params.db
-    .listRecords({
+  const rawRules: LedgerRecord[] = [];
+  const pageSize = 500;
+  let offset = 0;
+  while (true) {
+    const page = params.db.listRecords({
       realmIds: governingList,
       kinds: ["rule"],
       includeSuperseded: false,
       excludeSensitivities: ["secret"],
-      limit: 5000,
-    })
-    .items.filter(
-      (r) =>
-        r.orgId === params.orgId &&
-        r.kind === "rule" &&
-        r.status === "active" &&
-        r.redactedAt === null &&
-        r.sensitivity !== "secret" &&
-        governing.has(r.realmId) &&
-        params.vis.canSeeRecord(r),
-    );
+      limit: pageSize,
+      offset,
+    });
+    rawRules.push(...page.items);
+    if (page.items.length < pageSize || rawRules.length >= page.total) {
+      break;
+    }
+    offset += page.items.length;
+  }
+
+  const allRules = rawRules.filter(
+    (r) =>
+      r.orgId === params.orgId &&
+      r.kind === "rule" &&
+      r.status === "active" &&
+      r.redactedAt === null &&
+      r.sensitivity !== "secret" &&
+      governing.has(r.realmId) &&
+      params.vis.canSeeRecord(r),
+  );
 
   const visibleObjectsById = new Map(
     params.sanitizedVisibleObjects.map((o) => [o.id, o]),
@@ -412,23 +423,43 @@ export function collectActiveDecisionHeads(params: {
 
 /**
  * Checks whether an object (or any of its `within` descendants, and optionally `within` ancestors)
- * carries ANY active non-redacted rule across the org. Used strictly by I4 subtractive write guards
- * (`setObjectState` to inactive, `deleteObject`) so agents cannot evade rules in any realm.
+ * carries ANY active non-redacted non-secret rule within the object's governance domain
+ * (`ancestors(obj.realmId) ∪ {obj.realmId} ∪ descendants(obj.realmId)`).
+ *
+ * Used strictly by I4 subtractive write guards (`setObjectState` to inactive, `deleteObject`).
+ * Restricting to the object's vertical realm lineage prevents cross-sibling existence probing
+ * and cross-sibling tag DoS locks while preserving complete I4 rule enforcement.
  */
 export function hasActiveRulesOnObjectHierarchy(params: {
   db: DbPort;
+  realms: Realm[];
   orgId: string;
   objectId: string;
   includeAncestors?: boolean;
 }): boolean {
-  const allOrgObjects = params.db.listObjects({ orgId: params.orgId });
-  const byId = new Map(allOrgObjects.map((o) => [o.id, o]));
-  const root = byId.get(params.objectId);
-  if (!root) return false;
+  const root = params.db.getObject(params.objectId);
+  if (!root || root.orgId !== params.orgId) return false;
+
+  const orgRealms = params.realms.filter((r) => r.orgId === params.orgId);
+  const orgRealmsById = new Map(orgRealms.map((r) => [r.id, r]));
+  const candidateRealms = new Set<string>([
+    root.realmId,
+    ...getAncestorIds(orgRealmsById, root.realmId),
+    ...getDescendantIds(orgRealms, root.realmId),
+  ]);
+
+  const lineageObjects = params.db.listObjects({
+    orgId: params.orgId,
+    realmIds: Array.from(candidateRealms),
+  });
+  const byId = new Map(lineageObjects.map((o) => [o.id, o]));
+  if (!byId.has(root.id)) {
+    byId.set(root.id, root);
+  }
 
   const targetObjIds = new Set<string>([
     root.id,
-    ...getDescendantObjectIds(allOrgObjects, root.id),
+    ...getDescendantObjectIds(lineageObjects, root.id),
   ]);
 
   if (params.includeAncestors) {
@@ -443,27 +474,59 @@ export function hasActiveRulesOnObjectHierarchy(params: {
     }
   }
 
-  const candidateEntryIds = new Set<string>(
+  const directEntryIds = new Set<string>(
     params.db.listEntryIdsForObjects(params.orgId, Array.from(targetObjIds)),
   );
+  if (directEntryIds.size > 0) {
+    const directRecs = params.db.getRecordsByIds(Array.from(directEntryIds));
+    if (
+      directRecs.some(
+        (r) =>
+          r.orgId === params.orgId &&
+          r.kind === "rule" &&
+          r.status === "active" &&
+          r.redactedAt === null &&
+          r.sensitivity !== "secret" &&
+          candidateRealms.has(r.realmId),
+      )
+    ) {
+      return true;
+    }
+  }
+
+  // Tag-matched rules only govern an object `o` when they reside in `o.realmId` or an ancestor realm of `o`.
+  const tagRealmsByEntryId = new Map<string, Set<string>>();
   for (const oid of targetObjIds) {
     const o = byId.get(oid);
     if (!o) continue;
     const normTag = tryNormalizeResourceTag(`${o.kind}:${o.name}`);
     if (!normTag) continue;
+    const objGoverningRealms = new Set<string>([
+      o.realmId,
+      ...getAncestorIds(orgRealmsById, o.realmId),
+    ]);
     for (const eid of params.db.listEntryIdsByResourceTag(params.orgId, normTag)) {
-      candidateEntryIds.add(eid);
+      let allowed = tagRealmsByEntryId.get(eid);
+      if (!allowed) {
+        allowed = new Set<string>();
+        tagRealmsByEntryId.set(eid, allowed);
+      }
+      for (const rid of objGoverningRealms) {
+        allowed.add(rid);
+      }
     }
   }
 
-  if (candidateEntryIds.size === 0) return false;
-  const recs = params.db.getRecordsByIds(Array.from(candidateEntryIds));
-  return recs.some(
+  if (tagRealmsByEntryId.size === 0) return false;
+  const tagRecs = params.db.getRecordsByIds(Array.from(tagRealmsByEntryId.keys()));
+  return tagRecs.some(
     (r) =>
       r.orgId === params.orgId &&
       r.kind === "rule" &&
       r.status === "active" &&
-      r.redactedAt === null,
+      r.redactedAt === null &&
+      r.sensitivity !== "secret" &&
+      Boolean(tagRealmsByEntryId.get(r.id)?.has(r.realmId)),
   );
 }
 
@@ -499,25 +562,43 @@ export function collectObjectCardEntryIds(params: {
 
 /**
  * Prompt-injection guard for L3 narrative cards (`#7`):
- * Demotes ATX headings (`# ...` -> `**...**`), neutralizes Setext heading underlines (`===`/`---`),
- * and prefixes every line as a blockquote (`> ...`) so narrative text can NEVER spoof `## 规矩`
- * or top-level sections when read by downstream agents.
+ * - Normalizes ALL ASCII and Unicode line breaks (`\r\n`, lone `\r`, `\u2028`, `\u2029`, `\u0085`, `\v`, `\f`)
+ *   before line splitting so lone CR or Unicode separators cannot escape the blockquote.
+ * - Strips leading blockquote prefixes (`>`) before demoting ATX headings (`# ...` -> `**...**`),
+ *   list-nested ATX headings (`- ## ...` -> `- **...**`), and CommonMark Setext heading underlines
+ *   (`=`/`-` of any length -> `—`).
+ * - Prefixes every line as a flat blockquote (`> ...`) so narrative text can NEVER spoof `## 规矩`
+ *   or top-level sections when read by downstream agents.
  */
 export function sanitizeNarrativeForAgent(md: string): string {
-  const normalized = md.replace(/\r\n/g, "\n").trim();
+  const normalized = md
+    .replace(/\r\n?|[\u2028\u2029\u0085\v\f]/g, "\n")
+    .replace(/\u0000/g, "")
+    .trim();
   if (!normalized) return "> _(empty)_";
   const lines = normalized.split("\n");
   return lines
     .map((rawLine) => {
-      const atx = /^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/.exec(rawLine);
+      // Strip any attacker-supplied leading blockquote prefixes before inspecting for headings
+      const inner = rawLine.replace(/^(?:\s*>\s*)+/, "");
+      const atx = /^\s{0,3}#{1,6}(?:\s+(.*?)|)\s*#*\s*$/.exec(inner);
       if (atx) {
-        const headingText = atx[1]!.trim();
+        const headingText = (atx[1] ?? "").trim();
         return headingText ? `> **${headingText}**` : ">";
       }
-      if (/^\s{0,3}(?:={3,}|-{3,})\s*$/.test(rawLine)) {
+      const listAtx =
+        /^(\s{0,3}(?:[-*+]|\d{1,9}[.)])\s+)\s{0,3}#{1,6}(?:\s+(.*?)|)\s*#*\s*$/.exec(
+          inner,
+        );
+      if (listAtx) {
+        const listPrefix = listAtx[1]!;
+        const headingText = (listAtx[2] ?? "").trim();
+        return headingText ? `> ${listPrefix}**${headingText}**` : `> ${listPrefix.trimEnd()}`;
+      }
+      if (/^\s{0,3}(?:=+|-+)\s*$/.test(inner)) {
         return "> —";
       }
-      const trimmedRight = rawLine.replace(/\s+$/, "");
+      const trimmedRight = inner.replace(/\s+$/, "");
       return trimmedRight ? `> ${trimmedRight}` : ">";
     })
     .join("\n");

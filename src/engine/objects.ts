@@ -629,10 +629,25 @@ export class ObjectEngine {
         throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
       }
 
+      // Enforce basic write permission BEFORE rule inspection so non-writers (e.g. read-only mounts)
+      // cannot probe whether active rules exist on objects they are not allowed to mutate.
+      assertWriteAccess({
+        realms,
+        mounts,
+        actor: params.actor,
+        viewerRealmId: viewerRealm.id,
+        targetRealmId: obj.realmId,
+        assetKind: "ledger",
+        orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: "content",
+      });
+
       const requiresAdminForActiveRules =
         params.state !== "active" &&
         hasActiveRulesOnObjectHierarchy({
           db: this.db,
+          realms,
           orgId: viewerRealm.orgId,
           objectId: obj.id,
           includeAncestors: true,
@@ -647,17 +662,19 @@ export class ObjectEngine {
         );
       }
 
-      assertWriteAccess({
-        realms,
-        mounts,
-        actor: params.actor,
-        viewerRealmId: viewerRealm.id,
-        targetRealmId: obj.realmId,
-        assetKind: "ledger",
-        orgPolicy,
-        writeScope: params.writeScope ?? "self",
-        category: requiresAdminForActiveRules ? "admin" : "content",
-      });
+      if (requiresAdminForActiveRules) {
+        assertWriteAccess({
+          realms,
+          mounts,
+          actor: params.actor,
+          viewerRealmId: viewerRealm.id,
+          targetRealmId: obj.realmId,
+          assetKind: "ledger",
+          orgPolicy,
+          writeScope: params.writeScope ?? "self",
+          category: "admin",
+        });
+      }
 
       const vis = createVisibilityHelpers({
         db: this.db,
@@ -1145,6 +1162,7 @@ export class ObjectEngine {
       if (
         hasActiveRulesOnObjectHierarchy({
           db: this.db,
+          realms,
           orgId: viewerRealm.orgId,
           objectId: obj.id,
           includeAncestors: false,

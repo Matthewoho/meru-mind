@@ -457,6 +457,7 @@ export function createVisibilityHelpers(params: {
   const sanitizeDistillation = (dist: Distillation): Distillation => {
     const cleanHardFacts = { ...dist.hardFacts };
     delete cleanHardFacts.basisRealmIds;
+    delete cleanHardFacts.objectRef;
     return {
       ...dist,
       hardFacts: cleanHardFacts,

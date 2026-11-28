@@ -208,8 +208,8 @@ describe("v0.6.6 Sandboxed Offline Mermaid, Scroll Preservation, Load More & Pre
       dependencies?: Record<string, string>;
       devDependencies?: Record<string, string>;
     };
-    expect(pkg.version).toBe("0.6.6");
-    expect(MERU_MIND_VERSION).toBe("0.6.6");
+    expect(pkg.version).toBe("0.7.0");
+    expect(MERU_MIND_VERSION).toBe("0.7.0");
     expect(pkg.devDependencies?.mermaid).toBe("11.17.2");
     expect(pkg.dependencies?.mermaid).toBeUndefined();
 
@@ -298,9 +298,9 @@ describe("v0.6.6 Sandboxed Offline Mermaid, Scroll Preservation, Load More & Pre
     expect(MERMAID_FRAME_JS_SOURCE).toContain("vbscript:");
     expect(MERMAID_FRAME_JS_SOURCE).toContain("data:text/html");
 
-    // Docs & Threat Model synced to v0.6.6
+    // Docs & Threat Model synced to v0.7.0
     expect(fs.readFileSync(path.resolve("docs/deployment-and-frontend.md"), "utf8")).toContain(
-      "ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.6}",
+      "ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.7.0}",
     );
     expect(fs.readFileSync(path.resolve("THREAT_MODEL.md"), "utf8")).toContain(
       "Opaque-Origin Offline Mermaid Sandbox",

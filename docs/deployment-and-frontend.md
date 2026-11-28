@@ -15,7 +15,7 @@ Meru Mind `v0.3+` runs as a **single Node.js 22+ process owning one SQLite WAL d
 
 A 1 vCPU / 1 GB RAM instance handles a small-to-medium human-AI team comfortably with zero heavy middleware (no Kafka, no Elasticsearch, no Neo4j, no CockroachDB).
 
-All Compose files (`deploy/docker-compose.yml`, `deploy/docker-compose.oidc-pocketid.yml`, `deploy/docker-compose.oidc-dex.yml`) pull the multi-arch (`linux/amd64`, `linux/arm64`) prebuilt image `ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.6.6}` automatically published on release tags by `.github/workflows/docker-publish.yml`. For local source builds during development, layer `deploy/docker-compose.build.yml`:
+All Compose files (`deploy/docker-compose.yml`, `deploy/docker-compose.oidc-pocketid.yml`, `deploy/docker-compose.oidc-dex.yml`) pull the multi-arch (`linux/amd64`, `linux/arm64`) prebuilt image `ghcr.io/matthewoho/meru-mind:${MERU_MIND_TAG:-v0.7.0}` automatically published on release tags by `.github/workflows/docker-publish.yml`. For local source builds during development, layer `deploy/docker-compose.build.yml`:
 
 ```bash
 docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.build.yml up -d --build

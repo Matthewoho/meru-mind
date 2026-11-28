@@ -782,7 +782,22 @@ describe("v0.7.0 Slice 3: card_object, V3 Freshness, L5 Closure, POST /v1/settle
       expect(showSoft.card.cardFreshness?.summaryLine).toContain(
         "其后新增：决定 +1",
       );
-      expect(showSoft.card.narrativeCard?.narrativeMd).toContain(
+      // Agents strictly receive safeNarrativeMd (raw narrativeMd is null for non-human actors)
+      expect(showSoft.card.narrativeCard?.narrativeMd).toBeNull();
+      expect(showSoft.card.narrativeCard?.safeNarrativeMd).toContain(
+        "Billing overview line.",
+      );
+    }
+
+    // Human readers still receive raw narrativeMd for Studio UI rendering
+    const showSoftHuman = await engine.sea.show({
+      actor: humanAlice,
+      viewerRealmId: b1.id,
+      ref: "service:billing",
+    });
+    expect(showSoftHuman.refType).toBe("object");
+    if (showSoftHuman.refType === "object") {
+      expect(showSoftHuman.card.narrativeCard?.narrativeMd).toContain(
         "Billing overview line.",
       );
     }
@@ -1293,8 +1308,9 @@ describe("v0.7.0 Slice 3: card_object, V3 Freshness, L5 Closure, POST /v1/settle
     expect(cliShow.refType).toBe("object");
     if (cliShow.refType === "object") {
       expect(cliShow.card.narrativeCard?.id).toBe(cliSettled.id);
-      expect(cliShow.card.narrativeCard?.narrativeMd).toBe(
-        "Settled cleanly via remote CLI.",
+      expect(cliShow.card.narrativeCard?.narrativeMd).toBeNull();
+      expect(cliShow.card.narrativeCard?.safeNarrativeMd).toBe(
+        "> Settled cleanly via remote CLI.",
       );
       expect(cliShow.card.cardFreshness?.status).toBe("fresh");
     }

@@ -3989,11 +3989,12 @@ export class SeaEngine {
     }
 
     const batchSize = Math.min(500, Math.max(limit * 2, 100));
+    const MAX_SCAN_BATCHES = 20;
     const filtered: ChangeLogEntry[] = [];
     let scanSeq = sinceSeq;
     let generation = this.db.getChangeLogGeneration();
 
-    while (filtered.length < limit) {
+    for (let batch = 0; batch < MAX_SCAN_BATCHES && filtered.length < limit; batch++) {
       const raw = this.db.listChangeLogForPump({
         orgId: viewerRealm.orgId,
         ledgerRealmIds: scope.readableLedgerIds,
@@ -4697,7 +4698,12 @@ export class SeaEngine {
                 : null,
             sourceIds: cleanDist.sourceIds,
             freshness,
-            narrativeMd: isHardStale ? null : rawObjCard.narrativeMd,
+            // Only expose raw unsanitized narrativeMd to human callers (e.g. Studio UI's <meru-markdown>);
+            // non-human agents (CLI/MCP/HTTP) strictly receive heading-demoted `safeNarrativeMd` only.
+            narrativeMd:
+              isHardStale || params.actor.kind !== "human"
+                ? null
+                : rawObjCard.narrativeMd,
             safeNarrativeMd: isHardStale
               ? null
               : sanitizeNarrativeForAgent(rawObjCard.narrativeMd),
@@ -5439,12 +5445,13 @@ export class SeaEngine {
 
         const now = new Date().toISOString();
         const periodKey = resolved.object.id;
+        // Persist strictly IDs (NEVER writer-view realm paths / canonicalRef) so mounted readers
+        // can never discover hidden ancestor slugs or sibling same-name object existence.
         const hardFacts: Record<string, unknown> = {
           realmId: targetRealmId,
           layer: "card_object",
           periodKey,
           objectId: resolved.object.id,
-          objectRef: resolved.canonicalRef,
           activeDecisionIds,
           activeRuleIds,
           basisRealmIds,
@@ -5452,8 +5459,9 @@ export class SeaEngine {
           computedAt: now,
         };
 
+        const bareObjectLabel = `${resolved.object.kind}:${resolved.object.name}`;
         const defaultNarrative = [
-          `Object summary (${resolved.canonicalRef}):`,
+          `Object summary (${bareObjectLabel}):`,
           `- Active decisions: ${activeDecisionIds.length}`,
           `- Scoped rules: ${activeRuleIds.length}`,
           `- Recent findings: ${recentFindingIds.length}`,

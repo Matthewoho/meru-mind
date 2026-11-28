@@ -145,7 +145,7 @@ export MERU_MIND_EMBED_DIM="1536"
 - **Experimental surfaces** (marked `[experimental]` in `--help`, excluded from the official Agent Skill): `file` (local shared drive), `raw` (direct seabed CLI capture), `settle` (distillation cards), and the `thing` record kind.
 - **SQLite canonical backend**: SQLite (`node:sqlite` WAL) is the sole core backend and online source of truth. Migrating to Postgres is a future trigger-based project (not a zero-rewrite port swap).
 
-### Known Limitations (`v0.6.6`)
+### Known Limitations (`v0.7.0`)
 1. **Lexical-only by default**: Without an external embedding endpoint configured, recall relies purely on CJK-bigram + Latin FTS5 and windowed coverage.
 2. **Bulk import does not auto-link `supersedes`**: Imported Markdown/JSONL entries without explicit `supersedes` references remain active side-by-side until explicitly linked (live writes return a neutral related-active echo so agents can link them explicitly).
 3. **Single-writer SQLite server model**: `meru-mind serve` takes an exclusive writer lock on `mind.sqlite` and expects persistent local block storage (avoid multi-replica containers over NFS/SMB).
@@ -174,7 +174,7 @@ We evaluated Meru Mind (lexical-only, `vector_enabled: false`) against a real-wo
 
 ---
 
-## Shipped Capabilities (`v0.2.0` → `v0.6.6`)
+## Shipped Capabilities (`v0.2.0` → `v0.7.0`)
 
 See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md), [`docs/UI_BUILDER_SKILL.md`](./docs/UI_BUILDER_SKILL.md), and [`THREAT_MODEL.md`](./THREAT_MODEL.md) for deployment, security, and custom UI authoring details:
 
@@ -191,6 +191,7 @@ See [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md), [`do
 - **`v0.6.4`**: Studio UI UX & plain-language redesign — single `VOCAB` translation layer (`Entries` / `Objects` / `Rules` / `Inbox` & `记录` / `对象` / `规矩` / `待分拣`), direct-content workspace (removing the redundant Overview tab & 4-cell KPI strip), auto-collapsing right properties rail (moving `rec_xxx` off list cards), Linear-style certainty-circle segmented composer (replacing native `<select>`), and teaching empty states.
 - **`v0.6.5`**: Opt-in non-root `--write-scope subtree` domain tokens (Schema v14, strict `content` vs `admin` write policy separation, automatic Cookie downgrade to `self`), full remote `object` lifecycle (`/v1/objects/*` with `--if-not-exists` drift reporting and human-only `object delete`), and unified transactional online/local batch import (`POST /v1/import/batch`) + independent zero-truncation SHA-256 verification (`POST /v1/import/verify`) with `--target record|seabed`, NFC normalization, fatal UTF-8 decoding, 1.2 MB per-item cap, and sealed tree-mode cross-realm `sourceRef` isolation. Note: seabed imports preserve exact raw UTF-8 bytes (pre-v0.6.5 trimmed seabed rows with leading/trailing whitespace append one byte-exact revision on first re-import), and `sensitivity: "secret"` entries remain excluded from discovery (`ls`/`search`/`changes`) and `import verify` (never readable or oracle-able through import/verify).
 - **`v0.6.6`**: Studio UI sandboxed offline Mermaid rendering (SHA-256-verified vendored `mermaid@11.17.2` isolated in an HTTP `Content-Security-Policy: sandbox allow-scripts` opaque `null`-origin iframe with `securityLevel: "strict"`, `connect-src 'none'`, lazy `IntersectionObserver` + serial render queue, 50,000-char & 20-diagram caps, Diagram/Source/Expand/Copy toolbar, live Light/Dark theme sync, and source-first fallback), systemic scroll preservation via dedicated `#meru-popover-layer` / `#meru-modal-layer`, localized presence updates, pixel-exact incremental Load More pagination, real post-mount popover positioning, and plain-language Presence UX.
+- **`v0.7.0`**: Zero-migration (Schema v14) Object-Centric Memory Kernel & Studio Center Object Page — Slice 0 visibility-first security hardening (visible-only object counts/entryIds, unified `filterVisibleChangeFrames` across `changes`, Pump, WebSocket, and write-time `collisionHints`, explicit `--target` in `import verify --check-realm`, and safe `show sea_<id>` dive hint), Slice 1 object-scoped rules & `show <object> [--with <objRef>...]` briefs (upward `within` ancestor inheritance, untruncated `realm > object > with` rule layering, realm brief `realmRules` vs `scopedObjectRules` split, complete governance-realm I4 subtractive guards, and I3 write-time bound-rule echo), Slice 3 L3 `card_object` narrative cards (`POST /v1/settle` with secret-guard & 32 KB cap, fail-closed L5 source closure, deterministic per-reader V3 freshness `fresh | soft_stale | hard_stale`, `hard_stale` suppression with human-only `?include_stale_narrative=1`, prompt-injection heading demotion/blockquoting, and SQL-level `changes --about <objRef>`), plus Studio's full-width Center Object Page (`?object=...`) with default-collapsed inspector, single-row linear SVG signal bar, capped Active Decisions, 3-state L3 Narrative Card, and scroll-preserving Record Stream.
 
 ## License
 

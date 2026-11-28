@@ -163,7 +163,7 @@ MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
 
 ---
 
-## 已交付能力演进（`v0.2.0` → `v0.6.6`）
+## 已交付能力演进（`v0.2.0` → `v0.7.0`）
 
 完整云端自托管部署方案、安全模型与自定义前端指南见 [`docs/deployment-and-frontend.md`](./docs/deployment-and-frontend.md)、[`docs/UI_BUILDER_SKILL.md`](./docs/UI_BUILDER_SKILL.md) 与 [`THREAT_MODEL.md`](./THREAT_MODEL.md)：
 
@@ -180,6 +180,7 @@ MERU_DOMAIN=mind.example.com docker compose -f deploy/docker-compose.yml up -d
 - **`v0.6.4`**：内置 Studio UI 大白话与极简交互重构——统一 `VOCAB` 词汇层（识界 / 记录 / 对象 / 规矩 / 待分拣）、取消冗余 Overview 与 4 格统计条默认直出记录流、右侧属性栏自动收放（列表卡去 `rec_xxx`）、Linear 风格「发现 / 决定 / 提议」分段器新建弹窗（替代原生 `<select>`）以及可复制命令的引导空态。
 - **`v0.6.5`**：支持非根领域 Token 显式开启 `--write-scope subtree` 后代内容写入（Schema v14，严格区分 `content` 与 `admin` 写策略，浏览器 Cookie 自动降级为 `self`）、补齐远程 `object` 全生命周期（`/v1/objects/*`、`--if-not-exists` 幂等与漂移报告、`object delete` 仅限人工），以及统一事务化在线/本地批量导入（`POST /v1/import/batch`）与零截断独立 SHA-256 核验（`POST /v1/import/verify`，支持 `--target record|seabed`、NFC 规范化、严格 UTF-8 解码、1.2 MB 单条上限，并封堵 `tree` 模式跨识界 `sourceRef` 存在性泄露）。说明：Seabed 导入按原始 UTF-8 字节精确保存（升级前若存在首尾被裁剪空白的旧 Seabed 记录，首次重导会追加一条字节精确的新版本）；`sensitivity: "secret"` 条目继续在所有发现面（`ls`/`search`/`changes`）与 `import verify` 中排除（导入/核验不可读、不可探测）。
 - **`v0.6.6`**：Studio UI 沙箱化离线 Mermaid 渲染（SHA-256 校验内置 `mermaid@11.17.2`，通过 HTTP `Content-Security-Policy: sandbox allow-scripts` 在不透明 `null` 源隔离 iframe 中渲染，`securityLevel: "strict"` + `connect-src 'none'` + 懒加载串行队列 + 单图 50,000 字符 / 单篇 20 图上限 + 图表/源码/展开/复制工具栏 + 深浅主题原地同步 + 源码优先降级）、全站防跳顶滚动保活（独立 `#meru-popover-layer` / `#meru-modal-layer`、局部在线面板刷新、增量「加载更多」像素级保位与极简分页底栏）、基于真实挂载尺寸的弹窗精确定位，以及去黑话的在线状态视图（移除「未挂事」合成桶，统一「按任务 / 按成员 / 未关联任务」大白话文案）。
+- **`v0.7.0`**：零 Schema 迁移（保持 Schema v14）的对象中心记忆内核与 Studio 中央对象主视图——Slice 0 可见性安全收敛（仅统计可见非 secret 非 redacted 对象计数与 ID、统一 `filterVisibleChangeFrames` 覆盖 `changes`/Pump/WebSocket/`write` 碰撞提示、`import verify --check-realm` 显式 `--target` 与无探针 `show sea_<id>` 下潜提示）、Slice 1 对象级规矩与 `show <object> [--with <objRef>...]` 完整对象简报（`within` 祖先上行继承、永不截断的 `realm > object > with` 规矩分层、识界简报拆分识界规矩与对象规矩、治理域内 I4 减法写守卫与 I3 写时绑定规矩回显）、Slice 3 L3 `card_object` 对象叙事卡（`POST /v1/settle` + secret-guard + 32 KB 上限、L5 源码闭包失败即隐藏、按读者现算的 V3 新鲜度 `fresh | soft_stale | hard_stale`、`hard_stale` 自动隐藏旧叙事与仅人类可读历史叙事、防提示词注入标题降级与 SQL 级 `changes --about <objRef>`），以及 Studio 全宽中央 Object Page（`?object=...`、默认收起右栏、单行线性 SVG 信号条、活跃决定收束、三态 L3 叙事卡与保位加载记录流）。
 
 ## 开源协议
 

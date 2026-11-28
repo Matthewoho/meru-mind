@@ -248,12 +248,13 @@ export class MindPump {
     }
 
     const batchSize = Math.min(500, Math.max(limit * 2, 100));
+    const MAX_SCAN_BATCHES = 20;
     const collected: PumpChangeFrame[] = [];
     let scanSeq = sinceSeq;
     let resGen = currentGen;
     let resTopoVer = topoVer;
 
-    while (collected.length < limit) {
+    for (let batch = 0; batch < MAX_SCAN_BATCHES && collected.length < limit; batch++) {
       const raw = this.db.listChangeLogForPump({
         orgId: this.principal.orgId,
         ledgerRealmIds: scope.readableLedgerIds,
