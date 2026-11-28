@@ -834,5 +834,16 @@ describe("v0.7.0 Commit 1: Slice 0 security fixes (L1/L2), remote rule --about, 
       expect(desc.length).toBeLessThanOrEqual(220);
       expect(desc.startsWith("[read]") || desc.startsWith("[write]")).toBe(true);
     }
+    // Verify v0.7.0 input schema parity across local stdio MCP and remote HTTP MCP
+    for (const toolList of [localTools, httpTools]) {
+      const showTool = toolList.find((t) => t.name === "mind_show")!;
+      const changesTool = toolList.find((t) => t.name === "mind_changes")!;
+      expect(
+        (showTool.inputSchema?.properties ?? {}) as Record<string, unknown>,
+      ).toHaveProperty("with");
+      expect(
+        (changesTool.inputSchema?.properties ?? {}) as Record<string, unknown>,
+      ).toHaveProperty("about");
+    }
   });
 });

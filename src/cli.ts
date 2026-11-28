@@ -502,14 +502,15 @@ Examples:
 `,
   changes: `Risk: read
 When to use: Poll incremental visible change log entries after a sequence number.
-Usage: meru-mind changes [--since <seq>] [--in <realm>] [--limit <n>] [--include-descendant-seabed]
+Usage: meru-mind changes [--since <seq>] [--in <realm>] [--about <objRef>] [--limit <n>] [--include-descendant-seabed]
 Flags:
   --since <seq>          Return changes with seq > value (default: 0)
   --in <realm>           SQL-pushed realm subtree filter
+  --about <objRef>       SQL-pushed unified object filter (catches link/unlink & card_object)
   --limit <n>            Max entries per page (default: 50, max: 500)
 Examples:
   meru-mind changes --since 0
-  meru-mind changes --since 42 --in /ops --limit 20
+  meru-mind changes --since 42 --in /ops --about service:api --limit 20
 `,
   write: `Risk: write
 When to use: Record a conclusion (finding, decision, claim, proposal, verdict). Rules require 'meru-mind rule add --as-human'.
@@ -602,10 +603,12 @@ Examples:
   meru-mind redact rec_0123456789abcdef --reason "secret leaked" --as-human
 `,
   settle: `Risk: write [experimental]
-When to use: Create a deterministic distillation slice or cognitive card for a realm (experimental).
+When to use: Create a deterministic distillation slice, realm card, or object narrative card (card_object).
 Usage:
+  meru-mind settle --layer card_object --about <objRef> [--narrative <text>]
   meru-mind settle --in <realm> --layer <layer> --period <key> [--narrative <text>] [--sources <a,b>]
 Examples:
+  meru-mind settle --layer card_object --about service:api --narrative "Summary of API decisions"
   meru-mind settle --in /ops --layer card_realm --period 2026-11-22
 `,
   import: `Risk: write
@@ -1623,7 +1626,7 @@ async function main(): Promise<void> {
     if (cmd === "changes") {
       assertAllowedFlags(
         flags,
-        ["since", "in", "limit", "include-descendant-seabed"],
+        ["since", "in", "about", "limit", "include-descendant-seabed"],
         "changes",
       );
       const includeDescendantSeabed = flagBool(
@@ -1639,6 +1642,7 @@ async function main(): Promise<void> {
         actor,
         viewerRealmId: ctx.boundViewerRealmId,
         in: flagStr(flags, "in") ?? sub,
+        about: flagStr(flags, "about"),
         sinceSeq: parseIntFlag(flags, "since", { min: 0 }) ?? 0,
         limit: parseIntFlag(flags, "limit", { min: 1 }),
         includeDescendantSeabed,
@@ -3111,29 +3115,38 @@ async function main(): Promise<void> {
     if (cmd === "settle") {
       assertAllowedFlags(
         flags,
-        ["in", "layer", "period", "narrative", "sources"],
+        ["in", "about", "layer", "period", "narrative", "sources"],
         "settle",
       );
       const ctx = resolveSessionContext({ engine, flags });
-      const inRef = requireFlag(flags, "in", "settle");
-      const targetRealm = resolveVisibleRealm({
-        realms: ctx.realms,
-        orgId: ctx.org.id,
-        ref: inRef,
-        scope: ctx.boundScope,
-      });
+      const layer = requireFlag(flags, "layer", "settle") as DistillationLayer;
       const sourceIds = parseCsvFlag(flags, "sources");
-      const res = await engine.sea.settle({
-        actor,
-        viewerRealmId: ctx.boundViewerRealmId,
-        targetRealmId: targetRealm.id,
-        layer: requireFlag(flags, "layer", "settle") as DistillationLayer,
-        periodKey: requireFlag(flags, "period", "settle"),
-        narrativeMd: flagStr(flags, "narrative"),
-        sourceIds: sourceIds.length > 0 ? sourceIds : undefined,
+      const surface = new LocalMindSurface({
+        engine,
+        principal: {
+          tokenId: null,
+          orgId: ctx.org.id,
+          actor,
+          boundRealmId: ctx.boundViewerRealmId,
+          boundSource: ctx.boundSource,
+          authKind: "local",
+        },
+        ownsEngine: false,
       });
-      output(res, formatGenericMarkdown("Settled Distillation", res));
-      return;
+      try {
+        const res = await surface.settle({
+          in: flagStr(flags, "in"),
+          about: flagStr(flags, "about"),
+          layer,
+          periodKey: flagStr(flags, "period"),
+          narrativeMd: flagStr(flags, "narrative"),
+          sourceIds: sourceIds.length > 0 ? sourceIds : undefined,
+        });
+        output(res, formatGenericMarkdown("Settled Distillation", res));
+        return;
+      } finally {
+        await surface.close();
+      }
     }
 
     if (cmd === "import") {

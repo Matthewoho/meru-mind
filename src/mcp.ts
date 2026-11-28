@@ -463,10 +463,11 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
 
   server.tool(
     "mind_changes",
-    "[read] Read incremental visible change log after since seq. Optional in (/realm) filters changes in SQL.",
+    "[read] Read incremental visible change log after since seq. Optional in (/realm) or about (kind:name) filters in SQL.",
     {
       since: z.number().int().nonnegative().optional(),
       in: z.string().optional(),
+      about: z.string().optional(),
       limit: z.number().int().positive().max(500).optional(),
       include_descendant_seabed: z.boolean().optional(),
     },
@@ -479,6 +480,7 @@ export async function createMindMcpServer(options?: MindMcpServerOptions) {
             actor: boundActor,
             viewerRealmId: boundViewerRealmId,
             in: args.in,
+            about: args.about,
             sinceSeq: args.since ?? 0,
             limit: args.limit ?? 50,
             includeDescendantSeabed,

@@ -8,10 +8,12 @@ import {
   type PumpChangeFrame,
 } from "../types.js";
 import { resolveVisibleRealm } from "../engine/objects.js";
+import { resolveChangeAboutFilter } from "../engine/refs.js";
 import {
   createVisibilityHelpers,
   filterVisibleChangeFrames,
 } from "../engine/visibility.js";
+import type { ChangeLogAboutFilter } from "../ports.js";
 import { isPrincipalTokenActive } from "./tokens.js";
 
 /**
@@ -86,6 +88,7 @@ export interface PumpPollParams {
   generation?: number;
   limit?: number;
   realmRef?: string;
+  about?: string;
   includeDescendantSeabed?: boolean;
   waitSeconds?: number;
   signal?: AbortSignal;
@@ -161,6 +164,7 @@ export class MindPump {
     generation?: number;
     limit?: number;
     realmRef?: string;
+    about?: string;
     includeDescendantSeabed?: boolean;
   }): PumpPollResult {
     const includeDescendantSeabed = Boolean(params.includeDescendantSeabed);
@@ -230,6 +234,19 @@ export class MindPump {
       includeDescendantSeabed,
     });
 
+    let aboutFilter: ChangeLogAboutFilter | undefined;
+    if (params.about?.trim()) {
+      aboutFilter = resolveChangeAboutFilter({
+        db: this.db,
+        realms,
+        orgId: this.principal.orgId,
+        aboutRef: params.about.trim(),
+        scope,
+        vis,
+      });
+      includeOrgLevel = false;
+    }
+
     const batchSize = Math.min(500, Math.max(limit * 2, 100));
     const collected: PumpChangeFrame[] = [];
     let scanSeq = sinceSeq;
@@ -246,6 +263,7 @@ export class MindPump {
         limit: batchSize,
         includeSecret: false,
         filterRealmIds,
+        aboutFilter,
       });
       resGen = raw.generation;
       resTopoVer = raw.topologyVersion;

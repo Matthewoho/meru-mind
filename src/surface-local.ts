@@ -60,6 +60,7 @@ import type {
   SurfaceRedactInput,
   SurfaceSearchParams,
   SurfaceSetObjectStateInput,
+  SurfaceSettleInput,
   SurfaceShowParams,
   SurfaceTreeParams,
   SurfaceUnlinkObjectInput,
@@ -74,6 +75,7 @@ import {
   type ChangeLogEntry,
   type ChangesResult,
   type CreateObjectResult,
+  type Distillation,
   type EntryObjectLink,
   type ImportBatchInput,
   type ImportBatchResult,
@@ -367,6 +369,7 @@ export class LocalMindSurface implements MindSurface {
       history: params.history,
       context: params.context,
       includeDescendantSeabed,
+      includeStaleNarrative: params.includeStaleNarrative,
       scopeCeiling: ctx.scope,
     });
     this.updateLastReadSeq(ctx.scope);
@@ -403,6 +406,7 @@ export class LocalMindSurface implements MindSurface {
       generation: params?.generation,
       limit: params?.limit ?? 50,
       realmRef: params?.in,
+      about: params?.about,
       includeDescendantSeabed: params?.includeDescendantSeabed,
       waitSeconds: params?.waitSeconds ?? 0,
       signal: params?.signal,
@@ -649,6 +653,37 @@ export class LocalMindSurface implements MindSurface {
         `Cannot ${action} "${targetRealm.path}": realm is outside your bound subtree.`,
       );
     }
+  }
+
+  async settle(params: SurfaceSettleInput): Promise<Distillation> {
+    const aboutPart = params.about ? ` --about ${params.about}` : "";
+    const inPart = params.in ? ` --in ${params.in}` : "";
+    const periodPart = params.periodKey ? ` --period ${params.periodKey}` : "";
+    const cliCmd = `meru-mind settle --layer ${params.layer}${inPart}${aboutPart}${periodPart}`;
+    this.assertNotWeakenedCookie("settle", cliCmd);
+    const ctx = this.resolveScopeContext(false);
+    let targetRealmId: string | undefined;
+    if (params.in?.trim()) {
+      const targetRealm = resolveVisibleRealm({
+        realms: ctx.realms,
+        orgId: ctx.org.id,
+        ref: params.in.trim(),
+        scope: ctx.scope,
+      });
+      targetRealmId = targetRealm.id;
+    }
+    return this.engine.sea.settle({
+      actor: this.principal.actor,
+      viewerRealmId: this.principal.boundRealmId,
+      targetRealmId,
+      about: params.about,
+      layer: params.layer,
+      periodKey: params.periodKey,
+      narrativeMd: params.narrativeMd,
+      sourceIds: params.sourceIds,
+      writeScope: this.effectiveWriteScope(),
+      scopeCeiling: ctx.scope,
+    });
   }
 
   async move(params: SurfaceMoveInput): Promise<MoveEntriesResult> {

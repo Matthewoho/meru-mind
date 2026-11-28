@@ -138,6 +138,17 @@ export interface RealmRecordCountRow {
   decisions: number;
 }
 
+export interface ChangeLogAboutFilter {
+  /** Target object ID + visible `within` descendant object IDs */
+  objectIds: string[];
+  /** Normalized `<kind>:<name>` resource tag if valid, else null */
+  resourceTag: string | null;
+  /** Optional realm restriction when `--about` was realm-qualified (`/<realm>/<kind>:<name>`) */
+  scopedRealmId?: string | null;
+  /** Optional explicit record IDs resolved via `thing` records */
+  thingEntryIds?: string[];
+}
+
 export interface UnifiedEntryRef {
   id: string;
   sourceType: "record" | "seabed";
@@ -489,6 +500,11 @@ export interface DbPort {
     realmId: string,
     layer: DistillationLayer,
   ): Distillation | null;
+  getLatestDistillationByPeriodKey(
+    realmId: string,
+    layer: DistillationLayer,
+    periodKey: string,
+  ): Distillation | null;
   getLatestDistillationsByRealms(
     realmIds: string[],
     layer: DistillationLayer,
@@ -567,6 +583,7 @@ export interface DbPort {
     limit: number;
     includeSecret?: boolean;
     filterRealmIds?: string[];
+    aboutFilter?: ChangeLogAboutFilter;
   }): { generation: number; topologyVersion: number; frames: PumpChangeFrame[] };
   resetChangeLog(): { generation: number; clearedCount: number };
 

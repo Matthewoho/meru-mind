@@ -2,9 +2,12 @@ import { getAncestorIds } from "../policy.js";
 import type { DbPort } from "../ports.js";
 import type {
   AccessScope,
+  CardStaleReason,
+  Distillation,
   LedgerRecord,
   MindObject,
   ObjectBriefRule,
+  ObjectCardFreshness,
   Realm,
   ScopedRuleSource,
 } from "../types.js";
@@ -462,4 +465,273 @@ export function hasActiveRulesOnObjectHierarchy(params: {
       r.status === "active" &&
       r.redactedAt === null,
   );
+}
+
+/**
+ * Single authoritative entry-ID collector for a real `MindObject` used identically by
+ * `settle --layer card_object` and deterministic per-reader `V3` freshness evaluation.
+ * Collects entries linked to the object + its visible `within` descendants inside `allowedRealmIds`,
+ * unioned with `resource_tags` matching `<kind>:<name>`.
+ */
+export function collectObjectCardEntryIds(params: {
+  db: DbPort;
+  orgId: string;
+  object: MindObject;
+  sanitizedVisibleObjects: MindObject[];
+  allowedRealmIds: Set<string>;
+}): string[] {
+  const objectsInAllowed = params.sanitizedVisibleObjects.filter((o) =>
+    params.allowedRealmIds.has(o.realmId),
+  );
+  const subtreeObjIds = [
+    params.object.id,
+    ...getDescendantObjectIds(objectsInAllowed, params.object.id),
+  ];
+  const viaObj = params.db.listEntryIdsForObjects(params.orgId, subtreeObjIds);
+  const normTag = tryNormalizeResourceTag(
+    `${params.object.kind}:${params.object.name}`,
+  );
+  const viaTag = normTag
+    ? params.db.listEntryIdsByResourceTag(params.orgId, normTag)
+    : [];
+  return Array.from(new Set([...viaObj, ...viaTag]));
+}
+
+/**
+ * Prompt-injection guard for L3 narrative cards (`#7`):
+ * Demotes ATX headings (`# ...` -> `**...**`), neutralizes Setext heading underlines (`===`/`---`),
+ * and prefixes every line as a blockquote (`> ...`) so narrative text can NEVER spoof `## 规矩`
+ * or top-level sections when read by downstream agents.
+ */
+export function sanitizeNarrativeForAgent(md: string): string {
+  const normalized = md.replace(/\r\n/g, "\n").trim();
+  if (!normalized) return "> _(empty)_";
+  const lines = normalized.split("\n");
+  return lines
+    .map((rawLine) => {
+      const atx = /^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/.exec(rawLine);
+      if (atx) {
+        const headingText = atx[1]!.trim();
+        return headingText ? `> **${headingText}**` : ">";
+      }
+      if (/^\s{0,3}(?:={3,}|-{3,})\s*$/.test(rawLine)) {
+        return "> —";
+      }
+      const trimmedRight = rawLine.replace(/\s+$/, "");
+      return trimmedRight ? `> ${trimmedRight}` : ">";
+    })
+    .join("\n");
+}
+
+/**
+ * Deterministic per-reader V3 freshness evaluation for `card_object` distillations.
+ *
+ * - Computed strictly on-the-fly per reader; NEVER persisted, cached, or emitted in live-pulse/ETag.
+ * - Evaluates strictly within `readerVisibleLedgerRealms ∩ dist.hardFacts.basisRealmIds`
+ *   so hidden sibling entries never flip a card stale AND wider readers never see false staleness.
+ * - Missing or malformed `basisRealmIds` fails safe to `hard_stale`.
+ * - Uses the exact same `collectObjectCardEntryIds`, `collectActiveDecisionHeads`, and
+ *   `collectObjectScopedRules` (object + upward `within` ancestors ONLY; NO Wall rules; NO `--with`)
+ *   that `settle card_object` used at write time.
+ */
+export function evaluateCardObjectFreshness(params: {
+  db: DbPort;
+  realms: Realm[];
+  orgId: string;
+  dist: Distillation;
+  object: MindObject;
+  scope: AccessScope;
+  vis: VisibilityHelpers;
+  sanitizedVisibleObjects: MindObject[];
+}): ObjectCardFreshness {
+  const { db, realms, orgId, dist, object, scope, vis, sanitizedVisibleObjects } =
+    params;
+
+  const rawBasis = dist.hardFacts?.basisRealmIds;
+  if (
+    !Array.isArray(rawBasis) ||
+    !rawBasis.every((x) => typeof x === "string")
+  ) {
+    const msg = "已过时：卡片缺少基线范围信息（需重新 settle）";
+    return {
+      status: "hard_stale",
+      reasons: [
+        {
+          kind: "missing_basis",
+          message: msg,
+        },
+      ],
+      summaryLine: msg,
+      addedDecisionIds: [],
+      removedDecisionIds: [],
+      addedRuleIds: [],
+      removedRuleIds: [],
+    };
+  }
+
+  const readerLedgerSet = new Set(scope.readableLedgerIds);
+  const effectiveRealms = new Set(
+    rawBasis.filter((rid) => readerLedgerSet.has(rid)),
+  );
+
+  const cardEntryIds = collectObjectCardEntryIds({
+    db,
+    orgId,
+    object,
+    sanitizedVisibleObjects,
+    allowedRealmIds: effectiveRealms,
+  });
+  const currentDecisions = collectActiveDecisionHeads({
+    db,
+    orgId,
+    entryIds: cardEntryIds,
+    vis,
+    allowedRealmIds: effectiveRealms,
+  });
+  const currentRules = collectObjectScopedRules({
+    db,
+    realms,
+    orgId,
+    object,
+    objectKind: object.kind,
+    objectName: object.name,
+    scopedRealmId: object.realmId,
+    scope,
+    vis,
+    sanitizedVisibleObjects,
+    scopeSource: "object",
+    allowedRealmIds: effectiveRealms,
+  });
+
+  const baseDecisionIds = Array.isArray(dist.hardFacts?.activeDecisionIds)
+    ? dist.hardFacts.activeDecisionIds.filter(
+        (x): x is string => typeof x === "string",
+      )
+    : [];
+  const baseRuleIds = Array.isArray(dist.hardFacts?.activeRuleIds)
+    ? dist.hardFacts.activeRuleIds.filter(
+        (x): x is string => typeof x === "string",
+      )
+    : [];
+
+  const baseDecisionSet = new Set(baseDecisionIds);
+  const baseRuleSet = new Set(baseRuleIds);
+  const curDecisionIds = currentDecisions.map((d) => d.id);
+  const curRuleIds = currentRules.map((r) => r.id);
+  const curDecisionSet = new Set(curDecisionIds);
+  const curRuleSet = new Set(curRuleIds);
+
+  const removedDecisionIds = baseDecisionIds.filter(
+    (id) => !curDecisionSet.has(id),
+  );
+  const addedDecisionIds = curDecisionIds.filter(
+    (id) => !baseDecisionSet.has(id),
+  );
+  const removedRuleIds = baseRuleIds.filter((id) => !curRuleSet.has(id));
+  const addedRuleIds = curRuleIds.filter((id) => !baseRuleSet.has(id));
+
+  const reasons: CardStaleReason[] = [];
+  const hardReasonMsgs: string[] = [];
+
+  for (const id of removedDecisionIds) {
+    const rec = db.getRecord(id);
+    const headId =
+      rec && vis.canSeeRecord(rec) ? vis.resolveCurrentHeadId(rec) : null;
+    if (headId) {
+      const message = `${id} 已被 ${headId} 取代`;
+      reasons.push({
+        kind: "decision_superseded",
+        entryId: id,
+        replacedById: headId,
+        message,
+      });
+      hardReasonMsgs.push(message);
+    } else {
+      const message = `决定 ${id} 已失效`;
+      reasons.push({
+        kind: "decision_removed",
+        entryId: id,
+        replacedById: null,
+        message,
+      });
+      hardReasonMsgs.push(message);
+    }
+  }
+
+  for (const id of removedRuleIds) {
+    const rec = db.getRecord(id);
+    const headId =
+      rec && vis.canSeeRecord(rec) ? vis.resolveCurrentHeadId(rec) : null;
+    const message = headId
+      ? `规矩 ${id} 已被 ${headId} 取代`
+      : `规矩 ${id} 已失效`;
+    reasons.push({
+      kind: "rule_removed",
+      entryId: id,
+      replacedById: headId,
+      message,
+    });
+    hardReasonMsgs.push(message);
+  }
+
+  for (const id of addedRuleIds) {
+    const message = `新增规矩 ${id}`;
+    reasons.push({
+      kind: "rule_added",
+      entryId: id,
+      message,
+    });
+    hardReasonMsgs.push(message);
+  }
+
+  if (addedDecisionIds.length > 0) {
+    reasons.push({
+      kind: "decision_added",
+      count: addedDecisionIds.length,
+      message: `其后新增：决定 +${addedDecisionIds.length}`,
+    });
+  }
+
+  if (
+    removedDecisionIds.length > 0 ||
+    removedRuleIds.length > 0 ||
+    addedRuleIds.length > 0
+  ) {
+    const preview = hardReasonMsgs.slice(0, 2).join("；");
+    const extra =
+      hardReasonMsgs.length > 2
+        ? ` 等 ${hardReasonMsgs.length} 项变更`
+        : "";
+    return {
+      status: "hard_stale",
+      reasons,
+      summaryLine: `已过时：${preview}${extra}（需重新 settle）`,
+      addedDecisionIds,
+      removedDecisionIds,
+      addedRuleIds,
+      removedRuleIds,
+    };
+  }
+
+  if (addedDecisionIds.length > 0) {
+    return {
+      status: "soft_stale",
+      reasons,
+      summaryLine: `其后新增：决定 +${addedDecisionIds.length}`,
+      addedDecisionIds,
+      removedDecisionIds,
+      addedRuleIds,
+      removedRuleIds,
+    };
+  }
+
+  return {
+    status: "fresh",
+    reasons: [],
+    summaryLine: null,
+    addedDecisionIds: [],
+    removedDecisionIds: [],
+    addedRuleIds: [],
+    removedRuleIds: [],
+  };
 }

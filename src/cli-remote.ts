@@ -20,6 +20,7 @@ import {
   RemoteMindSurface,
   runRealmDoctor,
   type ActorRole,
+  type DistillationLayer,
   type ImportBatchItemResult,
   type ImportBatchRealmProjection,
   type ImportBatchResult,
@@ -203,6 +204,7 @@ export async function runRemoteCliCommand(
       const res = await surface.changes({
         sinceSeq: intFlag(flags, "since") ?? 0,
         in: str(flags, "in") ?? sub,
+        about: str(flags, "about"),
         limit: intFlag(flags, "limit"),
         includeDescendantSeabed: bool(flags, "include-descendant-seabed"),
         waitSeconds: intFlag(flags, "wait"),
@@ -359,6 +361,26 @@ export async function runRemoteCliCommand(
         reason: str(flags, "reason"),
       });
       output(res, formatGenericMarkdown("Redacted", res));
+      return;
+    }
+
+    if (cmd === "settle") {
+      const rawSources = str(flags, "sources");
+      const sourceIds = rawSources
+        ? rawSources
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined;
+      const res = await surface.settle({
+        in: str(flags, "in"),
+        about: str(flags, "about"),
+        layer: reqStr(flags, "layer", "settle") as DistillationLayer,
+        periodKey: str(flags, "period"),
+        narrativeMd: str(flags, "narrative"),
+        sourceIds: sourceIds && sourceIds.length > 0 ? sourceIds : undefined,
+      });
+      output(res, formatGenericMarkdown("Settled Distillation", res));
       return;
     }
 

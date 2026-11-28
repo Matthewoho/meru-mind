@@ -249,6 +249,38 @@ export function createVisibilityHelpers(params: {
     return access !== "none";
   };
 
+  /**
+   * Fail-closed source visibility check strictly for `card_object` L5 source closure.
+   * NEVER falls back to `true` for missing/dangling/unknown IDs (unlike `isRefVisible`).
+   */
+  const isStrictCardSourceVisible = (sid: string): boolean => {
+    if (!sid) return false;
+    const rec = getCachedRecord(sid);
+    if (rec) {
+      if (
+        rec.orgId !== scope.orgId ||
+        rec.sensitivity === "secret" ||
+        rec.redactedAt !== null ||
+        rec.status === "retracted"
+      ) {
+        return false;
+      }
+      return canSeeRecord(rec);
+    }
+    const sea = getCachedSeabed(sid);
+    if (sea) {
+      if (
+        sea.orgId !== scope.orgId ||
+        sea.sensitivity === "secret" ||
+        sea.redactedAt !== null
+      ) {
+        return false;
+      }
+      return canSeeSeabed(sea);
+    }
+    return false;
+  };
+
   const canSeeDistillation = (dist: Distillation): boolean => {
     if (!ledgerSet.has(dist.realmId)) return false;
     const access = resolveAccess({
@@ -260,7 +292,29 @@ export function createVisibilityHelpers(params: {
       assetKind: "ledger",
       orgPolicy: scope.policy,
     });
-    return access !== "none";
+    if (access === "none") return false;
+
+    if (dist.layer === "card_object") {
+      // Precedence: retracted > L5 source closure > V3 freshness
+      if ((dist.status as string) === "retracted") return false;
+      const targetObj = db.getObject(dist.periodKey);
+      if (
+        !targetObj ||
+        targetObj.orgId !== scope.orgId ||
+        !ledgerSet.has(targetObj.realmId)
+      ) {
+        return false;
+      }
+      if (dist.sourceIds.length > 0) {
+        preloadRefs(dist.sourceIds);
+        for (const sid of dist.sourceIds) {
+          if (!isStrictCardSourceVisible(sid)) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
   };
 
   const canSeeDriveRealm = (realmId: string): boolean => {
@@ -400,10 +454,15 @@ export function createVisibilityHelpers(params: {
       sea.sourceRef && isRefVisible(sea.sourceRef) ? sea.sourceRef : null,
   });
 
-  const sanitizeDistillation = (dist: Distillation): Distillation => ({
-    ...dist,
-    sourceIds: dist.sourceIds.filter(isRefVisible),
-  });
+  const sanitizeDistillation = (dist: Distillation): Distillation => {
+    const cleanHardFacts = { ...dist.hardFacts };
+    delete cleanHardFacts.basisRealmIds;
+    return {
+      ...dist,
+      hardFacts: cleanHardFacts,
+      sourceIds: dist.sourceIds.filter(isRefVisible),
+    };
+  };
 
   const isOrphanSuperseded = (rec: LedgerRecord): boolean =>
     rec.status === "superseded" && rec.supersededById === null;

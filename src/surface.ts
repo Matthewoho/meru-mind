@@ -10,6 +10,8 @@ import type {
   ChangeLogEntry,
   ChangesResult,
   CreateObjectResult,
+  Distillation,
+  DistillationLayer,
   EntryObjectLink,
   ImportBatchInput,
   ImportBatchResult,
@@ -74,6 +76,8 @@ export interface SurfaceShowParams {
   history?: boolean;
   context?: number;
   includeDescendantSeabed?: boolean;
+  /** Human-only Studio UI opt-in to view collapsed historic text on hard_stale card_object */
+  includeStaleNarrative?: boolean;
 }
 
 export interface SurfaceSearchParams {
@@ -93,6 +97,7 @@ export interface SurfaceChangesParams {
   sinceSeq?: number;
   generation?: number;
   in?: string;
+  about?: string;
   limit?: number;
   includeDescendantSeabed?: boolean;
   /** Optional long-poll wait in seconds (0..25); supported on server/pump surfaces */
@@ -146,6 +151,15 @@ export interface SurfaceMoveInput {
   /** Optional CAS guard: verify every entry currently resides in this realm before moving (ideal for inbox triage) */
   expectedFromRealmRef?: string;
   idempotencyKey?: string;
+}
+
+export interface SurfaceSettleInput {
+  in?: string;
+  about?: string;
+  layer: DistillationLayer;
+  periodKey?: string;
+  narrativeMd?: string;
+  sourceIds?: string[];
 }
 
 export interface SurfaceAddRuleInput {
@@ -257,6 +271,7 @@ export interface MindSurface {
   changes(params?: SurfaceChangesParams): Promise<ChangesResult>;
   write(params: SurfaceWriteInput): Promise<SurfaceWriteResult>;
   rawAdd(params: SurfaceRawAddInput): Promise<SeabedEntry>;
+  settle(params: SurfaceSettleInput): Promise<Distillation>;
   move(params: SurfaceMoveInput): Promise<MoveEntriesResult>;
   getEntryChain(entryId: string): Promise<ShowSupersedeChainResult>;
 

@@ -45,6 +45,7 @@ export type {
   SurfaceWriteResult,
   SurfaceRawAddInput,
   SurfaceMoveInput,
+  SurfaceSettleInput,
   SurfaceAddRuleInput,
   SurfaceRedactInput,
   SurfaceCreateRealmInput,
@@ -312,6 +313,7 @@ export {
   computeDuplicateObjectKeys,
   formatCanonicalObjectRef,
   resolveFileRef,
+  resolveChangeAboutFilter,
   resolveUnifiedObjectRead,
   resolveAboutRefsForWrite,
   type ParsedRef,
@@ -401,11 +403,14 @@ export { exportRecordsAsMarkdown } from "./engine/export-md.js";
 export {
   classifyRulesForViewer,
   collectActiveDecisionHeads,
+  collectObjectCardEntryIds,
   collectObjectScopedRules,
   collectWallRules,
   computeGoverningRealmIds,
+  evaluateCardObjectFreshness,
   extractRuleBodyText,
   hasActiveRulesOnObjectHierarchy,
+  sanitizeNarrativeForAgent,
   walkVisibleWithinAncestors,
 } from "./engine/object-rules.js";
 export {

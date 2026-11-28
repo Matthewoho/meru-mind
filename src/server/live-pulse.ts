@@ -212,6 +212,7 @@ export function withLivePulse(
       return out;
     },
 
+    settle: (params) => inner.settle(params),
     move: (params) => inner.move(params),
     getEntryChain: (entryId) => inner.getEntryChain(entryId),
     addRule: (params) => inner.addRule(params),

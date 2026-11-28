@@ -20,6 +20,7 @@ import type {
   SurfaceRedactInput,
   SurfaceSearchParams,
   SurfaceSetObjectStateInput,
+  SurfaceSettleInput,
   SurfaceShowParams,
   SurfaceTreeParams,
   SurfaceUnlinkObjectInput,
@@ -32,6 +33,7 @@ import {
   type AuthTokenPublic,
   type ChangesResult,
   type CreateObjectResult,
+  type Distillation,
   type EntryObjectLink,
   type ImportBatchInput,
   type ImportBatchResult,
@@ -321,6 +323,7 @@ export class RemoteMindSurface implements MindSurface {
         history: params.history,
         context: params.context,
         include_descendant_seabed: params.includeDescendantSeabed,
+        include_stale_narrative: params.includeStaleNarrative,
       },
     });
   }
@@ -348,6 +351,7 @@ export class RemoteMindSurface implements MindSurface {
         since: params?.sinceSeq,
         generation: params?.generation,
         in: params?.in,
+        about: params?.about,
         limit: params?.limit,
         include_descendant_seabed: params?.includeDescendantSeabed,
         wait: params?.waitSeconds,
@@ -373,6 +377,12 @@ export class RemoteMindSurface implements MindSurface {
 
   async rawAdd(params: SurfaceRawAddInput): Promise<SeabedEntry> {
     return this.request<SeabedEntry>("POST", "/v1/raw", {
+      body: params,
+    });
+  }
+
+  async settle(params: SurfaceSettleInput): Promise<Distillation> {
+    return this.request<Distillation>("POST", "/v1/settle", {
       body: params,
     });
   }

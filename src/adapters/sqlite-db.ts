@@ -16,6 +16,7 @@ import {
   type SearchConcept,
 } from "../query/fts-query.js";
 import type {
+  ChangeLogAboutFilter,
   DateWindowMatch,
   DateWindowQueryParams,
   DateWindowQueryResult,
@@ -4334,6 +4335,21 @@ export class SqliteDb implements DbPort {
     return row ? this.mapDistillation(row) : null;
   }
 
+  getLatestDistillationByPeriodKey(
+    realmId: string,
+    layer: DistillationLayer,
+    periodKey: string,
+  ): Distillation | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM distillations
+         WHERE realm_id = ? AND layer = ? AND period_key = ? AND status = 'active'
+         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(realmId, layer, periodKey) as Record<string, unknown> | undefined;
+    return row ? this.mapDistillation(row) : null;
+  }
+
   getLatestDistillationsByRealms(
     realmIds: string[],
     layer: DistillationLayer,
@@ -5062,6 +5078,7 @@ export class SqliteDb implements DbPort {
     limit: number;
     includeSecret?: boolean;
     filterRealmIds?: string[];
+    aboutFilter?: ChangeLogAboutFilter;
   }): { generation: number; topologyVersion: number; frames: PumpChangeFrame[] } {
     const generation = this.getChangeLogGeneration();
     const topologyVersion = this.getTopologyVersion();
@@ -5082,8 +5099,8 @@ export class SqliteDb implements DbPort {
     const branches: string[] = [];
     const sqlParams: SQLInputValue[] = [params.orgId, generation, params.sinceSeq];
 
-    // Org-level events are only ever visible when entity_type = 'org' (unless caller narrowed to specific realms)
-    if (!filterSet) {
+    // Org-level events are only ever visible when entity_type = 'org' (unless caller narrowed to specific realms or --about)
+    if (!filterSet && !params.aboutFilter) {
       branches.push(`(cl.realm_id = '__org__' AND cl.entity_type = 'org')`);
     }
     if (ledgerIds.length > 0) {
@@ -5098,7 +5115,7 @@ export class SqliteDb implements DbPort {
       );
       sqlParams.push(...seabedIds);
     }
-    if (driveIds.length > 0) {
+    if (driveIds.length > 0 && !params.aboutFilter) {
       branches.push(
         `(COALESCE(cl.asset_class, CASE WHEN cl.entity_type = 'drive' THEN 'drive' ELSE 'ledger' END) = 'drive' AND cl.realm_id IN (${placeholders(driveIds.length)}))`,
       );
@@ -5115,6 +5132,64 @@ export class SqliteDb implements DbPort {
       `cl.seq > ?`,
       `(${branches.join(" OR ")})`,
     ];
+
+    if (params.aboutFilter) {
+      const af = params.aboutFilter;
+      const objIds = Array.from(new Set(af.objectIds.filter(Boolean)));
+      const thingIds = Array.from(new Set((af.thingEntryIds ?? []).filter(Boolean))).slice(
+        0,
+        500,
+      );
+      const aboutClauses: string[] = [];
+
+      if (objIds.length > 0) {
+        const objPh = placeholders(objIds.length);
+        // 1. Direct object lifecycle events (create, move, state, alias, delete, evidence_redacted)
+        aboutClauses.push(`(cl.entity_type = 'object' AND cl.entity_id IN (${objPh}))`);
+        sqlParams.push(...objIds);
+        // 2. Link AND unlink events matched by ":<objectId>" suffix even after entry_objects row deletion
+        aboutClauses.push(
+          `(cl.entity_type = 'entry_object' AND instr(cl.entity_id, ':') > 0 AND substr(cl.entity_id, instr(cl.entity_id, ':') + 1) IN (${objPh}))`,
+        );
+        sqlParams.push(...objIds);
+        // 3. Record, seabed, and resource_tag events for entries linked via entry_objects
+        aboutClauses.push(
+          `(cl.entity_type IN ('record', 'seabed', 'resource_tag') AND EXISTS (SELECT 1 FROM entry_objects eo WHERE eo.org_id = cl.org_id AND eo.entry_id = cl.entity_id AND eo.object_id IN (${objPh})))`,
+        );
+        sqlParams.push(...objIds);
+        // 4. card_object distillations settled for the target object (or its visible descendants)
+        aboutClauses.push(
+          `(cl.entity_type = 'distillation' AND EXISTS (SELECT 1 FROM distillations d WHERE d.id = cl.entity_id AND d.layer = 'card_object' AND d.period_key IN (${objPh})))`,
+        );
+        sqlParams.push(...objIds);
+      }
+
+      if (af.resourceTag) {
+        if (af.scopedRealmId) {
+          aboutClauses.push(
+            `(cl.entity_type IN ('record', 'seabed', 'resource_tag') AND cl.realm_id = ? AND EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.org_id = cl.org_id AND rt.entry_id = cl.entity_id AND rt.tag = ?))`,
+          );
+          sqlParams.push(af.scopedRealmId, af.resourceTag);
+        } else {
+          aboutClauses.push(
+            `(cl.entity_type IN ('record', 'seabed', 'resource_tag') AND EXISTS (SELECT 1 FROM resource_tags rt WHERE rt.org_id = cl.org_id AND rt.entry_id = cl.entity_id AND rt.tag = ?))`,
+          );
+          sqlParams.push(af.resourceTag);
+        }
+      }
+
+      if (thingIds.length > 0) {
+        aboutClauses.push(
+          `(cl.entity_type = 'record' AND cl.entity_id IN (${placeholders(thingIds.length)}))`,
+        );
+        sqlParams.push(...thingIds);
+      }
+
+      if (aboutClauses.length === 0) {
+        return { generation, topologyVersion, frames: [] };
+      }
+      where.push(`(${aboutClauses.join(" OR ")})`);
+    }
 
     if (!params.includeSecret) {
       where.push(`NOT (

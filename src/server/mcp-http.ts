@@ -180,10 +180,11 @@ export function createSurfaceMcpServer(surface: MindSurface): McpServer {
 
   server.tool(
     "mind_changes",
-    "[read] Read incremental visible change log after since seq. Optional in (/realm) filters changes in SQL.",
+    "[read] Read incremental visible change log after since seq. Optional in (/realm) or about (kind:name) filters in SQL.",
     {
       since: z.number().int().nonnegative().optional(),
       in: z.string().optional(),
+      about: z.string().optional(),
       limit: z.number().int().positive().max(500).optional(),
       include_descendant_seabed: z.boolean().optional(),
     },
@@ -193,6 +194,7 @@ export function createSurfaceMcpServer(surface: MindSurface): McpServer {
           await surface.changes({
             sinceSeq: args.since ?? 0,
             in: args.in,
+            about: args.about,
             limit: args.limit ?? 50,
             includeDescendantSeabed: args.include_descendant_seabed,
           }),

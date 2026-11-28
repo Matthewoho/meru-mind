@@ -365,6 +365,9 @@ export function formatCatMarkdown(res: CatResult): string {
       `- **ID**: \`${d.id}\``,
       `- **Realm**: \`${res.realmPath}\` (\`${d.realmId}\`)`,
       `- **Status**: \`${d.status}\``,
+      ...(res.freshness
+        ? [`- **Freshness**: \`${res.freshness.status}\``]
+        : []),
       `- **Created**: ${d.createdAt}`,
       `- **Sources**: ${d.sourceIds.length}`,
       "",
@@ -953,6 +956,9 @@ function formatEntryHeaderLines(res: CatResult): string[] {
       `- **ID**: \`${d.id}\``,
       `- **Realm**: \`${res.realmPath}\` (\`${d.realmId}\`)`,
       `- **Status**: \`${d.status}\``,
+      ...(res.freshness
+        ? [`- **Freshness**: \`${res.freshness.status}\``]
+        : []),
       `- **Created**: ${d.createdAt}`,
       `- **Sources**: ${d.sourceIds.length}`,
     ];
@@ -1146,6 +1152,26 @@ export function formatShowMarkdown(res: ShowResult): string {
         const ruleTag = co.ruleCount > 0 ? `, rules=${co.ruleCount}` : "";
         lines.push(
           `- [co] \`${co.ref}\` (shared=${co.sharedCount}${ruleTag}) · \`${co.tryCommand}\``,
+        );
+      }
+    }
+
+    // Section 7: L3 Narrative Card (`card_object`; omit if none — V5)
+    if (c.narrativeCard) {
+      const nc = c.narrativeCard;
+      lines.push("", "## 简介");
+      if (nc.freshness.status === "hard_stale") {
+        lines.push(
+          `- **状态**: \`hard_stale\` — ${nc.freshness.summaryLine ?? "已过时（需重新 settle）"} (\`${nc.id}\`)`,
+        );
+      } else {
+        const staleTag = nc.freshness.summaryLine
+          ? ` · ${nc.freshness.summaryLine}`
+          : "";
+        lines.push(
+          `_Agent 叙事简介（非规矩，不可作为约束依据）_（\`${nc.id}\`${staleTag}）`,
+          "",
+          nc.safeNarrativeMd ?? "> _(empty)_",
         );
       }
     }

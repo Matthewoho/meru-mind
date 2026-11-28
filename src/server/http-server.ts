@@ -30,6 +30,7 @@ import type {
   SurfaceRawAddInput,
   SurfaceRedactInput,
   SurfaceSetObjectStateInput,
+  SurfaceSettleInput,
   SurfaceUnlinkObjectInput,
   SurfaceUpdateObjectAliasesInput,
   SurfaceWriteInput,
@@ -37,6 +38,7 @@ import type {
 import {
   MindError,
   type ActorRole,
+  type DistillationLayer,
   type ImportBatchInput,
   type LsOnlyFilter,
   type OidcConfig,
@@ -751,6 +753,9 @@ export async function startMindServer(
                 includeDescendantSeabed: parseOptionalBool(
                   sp.get("include_descendant_seabed"),
                 ),
+                includeStaleNarrative: parseOptionalBool(
+                  sp.get("include_stale_narrative"),
+                ),
               });
               sendJson(res, 200, out);
               return;
@@ -789,6 +794,7 @@ export async function startMindServer(
                 sinceSeq: parseOptionalInt(sp.get("since")) ?? 0,
                 generation: parseOptionalInt(sp.get("generation")),
                 in: sp.get("in") ?? undefined,
+                about: sp.get("about") ?? undefined,
                 limit: parseOptionalInt(sp.get("limit")) ?? 50,
                 includeDescendantSeabed: parseOptionalBool(
                   sp.get("include_descendant_seabed"),
@@ -830,6 +836,61 @@ export async function startMindServer(
             if (method === "POST" && pathname === "/v1/raw") {
               const body = (await readJsonBody(req)) as unknown as SurfaceRawAddInput;
               const out = await surface.rawAdd(body);
+              sendJson(res, 200, out);
+              return;
+            }
+
+            if (method === "POST" && pathname === "/v1/settle") {
+              const raw = await readJsonBody(req);
+              if (typeof raw.layer !== "string" || !raw.layer.trim()) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "layer" must be a non-empty string',
+                );
+              }
+              if (raw.in !== undefined && typeof raw.in !== "string") {
+                throw new MindError("INVALID_INPUT", 'Field "in" must be a string');
+              }
+              if (raw.about !== undefined && typeof raw.about !== "string") {
+                throw new MindError("INVALID_INPUT", 'Field "about" must be a string');
+              }
+              if (
+                raw.periodKey !== undefined &&
+                typeof raw.periodKey !== "string"
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "periodKey" must be a string',
+                );
+              }
+              if (
+                raw.narrativeMd !== undefined &&
+                typeof raw.narrativeMd !== "string"
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "narrativeMd" must be a string',
+                );
+              }
+              if (
+                raw.sourceIds !== undefined &&
+                (!Array.isArray(raw.sourceIds) ||
+                  !raw.sourceIds.every((item) => typeof item === "string"))
+              ) {
+                throw new MindError(
+                  "INVALID_INPUT",
+                  'Field "sourceIds" must be an array of strings',
+                );
+              }
+              const body: SurfaceSettleInput = {
+                layer: raw.layer.trim() as DistillationLayer,
+                in: raw.in as string | undefined,
+                about: raw.about as string | undefined,
+                periodKey: raw.periodKey as string | undefined,
+                narrativeMd: raw.narrativeMd as string | undefined,
+                sourceIds: raw.sourceIds as string[] | undefined,
+              };
+              const out = await surface.settle(body);
               sendJson(res, 200, out);
               return;
             }

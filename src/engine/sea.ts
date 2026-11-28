@@ -18,7 +18,7 @@ import {
   windowText,
 } from "../format/snippet.js";
 import {
-  assertAccess,
+  assertWriteAccess,
   getDescendantIds,
   intersectAccessScopes,
   isRealmEffectivelyArchived,
@@ -28,6 +28,7 @@ import {
 } from "../policy.js";
 import type {
   BlobPort,
+  ChangeLogAboutFilter,
   DbPort,
   DrivePort,
   EmbedderPort,
@@ -56,6 +57,8 @@ import {
   type LsTargetType,
   type MindObject,
   type ObjectCard,
+  type ObjectCardFreshness,
+  type ObjectCardNarrative,
   type ObjectTreeNode,
   type OrgPolicy,
   type Realm,
@@ -96,16 +99,21 @@ import {
   formatStoredSourceRef,
   OPAQUE_FILE_NOT_FOUND,
   parseRefSyntax,
+  resolveChangeAboutFilter,
   resolveFileRef,
   resolveUnifiedObjectRead,
 } from "./refs.js";
 import {
   classifyRulesForViewer,
   collectActiveDecisionHeads,
+  collectObjectCardEntryIds,
   collectObjectScopedRules,
   collectWallRules,
   compareEntriesDesc,
+  evaluateCardObjectFreshness,
+  sanitizeNarrativeForAgent,
 } from "./object-rules.js";
+import { assertNoAccidentalSecret } from "./secret-guard.js";
 import {
   createVisibilityHelpers,
   filterVisibleChangeFrames,
@@ -125,7 +133,11 @@ const VALID_DISTILLATION_LAYERS = new Set<string>([
   "card_realm",
   "card_person",
   "card_progress",
+  "card_object",
 ]);
+
+const MAX_SETTLE_NARRATIVE_CHARS = 32768;
+const MAX_CARD_OBJECT_SOURCES = 1000;
 
 const NON_RULE_RECORD_KINDS: RecordKind[] = [
   "thing",
@@ -1026,7 +1038,40 @@ export class SeaEngine {
       const dist = this.db.getDistillation(query.id);
       if (dist && vis.canSeeDistillation(dist)) {
         vis.preloadRefs(dist.sourceIds);
-        items.push(toDistillationItem(dist, ["id"], 1));
+        let safeDist = dist;
+        if (dist.layer === "card_object" && viewerRealm) {
+          const targetObj = this.db.getObject(dist.periodKey);
+          if (targetObj && targetObj.orgId === viewerRealm.orgId) {
+            const allVisObjs = vis.sanitizeObjects(
+              this.db.listObjects({
+                orgId: viewerRealm.orgId,
+                realmIds: scope.readableLedgerIds,
+              }),
+            );
+            const freshness = evaluateCardObjectFreshness({
+              db: this.db,
+              realms,
+              orgId: viewerRealm.orgId,
+              dist,
+              object: targetObj,
+              scope,
+              vis,
+              sanitizedVisibleObjects: allVisObjs,
+            });
+            if (freshness.status === "hard_stale") {
+              safeDist = {
+                ...dist,
+                narrativeMd: freshness.summaryLine ?? "已过时（需重新 settle）",
+              };
+            } else {
+              safeDist = {
+                ...dist,
+                narrativeMd: sanitizeNarrativeForAgent(dist.narrativeMd),
+              };
+            }
+          }
+        }
+        items.push(toDistillationItem(safeDist, ["id"], 1));
       }
       annotateRecallPage(items);
       return {
@@ -2168,7 +2213,7 @@ export class SeaEngine {
           rejectIfFts();
           continue;
         }
-        if (dist.status === "retracted") {
+        if (dist.status === "retracted" || dist.layer === "card_object") {
           rejectIfFts();
           continue;
         }
@@ -3518,6 +3563,43 @@ export class SeaEngine {
       }
       vis.preloadRefs(dist.sourceIds);
       const clean = vis.sanitizeDistillation(dist);
+      if (dist.layer === "card_object") {
+        const targetObj = this.db.getObject(dist.periodKey);
+        if (!targetObj || targetObj.orgId !== viewerRealm.orgId) {
+          throw new MindError("NOT_FOUND", OPAQUE_ENTRY_NOT_FOUND);
+        }
+        const allVisibleObjects = vis.sanitizeObjects(
+          this.db.listObjects({
+            orgId: viewerRealm.orgId,
+            realmIds: scope.readableLedgerIds,
+          }),
+        );
+        const freshness = evaluateCardObjectFreshness({
+          db: this.db,
+          realms,
+          orgId: viewerRealm.orgId,
+          dist,
+          object: targetObj,
+          scope,
+          vis,
+          sanitizedVisibleObjects: allVisibleObjects,
+        });
+        if (freshness.status === "hard_stale") {
+          clean.narrativeMd = freshness.summaryLine ?? "已过时（需重新 settle）";
+        } else {
+          const staleSuffix = freshness.summaryLine
+            ? ` · ${freshness.summaryLine}`
+            : "";
+          clean.narrativeMd = `_Agent 叙事简介（非规矩，不可作为约束依据）_${staleSuffix}\n\n${sanitizeNarrativeForAgent(clean.narrativeMd)}`;
+        }
+        return {
+          kind: "distillation",
+          behaviorClass: "conclusion",
+          distillation: clean,
+          realmPath: vis.getSanitizedRealmPath(distRealm.id),
+          freshness,
+        };
+      }
       return {
         kind: "distillation",
         behaviorClass: "conclusion",
@@ -3764,6 +3846,7 @@ export class SeaEngine {
     viewerRealmId: string;
     in?: string;
     target?: string;
+    about?: string;
     sinceSeq?: number;
     limit?: number;
     includeDescendantSeabed?: boolean;
@@ -3834,6 +3917,19 @@ export class SeaEngine {
       includeDescendantSeabed: Boolean(params.includeDescendantSeabed),
     });
 
+    let aboutFilter: ChangeLogAboutFilter | undefined;
+    if (params.about?.trim()) {
+      aboutFilter = resolveChangeAboutFilter({
+        db: this.db,
+        realms,
+        orgId: viewerRealm.orgId,
+        aboutRef: params.about.trim(),
+        scope,
+        vis,
+      });
+      includeOrgLevel = false;
+    }
+
     const batchSize = Math.min(500, Math.max(limit * 2, 100));
     const filtered: ChangeLogEntry[] = [];
     let scanSeq = sinceSeq;
@@ -3849,6 +3945,7 @@ export class SeaEngine {
         limit: batchSize,
         includeSecret: false,
         filterRealmIds,
+        aboutFilter,
       });
       generation = raw.generation;
       if (raw.frames.length === 0) break;
@@ -4088,6 +4185,7 @@ export class SeaEngine {
     chars?: number;
     full?: boolean;
     includeDescendantSeabed?: boolean;
+    includeStaleNarrative?: boolean;
     scopeCeiling?: AccessScope;
   }): Promise<ShowResult> {
     const rawWith = params.with ?? [];
@@ -4507,6 +4605,53 @@ export class SeaEngine {
         includeSecret: false,
       });
 
+      // L3 Narrative Card (`card_object`) with fail-closed L5 source closure + deterministic per-reader V3 freshness
+      let narrativeCard: ObjectCardNarrative | undefined;
+      let cardFreshness: ObjectCardFreshness | undefined;
+      if (resolved.object) {
+        const rawObjCard = this.db.getLatestDistillationByPeriodKey(
+          resolved.object.realmId,
+          "card_object",
+          resolved.object.id,
+        );
+        if (rawObjCard && vis.canSeeDistillation(rawObjCard)) {
+          const freshness = evaluateCardObjectFreshness({
+            db: this.db,
+            realms,
+            orgId: viewerRealm.orgId,
+            dist: rawObjCard,
+            object: resolved.object,
+            scope,
+            vis,
+            sanitizedVisibleObjects: allVisibleObjects,
+          });
+          const cleanDist = vis.sanitizeDistillation(rawObjCard);
+          const isHardStale = freshness.status === "hard_stale";
+          cardFreshness = freshness;
+          narrativeCard = {
+            id: cleanDist.id,
+            realmId: cleanDist.realmId,
+            periodKey: cleanDist.periodKey,
+            createdAt: cleanDist.createdAt,
+            settledBy:
+              typeof cleanDist.hardFacts.settledBy === "string"
+                ? cleanDist.hardFacts.settledBy
+                : null,
+            sourceIds: cleanDist.sourceIds,
+            freshness,
+            narrativeMd: isHardStale ? null : rawObjCard.narrativeMd,
+            safeNarrativeMd: isHardStale
+              ? null
+              : sanitizeNarrativeForAgent(rawObjCard.narrativeMd),
+            ...(isHardStale &&
+            params.includeStaleNarrative &&
+            params.actor.kind === "human"
+              ? { historicNarrativeMd: rawObjCard.narrativeMd }
+              : {}),
+          };
+        }
+      }
+
       const card: ObjectCard = {
         ref: resolved.canonicalRef,
         kind: resolved.objectKind,
@@ -4537,6 +4682,7 @@ export class SeaEngine {
         },
         children,
         coOccurring,
+        ...(narrativeCard ? { narrativeCard, cardFreshness } : {}),
         latestSeq,
         recentEntries,
         try: `meru-mind ls ${resolved.canonicalRef}`,
@@ -5008,10 +5154,13 @@ export class SeaEngine {
     actor: Actor;
     viewerRealmId: string;
     targetRealmId?: string;
+    about?: string;
     layer: DistillationLayer;
-    periodKey: string;
+    periodKey?: string;
     narrativeMd?: string;
     sourceIds?: string[];
+    writeScope?: TokenWriteScope;
+    scopeCeiling?: AccessScope;
   }): Promise<Distillation> {
     if (!VALID_DISTILLATION_LAYERS.has(params.layer)) {
       throw new MindError(
@@ -5019,7 +5168,249 @@ export class SeaEngine {
         `Invalid distillation layer: "${String(params.layer)}"`,
       );
     }
-    const periodKey = params.periodKey.trim();
+    if (
+      params.narrativeMd !== undefined &&
+      params.narrativeMd.length > MAX_SETTLE_NARRATIVE_CHARS
+    ) {
+      throw new MindError(
+        "INVALID_INPUT",
+        `narrativeMd exceeds maximum length of ${MAX_SETTLE_NARRATIVE_CHARS} characters (got ${params.narrativeMd.length})`,
+      );
+    }
+    if (params.narrativeMd && params.narrativeMd.trim()) {
+      assertNoAccidentalSecret({
+        texts: [params.narrativeMd],
+        sensitivity: "internal",
+        surfaceHint:
+          "Remove plaintext credentials before settling a distillation card.",
+      });
+    }
+
+    if (params.layer === "card_object") {
+      if (params.periodKey !== undefined && params.periodKey.trim() !== "") {
+        throw new MindError(
+          "INVALID_INPUT",
+          "card_object does not accept --period / periodKey; the server sets periodKey to the target object's ID.",
+        );
+      }
+      if (params.sourceIds !== undefined && params.sourceIds.length > 0) {
+        throw new MindError(
+          "INVALID_INPUT",
+          "card_object does not accept caller-supplied --sources / sourceIds; the server computes sourceIds deterministically.",
+        );
+      }
+      const aboutRaw = params.about?.trim() ?? "";
+      if (!aboutRaw) {
+        throw new MindError(
+          "INVALID_INPUT",
+          "card_object requires --about <objRef> pointing to a visible object.",
+          { try: "meru-mind settle --layer card_object --about service:api --narrative \"...\"" },
+        );
+      }
+      const parsedAbout = parseRefSyntax(aboutRaw);
+      if (parsedAbout.kind !== "object") {
+        throw new MindError(
+          "INVALID_REF",
+          `Invalid --about reference "${aboutRaw}": expected <kind>:<name>, /<realm>/<kind>:<name>, or obj_...`,
+        );
+      }
+
+      return this.db.transaction(() => {
+        const realms = this.db.listRealms();
+        const mounts = this.db.listMounts();
+        const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
+        if (!viewerRealm) {
+          throw new MindError("NOT_FOUND", OPAQUE_REALM_NOT_FOUND);
+        }
+        const orgPolicy = this.getOrgPolicy(viewerRealm.orgId);
+
+        const baseScope = resolveAccessScope({
+          realms,
+          mounts,
+          viewerRealmId: viewerRealm.id,
+          orgPolicy,
+          includeDescendantSeabed: false,
+        });
+        const scope = params.scopeCeiling
+          ? intersectAccessScopes(baseScope, params.scopeCeiling)
+          : baseScope;
+
+        const vis = this.buildVisibilityHelpers({
+          realms,
+          mounts,
+          actor: params.actor,
+          viewerRealmId: viewerRealm.id,
+          scope,
+          ledgerRealmIds: scope.readableLedgerIds,
+          seabedRealmIds: scope.readableSeabedIds,
+          includeDescendantSeabed: false,
+        });
+
+        const resolved = resolveUnifiedObjectRead({
+          db: this.db,
+          realms,
+          orgId: viewerRealm.orgId,
+          parsed: parsedAbout,
+          scope,
+          vis,
+          verb: "show",
+          allowEmpty: true,
+        });
+        if (!resolved.object) {
+          throw new MindError("NOT_FOUND", OPAQUE_OBJECT_NOT_FOUND);
+        }
+
+        const targetRealmId = resolved.object.realmId;
+        if (params.targetRealmId && params.targetRealmId !== targetRealmId) {
+          throw new MindError(
+            "INVALID_INPUT",
+            `card_object must be settled in the target object's realm (${resolved.realmPath ?? targetRealmId}); omit --in or match the object's realm.`,
+          );
+        }
+
+        assertWriteAccess({
+          realms,
+          mounts,
+          actor: params.actor,
+          viewerRealmId: params.viewerRealmId,
+          targetRealmId,
+          assetKind: "ledger",
+          orgPolicy,
+          writeScope: params.writeScope ?? "self",
+          category: "content",
+        });
+
+        const targetRealm = realms.find((r) => r.id === targetRealmId)!;
+        const basisRealmIds = Array.from(new Set(scope.readableLedgerIds)).sort();
+        const basisSet = new Set(basisRealmIds);
+
+        const allVisibleObjects = vis.sanitizeObjects(
+          this.db.listObjects({
+            orgId: targetRealm.orgId,
+            realmIds: scope.readableLedgerIds,
+          }),
+        );
+        const cardEntryIds = collectObjectCardEntryIds({
+          db: this.db,
+          orgId: targetRealm.orgId,
+          object: resolved.object,
+          sanitizedVisibleObjects: allVisibleObjects,
+          allowedRealmIds: basisSet,
+        });
+
+        const activeDecisions = collectActiveDecisionHeads({
+          db: this.db,
+          orgId: targetRealm.orgId,
+          entryIds: cardEntryIds,
+          vis,
+          allowedRealmIds: basisSet,
+        });
+        const activeRules = collectObjectScopedRules({
+          db: this.db,
+          realms,
+          orgId: targetRealm.orgId,
+          object: resolved.object,
+          objectKind: resolved.object.kind,
+          objectName: resolved.object.name,
+          scopedRealmId: targetRealmId,
+          scope,
+          vis,
+          sanitizedVisibleObjects: allVisibleObjects,
+          scopeSource: "object",
+          allowedRealmIds: basisSet,
+        });
+        const recentFindings =
+          cardEntryIds.length > 0
+            ? this.db
+                .getRecordsByIds(cardEntryIds)
+                .filter(
+                  (r) =>
+                    r.orgId === targetRealm.orgId &&
+                    r.kind === "finding" &&
+                    r.status === "active" &&
+                    r.supersededById === null &&
+                    r.redactedAt === null &&
+                    r.sensitivity !== "secret" &&
+                    basisSet.has(r.realmId) &&
+                    vis.canSeeRecord(r),
+                )
+                .sort(compareEntriesDesc)
+                .slice(0, 50)
+            : [];
+
+        const activeDecisionIds = activeDecisions.map((r) => r.id);
+        const activeRuleIds = activeRules.map((r) => r.id);
+        const recentFindingIds = recentFindings.map((r) => r.id);
+
+        // L6: enforce activeDecisionIds ∪ activeRuleIds ⊆ sourceIds; reject if > cap (NEVER silently truncate)
+        const sourceIds = Array.from(
+          new Set([...activeDecisionIds, ...activeRuleIds, ...recentFindingIds]),
+        );
+        if (sourceIds.length > MAX_CARD_OBJECT_SOURCES) {
+          throw new MindError(
+            "INVALID_INPUT",
+            `card_object source count (${sourceIds.length}) exceeds maximum cap of ${MAX_CARD_OBJECT_SOURCES}; cannot truncate sourceIds without breaking L5/L6 invariants.`,
+          );
+        }
+
+        const now = new Date().toISOString();
+        const periodKey = resolved.object.id;
+        const hardFacts: Record<string, unknown> = {
+          realmId: targetRealmId,
+          layer: "card_object",
+          periodKey,
+          objectId: resolved.object.id,
+          objectRef: resolved.canonicalRef,
+          activeDecisionIds,
+          activeRuleIds,
+          basisRealmIds,
+          settledBy: params.actor.id,
+          computedAt: now,
+        };
+
+        const defaultNarrative = [
+          `Object summary (${resolved.canonicalRef}):`,
+          `- Active decisions: ${activeDecisionIds.length}`,
+          `- Scoped rules: ${activeRuleIds.length}`,
+          `- Recent findings: ${recentFindingIds.length}`,
+        ].join("\n");
+
+        const distillation: Distillation = {
+          id: makeId("dist"),
+          realmId: targetRealmId,
+          layer: "card_object",
+          periodKey,
+          status: "active",
+          hardFacts,
+          narrativeMd: params.narrativeMd?.trim() || defaultNarrative,
+          sourceIds,
+          createdAt: now,
+        };
+
+        this.db.insertDistillation(distillation);
+        this.db.supersedeActiveDistillations(
+          targetRealmId,
+          "card_object",
+          periodKey,
+          distillation.id,
+        );
+
+        // Fable R2 #6: Do NOT index card_object into fts_items or vec_pending!
+        this.db.appendChangeLog({
+          orgId: targetRealm.orgId,
+          realmId: distillation.realmId,
+          entityType: "distillation",
+          entityId: distillation.id,
+          op: "settle",
+          actorId: params.actor.id,
+          createdAt: now,
+        });
+
+        return vis.sanitizeDistillation(distillation);
+      });
+    }
+
+    const periodKey = (params.periodKey ?? "").trim();
     if (!periodKey) {
       throw new MindError("INVALID_INPUT", "periodKey cannot be empty");
     }
@@ -5031,15 +5422,16 @@ export class SeaEngine {
       const viewerRealm = realms.find((r) => r.id === params.viewerRealmId);
       const orgPolicy = this.getOrgPolicy(viewerRealm?.orgId);
 
-      assertAccess({
+      assertWriteAccess({
         realms,
         mounts,
         actor: params.actor,
         viewerRealmId: params.viewerRealmId,
         targetRealmId,
         assetKind: "ledger",
-        required: "write",
         orgPolicy,
+        writeScope: params.writeScope ?? "self",
+        category: "content",
       });
 
       const targetRealm = realms.find((r) => r.id === targetRealmId)!;
@@ -5136,6 +5528,7 @@ export class SeaEngine {
         activeRuleIds,
         activeThingIds,
         participants: Array.from(authors).sort(),
+        settledBy: params.actor.id,
         computedAt: now,
       };
 
@@ -5267,7 +5660,11 @@ export class SeaEngine {
         return `${sea.kind}:${sea.topicId ?? sea.realmId}\n${sea.text}`.trim() || null;
       }
       const dist = this.db.getDistillation(pending.itemId);
-      if (!dist || (dist.status as string) === "retracted") {
+      if (
+        !dist ||
+        (dist.status as string) === "retracted" ||
+        dist.layer === "card_object"
+      ) {
         return null;
       }
       return `${dist.layer}:${dist.periodKey}\n${dist.narrativeMd}`.trim() || null;
@@ -5368,7 +5765,11 @@ export class SeaEngine {
             liveRealmId = sea.realmId;
           } else {
             const dist = this.db.getDistillation(pending.itemId);
-            if (!dist || (dist.status as string) === "retracted") {
+            if (
+              !dist ||
+              (dist.status as string) === "retracted" ||
+              dist.layer === "card_object"
+            ) {
               this.db.deletePendingVector(pending.itemId);
               skipped += 1;
               continue;
@@ -5544,7 +5945,9 @@ export class SeaEngine {
               `${d.id}: missing sourceIds [${missing.join(", ")}]`,
             );
           }
-          if ((d.status as string) === "retracted") continue;
+          if ((d.status as string) === "retracted" || d.layer === "card_object") {
+            continue;
+          }
           const orgId = realmsById.get(d.realmId)?.orgId ?? "";
           indexOneSync({
             itemId: d.id,

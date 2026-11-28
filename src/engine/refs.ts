@@ -1,5 +1,5 @@
 import { normalizeSafeRelPath } from "../adapters/local-drive.js";
-import type { DbPort } from "../ports.js";
+import type { ChangeLogAboutFilter, DbPort } from "../ports.js";
 import {
   MindError,
   type AccessScope,
@@ -515,6 +515,7 @@ export interface UnifiedObjectResolution {
   ledgerRealmIds: string[];
   seabedRealmIds: string[];
   entryIds: string[];
+  thingEntryIds?: string[];
   countsBySource: {
     viaObject: number;
     viaTag: number;
@@ -810,6 +811,7 @@ export function resolveUnifiedObjectRead(params: {
     ledgerRealmIds: scope.readableLedgerIds,
     seabedRealmIds: scope.readableSeabedIds,
     entryIds: combinedEntryIds,
+    thingEntryIds: Array.from(thingEntryIdSet),
     countsBySource: {
       viaObject: objectEntryIds.length,
       viaTag: filteredTagEntryIds.length,
@@ -965,5 +967,69 @@ export function resolveAboutRefsForWrite(params: {
     objectIds: Array.from(new Set(objectIds)).sort(),
     resourceTags: Array.from(new Set(resourceTags)).sort(),
     ...(thingId ? { thingId } : {}),
+  };
+}
+
+/**
+ * Resolves `changes --about <objRef>` into a SQL-pushable `ChangeLogAboutFilter`.
+ * Uses the exact same visibility-checked resolver as `show`/`ls`/`search` so hidden vs
+ * nonexistent objects return byte-identical opaque `NOT_FOUND` errors (`V9` / `L3`).
+ */
+export function resolveChangeAboutFilter(params: {
+  db: DbPort;
+  realms: Realm[];
+  orgId: string;
+  aboutRef: string;
+  scope: AccessScope;
+  vis: VisibilityHelpers;
+}): ChangeLogAboutFilter {
+  const trimmed = params.aboutRef.trim();
+  const parsed = parseRefSyntax(trimmed);
+  if (parsed.kind !== "object") {
+    throw new MindError(
+      "INVALID_REF",
+      `Invalid --about reference "${params.aboutRef}": expected <kind>:<name>, /<realm>/<kind>:<name>, or obj_...`,
+      { try: "meru-mind changes --since 0 --about service:api" },
+    );
+  }
+  const resolved = resolveUnifiedObjectRead({
+    db: params.db,
+    realms: params.realms,
+    orgId: params.orgId,
+    parsed,
+    scope: params.scope,
+    vis: params.vis,
+    verb: "show",
+    allowEmpty: false,
+  });
+
+  let objectIds: string[] = [];
+  if (resolved.object) {
+    const allVisibleObjects = params.vis.sanitizeObjects(
+      params.db.listObjects({
+        orgId: params.orgId,
+        realmIds: params.scope.readableLedgerIds,
+      }),
+    );
+    objectIds = [
+      resolved.object.id,
+      ...getDescendantObjectIds(allVisibleObjects, resolved.object.id),
+    ];
+  }
+
+  let resourceTag: string | null = null;
+  try {
+    resourceTag = normalizeResourceTag(
+      `${resolved.objectKind}:${resolved.objectName}`,
+    );
+  } catch {
+    resourceTag = null;
+  }
+
+  return {
+    objectIds,
+    resourceTag,
+    scopedRealmId: resolved.scopedRealmId,
+    thingEntryIds: resolved.thingEntryIds ?? [],
   };
 }

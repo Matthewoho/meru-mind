@@ -320,7 +320,8 @@ export type DistillationLayer =
   | "slice_month"
   | "card_realm"
   | "card_person"
-  | "card_progress";
+  | "card_progress"
+  | "card_object";
 
 export interface Distillation {
   id: string;
@@ -1030,6 +1031,52 @@ export interface ObjectBriefCoOccurring {
   tryCommand: string;
 }
 
+export type CardFreshnessStatus = "fresh" | "soft_stale" | "hard_stale";
+
+export interface CardStaleReason {
+  kind:
+    | "missing_basis"
+    | "decision_superseded"
+    | "decision_removed"
+    | "decision_added"
+    | "rule_added"
+    | "rule_removed";
+  entryId?: string;
+  replacedById?: string | null;
+  count?: number;
+  message: string;
+}
+
+export interface ObjectCardFreshness {
+  status: CardFreshnessStatus;
+  reasons: CardStaleReason[];
+  /** Concise single-line summary when soft_stale or hard_stale; null when fresh */
+  summaryLine: string | null;
+  addedDecisionIds: string[];
+  removedDecisionIds: string[];
+  addedRuleIds: string[];
+  removedRuleIds: string[];
+}
+
+export interface ObjectCardNarrative {
+  id: string;
+  realmId: string;
+  periodKey: string;
+  createdAt: string;
+  settledBy: string | null;
+  sourceIds: string[];
+  freshness: ObjectCardFreshness;
+  /** Raw narrative markdown when fresh/soft_stale; strictly null on hard_stale */
+  narrativeMd: string | null;
+  /** Heading-demoted, blockquoted narrative markdown safe for agent rendering; null on hard_stale */
+  safeNarrativeMd: string | null;
+  /**
+   * Populated ONLY when a human caller explicitly opts into historic stale preview
+   * (`include_stale_narrative=1` in Studio UI); NEVER populated for agents or CLI/MCP output.
+   */
+  historicNarrativeMd?: string | null;
+}
+
 export interface ObjectCard {
   ref: string;
   kind: string;
@@ -1049,6 +1096,8 @@ export interface ObjectCard {
   recentFindings: ObjectBriefSection<ObjectBriefEntrySummary>;
   children: ObjectBriefChild[];
   coOccurring: ObjectBriefCoOccurring[];
+  narrativeCard?: ObjectCardNarrative;
+  cardFreshness?: ObjectCardFreshness;
   latestSeq: number;
   recentEntries: LsEntry[];
   try: string;
@@ -1151,6 +1200,7 @@ export type CatResult =
       behaviorClass: "conclusion";
       distillation: Distillation;
       realmPath: string;
+      freshness?: ObjectCardFreshness;
     }
   | {
       kind: "drive";
